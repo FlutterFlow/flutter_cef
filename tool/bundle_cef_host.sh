@@ -35,13 +35,20 @@ mkdir -p "$APP/Contents/Frameworks"
 rm -rf "$DEST"
 cp -R "$HOST_APP" "$DEST"
 
-# Sign inside-out with one identity so library validation passes (no need for
-# the disable-library-validation entitlement when everything shares an identity).
-codesign --force --sign "$IDENTITY" \
-  "$DEST/Contents/Frameworks/Chromium Embedded Framework.framework"
+# Sign inside-out: each helper, then cef_host last. Keep CEF's own framework
+# signature (re-signing breaks the versioned-framework seal on Xcode 26; helpers
+# load it under disable-library-validation).
+for h in "$DEST"/Contents/Frameworks/*Helper*.app; do
+  [ -d "$h" ] || continue
+  if [ -f "$ENT" ]; then
+    codesign --force --options runtime --timestamp=none --entitlements "$ENT" --sign "$IDENTITY" "$h"
+  else
+    codesign --force --options runtime --timestamp=none --sign "$IDENTITY" "$h"
+  fi
+done
 if [ -f "$ENT" ]; then
-  codesign --force --sign "$IDENTITY" --entitlements "$ENT" "$DEST"
+  codesign --force --options runtime --timestamp=none --entitlements "$ENT" --sign "$IDENTITY" "$DEST"
 else
-  codesign --force --sign "$IDENTITY" "$DEST"
+  codesign --force --options runtime --timestamp=none --sign "$IDENTITY" "$DEST"
 fi
 echo "[flutter_cef] done. Remember the host app must NOT be sandboxed; see the README."

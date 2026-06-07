@@ -2,10 +2,16 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <!-- Development-category signing so the kernel assigns a recognized CS
-       validation category. (Single-process CEF has no child processes to
-       validate; when bundled into a host app, re-sign with the app's identity
-       and entitlements.) -->
+  <!-- Shared by cef_host (browser) and all CEF helper processes. The renderer
+       and GPU helpers JIT JavaScript / WebAssembly, so they need JIT + unsigned
+       executable memory under hardened runtime. Library validation is relaxed
+       because the framework is loaded by dlopen; when everything is signed with
+       one identity it would pass anyway, but this keeps ad-hoc/dev builds
+       working too. get-task-allow is for local debugging — drop it (and notarize)
+       for distribution. -->
+  <key>com.apple.security.cs.allow-jit</key><true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
+  <key>com.apple.security.cs.disable-library-validation</key><true/>
   <key>com.apple.security.get-task-allow</key><true/>
 </dict>
 </plist>
