@@ -76,20 +76,21 @@ stay on.
 
 ## Roadmap
 
-Working today: live OSR render (on/off-screen), pointer/scroll/keyboard input,
-`<select>` popups, page cursor, navigation + history, loading/title/url/error/
-console events, `executeJavaScript`.
+Working today: live OSR render (on/off-screen, HiDPI/Retina-crisp),
+pointer/scroll/keyboard input, `<select>` popups, page cursor, navigation +
+history, loading/title/url/error/console events, `executeJavaScript`.
 
 Next:
 
-- **GPU zero-copy** — `OnAcceleratedPaint` hands back an `IOSurfaceRef` directly
-  (macOS, CEF ≥147); blit it into the texture surface instead of the CPU
-  `OnPaint` memcpy. Requires the GPU process, i.e. multi-process.
-- **Multi-process + signed helpers** — replace `--single-process` with the four
-  CEF helper bundles (`(GPU)`/`(Renderer)`/`(Plugin)`/`(Alerts)`), each
-  hardened-runtime signed with one identity + JIT entitlements, so Chromium 144's
-  Mach-port peer validation passes with enforcement on (no
-  `MachPortRendezvous*` disable). Unlocks the GPU path + site isolation.
+- **Multi-process (opt-in today, default later)** — `-DCEF_MULTI_PROCESS=ON`
+  builds the five CEF helper bundles (base + `(GPU)`/`(Renderer)`/`(Plugin)`/
+  `(Alerts)`) and drops `--single-process`, enabling the GPU/Viz process + site
+  isolation. It runs, but Chromium 144's Mach-port peer validation only fully
+  clears (`-67030`) with a **Developer ID identity + notarization** — so
+  single-process stays the default until that's wired into a release pipeline.
+- **GPU zero-copy** — on top of multi-process: `OnAcceleratedPaint` hands back an
+  `IOSurfaceRef` directly (macOS, CEF ≥147); blit it into the texture surface
+  instead of the CPU `OnPaint` memcpy.
 - **`evaluateJavaScript`** (V8 round-trip return value), IME/composition
   (CJK/emoji), dialogs, downloads, context menus, find, zoom, cookies, devtools.
 - **Windows / Linux** — the federated structure is ready; each needs its own host
