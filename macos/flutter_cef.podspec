@@ -20,7 +20,9 @@ rendering when off-screen. macOS only.
   s.source_files     = 'Classes/**/*'
   s.dependency 'FlutterMacOS'
 
-  s.platform = :osx, '11.0'
+  # The Swift bridge itself is 10.15-clean; live rendering needs macOS 12+ at
+  # runtime (CEF 144), gated by cef_host.app's own LSMinimumSystemVersion.
+  s.platform = :osx, '10.15'
   s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES' }
   s.swift_version = '5.0'
   s.resource_bundles = {'flutter_cef_privacy' => ['Resources/PrivacyInfo.xcprivacy']}

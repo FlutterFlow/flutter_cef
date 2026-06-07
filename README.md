@@ -2,7 +2,7 @@
 
 Embed a **live Chromium browser** (via the [Chromium Embedded Framework](https://bitbucket.org/chromiumembedded/cef/)) as a Flutter widget — rendered into a `Texture`, so it composites, transforms, clips, and zooms like any other widget, and **keeps rendering even when off-screen / not focused**. Pointer, scroll, and keyboard input are forwarded; the page cursor drives a `MouseRegion`.
 
-> Status: **experimental, macOS only.** Real Chromium (any site — JS/CSS/WebGL/video). Single-process OSR today (simple to sign; see Roadmap for the GPU/multi-process upgrade). No mobile (iOS bans third-party engines); desktop by nature.
+> Status: **experimental, macOS 12+ only** (CEF 144 runtime floor). Real Chromium (any site — JS/CSS/WebGL/video). Single-process OSR today (simple to sign; see Roadmap for the GPU/multi-process upgrade). No mobile (iOS bans third-party engines); desktop by nature.
 
 ```dart
 import 'package:flutter_cef/flutter_cef.dart';
@@ -41,7 +41,7 @@ export FLUTTER_CEF_HOST="$PWD/native/cef_host/build/cef_host.app/Contents/MacOS/
 cd example && flutter run -d macos
 ```
 
-For a **distributable** app, `cef_host.app` + the CEF framework must be bundled into your `.app` and signed by your build (the plugin auto-resolves a bundled copy under `Contents/Frameworks`). Your entitlements need at least `com.apple.security.cs.disable-library-validation` (and JIT entitlements under hardened runtime). The build-phase bundling is the next infra item — see Roadmap.
+For a **distributable** app, `cef_host.app` + the CEF framework must be bundled into your `.app` and signed by your build (the plugin auto-resolves a bundled copy under `Contents/Frameworks`). Your host app **must not be App-Sandboxed** (CEF spawns the helper, shares a global IOSurface, and writes a cache); entitlements need `com.apple.security.cs.disable-library-validation` and JIT — see `example/macos/Runner/*.entitlements` for the reference set. The build-phase bundling is the next infra item — see Roadmap.
 
 ## Roadmap
 
