@@ -8,10 +8,14 @@
 // (no NSWindow), it keeps rendering live even when the view is off-screen — the
 // whole point of the CEF path.
 //
-// CEF runs --single-process: renderer + GPU live in this process, so there are
-// no CEF child processes and thus no Mach-port child-signature validation
-// (Chromium 144's process_requirement.cc -67030), which a sandbox-free helper
-// would otherwise trip.
+// By default CEF runs --single-process: renderer + GPU live in this process, so
+// there are no child processes and thus no Mach-port peer validation (Chromium
+// 144's process_requirement.cc -67030). Define CEF_HOST_MULTIPROCESS (CMake
+// -DCEF_MULTI_PROCESS=ON) to instead spawn the CEF helper subprocesses
+// (GPU/Renderer/Plugin/Alerts) from Contents/Frameworks — required for the
+// GPU/Viz process and OnAcceleratedPaint, but the whole bundle then needs to be
+// hardened-runtime signed with one Developer-ID identity + notarized to clear
+// peer validation cleanly.
 //
 // Args: --url=<url> --width=<px> --height=<px> --iosurface-id=<id> --ipc=<path>
 //
@@ -92,10 +96,11 @@ constexpr uint8_t kOpExecuteJs = 0x25;  // {utf8 code}
 int g_ipc_fd = -1;
 std::mutex g_ipc_write_mutex;
 
-std::mutex g_surface_mutex;      // guards g_surface / g_width / g_height
+std::mutex g_surface_mutex;      // guards g_surface / g_width / g_height / g_dpr
 IOSurfaceRef g_surface = nullptr;
-int g_width = 800;
+int g_width = 800;   // logical (DIP) — GetViewRect; CEF scales by g_dpr.
 int g_height = 600;
+double g_dpr = 1.0;  // device pixel ratio; the IOSurface is logical*g_dpr px.
 
 CefRefPtr<CefBrowser> g_browser;
 
@@ -246,6 +251,16 @@ class HostRenderHandler : public CefRenderHandler {
     rect = CefRect(0, 0, g_width, g_height);
   }
 
+  // Report the device scale so CEF renders the OSR buffer at logical*dpr
+  // (Retina-native) instead of 1x upscaled — fixes the blur on HiDPI displays.
+  bool GetScreenInfo(CefRefPtr<CefBrowser>, CefScreenInfo& info) override {
+    std::lock_guard<std::mutex> lock(g_surface_mutex);
+    info.device_scale_factor = static_cast<float>(g_dpr);
+    info.rect = CefRect(0, 0, g_width, g_height);
+    info.available_rect = info.rect;
+    return true;
+  }
+
   void OnPaint(CefRefPtr<CefBrowser>, PaintElementType type, const RectList&,
                const void* buffer, int width, int height) override {
     std::lock_guard<std::mutex> lock(g_surface_mutex);
@@ -360,11 +375,16 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
       const CefString&, CefRefPtr<CefCommandLine> command_line) override {
     command_line->AppendSwitch("use-mock-keychain");
     command_line->AppendSwitchWithValue("password-store", "basic");
+#ifndef CEF_HOST_MULTIPROCESS
+    // Single-process (default): no child processes, so no Mach-port peer
+    // validation (Chromium 144's -67030). The trade-off vs multi-process is no
+    // GPU/Viz process — i.e. no OnAcceleratedPaint. See CEF_MULTI_PROCESS.
     command_line->AppendSwitch("single-process");
     command_line->AppendSwitchWithValue(
         "disable-features",
         "MachPortRendezvousValidatePeerRequirements,"
         "MachPortRendezvousEnforcePeerRequirements");
+#endif
     command_line->AppendSwitch("enable-logging");
     command_line->AppendSwitchWithValue("log-file", "/tmp/cef_host_chromium.log");
     command_line->AppendSwitchWithValue("v", "1");
@@ -617,10 +637,12 @@ int main(int argc, char* argv[]) {
   std::string ipc_path = ArgValue(argc, argv, "ipc");
   std::string ws = ArgValue(argc, argv, "width");
   std::string hs = ArgValue(argc, argv, "height");
+  std::string dprs = ArgValue(argc, argv, "dpr");
   std::string sid = ArgValue(argc, argv, "iosurface-id");
   if (url.empty()) url = "about:blank";
   if (!ws.empty()) g_width = atoi(ws.c_str());
   if (!hs.empty()) g_height = atoi(hs.c_str());
+  if (!dprs.empty()) g_dpr = atof(dprs.c_str());
   g_initial_url = url;
 
   if (!sid.empty()) {
@@ -653,14 +675,27 @@ int main(int argc, char* argv[]) {
     // A plain (non-.app) executable can't auto-locate the framework Resources
     // (icudtl.dat, *.pak, locale .lproj), so point CEF at them explicitly via a
     // normalized (no "..") framework dir.
+    std::string exe_dir = ExecutableDir();
     std::string fw_raw =
-        ExecutableDir() + "/../Frameworks/Chromium Embedded Framework.framework";
+        exe_dir + "/../Frameworks/Chromium Embedded Framework.framework";
     char fw_real[4096];
     std::string fw =
         realpath(fw_raw.c_str(), fw_real) ? std::string(fw_real) : fw_raw;
     CefString(&settings.framework_dir_path) = fw;
     CefString(&settings.resources_dir_path) = fw + "/Resources";
     CefString(&settings.locales_dir_path) = fw + "/Resources";
+#ifdef CEF_HOST_MULTIPROCESS
+    // Multi-process: point CEF at the base helper subprocess + the cef_host
+    // bundle. CEF derives the (GPU)/(Renderer)/(Plugin)/(Alerts) variants from
+    // the base helper name.
+    auto normalize = [](const std::string& p) {
+      char buf[4096];
+      return realpath(p.c_str(), buf) ? std::string(buf) : p;
+    };
+    CefString(&settings.browser_subprocess_path) = normalize(
+        exe_dir + "/../Frameworks/cef_host Helper.app/Contents/MacOS/cef_host Helper");
+    CefString(&settings.main_bundle_path) = normalize(exe_dir + "/../..");
+#endif
     CefRefPtr<HostApp> app(new HostApp);
     if (!CefInitialize(main_args, settings, app, nullptr)) {
       fprintf(stderr, "[cef_host] CefInitialize failed\n");

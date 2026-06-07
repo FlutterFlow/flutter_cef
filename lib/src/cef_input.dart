@@ -90,6 +90,71 @@ final Map<LogicalKeyboardKey, int> kCefSpecialWindowsKeyCodes =
 /// behavior CEF derives natively.
 int? cefMacKeyCode(LogicalKeyboardKey key) => kCefMacKeyCodes[key];
 
+/// macOS virtual keycodes (`kVK_*`) keyed by **physical** key. CEF on macOS
+/// interprets `native_key_code` as a macOS keycode, so it must reflect the
+/// physical key position — NOT a Windows VK. (Falling back to the VK made e.g.
+/// `0`→VK 0x30, which is macOS keycode 48 = Tab, moving focus instead of typing.)
+/// Physical keys are layout-independent, so this is correct on any layout.
+final Map<PhysicalKeyboardKey, int> kCefMacKeyCodesByPhysical =
+    <PhysicalKeyboardKey, int>{
+  // Letters
+  PhysicalKeyboardKey.keyA: 0, PhysicalKeyboardKey.keyS: 1,
+  PhysicalKeyboardKey.keyD: 2, PhysicalKeyboardKey.keyF: 3,
+  PhysicalKeyboardKey.keyH: 4, PhysicalKeyboardKey.keyG: 5,
+  PhysicalKeyboardKey.keyZ: 6, PhysicalKeyboardKey.keyX: 7,
+  PhysicalKeyboardKey.keyC: 8, PhysicalKeyboardKey.keyV: 9,
+  PhysicalKeyboardKey.keyB: 11, PhysicalKeyboardKey.keyQ: 12,
+  PhysicalKeyboardKey.keyW: 13, PhysicalKeyboardKey.keyE: 14,
+  PhysicalKeyboardKey.keyR: 15, PhysicalKeyboardKey.keyY: 16,
+  PhysicalKeyboardKey.keyT: 17, PhysicalKeyboardKey.keyO: 31,
+  PhysicalKeyboardKey.keyU: 32, PhysicalKeyboardKey.keyI: 34,
+  PhysicalKeyboardKey.keyP: 35, PhysicalKeyboardKey.keyL: 37,
+  PhysicalKeyboardKey.keyJ: 38, PhysicalKeyboardKey.keyK: 40,
+  PhysicalKeyboardKey.keyN: 45, PhysicalKeyboardKey.keyM: 46,
+  // Digit row
+  PhysicalKeyboardKey.digit1: 18, PhysicalKeyboardKey.digit2: 19,
+  PhysicalKeyboardKey.digit3: 20, PhysicalKeyboardKey.digit4: 21,
+  PhysicalKeyboardKey.digit6: 22, PhysicalKeyboardKey.digit5: 23,
+  PhysicalKeyboardKey.digit9: 25, PhysicalKeyboardKey.digit7: 26,
+  PhysicalKeyboardKey.digit8: 28, PhysicalKeyboardKey.digit0: 29,
+  // Punctuation
+  PhysicalKeyboardKey.equal: 24, PhysicalKeyboardKey.minus: 27,
+  PhysicalKeyboardKey.bracketRight: 30, PhysicalKeyboardKey.bracketLeft: 33,
+  PhysicalKeyboardKey.quote: 39, PhysicalKeyboardKey.semicolon: 41,
+  PhysicalKeyboardKey.backslash: 42, PhysicalKeyboardKey.comma: 43,
+  PhysicalKeyboardKey.slash: 44, PhysicalKeyboardKey.period: 47,
+  PhysicalKeyboardKey.backquote: 50,
+  // Whitespace / editing / nav
+  PhysicalKeyboardKey.enter: 36, PhysicalKeyboardKey.tab: 48,
+  PhysicalKeyboardKey.space: 49, PhysicalKeyboardKey.backspace: 51,
+  PhysicalKeyboardKey.escape: 53, PhysicalKeyboardKey.delete: 117,
+  PhysicalKeyboardKey.home: 115, PhysicalKeyboardKey.pageUp: 116,
+  PhysicalKeyboardKey.end: 119, PhysicalKeyboardKey.pageDown: 121,
+  PhysicalKeyboardKey.arrowLeft: 123, PhysicalKeyboardKey.arrowRight: 124,
+  PhysicalKeyboardKey.arrowDown: 125, PhysicalKeyboardKey.arrowUp: 126,
+  // Function row
+  PhysicalKeyboardKey.f1: 122, PhysicalKeyboardKey.f2: 120,
+  PhysicalKeyboardKey.f3: 99, PhysicalKeyboardKey.f4: 118,
+  PhysicalKeyboardKey.f5: 96, PhysicalKeyboardKey.f6: 97,
+  PhysicalKeyboardKey.f7: 98, PhysicalKeyboardKey.f8: 100,
+  PhysicalKeyboardKey.f9: 101, PhysicalKeyboardKey.f10: 109,
+  PhysicalKeyboardKey.f11: 103, PhysicalKeyboardKey.f12: 111,
+  // Numpad
+  PhysicalKeyboardKey.numpad0: 82, PhysicalKeyboardKey.numpad1: 83,
+  PhysicalKeyboardKey.numpad2: 84, PhysicalKeyboardKey.numpad3: 85,
+  PhysicalKeyboardKey.numpad4: 86, PhysicalKeyboardKey.numpad5: 87,
+  PhysicalKeyboardKey.numpad6: 88, PhysicalKeyboardKey.numpad7: 89,
+  PhysicalKeyboardKey.numpad8: 91, PhysicalKeyboardKey.numpad9: 92,
+  PhysicalKeyboardKey.numpadDecimal: 65, PhysicalKeyboardKey.numpadMultiply: 67,
+  PhysicalKeyboardKey.numpadAdd: 69, PhysicalKeyboardKey.numpadDivide: 75,
+  PhysicalKeyboardKey.numpadEnter: 76, PhysicalKeyboardKey.numpadSubtract: 78,
+  PhysicalKeyboardKey.numpadEqual: 81,
+};
+
+/// The macOS native keycode for the physical [key], or null if unmapped.
+int? cefMacNativeKeyCode(PhysicalKeyboardKey key) =>
+    kCefMacKeyCodesByPhysical[key];
+
 /// The Windows virtual-key code for [key]: the special-key table first, then
 /// a→VK_A..z→VK_Z, A–Z, and 0–9. 0 if unmapped (a printable that rides CHAR).
 int cefWindowsKeyCode(LogicalKeyboardKey key) {

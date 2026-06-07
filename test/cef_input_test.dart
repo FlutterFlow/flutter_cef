@@ -75,6 +75,31 @@ void main() {
     });
   });
 
+  group('cefMacNativeKeyCode — physical key -> macOS keycode', () {
+    test('digit 0 -> 29 (kVK_ANSI_0), NOT 48 (Tab) — the focus-move bug', () {
+      expect(cefMacNativeKeyCode(PhysicalKeyboardKey.digit0), 29);
+      expect(cefMacNativeKeyCode(PhysicalKeyboardKey.digit0), isNot(48));
+    });
+    test('no digit resolves to Tab (48)', () {
+      final digits = [
+        PhysicalKeyboardKey.digit0, PhysicalKeyboardKey.digit1,
+        PhysicalKeyboardKey.digit2, PhysicalKeyboardKey.digit3,
+        PhysicalKeyboardKey.digit4, PhysicalKeyboardKey.digit5,
+        PhysicalKeyboardKey.digit6, PhysicalKeyboardKey.digit7,
+        PhysicalKeyboardKey.digit8, PhysicalKeyboardKey.digit9,
+      ];
+      expect(digits.map(cefMacNativeKeyCode), isNot(contains(48)));
+    });
+    test('representative letters / whitespace map to their kVK codes', () {
+      expect(cefMacNativeKeyCode(PhysicalKeyboardKey.keyA), 0);
+      expect(cefMacNativeKeyCode(PhysicalKeyboardKey.keyZ), 6);
+      expect(cefMacNativeKeyCode(PhysicalKeyboardKey.tab), 48);
+      expect(cefMacNativeKeyCode(PhysicalKeyboardKey.space), 49);
+      expect(cefMacNativeKeyCode(PhysicalKeyboardKey.backspace), 51);
+      expect(cefMacNativeKeyCode(PhysicalKeyboardKey.enter), 36);
+    });
+  });
+
   group('cefMouseButton', () {
     test('primary -> 0 (left)', () => expect(cefMouseButton(kPrimaryButton), 0));
     test('middle -> 1', () => expect(cefMouseButton(kMiddleMouseButton), 1));

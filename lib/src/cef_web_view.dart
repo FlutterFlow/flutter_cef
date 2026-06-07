@@ -69,14 +69,15 @@ class _CefWebViewState extends State<CefWebView> {
   }
 
   Future<void> _ensureSession(Size size) async {
+    final dpr = MediaQuery.maybeOf(context)?.devicePixelRatio ?? 1.0;
     final w = size.width.round();
     final h = size.height.round();
     if (w <= 0 || h <= 0) return;
     if (_textureId == null && !_creating) {
       _creating = true;
       try {
-        final id =
-            await _controller.create(url: widget.url, width: w, height: h);
+        final id = await _controller.create(
+            url: widget.url, width: w, height: h, dpr: dpr);
         _lastSize = size;
         if (mounted) setState(() => _textureId = id);
       } finally {
@@ -86,7 +87,7 @@ class _CefWebViewState extends State<CefWebView> {
     }
     if (_textureId != null && _lastSize != size) {
       _lastSize = size;
-      _controller.resize(w, h);
+      _controller.resize(w, h, dpr: dpr);
     }
   }
 
@@ -189,10 +190,11 @@ class _CefWebViewState extends State<CefWebView> {
   KeyEventResult _onKeyEvent(FocusNode node, KeyEvent event) {
     final mods = _cefModifiers();
     final wkc = cefWindowsKeyCode(event.logicalKey);
-    // CEF on macOS resolves editing keys (backspace/delete/arrows/enter) from
-    // the native macOS keycode, not the Windows VK; printable chars ride the
-    // separate CHAR event.
-    final nkc = cefMacKeyCode(event.logicalKey) ?? wkc;
+    // native_key_code MUST be the macOS keycode for the physical key — CEF on
+    // macOS keys editing/navigation off it. Deriving it from the Windows VK
+    // collides (e.g. 0 -> VK 0x30 == macOS keycode 48 == Tab, moving focus).
+    // Printable text still rides the separate CHAR event below.
+    final nkc = cefMacNativeKeyCode(event.physicalKey) ?? wkc;
     if (event is KeyDownEvent || event is KeyRepeatEvent) {
       _controller.sendKey(
           type: 0, modifiers: mods, windowsKeyCode: wkc, nativeKeyCode: nkc);

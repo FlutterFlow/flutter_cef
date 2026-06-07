@@ -160,16 +160,19 @@ final class CefWebSession: NSObject, FlutterTexture {
   // MARK: Buffers
 
   private func allocateBuffers(_ w: Int, _ h: Int) -> Bool {
-    // 64-byte-aligned stride so the IOSurface is compatible with the Metal /
-    // CVPixelBuffer the FlutterTexture samples. cef_host copies row-by-row using
-    // IOSurfaceGetBytesPerRow, so a padded stride is fine on the renderer side.
-    let bytesPerRow = ((w * 4) + 63) & ~63
+    // Allocate at PHYSICAL (Retina) resolution = logical * dpr, so the texture
+    // is crisp on HiDPI displays; cef_host renders the OSR buffer at the same
+    // scale (via GetScreenInfo.device_scale_factor). 64-byte-aligned stride keeps
+    // the IOSurface Metal/CVPixelBuffer-compatible.
+    let pw = max(1, Int((Double(w) * Double(dpr)).rounded()))
+    let ph = max(1, Int((Double(h) * Double(dpr)).rounded()))
+    let bytesPerRow = ((pw * 4) + 63) & ~63
     let props: [CFString: Any] = [
-      kIOSurfaceWidth: w,
-      kIOSurfaceHeight: h,
+      kIOSurfaceWidth: pw,
+      kIOSurfaceHeight: ph,
       kIOSurfaceBytesPerElement: 4,
       kIOSurfaceBytesPerRow: bytesPerRow,
-      kIOSurfaceAllocSize: bytesPerRow * h,
+      kIOSurfaceAllocSize: bytesPerRow * ph,
       kIOSurfacePixelFormat: kCVPixelFormatType_32BGRA,
       "IOSurfaceIsGlobal" as CFString: true,  // resolvable cross-process by id
     ]
@@ -192,7 +195,7 @@ final class CefWebSession: NSObject, FlutterTexture {
     ioSurface = surf
     pixelBuffer = buffer
     bufferLock.unlock()
-    NSLog("[cef] allocated IOSurface id=\(IOSurfaceGetID(surf)) \(w)x\(h) stride=\(bytesPerRow)")
+    NSLog("[cef] allocated IOSurface id=\(IOSurfaceGetID(surf)) \(pw)x\(ph) (logical \(w)x\(h) @\(dpr)x) stride=\(bytesPerRow)")
     return true
   }
 
@@ -227,6 +230,7 @@ final class CefWebSession: NSObject, FlutterTexture {
       "--url=\(url)",
       "--width=\(width)",
       "--height=\(height)",
+      "--dpr=\(dpr)",
       "--iosurface-id=\(surfaceId)",
       "--ipc=\(socketPath)",
     ]
