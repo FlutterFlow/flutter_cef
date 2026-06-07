@@ -1,6 +1,8 @@
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
+import 'cef_input.dart';
+
 /// Controls one CEF browser session: navigate, resize, forward input, and
 /// observe the page cursor. Backed by a host-side `cef_host` subprocess that
 /// renders the page off-screen into a [Texture].
@@ -37,7 +39,7 @@ class CefWebController {
         final a = (call.arguments as Map).cast<String, dynamic>();
         final id = a['sessionId'] as String?;
         if (id != null) {
-          _bySession[id]?.cursor.value = _mapCursor(a['cursor'] as int? ?? 0);
+          _bySession[id]?.cursor.value = cefCursorForType(a['cursor'] as int? ?? 0);
         }
       }
       return null;
@@ -91,7 +93,7 @@ class CefWebController {
       'sessionId': sessionId,
       'type': type,
       'button': button,
-      'clickCount': clickCount,
+      'clickCount': clampCefClickCount(clickCount),
       'modifiers': modifiers,
       'x': x,
       'y': y,
@@ -122,23 +124,5 @@ class CefWebController {
     _bySession.remove(sessionId);
     cursor.dispose();
     await _channel.invokeMethod('dispose', {'sessionId': sessionId});
-  }
-
-  // CEF cef_cursor_type_t -> Flutter cursor (the common ones; rest = basic).
-  static MouseCursor _mapCursor(int t) {
-    switch (t) {
-      case 1:
-        return SystemMouseCursors.precise; // CT_CROSS
-      case 2:
-        return SystemMouseCursors.click; // CT_HAND
-      case 3:
-        return SystemMouseCursors.text; // CT_IBEAM
-      case 4:
-        return SystemMouseCursors.wait; // CT_WAIT
-      case 5:
-        return SystemMouseCursors.help; // CT_HELP
-      default:
-        return SystemMouseCursors.basic;
-    }
   }
 }

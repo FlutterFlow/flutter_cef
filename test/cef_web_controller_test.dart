@@ -69,4 +69,13 @@ void main() {
     expect(CefWebController().sessionId,
         isNot(equals(CefWebController().sessionId)));
   });
+
+  test('sendPointer clamps clickCount to Chromium-legal 1..3', () async {
+    final c = CefWebController(sessionId: 'sp');
+    c.sendPointer(type: 1, x: 5, y: 6, clickCount: 9);
+    await Future<void>.delayed(Duration.zero);
+    final args = (log.firstWhere((m) => m.method == 'pointer').arguments as Map)
+        .cast<String, dynamic>();
+    expect(args['clickCount'], 3);
+  });
 }

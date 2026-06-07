@@ -2,6 +2,7 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
+import 'cef_input.dart';
 import 'cef_web_controller.dart';
 
 /// A live Chromium (CEF) browser rendered into a Flutter [Texture].
@@ -132,34 +133,21 @@ class _CefWebViewState extends State<CefWebView> {
   }
 
   // ── input forwarding ──────────────────────────────────────────────
-  // CEF event flags.
-  static const int _evShift = 1 << 1, _evCtrl = 1 << 2, _evAlt = 1 << 3;
-  static const int _evLeftBtn = 1 << 4, _evMidBtn = 1 << 5, _evRightBtn = 1 << 6;
-  static const int _evCommand = 1 << 7;
   int _lastButton = 0;
-
-  int _cefButton(int buttons) {
-    if (buttons & kSecondaryButton != 0) return 2;
-    if (buttons & kMiddleMouseButton != 0) return 1;
-    return 0;
-  }
 
   int _cefModifiers([int buttons = 0]) {
     final keys = HardwareKeyboard.instance;
-    var m = 0;
-    if (keys.isShiftPressed) m |= _evShift;
-    if (keys.isControlPressed) m |= _evCtrl;
-    if (keys.isAltPressed) m |= _evAlt;
-    if (keys.isMetaPressed) m |= _evCommand;
-    if (buttons & kPrimaryButton != 0) m |= _evLeftBtn;
-    if (buttons & kMiddleMouseButton != 0) m |= _evMidBtn;
-    if (buttons & kSecondaryButton != 0) m |= _evRightBtn;
+    var m = cefButtonModifiers(buttons);
+    if (keys.isShiftPressed) m |= kCefEventFlagShiftDown;
+    if (keys.isControlPressed) m |= kCefEventFlagControlDown;
+    if (keys.isAltPressed) m |= kCefEventFlagAltDown;
+    if (keys.isMetaPressed) m |= kCefEventFlagCommandDown;
     return m;
   }
 
   void _onPointerDown(PointerDownEvent e) {
     _focusNode.requestFocus();
-    _lastButton = _cefButton(e.buttons);
+    _lastButton = cefMouseButton(e.buttons);
     _controller.sendPointer(
         type: 1,
         x: e.localPosition.dx,
@@ -200,11 +188,11 @@ class _CefWebViewState extends State<CefWebView> {
 
   KeyEventResult _onKeyEvent(FocusNode node, KeyEvent event) {
     final mods = _cefModifiers();
-    final wkc = _windowsKeyCode(event.logicalKey);
+    final wkc = cefWindowsKeyCode(event.logicalKey);
     // CEF on macOS resolves editing keys (backspace/delete/arrows/enter) from
     // the native macOS keycode, not the Windows VK; printable chars ride the
     // separate CHAR event.
-    final nkc = _macKeyCode[event.logicalKey] ?? wkc;
+    final nkc = cefMacKeyCode(event.logicalKey) ?? wkc;
     if (event is KeyDownEvent || event is KeyRepeatEvent) {
       _controller.sendKey(
           type: 0, modifiers: mods, windowsKeyCode: wkc, nativeKeyCode: nkc);
@@ -225,53 +213,5 @@ class _CefWebViewState extends State<CefWebView> {
       return KeyEventResult.handled;
     }
     return KeyEventResult.ignored;
-  }
-
-  // macOS virtual keycodes (kVK_*) for keys whose editing behavior CEF derives
-  // from the native code.
-  static final Map<LogicalKeyboardKey, int> _macKeyCode = {
-    LogicalKeyboardKey.backspace: 51,
-    LogicalKeyboardKey.delete: 117,
-    LogicalKeyboardKey.enter: 36,
-    LogicalKeyboardKey.numpadEnter: 76,
-    LogicalKeyboardKey.tab: 48,
-    LogicalKeyboardKey.escape: 53,
-    LogicalKeyboardKey.space: 49,
-    LogicalKeyboardKey.arrowLeft: 123,
-    LogicalKeyboardKey.arrowRight: 124,
-    LogicalKeyboardKey.arrowDown: 125,
-    LogicalKeyboardKey.arrowUp: 126,
-    LogicalKeyboardKey.home: 115,
-    LogicalKeyboardKey.end: 119,
-    LogicalKeyboardKey.pageUp: 116,
-    LogicalKeyboardKey.pageDown: 121,
-  };
-
-  static final Map<LogicalKeyboardKey, int> _specialVk = {
-    LogicalKeyboardKey.backspace: 0x08,
-    LogicalKeyboardKey.tab: 0x09,
-    LogicalKeyboardKey.enter: 0x0D,
-    LogicalKeyboardKey.numpadEnter: 0x0D,
-    LogicalKeyboardKey.escape: 0x1B,
-    LogicalKeyboardKey.space: 0x20,
-    LogicalKeyboardKey.pageUp: 0x21,
-    LogicalKeyboardKey.pageDown: 0x22,
-    LogicalKeyboardKey.end: 0x23,
-    LogicalKeyboardKey.home: 0x24,
-    LogicalKeyboardKey.arrowLeft: 0x25,
-    LogicalKeyboardKey.arrowUp: 0x26,
-    LogicalKeyboardKey.arrowRight: 0x27,
-    LogicalKeyboardKey.arrowDown: 0x28,
-    LogicalKeyboardKey.delete: 0x2E,
-  };
-
-  int _windowsKeyCode(LogicalKeyboardKey key) {
-    final s = _specialVk[key];
-    if (s != null) return s;
-    final id = key.keyId;
-    if (id >= 0x61 && id <= 0x7A) return id - 0x20; // a-z -> VK A-Z
-    if (id >= 0x41 && id <= 0x5A) return id; // A-Z
-    if (id >= 0x30 && id <= 0x39) return id; // 0-9
-    return 0;
   }
 }
