@@ -26,4 +26,8 @@ rendering when off-screen. macOS only.
   s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES' }
   s.swift_version = '5.0'
   s.resource_bundles = {'flutter_cef_privacy' => ['Resources/PrivacyInfo.xcprivacy']}
+  # cef_host.app is bundled into the host .app by the app target, not the pod
+  # (a pod script-phase runs before the app bundle exists). For dev, point the
+  # app at it via $FLUTTER_CEF_HOST; for a distributable build, add a Run Script
+  # phase calling tool/bundle_cef_host.sh — see the README.
 end

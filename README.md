@@ -10,13 +10,26 @@ import 'package:flutter_cef/flutter_cef.dart';
 CefWebView(url: 'https://flutter.dev')
 ```
 
-Script it via a controller:
+Drive and observe it via a controller:
 
 ```dart
-final controller = CefWebController();
-CefWebView(url: startUrl, controller: controller);
-// later: controller.navigate('https://example.com');
+final c = CefWebController();
+CefWebView(url: startUrl, controller: c);
+
+// navigation + history
+c.navigate('https://example.com');
+c.reload(); c.goBack(); c.goForward();
+c.executeJavaScript('document.body.style.zoom = 1.2');
+
+// page state (all ValueListenables) + callbacks
+ValueListenableBuilder(valueListenable: c.title, builder: (_, t, __) => Text('$t'));
+c.isLoading;  c.url;  c.canGoBack;  c.canGoForward;
+c.onLoadError = (e) => print('${e.errorCode} ${e.url}');
+c.onConsoleMessage = (m) => print(m.message);
 ```
+
+See `example/` for a full browser chrome (URL bar, back/forward/reload, loading
+bar, live title).
 
 ## How it works
 
@@ -41,14 +54,46 @@ export FLUTTER_CEF_HOST="$PWD/native/cef_host/build/cef_host.app/Contents/MacOS/
 cd example && flutter run -d macos
 ```
 
-For a **distributable** app, `cef_host.app` + the CEF framework must be bundled into your `.app` and signed by your build (the plugin auto-resolves a bundled copy under `Contents/Frameworks`). Your host app **must not be App-Sandboxed** (CEF spawns the helper, shares a global IOSurface, and writes a cache); entitlements need `com.apple.security.cs.disable-library-validation` and JIT — see `example/macos/Runner/*.entitlements` for the reference set. The build-phase bundling is the next infra item — see Roadmap.
+### Bundling into a distributable app
+
+For a shipped `.app` (no dev env var), `cef_host.app` must live in your bundle's
+`Contents/Frameworks` and be signed by your build. The plugin resolves it there
+automatically (`$FLUTTER_CEF_HOST` → pod resources → `Contents/Frameworks` →
+`Contents/Helpers`). After `flutter build macos`, run:
+
+```sh
+path/to/flutter_cef/tool/bundle_cef_host.sh "build/macos/.../YourApp.app" "" "<signing-identity>"
+```
+
+or wire it as a Run Script build phase on your Runner target (snippet in
+`tool/bundle_cef_host.sh`) so it runs before Xcode's code-sign phase. Your host
+app **must not be App-Sandboxed** (CEF spawns the helper, shares a global
+IOSurface, writes a cache); entitlements need
+`com.apple.security.cs.disable-library-validation` + JIT — see
+`example/macos/Runner/*.entitlements` for the reference set. Sign everything with
+one identity (framework → cef_host → app, inside-out) and library validation can
+stay on.
 
 ## Roadmap
 
-- **GPU zero-copy** (`OnAcceleratedPaint` → shared IOSurface) instead of the CPU `OnPaint` copy — removes latency/blur. Needs multi-process.
-- **Multi-process + signed helpers** (stability; unlocks the GPU path) instead of `--single-process`.
-- **JS bridge** (`evaluateJavaScript` + page↔host messaging), IME/composition (CJK/emoji), dialogs, downloads, context menus.
-- **Windows / Linux** (the federated structure is ready; each needs its own host + shared-texture path).
+Working today: live OSR render (on/off-screen), pointer/scroll/keyboard input,
+`<select>` popups, page cursor, navigation + history, loading/title/url/error/
+console events, `executeJavaScript`.
+
+Next:
+
+- **GPU zero-copy** — `OnAcceleratedPaint` hands back an `IOSurfaceRef` directly
+  (macOS, CEF ≥147); blit it into the texture surface instead of the CPU
+  `OnPaint` memcpy. Requires the GPU process, i.e. multi-process.
+- **Multi-process + signed helpers** — replace `--single-process` with the four
+  CEF helper bundles (`(GPU)`/`(Renderer)`/`(Plugin)`/`(Alerts)`), each
+  hardened-runtime signed with one identity + JIT entitlements, so Chromium 144's
+  Mach-port peer validation passes with enforcement on (no
+  `MachPortRendezvous*` disable). Unlocks the GPU path + site isolation.
+- **`evaluateJavaScript`** (V8 round-trip return value), IME/composition
+  (CJK/emoji), dialogs, downloads, context menus, find, zoom, cookies, devtools.
+- **Windows / Linux** — the federated structure is ready; each needs its own host
+  + shared-texture path.
 
 ## Credits
 

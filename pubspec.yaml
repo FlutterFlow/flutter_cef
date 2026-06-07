@@ -3,6 +3,11 @@ description: "Embed a live Chromium (CEF) browser as a Flutter Texture. macOS."
 version: 0.0.1
 publish_to: none
 # repository: https://github.com/<org>/flutter_cef  # set before publishing
+topics:
+  - webview
+  - chromium
+  - cef
+  - browser
 
 environment:
   sdk: ^3.10.4
