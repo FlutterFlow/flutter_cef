@@ -32,7 +32,27 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     case "dispose": destroy(args, result)
     case "pointer": pointer(args, result)
     case "key": key(args, result)
+    case "reload": withSession(args) { $0.reload() }; result(nil)
+    case "stop": withSession(args) { $0.stopLoad() }; result(nil)
+    case "goBack": withSession(args) { $0.goBack() }; result(nil)
+    case "goForward": withSession(args) { $0.goForward() }; result(nil)
+    case "executeJavaScript":
+      if let code = args["code"] as? String {
+        withSession(args) { $0.executeJavaScript(code) }
+      }
+      result(nil)
     default: result(FlutterMethodNotImplemented)
+    }
+  }
+
+  private func withSession(_ a: [String: Any], _ body: (CefWebSession) -> Void) {
+    if let id = a["sessionId"] as? String, let s = sessions[id] { body(s) }
+  }
+
+  /// Relay an event from a session (any thread) to Dart on the main thread.
+  private func emit(_ method: String, _ args: [String: Any]) {
+    DispatchQueue.main.async { [weak self] in
+      self?.channel?.invokeMethod(method, arguments: args)
     }
   }
 
@@ -58,10 +78,29 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       sessionId: sessionId, url: url, width: width, height: height, dpr: dpr,
       registry: registry, cefHostPath: cefHost)
     session.onCursor = { [weak self] cursor in
-      DispatchQueue.main.async {
-        self?.channel?.invokeMethod(
-          "cursor", arguments: ["sessionId": sessionId, "cursor": cursor])
-      }
+      self?.emit("cursor", ["sessionId": sessionId, "cursor": cursor])
+    }
+    session.onLoadState = { [weak self] loading, back, forward in
+      self?.emit("loadingState", [
+        "sessionId": sessionId, "isLoading": loading,
+        "canGoBack": back, "canGoForward": forward,
+      ])
+    }
+    session.onTitle = { [weak self] t in
+      self?.emit("title", ["sessionId": sessionId, "title": t])
+    }
+    session.onUrl = { [weak self] u in
+      self?.emit("url", ["sessionId": sessionId, "url": u])
+    }
+    session.onLoadError = { [weak self] code, url, text in
+      self?.emit("loadError", [
+        "sessionId": sessionId, "code": code, "url": url, "text": text,
+      ])
+    }
+    session.onConsole = { [weak self] level, message in
+      self?.emit("consoleMessage", [
+        "sessionId": sessionId, "level": level, "message": message,
+      ])
     }
     sessions[sessionId] = session
     result(["textureId": session.textureId, "width": width, "height": height])

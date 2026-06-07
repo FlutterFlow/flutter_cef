@@ -6,5 +6,6 @@
 /// the page cursor drives a [MouseRegion]. macOS only, for now.
 library;
 
+export 'src/cef_events.dart' show CefLoadError, CefConsoleMessage;
 export 'src/cef_web_controller.dart' show CefWebController;
 export 'src/cef_web_view.dart' show CefWebView;

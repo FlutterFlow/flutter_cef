@@ -16,20 +16,35 @@ import FlutterMacOS
 import IOSurface
 
 final class CefWebSession: NSObject, FlutterTexture {
-  // IPC opcodes (must match packages/cef_host/main.mm).
+  // IPC opcodes (must match native/cef_host/main.mm).
   private static let opPresent: UInt8 = 0x01
   private static let opReady: UInt8 = 0x02
   private static let opCursor: UInt8 = 0x03
   private static let opLog: UInt8 = 0x04
-
-  /// Called (off the main thread) when the page cursor changes; payload is the
-  /// CEF cursor-type int. The registrar wires this to a Dart channel event.
-  var onCursor: ((Int) -> Void)?
+  private static let opLoadState: UInt8 = 0x05
+  private static let opTitle: UInt8 = 0x06
+  private static let opUrl: UInt8 = 0x07
+  private static let opLoadErr: UInt8 = 0x08
+  private static let opConsole: UInt8 = 0x09
   private static let opPointer: UInt8 = 0x10
   private static let opResize: UInt8 = 0x11
   private static let opKey: UInt8 = 0x12
   private static let opShutdown: UInt8 = 0x14
   private static let opNavigate: UInt8 = 0x20
+  private static let opReload: UInt8 = 0x21
+  private static let opStop: UInt8 = 0x22
+  private static let opBack: UInt8 = 0x23
+  private static let opForward: UInt8 = 0x24
+  private static let opExecuteJs: UInt8 = 0x25
+
+  // Event callbacks (fired off the main thread). The registrar relays each to a
+  // Dart channel message.
+  var onCursor: ((Int) -> Void)?
+  var onLoadState: ((Bool, Bool, Bool) -> Void)?  // loading, back, forward
+  var onTitle: ((String) -> Void)?
+  var onUrl: ((String) -> Void)?
+  var onLoadError: ((Int, String, String) -> Void)?  // code, url, text
+  var onConsole: ((Int, String) -> Void)?  // level, "source:line\tmsg"
 
   let sessionId: String
   private(set) var textureId: Int64 = 0
@@ -94,6 +109,14 @@ final class CefWebSession: NSObject, FlutterTexture {
 
   func navigate(_ url: String) {
     sendFrame(Self.opNavigate, Array(url.utf8))
+  }
+
+  func reload() { sendFrame(Self.opReload) }
+  func stopLoad() { sendFrame(Self.opStop) }
+  func goBack() { sendFrame(Self.opBack) }
+  func goForward() { sendFrame(Self.opForward) }
+  func executeJavaScript(_ code: String) {
+    sendFrame(Self.opExecuteJs, Array(code.utf8))
   }
 
   // type: 0=move 1=down 2=up 3=wheel; button: 0=left 1=middle 2=right.
@@ -245,6 +268,28 @@ final class CefWebSession: NSObject, FlutterTexture {
       case Self.opLog:
         let msg = String(bytes: body[1...], encoding: .utf8) ?? ""
         NSLog("[cef_host:\(sessionId)] \(msg)")
+      case Self.opLoadState:
+        if body.count >= 4 {
+          onLoadState?(body[1] != 0, body[2] != 0, body[3] != 0)
+        }
+      case Self.opTitle:
+        onTitle?(String(bytes: body[1...], encoding: .utf8) ?? "")
+      case Self.opUrl:
+        onUrl?(String(bytes: body[1...], encoding: .utf8) ?? "")
+      case Self.opLoadErr:
+        if body.count >= 5 {
+          let code = readU32(body, 1)
+          let s = String(bytes: body[5...], encoding: .utf8) ?? ""
+          let parts = s.split(separator: "\n", maxSplits: 1,
+                              omittingEmptySubsequences: false)
+          onLoadError?(code, parts.count > 0 ? String(parts[0]) : "",
+                       parts.count > 1 ? String(parts[1]) : "")
+        }
+      case Self.opConsole:
+        if body.count >= 5 {
+          onConsole?(readU32(body, 1),
+                     String(bytes: body[5...], encoding: .utf8) ?? "")
+        }
       default:
         break
       }
@@ -278,6 +323,11 @@ final class CefWebSession: NSObject, FlutterTexture {
     for shift in stride(from: 56, through: 0, by: -8) {
       a.append(UInt8((bits >> UInt64(shift)) & 0xff))
     }
+  }
+
+  private func readU32(_ b: [UInt8], _ o: Int) -> Int {
+    return (Int(b[o]) << 24) | (Int(b[o + 1]) << 16) | (Int(b[o + 2]) << 8)
+      | Int(b[o + 3])
   }
 
   private func readAll(_ fd: Int32, _ buf: inout [UInt8], _ len: Int) -> Bool {

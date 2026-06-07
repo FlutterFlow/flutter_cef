@@ -22,10 +22,16 @@
 //                      0x12 key {type:u8,_,_,_,mods:u32,wkc:u32,nkc:u32,char:u32}
 //                      0x14 shutdown {}
 //                      0x20 navigate {utf8 url}
+//                      0x21 reload / 0x22 stop / 0x23 back / 0x24 forward {}
+//                      0x25 executeJs {utf8 code}
 //   cef_host -> host:  0x01 present {}
 //                      0x02 ready {}
 //                      0x03 cursor {type:u32}
 //                      0x04 log {utf8}
+//                      0x05 loadState {loading,back,forward : u8}
+//                      0x06 title {utf8} / 0x07 url {utf8}
+//                      0x08 loadError {code:u32}{utf8 "url\ntext"}
+//                      0x09 console {level:u32}{utf8 "source:line\tmsg"}
 
 #import <Cocoa/Cocoa.h>
 #import <IOSurface/IOSurface.h>
@@ -66,11 +72,21 @@ constexpr uint8_t kOpPresent = 0x01;
 constexpr uint8_t kOpReady = 0x02;
 constexpr uint8_t kOpCursor = 0x03;
 constexpr uint8_t kOpLog = 0x04;
+constexpr uint8_t kOpLoadState = 0x05;  // {loading,back,forward : u8}
+constexpr uint8_t kOpTitle = 0x06;      // {utf8}
+constexpr uint8_t kOpUrl = 0x07;        // {utf8} main-frame address
+constexpr uint8_t kOpLoadErr = 0x08;    // {code:u32}{utf8 "url\ntext"}
+constexpr uint8_t kOpConsole = 0x09;    // {level:u32}{utf8 "source:line\tmsg"}
 constexpr uint8_t kOpPointer = 0x10;
 constexpr uint8_t kOpResize = 0x11;
 constexpr uint8_t kOpKey = 0x12;
 constexpr uint8_t kOpShutdown = 0x14;
 constexpr uint8_t kOpNavigate = 0x20;
+constexpr uint8_t kOpReload = 0x21;
+constexpr uint8_t kOpStop = 0x22;
+constexpr uint8_t kOpBack = 0x23;
+constexpr uint8_t kOpForward = 0x24;
+constexpr uint8_t kOpExecuteJs = 0x25;  // {utf8 code}
 
 // ---- Shared runtime state ----
 int g_ipc_fd = -1;
@@ -137,6 +153,29 @@ void SendFrame(uint8_t opcode, const void* payload, uint32_t payload_len) {
 
 void SendLog(const std::string& msg) {
   SendFrame(kOpLog, msg.data(), static_cast<uint32_t>(msg.size()));
+}
+
+void SendUtf8(uint8_t op, const std::string& s) {
+  SendFrame(op, s.data(), static_cast<uint32_t>(s.size()));
+}
+
+void SendLoadState(bool loading, bool back, bool forward) {
+  uint8_t p[3];
+  p[0] = loading ? 1 : 0;
+  p[1] = back ? 1 : 0;
+  p[2] = forward ? 1 : 0;
+  SendFrame(kOpLoadState, p, 3);
+}
+
+// op payload: [u32 BE code][utf8 body]. Used for load-error and console.
+void SendCodePlusUtf8(uint8_t op, uint32_t code, const std::string& body) {
+  std::vector<uint8_t> p(4 + body.size());
+  p[0] = (code >> 24) & 0xff;
+  p[1] = (code >> 16) & 0xff;
+  p[2] = (code >> 8) & 0xff;
+  p[3] = code & 0xff;
+  memcpy(p.data() + 4, body.data(), body.size());
+  SendFrame(op, p.data(), static_cast<uint32_t>(p.size()));
 }
 
 uint32_t ReadU32BE(const uint8_t* p) {
@@ -264,12 +303,36 @@ class HostClient : public CefClient,
   CefRefPtr<CefRenderHandler> GetRenderHandler() override { return rh_; }
   CefRefPtr<CefLoadHandler> GetLoadHandler() override { return this; }
   CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
+
+  // CefLoadHandler: spinner + back/forward enablement.
+  void OnLoadingStateChange(CefRefPtr<CefBrowser>, bool isLoading,
+                            bool canGoBack, bool canGoForward) override {
+    SendLoadState(isLoading, canGoBack, canGoForward);
+  }
   void OnLoadError(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, ErrorCode code,
                    const CefString& text, const CefString& url) override {
     if (code == ERR_ABORTED) return;
-    SendLog("load error " + std::to_string(code) + " " + text.ToString() +
-            " @ " + url.ToString());
+    SendCodePlusUtf8(kOpLoadErr, static_cast<uint32_t>(code),
+                     url.ToString() + "\n" + text.ToString());
   }
+
+  // CefDisplayHandler: title / address / console -> host.
+  void OnTitleChange(CefRefPtr<CefBrowser>, const CefString& title) override {
+    SendUtf8(kOpTitle, title.ToString());
+  }
+  void OnAddressChange(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
+                       const CefString& url) override {
+    if (frame->IsMain()) SendUtf8(kOpUrl, url.ToString());
+  }
+  bool OnConsoleMessage(CefRefPtr<CefBrowser>, cef_log_severity_t level,
+                        const CefString& message, const CefString& source,
+                        int line) override {
+    SendCodePlusUtf8(kOpConsole, static_cast<uint32_t>(level),
+                     source.ToString() + ":" + std::to_string(line) + "\t" +
+                         message.ToString());
+    return false;  // also keep CEF's default console logging
+  }
+
   // The page's cursor (I-beam over text, hand over links, etc.). Forward the
   // type to the host so it can drive the Flutter MouseRegion cursor.
   bool OnCursorChange(CefRefPtr<CefBrowser>, CefCursorHandle,
@@ -341,6 +404,22 @@ void DoResize(int w, int h, uint32_t surface_id) {
 
 void DoNavigate(const std::string& url) {
   if (g_browser) g_browser->GetMainFrame()->LoadURL(url);
+}
+
+void DoReload() {
+  if (g_browser) g_browser->Reload();
+}
+void DoStopLoad() {
+  if (g_browser) g_browser->StopLoad();
+}
+void DoGoBack() {
+  if (g_browser) g_browser->GoBack();
+}
+void DoGoForward() {
+  if (g_browser) g_browser->GoForward();
+}
+void DoExecuteJs(const std::string& code) {
+  if (g_browser) g_browser->GetMainFrame()->ExecuteJavaScript(code, "", 0);
 }
 
 // type: 0=move 1=down 2=up 3=wheel; button: 0=left 1=middle 2=right.
@@ -423,6 +502,23 @@ void IpcReadLoop() {
       case kOpNavigate: {
         std::string url(reinterpret_cast<const char*>(p), plen);
         CefPostTask(TID_UI, base::BindOnce(&DoNavigate, url));
+        break;
+      }
+      case kOpReload:
+        CefPostTask(TID_UI, base::BindOnce(&DoReload));
+        break;
+      case kOpStop:
+        CefPostTask(TID_UI, base::BindOnce(&DoStopLoad));
+        break;
+      case kOpBack:
+        CefPostTask(TID_UI, base::BindOnce(&DoGoBack));
+        break;
+      case kOpForward:
+        CefPostTask(TID_UI, base::BindOnce(&DoGoForward));
+        break;
+      case kOpExecuteJs: {
+        std::string code(reinterpret_cast<const char*>(p), plen);
+        CefPostTask(TID_UI, base::BindOnce(&DoExecuteJs, code));
         break;
       }
       case kOpPointer: {

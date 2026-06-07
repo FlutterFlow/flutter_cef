@@ -1,14 +1,16 @@
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
+import 'cef_events.dart';
 import 'cef_input.dart';
 
-/// Controls one CEF browser session: navigate, resize, forward input, and
-/// observe the page cursor. Backed by a host-side `cef_host` subprocess that
-/// renders the page off-screen into a [Texture].
+/// Controls one CEF browser session: navigate, drive history, run JavaScript,
+/// forward input, and observe page state (loading, title, url, cursor). Backed
+/// by a host-side `cef_host` subprocess that renders the page off-screen into a
+/// [Texture].
 ///
 /// Usually you don't create this directly — [CefWebView] manages one for you.
-/// Use it when you need to script a view (navigate, send synthetic input).
+/// Use it when you need to script a view.
 class CefWebController {
   CefWebController({String? sessionId})
       : sessionId = sessionId ?? 'cef-${_counter++}';
@@ -27,6 +29,23 @@ class CefWebController {
   final ValueNotifier<MouseCursor> cursor =
       ValueNotifier<MouseCursor>(SystemMouseCursors.basic);
 
+  /// Whether a navigation is in progress (drives a spinner).
+  final ValueNotifier<bool> isLoading = ValueNotifier<bool>(false);
+
+  /// Whether [goBack] / [goForward] would do anything.
+  final ValueNotifier<bool> canGoBack = ValueNotifier<bool>(false);
+  final ValueNotifier<bool> canGoForward = ValueNotifier<bool>(false);
+
+  /// The current document title and main-frame URL.
+  final ValueNotifier<String> title = ValueNotifier<String>('');
+  final ValueNotifier<String> url = ValueNotifier<String>('');
+
+  /// Called when a navigation fails (DNS failure, offline, blocked, …).
+  void Function(CefLoadError error)? onLoadError;
+
+  /// Called for each `console.*` message the page emits.
+  void Function(CefConsoleMessage message)? onConsoleMessage;
+
   static final Map<String, CefWebController> _bySession =
       <String, CefWebController>{};
   static bool _handlerInstalled = false;
@@ -35,15 +54,43 @@ class CefWebController {
     if (_handlerInstalled) return;
     _handlerInstalled = true;
     _channel.setMethodCallHandler((call) async {
-      if (call.method == 'cursor') {
-        final a = (call.arguments as Map).cast<String, dynamic>();
-        final id = a['sessionId'] as String?;
-        if (id != null) {
-          _bySession[id]?.cursor.value = cefCursorForType(a['cursor'] as int? ?? 0);
-        }
-      }
+      final a = (call.arguments as Map?)?.cast<String, dynamic>();
+      final id = a?['sessionId'] as String?;
+      if (id != null) _bySession[id]?._onEvent(call.method, a!);
       return null;
     });
+  }
+
+  void _onEvent(String method, Map<String, dynamic> a) {
+    switch (method) {
+      case 'cursor':
+        cursor.value = cefCursorForType(a['cursor'] as int? ?? 0);
+        break;
+      case 'loadingState':
+        isLoading.value = a['isLoading'] as bool? ?? false;
+        canGoBack.value = a['canGoBack'] as bool? ?? false;
+        canGoForward.value = a['canGoForward'] as bool? ?? false;
+        break;
+      case 'title':
+        title.value = a['title'] as String? ?? '';
+        break;
+      case 'url':
+        url.value = a['url'] as String? ?? '';
+        break;
+      case 'loadError':
+        onLoadError?.call(CefLoadError(
+          errorCode: a['code'] as int? ?? 0,
+          url: a['url'] as String? ?? '',
+          errorText: a['text'] as String? ?? '',
+        ));
+        break;
+      case 'consoleMessage':
+        onConsoleMessage?.call(CefConsoleMessage(
+          level: a['level'] as int? ?? 0,
+          message: a['message'] as String? ?? '',
+        ));
+        break;
+    }
   }
 
   /// Spawn the renderer for [url] at [width]×[height] logical px. Returns the
@@ -69,6 +116,24 @@ class CefWebController {
 
   Future<void> navigate(String url) =>
       _channel.invokeMethod('navigate', {'sessionId': sessionId, 'url': url});
+
+  /// Reload the current page.
+  Future<void> reload() => _send('reload');
+
+  /// Stop the in-progress load.
+  Future<void> stop() => _send('stop');
+
+  /// Go back / forward in history (no-op at the ends — gate on [canGoBack] /
+  /// [canGoForward]).
+  Future<void> goBack() => _send('goBack');
+  Future<void> goForward() => _send('goForward');
+
+  /// Run [code] in the main frame (fire-and-forget; no return value).
+  Future<void> executeJavaScript(String code) => _channel
+      .invokeMethod('executeJavaScript', {'sessionId': sessionId, 'code': code});
+
+  Future<void> _send(String method) =>
+      _channel.invokeMethod(method, {'sessionId': sessionId});
 
   Future<void> resize(int width, int height, {double dpr = 1.0}) =>
       _channel.invokeMethod('resize', {
@@ -123,6 +188,11 @@ class CefWebController {
   Future<void> dispose() async {
     _bySession.remove(sessionId);
     cursor.dispose();
+    isLoading.dispose();
+    canGoBack.dispose();
+    canGoForward.dispose();
+    title.dispose();
+    url.dispose();
     await _channel.invokeMethod('dispose', {'sessionId': sessionId});
   }
 }

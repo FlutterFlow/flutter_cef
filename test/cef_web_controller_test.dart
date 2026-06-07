@@ -78,4 +78,73 @@ void main() {
         .cast<String, dynamic>();
     expect(args['clickCount'], 3);
   });
+
+  // Simulate a host -> Dart event for [sessionId].
+  Future<void> emit(String sessionId, String method, Map<String, Object?> a) {
+    return messenger.handlePlatformMessage(
+      'flutter_cef',
+      const StandardMethodCodec().encodeMethodCall(
+        MethodCall(method, {'sessionId': sessionId, ...a}),
+      ),
+      (_) {},
+    );
+  }
+
+  test('navigation + script verbs are forwarded for the session', () async {
+    final c = CefWebController(sessionId: 'nav');
+    await c.reload();
+    await c.stop();
+    await c.goBack();
+    await c.goForward();
+    await c.executeJavaScript('1+1');
+    expect(log.map((m) => m.method),
+        containsAll(['reload', 'stop', 'goBack', 'goForward', 'executeJavaScript']));
+    for (final m in log) {
+      expect((m.arguments as Map)['sessionId'], 'nav');
+    }
+    expect((log.firstWhere((m) => m.method == 'executeJavaScript').arguments
+        as Map)['code'], '1+1');
+  });
+
+  test('loadingState event updates loading + history notifiers', () async {
+    final c = CefWebController(sessionId: 'ls');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    await emit('ls', 'loadingState',
+        {'isLoading': true, 'canGoBack': true, 'canGoForward': false});
+    expect(c.isLoading.value, true);
+    expect(c.canGoBack.value, true);
+    expect(c.canGoForward.value, false);
+  });
+
+  test('title + url events update notifiers', () async {
+    final c = CefWebController(sessionId: 'tu');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    await emit('tu', 'title', {'title': 'Hello'});
+    await emit('tu', 'url', {'url': 'https://x.test/'});
+    expect(c.title.value, 'Hello');
+    expect(c.url.value, 'https://x.test/');
+  });
+
+  test('loadError event invokes the callback with a CefLoadError', () async {
+    final c = CefWebController(sessionId: 'le');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    CefLoadError? got;
+    c.onLoadError = (e) => got = e;
+    await emit('le', 'loadError',
+        {'code': -105, 'url': 'https://bad.test/', 'text': 'ERR_NAME_NOT_RESOLVED'});
+    expect(got, isNotNull);
+    expect(got!.errorCode, -105);
+    expect(got!.url, 'https://bad.test/');
+    expect(got!.errorText, 'ERR_NAME_NOT_RESOLVED');
+  });
+
+  test('consoleMessage event invokes the callback', () async {
+    final c = CefWebController(sessionId: 'cm');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    CefConsoleMessage? got;
+    c.onConsoleMessage = (m) => got = m;
+    await emit('cm', 'consoleMessage', {'level': 4, 'message': 'app.js:3\tboom'});
+    expect(got!.level, 4);
+    expect(got!.message, 'app.js:3\tboom');
+  });
 }
