@@ -1,27 +1,33 @@
-// This is a basic Flutter widget test.
-//
-// To perform an interaction with a widget in your test, use the WidgetTester
-// utility in the flutter_test package. For example, you can send tap and scroll
-// gestures. You can also use WidgetTester to find child widgets in the widget
-// tree, read text, and verify that the values of widget properties are correct.
+// Smoke test for the example app: the browser chrome (URL bar + Go) renders.
+// The host channel is mocked so CefWebView's create() resolves without a real
+// cef_host subprocess.
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:flutter_cef_example/main.dart';
 
 void main() {
-  testWidgets('Verify Platform version', (WidgetTester tester) async {
-    // Build our app and trigger a frame.
-    await tester.pumpWidget(const MyApp());
+  const channel = MethodChannel('flutter_cef');
+  final messenger =
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
 
-    // Verify that platform version is retrieved.
-    expect(
-      find.byWidgetPredicate(
-        (Widget widget) => widget is Text &&
-                           widget.data!.startsWith('Running on:'),
-      ),
-      findsOneWidget,
-    );
+  setUp(() {
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      if (call.method == 'create') {
+        return <String, dynamic>{'textureId': 1, 'width': 320, 'height': 240};
+      }
+      return null;
+    });
+  });
+  tearDown(() => messenger.setMockMethodCallHandler(channel, null));
+
+  testWidgets('shows the URL bar and Go button', (tester) async {
+    await tester.pumpWidget(const MyApp());
+    await tester.pump(); // let the post-frame create() resolve
+
+    expect(find.text('Go'), findsOneWidget);
+    expect(find.byType(TextField), findsOneWidget);
   });
 }

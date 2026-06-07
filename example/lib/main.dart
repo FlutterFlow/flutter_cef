@@ -1,61 +1,77 @@
 import 'package:flutter/material.dart';
-import 'dart:async';
-
-import 'package:flutter/services.dart';
 import 'package:flutter_cef/flutter_cef.dart';
 
-void main() {
-  runApp(const MyApp());
-}
+void main() => runApp(const MyApp());
 
-class MyApp extends StatefulWidget {
+class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
   @override
-  State<MyApp> createState() => _MyAppState();
+  Widget build(BuildContext context) => const MaterialApp(
+        title: 'flutter_cef',
+        debugShowCheckedModeBanner: false,
+        home: BrowserDemo(),
+      );
 }
 
-class _MyAppState extends State<MyApp> {
-  String _platformVersion = 'Unknown';
-  final _flutterCefPlugin = FlutterCef();
+/// Minimal browser: a URL bar driving one [CefWebView]. The first page loads
+/// via the `url` argument; subsequent navigations go through the controller.
+class BrowserDemo extends StatefulWidget {
+  const BrowserDemo({super.key});
 
   @override
-  void initState() {
-    super.initState();
-    initPlatformState();
-  }
+  State<BrowserDemo> createState() => _BrowserDemoState();
+}
 
-  // Platform messages are asynchronous, so we initialize in an async method.
-  Future<void> initPlatformState() async {
-    String platformVersion;
-    // Platform messages may fail, so we use a try/catch PlatformException.
-    // We also handle the message potentially returning null.
-    try {
-      platformVersion =
-          await _flutterCefPlugin.getPlatformVersion() ?? 'Unknown platform version';
-    } on PlatformException {
-      platformVersion = 'Failed to get platform version.';
-    }
+class _BrowserDemoState extends State<BrowserDemo> {
+  static const _startUrl = 'https://flutter.dev';
+  final CefWebController _controller = CefWebController();
+  final TextEditingController _urlBar =
+      TextEditingController(text: _startUrl);
 
-    // If the widget was removed from the tree while the asynchronous platform
-    // message was in flight, we want to discard the reply rather than calling
-    // setState to update our non-existent appearance.
-    if (!mounted) return;
+  void _go() => _controller.navigate(_normalize(_urlBar.text.trim()));
 
-    setState(() {
-      _platformVersion = platformVersion;
-    });
+  String _normalize(String s) => s.isEmpty
+      ? 'about:blank'
+      : (s.startsWith('http://') || s.startsWith('https://') ? s : 'https://$s');
+
+  @override
+  void dispose() {
+    _urlBar.dispose();
+    _controller.dispose();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      home: Scaffold(
-        appBar: AppBar(
-          title: const Text('Plugin example app'),
-        ),
-        body: Center(
-          child: Text('Running on: $_platformVersion\n'),
+    return Scaffold(
+      body: SafeArea(
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.all(8),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _urlBar,
+                      decoration: const InputDecoration(
+                        isDense: true,
+                        border: OutlineInputBorder(),
+                        hintText: 'Enter a URL',
+                      ),
+                      onSubmitted: (_) => _go(),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  FilledButton(onPressed: _go, child: const Text('Go')),
+                ],
+              ),
+            ),
+            Expanded(
+              child: CefWebView(url: _startUrl, controller: _controller),
+            ),
+          ],
         ),
       ),
     );

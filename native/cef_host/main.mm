@@ -1,0 +1,507 @@
+// cef_host — a standalone CEF off-screen-rendering subprocess.
+//
+// The Flutter host (the flutter_cef macOS plugin) allocates an IOSurface-backed
+// CVPixelBuffer, registers a FlutterTexture on it, and spawns one cef_host per
+// CefWebView. cef_host runs CEF windowless (OSR), paints the page into the
+// shared IOSurface, and notifies the host over a Unix-socket IPC so the host
+// calls textureFrameAvailable. Because the page renders to an offscreen buffer
+// (no NSWindow), it keeps rendering live even when the view is off-screen — the
+// whole point of the CEF path.
+//
+// CEF runs --single-process: renderer + GPU live in this process, so there are
+// no CEF child processes and thus no Mach-port child-signature validation
+// (Chromium 144's process_requirement.cc -67030), which a sandbox-free helper
+// would otherwise trip.
+//
+// Args: --url=<url> --width=<px> --height=<px> --iosurface-id=<id> --ipc=<path>
+//
+// IPC wire format: 4-byte big-endian length prefix, then [opcode][payload].
+//   host -> cef_host:  0x11 resize {w:u32,h:u32,iosurfaceId:u32}
+//                      0x20 navigate {utf8 url}
+//                      0x14 shutdown {}
+//   cef_host -> host:  0x02 ready {}
+//                      0x01 present {}
+//                      0x04 log {utf8}
+
+#import <Cocoa/Cocoa.h>
+#import <IOSurface/IOSurface.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <libgen.h>
+#include <mach-o/dyld.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+#include "include/base/cef_bind.h"
+#include "include/base/cef_callback.h"
+#include "include/cef_app.h"
+#include "include/cef_application_mac.h"
+#include "include/cef_browser.h"
+#include "include/cef_client.h"
+#include "include/cef_command_line.h"
+#include "include/cef_render_handler.h"
+#include "include/cef_task.h"
+#include "include/wrapper/cef_closure_task.h"
+#include "include/wrapper/cef_helpers.h"
+#include "include/wrapper/cef_library_loader.h"
+
+namespace {
+
+// ---- Opcodes ----
+constexpr uint8_t kOpPresent = 0x01;
+constexpr uint8_t kOpReady = 0x02;
+constexpr uint8_t kOpCursor = 0x03;
+constexpr uint8_t kOpLog = 0x04;
+constexpr uint8_t kOpPointer = 0x10;
+constexpr uint8_t kOpResize = 0x11;
+constexpr uint8_t kOpKey = 0x12;
+constexpr uint8_t kOpShutdown = 0x14;
+constexpr uint8_t kOpNavigate = 0x20;
+
+// ---- Shared runtime state ----
+int g_ipc_fd = -1;
+std::mutex g_ipc_write_mutex;
+
+std::mutex g_surface_mutex;      // guards g_surface / g_width / g_height
+IOSurfaceRef g_surface = nullptr;
+int g_width = 800;
+int g_height = 600;
+
+CefRefPtr<CefBrowser> g_browser;
+
+// ---- IPC helpers ----
+bool WriteAll(int fd, const void* buf, size_t len) {
+  const uint8_t* p = static_cast<const uint8_t*>(buf);
+  size_t off = 0;
+  while (off < len) {
+    ssize_t n = write(fd, p + off, len - off);
+    if (n <= 0) {
+      if (n < 0 && (errno == EINTR)) continue;
+      return false;
+    }
+    off += static_cast<size_t>(n);
+  }
+  return true;
+}
+
+bool ReadAll(int fd, void* buf, size_t len) {
+  uint8_t* p = static_cast<uint8_t*>(buf);
+  size_t off = 0;
+  while (off < len) {
+    ssize_t n = read(fd, p + off, len - off);
+    if (n == 0) return false;  // peer closed
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      return false;
+    }
+    off += static_cast<size_t>(n);
+  }
+  return true;
+}
+
+void SendFrame(uint8_t opcode, const void* payload, uint32_t payload_len) {
+  if (g_ipc_fd < 0) return;
+  std::lock_guard<std::mutex> lock(g_ipc_write_mutex);
+  uint32_t body_len = 1 + payload_len;
+  uint8_t hdr[4] = {static_cast<uint8_t>((body_len >> 24) & 0xff),
+                    static_cast<uint8_t>((body_len >> 16) & 0xff),
+                    static_cast<uint8_t>((body_len >> 8) & 0xff),
+                    static_cast<uint8_t>(body_len & 0xff)};
+  if (!WriteAll(g_ipc_fd, hdr, 4)) return;
+  if (!WriteAll(g_ipc_fd, &opcode, 1)) return;
+  if (payload_len) WriteAll(g_ipc_fd, payload, payload_len);
+}
+
+void SendLog(const std::string& msg) {
+  SendFrame(kOpLog, msg.data(), static_cast<uint32_t>(msg.size()));
+}
+
+uint32_t ReadU32BE(const uint8_t* p) {
+  return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) |
+         uint32_t(p[3]);
+}
+
+uint64_t ReadU64BE(const uint8_t* p) {
+  uint64_t v = 0;
+  for (int i = 0; i < 8; ++i) v = (v << 8) | p[i];
+  return v;
+}
+
+double ReadF64BE(const uint8_t* p) {
+  uint64_t bits = ReadU64BE(p);
+  double d;
+  memcpy(&d, &bits, sizeof(d));
+  return d;
+}
+
+// ---- CEF NSApplication (CefAppProtocol) ----
+}  // namespace
+
+@interface CefHostApplication : NSApplication <CefAppProtocol> {
+  BOOL handlingSendEvent_;
+}
+@end
+@implementation CefHostApplication
+- (BOOL)isHandlingSendEvent {
+  return handlingSendEvent_;
+}
+- (void)setHandlingSendEvent:(BOOL)h {
+  handlingSendEvent_ = h;
+}
+- (void)sendEvent:(NSEvent*)event {
+  CefScopedSendingEvent sendingEventScoper;
+  [super sendEvent:event];
+}
+@end
+
+namespace {
+
+// ---- Render handler: OSR -> shared IOSurface ----
+class HostRenderHandler : public CefRenderHandler {
+ public:
+  void GetViewRect(CefRefPtr<CefBrowser>, CefRect& rect) override {
+    std::lock_guard<std::mutex> lock(g_surface_mutex);
+    rect = CefRect(0, 0, g_width, g_height);
+  }
+
+  void OnPaint(CefRefPtr<CefBrowser>, PaintElementType type, const RectList&,
+               const void* buffer, int width, int height) override {
+    if (type != PET_VIEW) return;
+    std::lock_guard<std::mutex> lock(g_surface_mutex);
+    if (!g_surface) return;
+    // Only copy the region that fits the current surface; CEF may deliver a
+    // frame at the pre-resize size while a resize is in flight.
+    if (IOSurfaceLock(g_surface, 0, nullptr) != kIOReturnSuccess) return;
+    uint8_t* dst = static_cast<uint8_t*>(IOSurfaceGetBaseAddress(g_surface));
+    size_t dst_stride = IOSurfaceGetBytesPerRow(g_surface);
+    size_t surf_h = IOSurfaceGetHeight(g_surface);
+    size_t surf_w = IOSurfaceGetWidth(g_surface);
+    size_t src_stride = static_cast<size_t>(width) * 4;
+    size_t rows = std::min<size_t>(height, surf_h);
+    size_t copy_bytes = std::min<size_t>(src_stride, surf_w * 4);
+    const uint8_t* src = static_cast<const uint8_t*>(buffer);
+    for (size_t y = 0; y < rows; ++y) {
+      memcpy(dst + y * dst_stride, src + y * src_stride, copy_bytes);
+    }
+    IOSurfaceUnlock(g_surface, 0, nullptr);
+    SendFrame(kOpPresent, nullptr, 0);
+  }
+
+  IMPLEMENT_REFCOUNTING(HostRenderHandler);
+};
+
+class HostClient : public CefClient,
+                   public CefLoadHandler,
+                   public CefDisplayHandler {
+ public:
+  CefRefPtr<CefRenderHandler> rh_ = new HostRenderHandler();
+  CefRefPtr<CefRenderHandler> GetRenderHandler() override { return rh_; }
+  CefRefPtr<CefLoadHandler> GetLoadHandler() override { return this; }
+  CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
+  void OnLoadError(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, ErrorCode code,
+                   const CefString& text, const CefString& url) override {
+    if (code == ERR_ABORTED) return;
+    SendLog("load error " + std::to_string(code) + " " + text.ToString() +
+            " @ " + url.ToString());
+  }
+  // The page's cursor (I-beam over text, hand over links, etc.). Forward the
+  // type to the host so it can drive the Flutter MouseRegion cursor.
+  bool OnCursorChange(CefRefPtr<CefBrowser>, CefCursorHandle,
+                      cef_cursor_type_t type, const CefCursorInfo&) override {
+    uint8_t p[4];
+    uint32_t t = static_cast<uint32_t>(type);
+    p[0] = (t >> 24) & 0xff;
+    p[1] = (t >> 16) & 0xff;
+    p[2] = (t >> 8) & 0xff;
+    p[3] = t & 0xff;
+    SendFrame(kOpCursor, p, 4);
+    return true;
+  }
+  IMPLEMENT_REFCOUNTING(HostClient);
+};
+
+std::string g_initial_url;
+
+class HostApp : public CefApp, public CefBrowserProcessHandler {
+ public:
+  CefRefPtr<CefBrowserProcessHandler> GetBrowserProcessHandler() override {
+    return this;
+  }
+  void OnBeforeCommandLineProcessing(
+      const CefString&, CefRefPtr<CefCommandLine> command_line) override {
+    command_line->AppendSwitch("use-mock-keychain");
+    command_line->AppendSwitchWithValue("password-store", "basic");
+    command_line->AppendSwitch("single-process");
+    command_line->AppendSwitchWithValue(
+        "disable-features",
+        "MachPortRendezvousValidatePeerRequirements,"
+        "MachPortRendezvousEnforcePeerRequirements");
+    command_line->AppendSwitch("enable-logging");
+    command_line->AppendSwitchWithValue("log-file", "/tmp/cef_host_chromium.log");
+    command_line->AppendSwitchWithValue("v", "1");
+  }
+  void OnContextInitialized() override {
+    CEF_REQUIRE_UI_THREAD();
+    fprintf(stderr, "[cef_host] OnContextInitialized\n");
+    CefWindowInfo window_info;
+    window_info.SetAsWindowless(0);
+    CefBrowserSettings settings;
+    settings.windowless_frame_rate = 60;
+    g_browser = CefBrowserHost::CreateBrowserSync(
+        window_info, new HostClient(), g_initial_url, settings, nullptr,
+        nullptr);
+    fprintf(stderr, "[cef_host] browser=%p\n", (void*)g_browser.get());
+    SendFrame(kOpReady, nullptr, 0);
+  }
+  IMPLEMENT_REFCOUNTING(HostApp);
+};
+
+// ---- CEF-thread task helpers (IPC reader runs off the UI thread) ----
+void DoResize(int w, int h, uint32_t surface_id) {
+  IOSurfaceRef next = IOSurfaceLookup(surface_id);
+  if (!next) {
+    SendLog("resize: IOSurfaceLookup failed for id " + std::to_string(surface_id));
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_surface_mutex);
+    if (g_surface) CFRelease(g_surface);
+    g_surface = next;  // owns the +1 from Lookup
+    g_width = w;
+    g_height = h;
+  }
+  if (g_browser) g_browser->GetHost()->WasResized();
+}
+
+void DoNavigate(const std::string& url) {
+  if (g_browser) g_browser->GetMainFrame()->LoadURL(url);
+}
+
+// type: 0=move 1=down 2=up 3=wheel; button: 0=left 1=middle 2=right.
+void DoPointer(int type, int button, int click_count, uint32_t modifiers,
+               double x, double y, double dx, double dy) {
+  if (!g_browser) return;
+  CefMouseEvent ev;
+  ev.x = static_cast<int>(x);
+  ev.y = static_cast<int>(y);
+  ev.modifiers = modifiers;
+  CefRefPtr<CefBrowserHost> host = g_browser->GetHost();
+  switch (type) {
+    case 0:
+      host->SendMouseMoveEvent(ev, false);
+      break;
+    case 1:
+      host->SendMouseClickEvent(
+          ev, static_cast<cef_mouse_button_type_t>(button), false, click_count);
+      break;
+    case 2:
+      host->SendMouseClickEvent(
+          ev, static_cast<cef_mouse_button_type_t>(button), true, click_count);
+      break;
+    case 3:
+      host->SendMouseWheelEvent(ev, static_cast<int>(dx), static_cast<int>(dy));
+      break;
+    default:
+      break;
+  }
+}
+
+// type: 0=rawkeydown 2=keyup 3=char (cef_key_event_type_t).
+void DoKey(int type, uint32_t modifiers, int32_t windows_key_code,
+           int32_t native_key_code, uint32_t character) {
+  if (!g_browser) return;
+  CefKeyEvent ev;
+  ev.type = static_cast<cef_key_event_type_t>(type);
+  ev.modifiers = modifiers;
+  ev.windows_key_code = windows_key_code;
+  ev.native_key_code = native_key_code;
+  if (type == 3) {
+    ev.character = static_cast<char16_t>(character);
+    ev.unmodified_character = static_cast<char16_t>(character);
+  }
+  g_browser->GetHost()->SendKeyEvent(ev);
+}
+
+void DoShutdown() {
+  if (g_browser) {
+    g_browser->GetHost()->CloseBrowser(true);
+    g_browser = nullptr;
+  }
+  CefQuitMessageLoop();
+}
+
+// Reader thread: decode frames, marshal onto the CEF UI thread.
+void IpcReadLoop() {
+  for (;;) {
+    uint8_t hdr[4];
+    if (!ReadAll(g_ipc_fd, hdr, 4)) break;
+    uint32_t body_len = ReadU32BE(hdr);
+    if (body_len == 0 || body_len > (64u << 20)) break;
+    std::vector<uint8_t> body(body_len);
+    if (!ReadAll(g_ipc_fd, body.data(), body_len)) break;
+    uint8_t opcode = body[0];
+    const uint8_t* p = body.data() + 1;
+    uint32_t plen = body_len - 1;
+    switch (opcode) {
+      case kOpResize: {
+        if (plen < 12) break;
+        int w = static_cast<int>(ReadU32BE(p));
+        int h = static_cast<int>(ReadU32BE(p + 4));
+        uint32_t sid = ReadU32BE(p + 8);
+        CefPostTask(TID_UI, base::BindOnce(&DoResize, w, h, sid));
+        break;
+      }
+      case kOpNavigate: {
+        std::string url(reinterpret_cast<const char*>(p), plen);
+        CefPostTask(TID_UI, base::BindOnce(&DoNavigate, url));
+        break;
+      }
+      case kOpPointer: {
+        if (plen < 40) break;
+        int type = p[0], button = p[1], clicks = p[2];
+        uint32_t mods = ReadU32BE(p + 4);
+        double x = ReadF64BE(p + 8), y = ReadF64BE(p + 16);
+        double dx = ReadF64BE(p + 24), dy = ReadF64BE(p + 32);
+        CefPostTask(TID_UI, base::BindOnce(&DoPointer, type, button, clicks,
+                                           mods, x, y, dx, dy));
+        break;
+      }
+      case kOpKey: {
+        if (plen < 20) break;
+        int type = p[0];
+        uint32_t mods = ReadU32BE(p + 4);
+        int32_t wkc = static_cast<int32_t>(ReadU32BE(p + 8));
+        int32_t nkc = static_cast<int32_t>(ReadU32BE(p + 12));
+        uint32_t ch = ReadU32BE(p + 16);
+        CefPostTask(TID_UI, base::BindOnce(&DoKey, type, mods, wkc, nkc, ch));
+        break;
+      }
+      case kOpShutdown:
+        CefPostTask(TID_UI, base::BindOnce(&DoShutdown));
+        return;
+      default:
+        break;
+    }
+  }
+  // Parent died / socket closed: quit.
+  CefPostTask(TID_UI, base::BindOnce(&DoShutdown));
+}
+
+// ---- Arg parsing ----
+std::string ArgValue(int argc, char** argv, const char* key) {
+  std::string prefix = std::string("--") + key + "=";
+  for (int i = 1; i < argc; ++i) {
+    if (strncmp(argv[i], prefix.c_str(), prefix.size()) == 0) {
+      return std::string(argv[i] + prefix.size());
+    }
+  }
+  return std::string();
+}
+
+std::string ExecutableDir() {
+  char buf[4096];
+  uint32_t sz = sizeof(buf);
+  if (_NSGetExecutablePath(buf, &sz) != 0) return std::string();
+  char real[4096];
+  const char* resolved = realpath(buf, real) ? real : buf;
+  return std::string(dirname(const_cast<char*>(resolved)));
+}
+
+int ConnectUnixSocket(const std::string& path) {
+  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) return -1;
+  sockaddr_un addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+  if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+}  // namespace
+
+int main(int argc, char* argv[]) {
+  CefScopedLibraryLoader library_loader;
+  if (!library_loader.LoadInMain()) {
+    fprintf(stderr, "[cef_host] failed to load CEF framework\n");
+    return 1;
+  }
+
+  std::string url = ArgValue(argc, argv, "url");
+  std::string ipc_path = ArgValue(argc, argv, "ipc");
+  std::string ws = ArgValue(argc, argv, "width");
+  std::string hs = ArgValue(argc, argv, "height");
+  std::string sid = ArgValue(argc, argv, "iosurface-id");
+  if (url.empty()) url = "about:blank";
+  if (!ws.empty()) g_width = atoi(ws.c_str());
+  if (!hs.empty()) g_height = atoi(hs.c_str());
+  g_initial_url = url;
+
+  if (!sid.empty()) {
+    g_surface = IOSurfaceLookup(static_cast<uint32_t>(atoll(sid.c_str())));
+    if (!g_surface) {
+      fprintf(stderr, "[cef_host] IOSurfaceLookup failed for id %s\n",
+              sid.c_str());
+    }
+  }
+  if (!ipc_path.empty()) {
+    g_ipc_fd = ConnectUnixSocket(ipc_path);
+    if (g_ipc_fd < 0) {
+      fprintf(stderr, "[cef_host] failed to connect IPC socket %s\n",
+              ipc_path.c_str());
+    }
+  }
+
+  // Hand Chromium ONLY the program name. Our custom switches (--url,
+  // --iosurface-id, --ipc, --width, --height) are parsed by us above; if they
+  // reach Chromium's CommandLine, cef_initialize CHECK-crashes on them.
+  char* clean_argv[] = {argv[0]};
+  CefMainArgs main_args(1, clean_argv);
+  @autoreleasepool {
+    [CefHostApplication sharedApplication];
+    CefSettings settings;
+    settings.no_sandbox = true;
+    settings.windowless_rendering_enabled = true;
+    settings.log_severity = LOGSEVERITY_INFO;
+    CefString(&settings.root_cache_path) = "/tmp/cef_host_cache";
+    // A plain (non-.app) executable can't auto-locate the framework Resources
+    // (icudtl.dat, *.pak, locale .lproj), so point CEF at them explicitly via a
+    // normalized (no "..") framework dir.
+    std::string fw_raw =
+        ExecutableDir() + "/../Frameworks/Chromium Embedded Framework.framework";
+    char fw_real[4096];
+    std::string fw =
+        realpath(fw_raw.c_str(), fw_real) ? std::string(fw_real) : fw_raw;
+    CefString(&settings.framework_dir_path) = fw;
+    CefString(&settings.resources_dir_path) = fw + "/Resources";
+    CefString(&settings.locales_dir_path) = fw + "/Resources";
+    CefRefPtr<HostApp> app(new HostApp);
+    if (!CefInitialize(main_args, settings, app, nullptr)) {
+      fprintf(stderr, "[cef_host] CefInitialize failed\n");
+      return 1;
+    }
+    fprintf(stderr, "[cef_host] CefInitialize OK (fd=%d surface=%p)\n", g_ipc_fd,
+            (void*)g_surface);
+    std::thread reader;
+    if (g_ipc_fd >= 0) reader = std::thread(&IpcReadLoop);
+    CefRunMessageLoop();
+    if (reader.joinable()) {
+      shutdown(g_ipc_fd, SHUT_RDWR);
+      reader.join();
+    }
+    CefShutdown();
+  }
+  return 0;
+}

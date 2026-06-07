@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Development-category signing so the kernel assigns a recognized CS
+       validation category. (Single-process CEF has no child processes to
+       validate; when bundled into a host app, re-sign with the app's identity
+       and entitlements.) -->
+  <key>com.apple.security.get-task-allow</key><true/>
+</dict>
+</plist>
