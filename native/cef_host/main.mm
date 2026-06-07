@@ -16,11 +16,15 @@
 // Args: --url=<url> --width=<px> --height=<px> --iosurface-id=<id> --ipc=<path>
 //
 // IPC wire format: 4-byte big-endian length prefix, then [opcode][payload].
-//   host -> cef_host:  0x11 resize {w:u32,h:u32,iosurfaceId:u32}
-//                      0x20 navigate {utf8 url}
+//   host -> cef_host:  0x10 pointer {type:u8,button:u8,clicks:u8,_,mods:u32,
+//                                    x,y,dx,dy:f64}
+//                      0x11 resize {w:u32,h:u32,iosurfaceId:u32}
+//                      0x12 key {type:u8,_,_,_,mods:u32,wkc:u32,nkc:u32,char:u32}
 //                      0x14 shutdown {}
-//   cef_host -> host:  0x02 ready {}
-//                      0x01 present {}
+//                      0x20 navigate {utf8 url}
+//   cef_host -> host:  0x01 present {}
+//                      0x02 ready {}
+//                      0x03 cursor {type:u32}
 //                      0x04 log {utf8}
 
 #import <Cocoa/Cocoa.h>
@@ -37,6 +41,7 @@
 
 #include <libgen.h>
 #include <mach-o/dyld.h>
+#include <sys/event.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -77,6 +82,15 @@ int g_width = 800;
 int g_height = 600;
 
 CefRefPtr<CefBrowser> g_browser;
+
+// Popup widgets (<select> dropdowns, autofill) paint into a separate PET_POPUP
+// buffer that we composite over the view at the popup rect. Guarded by
+// g_surface_mutex.
+bool g_popup_visible = false;
+CefRect g_popup_rect;
+std::vector<uint8_t> g_popup_buf;
+int g_popup_w = 0;
+int g_popup_h = 0;
 
 // ---- IPC helpers ----
 bool WriteAll(int fd, const void* buf, size_t len) {
@@ -165,6 +179,26 @@ double ReadF64BE(const uint8_t* p) {
 
 namespace {
 
+// Copy a tight BGRA source rect into the surface at (dx,dy), clipped to the
+// surface bounds. CEF may deliver a frame at the pre-resize size while a resize
+// is in flight, so over-large sources are clipped rather than rejected.
+void BlitBGRA(uint8_t* dst, size_t dst_stride, int surf_w, int surf_h,
+              const uint8_t* src, int src_w, int src_h, int dx, int dy) {
+  for (int row = 0; row < src_h; ++row) {
+    const int y = dy + row;
+    if (y < 0 || y >= surf_h) continue;
+    const int x0 = dx < 0 ? 0 : dx;
+    const int sx0 = x0 - dx;
+    int w = src_w - sx0;
+    if (x0 + w > surf_w) w = surf_w - x0;
+    if (w <= 0) continue;
+    memcpy(
+        dst + static_cast<size_t>(y) * dst_stride + static_cast<size_t>(x0) * 4,
+        src + (static_cast<size_t>(row) * src_w + sx0) * 4,
+        static_cast<size_t>(w) * 4);
+  }
+}
+
 // ---- Render handler: OSR -> shared IOSurface ----
 class HostRenderHandler : public CefRenderHandler {
  public:
@@ -175,25 +209,48 @@ class HostRenderHandler : public CefRenderHandler {
 
   void OnPaint(CefRefPtr<CefBrowser>, PaintElementType type, const RectList&,
                const void* buffer, int width, int height) override {
-    if (type != PET_VIEW) return;
     std::lock_guard<std::mutex> lock(g_surface_mutex);
     if (!g_surface) return;
-    // Only copy the region that fits the current surface; CEF may deliver a
-    // frame at the pre-resize size while a resize is in flight.
     if (IOSurfaceLock(g_surface, 0, nullptr) != kIOReturnSuccess) return;
     uint8_t* dst = static_cast<uint8_t*>(IOSurfaceGetBaseAddress(g_surface));
-    size_t dst_stride = IOSurfaceGetBytesPerRow(g_surface);
-    size_t surf_h = IOSurfaceGetHeight(g_surface);
-    size_t surf_w = IOSurfaceGetWidth(g_surface);
-    size_t src_stride = static_cast<size_t>(width) * 4;
-    size_t rows = std::min<size_t>(height, surf_h);
-    size_t copy_bytes = std::min<size_t>(src_stride, surf_w * 4);
+    const size_t dst_stride = IOSurfaceGetBytesPerRow(g_surface);
+    const int surf_w = static_cast<int>(IOSurfaceGetWidth(g_surface));
+    const int surf_h = static_cast<int>(IOSurfaceGetHeight(g_surface));
     const uint8_t* src = static_cast<const uint8_t*>(buffer);
-    for (size_t y = 0; y < rows; ++y) {
-      memcpy(dst + y * dst_stride, src + y * src_stride, copy_bytes);
+    if (type == PET_VIEW) {
+      BlitBGRA(dst, dst_stride, surf_w, surf_h, src, width, height, 0, 0);
+      // Keep an open popup (<select> dropdown) painted on top of the view.
+      if (g_popup_visible && !g_popup_buf.empty()) {
+        BlitBGRA(dst, dst_stride, surf_w, surf_h, g_popup_buf.data(), g_popup_w,
+                 g_popup_h, g_popup_rect.x, g_popup_rect.y);
+      }
+    } else if (type == PET_POPUP) {
+      g_popup_w = width;
+      g_popup_h = height;
+      g_popup_buf.assign(src, src + static_cast<size_t>(width) * height * 4);
+      BlitBGRA(dst, dst_stride, surf_w, surf_h, src, width, height,
+               g_popup_rect.x, g_popup_rect.y);
     }
     IOSurfaceUnlock(g_surface, 0, nullptr);
     SendFrame(kOpPresent, nullptr, 0);
+  }
+
+  void OnPopupShow(CefRefPtr<CefBrowser> browser, bool show) override {
+    {
+      std::lock_guard<std::mutex> lock(g_surface_mutex);
+      g_popup_visible = show;
+      if (!show) {
+        g_popup_buf.clear();
+        g_popup_rect = CefRect();
+      }
+    }
+    // Repaint the view to erase the dropdown's pixels when it closes.
+    if (!show && browser) browser->GetHost()->Invalidate(PET_VIEW);
+  }
+
+  void OnPopupSize(CefRefPtr<CefBrowser>, const CefRect& rect) override {
+    std::lock_guard<std::mutex> lock(g_surface_mutex);
+    g_popup_rect = rect;
   }
 
   IMPLEMENT_REFCOUNTING(HostRenderHandler);
@@ -300,6 +357,9 @@ void DoPointer(int type, int button, int click_count, uint32_t modifiers,
       host->SendMouseMoveEvent(ev, false);
       break;
     case 1:
+      // Give the browser keyboard focus on press so text fields take input and
+      // show a caret (CEF won't route key events to an unfocused OSR browser).
+      host->SetFocus(true);
       host->SendMouseClickEvent(
           ev, static_cast<cef_mouse_button_type_t>(button), false, click_count);
       break;
@@ -394,6 +454,24 @@ void IpcReadLoop() {
   }
   // Parent died / socket closed: quit.
   CefPostTask(TID_UI, base::BindOnce(&DoShutdown));
+}
+
+// Belt-and-suspenders: if the host process dies without closing the socket
+// cleanly, kqueue NOTE_EXIT still tears us down so no cef_host orphans.
+void WatchParentDeath(pid_t parent) {
+  int kq = kqueue();
+  if (kq < 0) return;
+  struct kevent change;
+  EV_SET(&change, parent, EVFILT_PROC, EV_ADD | EV_ONESHOT, NOTE_EXIT, 0,
+         nullptr);
+  if (kevent(kq, &change, 1, nullptr, 0, nullptr) < 0) {
+    close(kq);  // parent already gone (ESRCH) — socket EOF will catch it
+    return;
+  }
+  struct kevent out;
+  const int n = kevent(kq, nullptr, 0, &out, 1, nullptr);  // blocks until exit
+  close(kq);
+  if (n > 0) CefPostTask(TID_UI, base::BindOnce(&DoShutdown));
 }
 
 // ---- Arg parsing ----
@@ -496,6 +574,7 @@ int main(int argc, char* argv[]) {
             (void*)g_surface);
     std::thread reader;
     if (g_ipc_fd >= 0) reader = std::thread(&IpcReadLoop);
+    std::thread(&WatchParentDeath, getppid()).detach();
     CefRunMessageLoop();
     if (reader.joinable()) {
       shutdown(g_ipc_fd, SHUT_RDWR);
