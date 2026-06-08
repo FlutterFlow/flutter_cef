@@ -43,6 +43,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -308,10 +309,12 @@ class HostRenderHandler : public CefRenderHandler {
     g_popup_rect = rect;
   }
 
-  // Multi-process GPU path: CEF's GPU/Viz process hands us a shared IOSurface
-  // (rotating pool — valid only for this call, must not be cached). Copy it into
-  // our persistent FlutterTexture surface. This is how frames arrive in
-  // multi-process (OnPaint isn't called when shared_texture_enabled is on).
+  // GPU zero-copy path — DORMANT. When shared_texture_enabled is true, CEF's
+  // GPU/Viz process hands us a shared IOSurface (rotating pool — valid only for
+  // this call, must not be cached) here instead of calling OnPaint. We keep
+  // shared_texture_enabled=false today because -67030 (ad-hoc signature
+  // validation) blocks the GPU→browser handoff, so this never fires and frames
+  // arrive via OnPaint. Re-enable once inside-out Developer-ID signing clears it.
   void OnAcceleratedPaint(CefRefPtr<CefBrowser>, PaintElementType type,
                           const RectList&,
                           const CefAcceleratedPaintInfo& info) override {
@@ -442,10 +445,23 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
         "disable-features",
         "MachPortRendezvousValidatePeerRequirements,"
         "MachPortRendezvousEnforcePeerRequirements");
+#else
+    // Multi-process SOFTWARE OSR: force software compositing so OnPaint's CPU
+    // readback receives the FULL composited frame. With the GPU/Viz process
+    // doing hardware compositing, the final frame stays in a GPU texture and the
+    // readback captures only the page background — a blank/white view. (Single
+    // process composites in-process, so it never hit this.) Only compositing
+    // moves to software; the renderer/utility processes stay separate, so
+    // heavy-page crash isolation (Google sign-in) is preserved.
+    command_line->AppendSwitch("disable-gpu-compositing");
 #endif
-    command_line->AppendSwitch("enable-logging");
-    command_line->AppendSwitchWithValue("log-file", "/tmp/cef_host_chromium.log");
-    command_line->AppendSwitchWithValue("v", "1");
+    // Verbose Chromium logging to /tmp only when explicitly debugging; off by
+    // default so a shipped build doesn't write logs behind the user's back.
+    if (std::getenv("FLUTTER_CEF_DEBUG")) {
+      command_line->AppendSwitch("enable-logging");
+      command_line->AppendSwitchWithValue("log-file", "/tmp/cef_host_chromium.log");
+      command_line->AppendSwitchWithValue("v", "1");
+    }
   }
   void OnContextInitialized() override {
     CEF_REQUIRE_UI_THREAD();
@@ -453,9 +469,18 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
     CefWindowInfo window_info;
     window_info.SetAsWindowless(0);
 #ifdef CEF_HOST_MULTIPROCESS
-    // Multi-process: ask the GPU process to deliver frames as a shared IOSurface
-    // (OnAcceleratedPaint) instead of a CPU OnPaint readback.
-    window_info.shared_texture_enabled = true;
+    // Multi-process render path: SOFTWARE OSR (OnPaint readback over Mojo), NOT
+    // the GPU shared-IOSurface OnAcceleratedPaint. Why: Chromium 144 fails to
+    // validate this process's own ad-hoc signature (-67030 in
+    // base/mac/process_requirement.cc), and that self-validation gates the
+    // GPU/Viz process's ability to hand an IOSurface back to the browser — so
+    // OnAcceleratedPaint never gets a live surface and the view stays blank.
+    // Mojo (input, navigation, the OnPaint bitmap) is unaffected, so software
+    // OSR renders correctly while the helper subprocesses still isolate the
+    // renderer/utility crashes heavy SPAs (Google sign-in) trigger. The
+    // zero-copy GPU path is re-enabled by `shared_texture_enabled = true` once
+    // correct inside-out Developer-ID signing clears -67030.
+    window_info.shared_texture_enabled = false;
 #endif
     CefBrowserSettings settings;
     settings.windowless_frame_rate = 60;

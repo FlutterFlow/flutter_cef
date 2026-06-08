@@ -2,7 +2,7 @@
 
 Embed a **live Chromium browser** (via the [Chromium Embedded Framework](https://bitbucket.org/chromiumembedded/cef/)) as a Flutter widget — rendered into a `Texture`, so it composites, transforms, clips, and zooms like any other widget, and **keeps rendering even when off-screen / not focused**. Pointer, scroll, and keyboard input are forwarded; the page cursor drives a `MouseRegion`.
 
-> Status: **experimental, macOS 12+ only** (CEF 144 runtime floor). Real Chromium (any site — JS/CSS/WebGL/video). **Multi-process by default** (GPU `OnAcceleratedPaint` → shared IOSurface, Retina-crisp, renderer/utility crashes isolated, so heavy SPAs like Google sign-in render and survive); `-DCEF_MULTI_PROCESS=OFF` for the simpler single-process build. No mobile (iOS bans third-party engines); desktop by nature.
+> Status: **experimental, macOS 12+ only** (CEF 144 runtime floor). Real Chromium (any site — JS/CSS/WebGL/video). **Multi-process by default** (software OSR — `OnPaint` CPU readback into a shared IOSurface, Retina-crisp; renderer/utility crashes isolated, so heavy SPAs like Google sign-in render and survive); `-DCEF_MULTI_PROCESS=OFF` for the simpler single-process build. No mobile (iOS bans third-party engines); desktop by nature.
 
 ```dart
 import 'package:flutter_cef/flutter_cef.dart';
@@ -77,19 +77,23 @@ stay on.
 ## Roadmap
 
 Working today: **multi-process** OSR render (on/off-screen, HiDPI/Retina-crisp,
-GPU `OnAcceleratedPaint` → shared IOSurface, heavy SPAs render + survive),
+software `OnPaint` readback into a shared IOSurface, heavy SPAs render + survive),
 pointer/scroll/keyboard input, `<select>` popups, page cursor, navigation +
 history, loading/title/url/error/console events, `executeJavaScript`.
 
 Next:
 
-- **Drop the Mach-port validation env-var crutch.** Multi-process renders today
-  by setting `MACH_PORT_RENDEZVOUS_PEER_VALDATION=0` (Chromium's typo) so the
-  process tree skips Chromium 144's peer validation — that env var is
-  transitional and will be removed upstream. The durable fix is **correct
-  inside-out Developer-ID signing** (`--timestamp`, no `get-task-allow`, sign
-  every Mach-O depth-first) — that's how OBS/JCEF satisfy the same validation
-  with no flag. Then notarize for distribution.
+- **Zero-copy GPU render (`OnAcceleratedPaint`).** Multi-process currently uses
+  software OSR (`OnPaint` CPU readback) + `--disable-gpu-compositing`, because the
+  GPU shared-texture path is blocked: Chromium 144 can't validate cef_host's
+  ad-hoc signature (`-67030`), which gates the GPU→browser IOSurface handoff.
+  Unblock it with **correct inside-out Developer-ID signing** (`--timestamp`, no
+  `get-task-allow`, sign every Mach-O depth-first — how OBS/JCEF satisfy the same
+  validation), then set `shared_texture_enabled = true` to switch on the
+  zero-copy path (the `OnAcceleratedPaint` handler is already in place). Then
+  notarize for distribution.
+- **OSR popup compositing.** Clicked links / `window.open` currently open a
+  native windowed browser instead of compositing into the OSR texture.
 - **`evaluateJavaScript`** (V8 round-trip return value), IME/composition
   (CJK/emoji), dialogs, downloads, context menus, find, zoom, cookies, devtools.
 - **Windows / Linux** — the federated structure is ready; each needs its own host

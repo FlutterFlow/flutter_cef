@@ -64,6 +64,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   private var connFd: Int32 = -1
   private var socketPath = ""
   private let writeLock = NSLock()
+  private var pendingFrames: [[UInt8]] = []  // queued until the pipe connects
   private var running = false
 
   init(sessionId: String, url: String, width: Int, height: Int, dpr: CGFloat,
@@ -247,7 +248,32 @@ final class CefWebSession: NSObject, FlutterTexture {
   private func acceptAndRead() {
     let fd = accept(listenFd, nil, nil)
     guard fd >= 0 else { NSLog("[cef] accept() failed"); return }
+    // Bring the pipe up and drain anything queued before it connected — all under
+    // writeLock so a concurrent sendFrame can't interleave with the flush.
+    bufferLock.lock()
+    let surf = ioSurface
+    bufferLock.unlock()
+    let w = width, h = height
+    writeLock.lock()
     connFd = fd
+    // 1. Re-sync geometry from the live surface. A resize() that fired before the
+    //    pipe connected was intentionally dropped (replaying it could reference a
+    //    since-freed / recycled IOSurface id); the current surface is always
+    //    valid. Without this the view stays blank until a manual window resize.
+    if let surf = surf {
+      var p = [UInt8]()
+      appendU32(&p, UInt32(w))
+      appendU32(&p, UInt32(h))
+      appendU32(&p, IOSurfaceGetID(surf))
+      let frame = frameBytes(Self.opResize, p)
+      _ = frame.withUnsafeBytes { writeAll(fd, $0.baseAddress!, frame.count) }
+    }
+    // 2. Flush queued non-resize frames (early navigate / executeJavaScript / …).
+    for f in pendingFrames {
+      _ = f.withUnsafeBytes { writeAll(fd, $0.baseAddress!, f.count) }
+    }
+    pendingFrames.removeAll()
+    writeLock.unlock()
     while running {
       var hdr = [UInt8](repeating: 0, count: 4)
       if !readAll(fd, &hdr, 4) { break }
@@ -302,16 +328,28 @@ final class CefWebSession: NSObject, FlutterTexture {
 
   // MARK: Wire helpers
 
-  private func sendFrame(_ op: UInt8, _ payload: [UInt8] = []) {
-    writeLock.lock()
-    defer { writeLock.unlock() }
-    guard connFd >= 0 else { return }
-    let bodyLen = 1 + payload.count
+  // Length-prefixed wire frame: [u32 bodyLen][op][payload]. Pure — no lock.
+  private func frameBytes(_ op: UInt8, _ payload: [UInt8]) -> [UInt8] {
     var frame = [UInt8]()
-    frame.reserveCapacity(4 + bodyLen)
-    appendU32(&frame, UInt32(bodyLen))
+    frame.reserveCapacity(5 + payload.count)
+    appendU32(&frame, UInt32(1 + payload.count))
     frame.append(op)
     frame.append(contentsOf: payload)
+    return frame
+  }
+
+  private func sendFrame(_ op: UInt8, _ payload: [UInt8] = []) {
+    let frame = frameBytes(op, payload)
+    writeLock.lock()
+    defer { writeLock.unlock() }
+    if connFd < 0 {
+      // Pipe not up yet. A pre-connect resize is re-synced from live geometry on
+      // connect (see acceptAndRead), so dropping it is correct — and avoids
+      // replaying a since-freed/recycled IOSurface id. Queue everything else
+      // (early navigate / executeJavaScript / …) so it isn't silently lost.
+      if op != Self.opResize { pendingFrames.append(frame) }
+      return
+    }
     _ = frame.withUnsafeBytes { writeAll(connFd, $0.baseAddress!, frame.count) }
   }
 
