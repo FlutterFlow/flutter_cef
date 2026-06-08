@@ -27,12 +27,12 @@ void main() {
 
   test('create returns the host texture id and forwards args', () async {
     final c = CefWebController(sessionId: 's1');
-    final id = await c.create(url: 'https://example.com', width: 100, height: 80);
+    final id =
+        await c.create(url: 'https://example.com', width: 100, height: 80);
     expect(id, 7);
     expect(c.textureId, 7);
-    final args =
-        (log.firstWhere((m) => m.method == 'create').arguments as Map)
-            .cast<String, dynamic>();
+    final args = (log.firstWhere((m) => m.method == 'create').arguments as Map)
+        .cast<String, dynamic>();
     expect(args['sessionId'], 's1');
     expect(args['url'], 'https://example.com');
     expect(args['width'], 100);
@@ -97,13 +97,17 @@ void main() {
     await c.goBack();
     await c.goForward();
     await c.executeJavaScript('1+1');
-    expect(log.map((m) => m.method),
-        containsAll(['reload', 'stop', 'goBack', 'goForward', 'executeJavaScript']));
+    expect(
+        log.map((m) => m.method),
+        containsAll(
+            ['reload', 'stop', 'goBack', 'goForward', 'executeJavaScript']));
     for (final m in log) {
       expect((m.arguments as Map)['sessionId'], 'nav');
     }
-    expect((log.firstWhere((m) => m.method == 'executeJavaScript').arguments
-        as Map)['code'], '1+1');
+    expect(
+        (log.firstWhere((m) => m.method == 'executeJavaScript').arguments
+            as Map)['code'],
+        '1+1');
   });
 
   test('loadingState event updates loading + history notifiers', () async {
@@ -130,8 +134,11 @@ void main() {
     await c.create(url: 'about:blank', width: 1, height: 1);
     CefLoadError? got;
     c.onLoadError = (e) => got = e;
-    await emit('le', 'loadError',
-        {'code': -105, 'url': 'https://bad.test/', 'text': 'ERR_NAME_NOT_RESOLVED'});
+    await emit('le', 'loadError', {
+      'code': -105,
+      'url': 'https://bad.test/',
+      'text': 'ERR_NAME_NOT_RESOLVED'
+    });
     expect(got, isNotNull);
     expect(got!.errorCode, -105);
     expect(got!.url, 'https://bad.test/');
@@ -143,7 +150,8 @@ void main() {
     await c.create(url: 'about:blank', width: 1, height: 1);
     CefConsoleMessage? got;
     c.onConsoleMessage = (m) => got = m;
-    await emit('cm', 'consoleMessage', {'level': 4, 'message': 'app.js:3\tboom'});
+    await emit(
+        'cm', 'consoleMessage', {'level': 4, 'message': 'app.js:3\tboom'});
     expect(got!.level, 4);
     expect(got!.message, 'app.js:3\tboom');
   });
@@ -249,7 +257,8 @@ void main() {
     final call =
         log.firstWhere((m) => m.method == 'evalReturning').arguments as Map;
     expect(call['code'], '1+1');
-    await emit('ev', 'evalResult', {'payload': '${call['id']}:{"ok":true,"v":2}'});
+    await emit(
+        'ev', 'evalResult', {'payload': '${call['id']}:{"ok":true,"v":2}'});
     expect(await future, 2);
   });
 

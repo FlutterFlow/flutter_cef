@@ -9,10 +9,10 @@ class MyApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => const MaterialApp(
-        title: 'flutter_cef',
-        debugShowCheckedModeBanner: false,
-        home: BrowserDemo(),
-      );
+    title: 'flutter_cef',
+    debugShowCheckedModeBanner: false,
+    home: BrowserDemo(),
+  );
 }
 
 /// A small browser built on one [CefWebView] + its [CefWebController]: a URL
@@ -56,8 +56,9 @@ class _BrowserDemoState extends State<BrowserDemo> {
 
   Future<void> _runJs() async {
     try {
-      final r = await _controller
-          .runJavaScriptReturningResult('document.title + " @ " + location.host');
+      final r = await _controller.runJavaScriptReturningResult(
+        'document.title + " @ " + location.host',
+      );
       _snack('JS → $r');
     } catch (e) {
       _snack('JS error: $e');
@@ -67,7 +68,8 @@ class _BrowserDemoState extends State<BrowserDemo> {
   void _snack(String msg) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(msg), duration: const Duration(seconds: 4)));
+      SnackBar(content: Text(msg), duration: const Duration(seconds: 4)),
+    );
   }
 
   void _go() => _controller.navigate(_normalize(_urlBar.text.trim()));
@@ -93,10 +95,16 @@ class _BrowserDemoState extends State<BrowserDemo> {
               padding: const EdgeInsets.all(8),
               child: Row(
                 children: [
-                  _navButton(Icons.arrow_back, _controller.canGoBack,
-                      _controller.goBack),
-                  _navButton(Icons.arrow_forward, _controller.canGoForward,
-                      _controller.goForward),
+                  _navButton(
+                    Icons.arrow_back,
+                    _controller.canGoBack,
+                    _controller.goBack,
+                  ),
+                  _navButton(
+                    Icons.arrow_forward,
+                    _controller.canGoForward,
+                    _controller.goForward,
+                  ),
                   IconButton(
                     icon: const Icon(Icons.refresh),
                     onPressed: _controller.reload,
@@ -141,7 +149,10 @@ class _BrowserDemoState extends State<BrowserDemo> {
               builder: (_, title, _) => Align(
                 alignment: Alignment.centerLeft,
                 child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 4,
+                  ),
                   child: Text(
                     title.isEmpty ? '—' : title,
                     maxLines: 1,
@@ -160,7 +171,11 @@ class _BrowserDemoState extends State<BrowserDemo> {
     );
   }
 
-  Widget _navButton(IconData icon, ValueListenable<bool> enabled, VoidCallback go) {
+  Widget _navButton(
+    IconData icon,
+    ValueListenable<bool> enabled,
+    VoidCallback go,
+  ) {
     return ValueListenableBuilder<bool>(
       valueListenable: enabled,
       builder: (_, can, _) =>

@@ -16,16 +16,30 @@ Drive and observe it via a controller:
 final c = CefWebController();
 CefWebView(url: startUrl, controller: c);
 
-// navigation + history
+// navigation + history + loading
 c.navigate('https://example.com');
-c.reload(); c.goBack(); c.goForward();
-c.executeJavaScript('document.body.style.zoom = 1.2');
+c.reload(); c.stop(); c.goBack(); c.goForward();
+c.loadHtmlString('<h1>hi</h1>'); c.loadFile('/abs/page.html');
+c.setZoomLevel(1.0);                 // 1.2^level (0 = 100%)
+c.find('term'); c.stopFind();        // results on c.onFindResult
 
-// page state (all ValueListenables) + callbacks
-ValueListenableBuilder(valueListenable: c.title, builder: (_, t, __) => Text('$t'));
-c.isLoading;  c.url;  c.canGoBack;  c.canGoForward;
+// JavaScript: run, return a value, and talk back from the page
+c.executeJavaScript('document.body.style.zoom = 1.2');
+final title = await c.runJavaScriptReturningResult('document.title'); // String/num/List/Map
+c.addJavaScriptChannel('Native', onMessageReceived: (m) => print('JS says $m'));
+// then in the page: window.Native.postMessage('hello')
+
+// page state (ValueListenables) + lifecycle/dialog callbacks
+c.isLoading;  c.url;  c.title;  c.canGoBack;  c.canGoForward;
+c.onPageStarted = (u) {}; c.onPageFinished = (u) {}; c.onProgress = (p) {};
+c.onUrlChange = (u) {}; c.onCreateWindow = (u) => c.navigate(u); // target=_blank
 c.onLoadError = (e) => print('${e.errorCode} ${e.url}');
 c.onConsoleMessage = (m) => print(m.message);
+c.onJavaScriptConfirmDialog = (req) async => askUser(req.message); // alert/confirm/prompt
+
+// cookies + scroll + storage
+c.setCookie(url: 'https://example.com/', name: 'sid', value: 'abc');
+c.scrollTo(0, 200); await c.getScrollPosition(); c.clearLocalStorage();
 ```
 
 See `example/` for a full browser chrome (URL bar, back/forward/reload, loading
@@ -78,8 +92,13 @@ stay on.
 
 Working today: **multi-process** OSR render (on/off-screen, HiDPI/Retina-crisp,
 software `OnPaint` readback into a shared IOSurface, heavy SPAs render + survive),
-pointer/scroll/keyboard input, `<select>` popups, page cursor, navigation +
-history, loading/title/url/error/console events, `executeJavaScript`.
+pointer/scroll/keyboard input, `<select>` popups, page cursor; navigation +
+history, page-lifecycle events (start/finish/progress/url-change), new-window
+routing (`onCreateWindow`), loading/title/url/error/console state; JS dialogs
+(alert/confirm/prompt), a JS bridge (`addJavaScriptChannel` +
+`runJavaScriptReturningResult` over `CefMessageRouter`), `executeJavaScript`;
+content zoom, find-in-page, `loadHtmlString`/`loadFile`, cookies, scroll, and
+title/user-agent getters.
 
 Next:
 
@@ -92,10 +111,10 @@ Next:
   validation), then set `shared_texture_enabled = true` to switch on the
   zero-copy path (the `OnAcceleratedPaint` handler is already in place). Then
   notarize for distribution.
-- **OSR popup compositing.** Clicked links / `window.open` currently open a
-  native windowed browser instead of compositing into the OSR texture.
-- **`evaluateJavaScript`** (V8 round-trip return value), IME/composition
-  (CJK/emoji), dialogs, downloads, context menus, find, zoom, cookies, devtools.
+- **IME / composition** (CJK, emoji), **downloads**, `loadRequest` with
+  custom headers / POST body, `setUserAgent`, devtools, and Windows / Linux
+  hosts (the federated structure is ready; each needs its own shared-texture
+  path).
 - **Windows / Linux** — the federated structure is ready; each needs its own host
   + shared-texture path.
 

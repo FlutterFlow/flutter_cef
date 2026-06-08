@@ -25,13 +25,15 @@ void main() {
     });
     addTearDown(() => messenger.setMockMethodCallHandler(channel, null));
 
-    await tester.pumpWidget(const Center(
-      child: SizedBox(
-        width: 320,
-        height: 240,
-        child: CefWebView(url: 'about:blank'),
+    await tester.pumpWidget(
+      const Center(
+        child: SizedBox(
+          width: 320,
+          height: 240,
+          child: CefWebView(url: 'about:blank'),
+        ),
       ),
-    ));
+    );
     await tester.pumpAndSettle();
 
     expect(calls, contains('create'));

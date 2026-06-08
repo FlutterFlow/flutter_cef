@@ -5,7 +5,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_cef/src/cef_input.dart';
 
 void main() {
-  group('cefWindowsKeyCode — editing/navigation keys resolve to Windows VK', () {
+  group('cefWindowsKeyCode — editing/navigation keys resolve to Windows VK',
+      () {
     // These are the codes CEF keys DOM behavior off of. Regressions here are
     // exactly the "backspace deletes nothing / arrows do nothing" class of bug.
     final expected = <LogicalKeyboardKey, int>{
@@ -46,7 +47,8 @@ void main() {
     });
   });
 
-  group('cefMacKeyCode — editing keys resolve from the native macOS keycode', () {
+  group('cefMacKeyCode — editing keys resolve from the native macOS keycode',
+      () {
     final expected = <LogicalKeyboardKey, int>{
       LogicalKeyboardKey.backspace: 51,
       LogicalKeyboardKey.delete: 117,
@@ -82,11 +84,16 @@ void main() {
     });
     test('no digit resolves to Tab (48)', () {
       final digits = [
-        PhysicalKeyboardKey.digit0, PhysicalKeyboardKey.digit1,
-        PhysicalKeyboardKey.digit2, PhysicalKeyboardKey.digit3,
-        PhysicalKeyboardKey.digit4, PhysicalKeyboardKey.digit5,
-        PhysicalKeyboardKey.digit6, PhysicalKeyboardKey.digit7,
-        PhysicalKeyboardKey.digit8, PhysicalKeyboardKey.digit9,
+        PhysicalKeyboardKey.digit0,
+        PhysicalKeyboardKey.digit1,
+        PhysicalKeyboardKey.digit2,
+        PhysicalKeyboardKey.digit3,
+        PhysicalKeyboardKey.digit4,
+        PhysicalKeyboardKey.digit5,
+        PhysicalKeyboardKey.digit6,
+        PhysicalKeyboardKey.digit7,
+        PhysicalKeyboardKey.digit8,
+        PhysicalKeyboardKey.digit9,
       ];
       expect(digits.map(cefMacNativeKeyCode), isNot(contains(48)));
     });
@@ -101,9 +108,11 @@ void main() {
   });
 
   group('cefMouseButton', () {
-    test('primary -> 0 (left)', () => expect(cefMouseButton(kPrimaryButton), 0));
+    test(
+        'primary -> 0 (left)', () => expect(cefMouseButton(kPrimaryButton), 0));
     test('middle -> 1', () => expect(cefMouseButton(kMiddleMouseButton), 1));
-    test('secondary -> 2 (right)', () => expect(cefMouseButton(kSecondaryButton), 2));
+    test('secondary -> 2 (right)',
+        () => expect(cefMouseButton(kSecondaryButton), 2));
     test('none -> 0', () => expect(cefMouseButton(0), 0));
     test('secondary wins over middle when both set', () {
       expect(cefMouseButton(kSecondaryButton | kMiddleMouseButton), 2);
@@ -115,10 +124,12 @@ void main() {
       expect(cefButtonModifiers(kPrimaryButton), kCefEventFlagLeftMouseButton);
     });
     test('middle -> middle flag', () {
-      expect(cefButtonModifiers(kMiddleMouseButton), kCefEventFlagMiddleMouseButton);
+      expect(cefButtonModifiers(kMiddleMouseButton),
+          kCefEventFlagMiddleMouseButton);
     });
     test('secondary -> right flag', () {
-      expect(cefButtonModifiers(kSecondaryButton), kCefEventFlagRightMouseButton);
+      expect(
+          cefButtonModifiers(kSecondaryButton), kCefEventFlagRightMouseButton);
     });
     test('combined buttons OR together', () {
       expect(

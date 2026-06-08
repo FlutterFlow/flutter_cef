@@ -170,7 +170,8 @@ class CefWebController {
   void _handleEvalResult(String payload) {
     final i = payload.indexOf(':');
     if (i < 0) return;
-    final completer = _evalPending.remove(int.tryParse(payload.substring(0, i)));
+    final completer =
+        _evalPending.remove(int.tryParse(payload.substring(0, i)));
     if (completer == null || completer.isCompleted) return;
     try {
       final decoded = jsonDecode(payload.substring(i + 1)) as Map;
@@ -266,8 +267,8 @@ class CefWebController {
   Future<void> goForward() => _send('goForward');
 
   /// Run [code] in the main frame (fire-and-forget; no return value).
-  Future<void> executeJavaScript(String code) => _channel
-      .invokeMethod('executeJavaScript', {'sessionId': sessionId, 'code': code});
+  Future<void> executeJavaScript(String code) => _channel.invokeMethod(
+      'executeJavaScript', {'sessionId': sessionId, 'code': code});
 
   /// Evaluate [code] in the main frame and return its value (decoded from JSON,
   /// so primitives, lists and maps all round-trip). Completes with an error if
@@ -301,7 +302,8 @@ class CefWebController {
 
   /// The current scroll offset from the top-left.
   Future<Offset> getScrollPosition() async {
-    final r = await runJavaScriptReturningResult('[window.scrollX,window.scrollY]');
+    final r =
+        await runJavaScriptReturningResult('[window.scrollX,window.scrollY]');
     if (r is List && r.length >= 2 && r[0] is num && r[1] is num) {
       return Offset((r[0] as num).toDouble(), (r[1] as num).toDouble());
     }
@@ -373,9 +375,8 @@ class CefWebController {
       });
 
   /// Stop the current find-in-page search and (by default) clear the selection.
-  Future<void> stopFind({bool clearSelection = true}) =>
-      _channel.invokeMethod(
-          'stopFind', {'sessionId': sessionId, 'clearSelection': clearSelection});
+  Future<void> stopFind({bool clearSelection = true}) => _channel.invokeMethod(
+      'stopFind', {'sessionId': sessionId, 'clearSelection': clearSelection});
 
   Future<void> _send(String method) =>
       _channel.invokeMethod(method, {'sessionId': sessionId});

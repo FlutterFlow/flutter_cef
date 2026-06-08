@@ -28,7 +28,8 @@ void main() {
   });
   tearDown(() => messenger.setMockMethodCallHandler(channel, null));
 
-  Widget boxed(Widget child, {double w = 320, double h = 240}) => Directionality(
+  Widget boxed(Widget child, {double w = 320, double h = 240}) =>
+      Directionality(
         textDirection: TextDirection.ltr,
         child: Center(child: SizedBox(width: w, height: h, child: child)),
       );

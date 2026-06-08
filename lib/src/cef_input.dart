@@ -33,8 +33,12 @@ int cefMouseButton(int flutterButtons) {
 int cefButtonModifiers(int flutterButtons) {
   var m = 0;
   if (flutterButtons & kPrimaryButton != 0) m |= kCefEventFlagLeftMouseButton;
-  if (flutterButtons & kMiddleMouseButton != 0) m |= kCefEventFlagMiddleMouseButton;
-  if (flutterButtons & kSecondaryButton != 0) m |= kCefEventFlagRightMouseButton;
+  if (flutterButtons & kMiddleMouseButton != 0) {
+    m |= kCefEventFlagMiddleMouseButton;
+  }
+  if (flutterButtons & kSecondaryButton != 0) {
+    m |= kCefEventFlagRightMouseButton;
+  }
   return m;
 }
 
