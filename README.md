@@ -2,7 +2,7 @@
 
 Embed a **live Chromium browser** (via the [Chromium Embedded Framework](https://bitbucket.org/chromiumembedded/cef/)) as a Flutter widget — rendered into a `Texture`, so it composites, transforms, clips, and zooms like any other widget, and **keeps rendering even when off-screen / not focused**. Pointer, scroll, and keyboard input are forwarded; the page cursor drives a `MouseRegion`.
 
-> Status: **experimental, macOS 12+ only** (CEF 144 runtime floor). Real Chromium (any site — JS/CSS/WebGL/video). Single-process OSR today (simple to sign; see Roadmap for the GPU/multi-process upgrade). No mobile (iOS bans third-party engines); desktop by nature.
+> Status: **experimental, macOS 12+ only** (CEF 144 runtime floor). Real Chromium (any site — JS/CSS/WebGL/video). **Multi-process by default** (GPU `OnAcceleratedPaint` → shared IOSurface, Retina-crisp, renderer/utility crashes isolated, so heavy SPAs like Google sign-in render and survive); `-DCEF_MULTI_PROCESS=OFF` for the simpler single-process build. No mobile (iOS bans third-party engines); desktop by nature.
 
 ```dart
 import 'package:flutter_cef/flutter_cef.dart';
@@ -76,21 +76,20 @@ stay on.
 
 ## Roadmap
 
-Working today: live OSR render (on/off-screen, HiDPI/Retina-crisp),
+Working today: **multi-process** OSR render (on/off-screen, HiDPI/Retina-crisp,
+GPU `OnAcceleratedPaint` → shared IOSurface, heavy SPAs render + survive),
 pointer/scroll/keyboard input, `<select>` popups, page cursor, navigation +
 history, loading/title/url/error/console events, `executeJavaScript`.
 
 Next:
 
-- **Multi-process (opt-in today, default later)** — `-DCEF_MULTI_PROCESS=ON`
-  builds the five CEF helper bundles (base + `(GPU)`/`(Renderer)`/`(Plugin)`/
-  `(Alerts)`) and drops `--single-process`, enabling the GPU/Viz process + site
-  isolation. It runs, but Chromium 144's Mach-port peer validation only fully
-  clears (`-67030`) with a **Developer ID identity + notarization** — so
-  single-process stays the default until that's wired into a release pipeline.
-- **GPU zero-copy** — on top of multi-process: `OnAcceleratedPaint` hands back an
-  `IOSurfaceRef` directly (macOS, CEF ≥147); blit it into the texture surface
-  instead of the CPU `OnPaint` memcpy.
+- **Drop the Mach-port validation env-var crutch.** Multi-process renders today
+  by setting `MACH_PORT_RENDEZVOUS_PEER_VALDATION=0` (Chromium's typo) so the
+  process tree skips Chromium 144's peer validation — that env var is
+  transitional and will be removed upstream. The durable fix is **correct
+  inside-out Developer-ID signing** (`--timestamp`, no `get-task-allow`, sign
+  every Mach-O depth-first) — that's how OBS/JCEF satisfy the same validation
+  with no flag. Then notarize for distribution.
 - **`evaluateJavaScript`** (V8 round-trip return value), IME/composition
   (CJK/emoji), dialogs, downloads, context menus, find, zoom, cookies, devtools.
 - **Windows / Linux** — the federated structure is ready; each needs its own host
