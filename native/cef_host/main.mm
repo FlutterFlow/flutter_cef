@@ -308,6 +308,47 @@ class HostRenderHandler : public CefRenderHandler {
     g_popup_rect = rect;
   }
 
+  // Multi-process GPU path: CEF's GPU/Viz process hands us a shared IOSurface
+  // (rotating pool — valid only for this call, must not be cached). Copy it into
+  // our persistent FlutterTexture surface. This is how frames arrive in
+  // multi-process (OnPaint isn't called when shared_texture_enabled is on).
+  void OnAcceleratedPaint(CefRefPtr<CefBrowser>, PaintElementType type,
+                          const RectList&,
+                          const CefAcceleratedPaintInfo& info) override {
+    if (type != PET_VIEW) return;  // popups still TODO on this path
+    IOSurfaceRef src =
+        reinterpret_cast<IOSurfaceRef>(info.shared_texture_io_surface);
+    if (!src) {
+      SendLog("OnAcceleratedPaint: null io_surface");
+      return;
+    }
+    std::lock_guard<std::mutex> lock(g_surface_mutex);
+    if (!g_surface) return;
+    if (IOSurfaceLock(src, kIOSurfaceLockReadOnly, nullptr) != kIOReturnSuccess) {
+      return;
+    }
+    if (IOSurfaceLock(g_surface, 0, nullptr) != kIOReturnSuccess) {
+      IOSurfaceUnlock(src, kIOSurfaceLockReadOnly, nullptr);
+      return;
+    }
+    auto* dst = static_cast<uint8_t*>(IOSurfaceGetBaseAddress(g_surface));
+    const auto* s = static_cast<const uint8_t*>(IOSurfaceGetBaseAddress(src));
+    const size_t dst_stride = IOSurfaceGetBytesPerRow(g_surface);
+    const size_t src_stride = IOSurfaceGetBytesPerRow(src);
+    const int rows = std::min<int>(IOSurfaceGetHeight(src),
+                                   IOSurfaceGetHeight(g_surface));
+    const size_t copy =
+        std::min<size_t>(static_cast<size_t>(IOSurfaceGetWidth(src)) * 4,
+                         static_cast<size_t>(IOSurfaceGetWidth(g_surface)) * 4);
+    for (int y = 0; y < rows; ++y) {
+      memcpy(dst + static_cast<size_t>(y) * dst_stride,
+             s + static_cast<size_t>(y) * src_stride, copy);
+    }
+    IOSurfaceUnlock(g_surface, 0, nullptr);
+    IOSurfaceUnlock(src, kIOSurfaceLockReadOnly, nullptr);
+    SendFrame(kOpPresent, nullptr, 0);
+  }
+
   IMPLEMENT_REFCOUNTING(HostRenderHandler);
 };
 
@@ -411,6 +452,11 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
     fprintf(stderr, "[cef_host] OnContextInitialized\n");
     CefWindowInfo window_info;
     window_info.SetAsWindowless(0);
+#ifdef CEF_HOST_MULTIPROCESS
+    // Multi-process: ask the GPU process to deliver frames as a shared IOSurface
+    // (OnAcceleratedPaint) instead of a CPU OnPaint readback.
+    window_info.shared_texture_enabled = true;
+#endif
     CefBrowserSettings settings;
     settings.windowless_frame_rate = 60;
     g_browser = CefBrowserHost::CreateBrowserSync(
