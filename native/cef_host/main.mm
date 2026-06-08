@@ -102,6 +102,7 @@ constexpr uint8_t kOpEvalResult = 0x16; // {utf8 "id:json"} runJavaScriptReturni
 constexpr uint8_t kOpChannelMsg = 0x17; // {utf8 "name:message"} JS channel -> host
 constexpr uint8_t kOpDownload = 0x18;   // {utf8 suggestedName} a download started
 constexpr uint8_t kOpImeBounds = 0x19;  // {u32 x}{u32 y}{u32 w}{u32 h} caret rect (DIP)
+constexpr uint8_t kOpCookies = 0x1a;    // {u32 id}{utf8 json-array} visitAllCookies result
 constexpr uint8_t kOpPointer = 0x10;
 constexpr uint8_t kOpResize = 0x11;
 constexpr uint8_t kOpKey = 0x12;
@@ -120,9 +121,12 @@ constexpr uint8_t kOpEvalReturning = 0x2a;  // {u32 id}{utf8 code}
 constexpr uint8_t kOpAddChannel = 0x2b;     // {utf8 name} register a JS channel
 constexpr uint8_t kOpSetCookie = 0x2c;      // {utf8 url\0name\0value\0domain\0path}
 constexpr uint8_t kOpClearCookies = 0x2d;   // {} delete all cookies
+constexpr uint8_t kOpVisitCookies = 0x2e;   // {u32 id}{utf8 url} enumerate (url empty = all)
+constexpr uint8_t kOpDeleteCookie = 0x2f;   // {utf8 url\0name} delete one
 constexpr uint8_t kOpImeSetComp = 0x30;     // {utf8 text} IME composition update
 constexpr uint8_t kOpImeCommit = 0x31;      // {utf8 text} commit composed text
 constexpr uint8_t kOpImeCancel = 0x32;      // {} cancel composition
+constexpr uint8_t kOpShowDevTools = 0x33;   // {} open DevTools in a window
 
 // ---- Shared runtime state ----
 int g_ipc_fd = -1;
@@ -852,6 +856,87 @@ void DoClearCookies() {
   CefRefPtr<CefCookieManager> mgr = CefCookieManager::GetGlobalManager(nullptr);
   if (mgr) mgr->DeleteCookies(CefString(), CefString(), nullptr);
 }
+
+// JSON-escape a UTF-8 string for embedding in the cookie array.
+std::string JsonEscape(const std::string& s) {
+  std::string out;
+  out.reserve(s.size() + 2);
+  for (unsigned char ch : s) {
+    switch (ch) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if (ch < 0x20) {
+          char buf[8];
+          snprintf(buf, sizeof(buf), "\\u%04x", ch);
+          out += buf;
+        } else {
+          out += static_cast<char>(ch);
+        }
+    }
+  }
+  return out;
+}
+
+std::string CookieToJson(const CefCookie& c) {
+  std::string out = "{";
+  out += "\"name\":\"" + JsonEscape(CefString(&c.name).ToString()) + "\",";
+  out += "\"value\":\"" + JsonEscape(CefString(&c.value).ToString()) + "\",";
+  out += "\"domain\":\"" + JsonEscape(CefString(&c.domain).ToString()) + "\",";
+  out += "\"path\":\"" + JsonEscape(CefString(&c.path).ToString()) + "\",";
+  out += "\"secure\":" + std::string(c.secure ? "true" : "false") + ",";
+  out += "\"httpOnly\":" + std::string(c.httponly ? "true" : "false");
+  return out + "}";
+}
+
+// Accumulates a Visit pass and flushes the JSON array on destruction, so the
+// 0-cookie case (Visit never called) still replies (godot-cef does the same).
+class HostCookieVisitor : public CefCookieVisitor {
+ public:
+  explicit HostCookieVisitor(uint32_t id) : id_(id) {}
+  bool Visit(const CefCookie& cookie, int, int, bool&) override {
+    if (!json_.empty()) json_ += ",";
+    json_ += CookieToJson(cookie);
+    return true;
+  }
+  ~HostCookieVisitor() override {
+    SendCodePlusUtf8(kOpCookies, id_, "[" + json_ + "]");
+  }
+
+ private:
+  uint32_t id_;
+  std::string json_;
+  IMPLEMENT_REFCOUNTING(HostCookieVisitor);
+};
+
+void DoVisitCookies(uint32_t id, const std::string& url) {
+  CefRefPtr<CefCookieManager> mgr = CefCookieManager::GetGlobalManager(nullptr);
+  // The visitor replies on destruction; a null manager just yields [].
+  CefRefPtr<HostCookieVisitor> visitor = new HostCookieVisitor(id);
+  if (!mgr) return;
+  if (url.empty()) {
+    mgr->VisitAllCookies(visitor);
+  } else {
+    mgr->VisitUrlCookies(url, true, visitor);
+  }
+}
+
+void DoDeleteCookie(const std::string& url, const std::string& name) {
+  CefRefPtr<CefCookieManager> mgr = CefCookieManager::GetGlobalManager(nullptr);
+  if (mgr) mgr->DeleteCookies(url, name, nullptr);
+}
+
+void DoShowDevTools() {
+  if (!g_browser) return;
+  // Windowed DevTools (default CefWindowInfo is windowed) — the OSR host can
+  // still host a real window. null client lets CEF manage it.
+  CefWindowInfo window_info;
+  CefBrowserSettings settings;
+  g_browser->GetHost()->ShowDevTools(window_info, nullptr, settings, CefPoint());
+}
 void DoImeSetComposition(const std::string& text) {
   if (!g_browser) return;
   CefString t(text);
@@ -1042,6 +1127,21 @@ void IpcReadLoop() {
       case kOpClearCookies:
         CefPostTask(TID_UI, base::BindOnce(&DoClearCookies));
         break;
+      case kOpVisitCookies: {
+        if (plen < 4) break;
+        uint32_t id = ReadU32BE(p);
+        std::string url(reinterpret_cast<const char*>(p + 4), plen - 4);
+        CefPostTask(TID_UI, base::BindOnce(&DoVisitCookies, id, url));
+        break;
+      }
+      case kOpDeleteCookie: {
+        std::string s(reinterpret_cast<const char*>(p), plen);
+        const size_t nul = s.find('\0');
+        std::string url = nul == std::string::npos ? s : s.substr(0, nul);
+        std::string name = nul == std::string::npos ? "" : s.substr(nul + 1);
+        CefPostTask(TID_UI, base::BindOnce(&DoDeleteCookie, url, name));
+        break;
+      }
       case kOpImeSetComp: {
         std::string text(reinterpret_cast<const char*>(p), plen);
         CefPostTask(TID_UI, base::BindOnce(&DoImeSetComposition, text));
@@ -1052,6 +1152,9 @@ void IpcReadLoop() {
         CefPostTask(TID_UI, base::BindOnce(&DoImeCommitText, text));
         break;
       }
+      case kOpShowDevTools:
+        CefPostTask(TID_UI, base::BindOnce(&DoShowDevTools));
+        break;
       case kOpImeCancel:
         CefPostTask(TID_UI, base::BindOnce(&DoImeCancel));
         break;

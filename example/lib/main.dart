@@ -65,6 +65,21 @@ class _BrowserDemoState extends State<BrowserDemo> {
     }
   }
 
+  /// Read every cookie the page can see and surface a quick summary — exercises
+  /// the host cookie visitor end-to-end.
+  Future<void> _dumpCookies() async {
+    try {
+      final cookies = await _controller.getCookies();
+      final preview = cookies
+          .take(3)
+          .map((c) => '${c.name}=${c.value}')
+          .join(', ');
+      _snack('${cookies.length} cookie(s)${preview.isEmpty ? '' : ' → $preview'}');
+    } catch (e) {
+      _snack('cookies error: $e');
+    }
+  }
+
   void _snack(String msg) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
@@ -157,6 +172,16 @@ and committed text — including emoji — should appear intact.</p>
                     icon: const Icon(Icons.code),
                     tooltip: 'runJavaScriptReturningResult(document.title)',
                     onPressed: _runJs,
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.cookie_outlined),
+                    tooltip: 'getCookies() for the current page',
+                    onPressed: _dumpCookies,
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.bug_report_outlined),
+                    tooltip: 'openDevTools()',
+                    onPressed: _controller.openDevTools,
                   ),
                   IconButton(
                     icon: const Icon(Icons.keyboard),

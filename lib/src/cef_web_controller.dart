@@ -106,6 +106,10 @@ class CefWebController {
   // 'evalResult' event. JS channels: name -> message handler.
   final Map<int, Completer<Object?>> _evalPending = <int, Completer<Object?>>{};
   int _evalNextId = 1;
+  // getCookies: pending requests keyed by id, resolved by the 'cookies' event.
+  final Map<int, Completer<List<CefCookie>>> _cookiePending =
+      <int, Completer<List<CefCookie>>>{};
+  int _cookieNextId = 1;
   final Map<String, void Function(String message)> _channels =
       <String, void Function(String)>{};
 
@@ -184,6 +188,9 @@ class CefWebController {
         break;
       case 'download':
         onDownload?.call(a['suggestedName'] as String? ?? '');
+        break;
+      case 'cookies':
+        _handleCookies(a['id'] as int? ?? 0, a['json'] as String? ?? '[]');
         break;
       case 'imeCompositionBounds':
         onImeCompositionBounds?.call(Rect.fromLTWH(
@@ -388,6 +395,41 @@ class CefWebController {
   Future<void> clearCookies() =>
       _channel.invokeMethod('clearCookies', {'sessionId': sessionId});
 
+  /// Read cookies from the global store. With no [url], returns every cookie;
+  /// with a [url], only the cookies that would be sent to it. Includes
+  /// `httpOnly` cookies (not reachable from page JavaScript).
+  Future<List<CefCookie>> getCookies({String? url}) {
+    final id = _cookieNextId++;
+    final completer = Completer<List<CefCookie>>();
+    _cookiePending[id] = completer;
+    _channel.invokeMethod(
+        'visitCookies', {'sessionId': sessionId, 'id': id, 'url': url ?? ''});
+    return completer.future;
+  }
+
+  /// Delete the cookie named [name] visible to [url].
+  Future<void> deleteCookie({required String url, required String name}) =>
+      _channel.invokeMethod(
+          'deleteCookie', {'sessionId': sessionId, 'url': url, 'name': name});
+
+  /// Resolve a pending [getCookies] from the host's JSON.
+  void _handleCookies(int id, String json) {
+    final completer = _cookiePending.remove(id);
+    if (completer == null || completer.isCompleted) return;
+    try {
+      final list = (jsonDecode(json) as List)
+          .map((e) => CefCookie.fromJson((e as Map).cast<String, dynamic>()))
+          .toList();
+      completer.complete(list);
+    } catch (e) {
+      completer.completeError(e);
+    }
+  }
+
+  /// Open Chromium's DevTools for this page in a separate window.
+  Future<void> openDevTools() =>
+      _channel.invokeMethod('showDevTools', {'sessionId': sessionId});
+
   /// Update the active IME composition with [text] (the in-progress, underlined
   /// text). Driven by [CefWebView]'s text-input integration for CJK/emoji
   /// composition; rarely called directly.
@@ -496,6 +538,10 @@ class CefWebController {
     _disposed = true;
     _bySession.remove(sessionId);
     _failPendingEvals('controller disposed');
+    for (final c in _cookiePending.values) {
+      if (!c.isCompleted) c.completeError(StateError('controller disposed'));
+    }
+    _cookiePending.clear();
     _channels.clear();
     cursor.dispose();
     isLoading.dispose();

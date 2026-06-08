@@ -39,7 +39,12 @@ c.onJavaScriptConfirmDialog = (req) async => askUser(req.message); // alert/conf
 
 // cookies + scroll + storage
 c.setCookie(url: 'https://example.com/', name: 'sid', value: 'abc');
+final cookies = await c.getCookies(); // read/enumerate; pass url: to scope
+c.deleteCookie(url: 'https://example.com/', name: 'sid');
 c.scrollTo(0, 200); await c.getScrollPosition(); c.clearLocalStorage();
+
+// open the Chrome DevTools inspector for this view in its own window
+c.openDevTools();
 ```
 
 See `example/` for a full browser chrome (URL bar, back/forward/reload, loading
@@ -119,8 +124,10 @@ navigation + history, page-lifecycle events (start/finish/progress/url-change),
 new-window routing (`onCreateWindow`), loading/title/url/error/console state; JS
 dialogs (alert/confirm/prompt), a JS bridge (`addJavaScriptChannel` +
 `runJavaScriptReturningResult` over `CefMessageRouter`), `executeJavaScript`;
-content zoom, find-in-page, `loadHtmlString`/`loadFile`, cookies, scroll,
-title/user-agent getters, and downloads.
+content zoom, find-in-page, `loadHtmlString`/`loadFile`, cookies
+(set/clear plus read/enumerate via `getCookies` + `deleteCookie`), scroll,
+title/user-agent getters, downloads, and a Chrome DevTools inspector window
+(`openDevTools`).
 
 Next:
 
@@ -137,7 +144,8 @@ Next:
   fast-updating pages (JCEF's named-mutex 2-slot buffer is a good reference).
 - **The CEF feature tail** that CefSharp/JCEF expose: `loadRequest` with custom
   headers / POST body, `setUserAgent`, request / resource interception, custom
-  scheme handlers, a typed DevTools/CDP client, and `CefPermissionHandler`
+  scheme handlers, a typed DevTools/CDP client (the inspector window already
+  ships via `openDevTools`; this is the programmatic CDP surface), and `CefPermissionHandler`
   (WebRTC camera/mic prompts).
 - **Windows / Linux** — the federated structure is ready; each needs its own host
   + shared-texture path.

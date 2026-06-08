@@ -40,6 +40,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   private static let opChannelMsg: UInt8 = 0x17
   private static let opDownload: UInt8 = 0x18
   private static let opImeBounds: UInt8 = 0x19
+  private static let opCookies: UInt8 = 0x1a
   private static let opNavigate: UInt8 = 0x20
   private static let opReload: UInt8 = 0x21
   private static let opStop: UInt8 = 0x22
@@ -54,9 +55,12 @@ final class CefWebSession: NSObject, FlutterTexture {
   private static let opAddChannel: UInt8 = 0x2b
   private static let opSetCookie: UInt8 = 0x2c
   private static let opClearCookies: UInt8 = 0x2d
+  private static let opVisitCookies: UInt8 = 0x2e
+  private static let opDeleteCookie: UInt8 = 0x2f
   private static let opImeSetComp: UInt8 = 0x30
   private static let opImeCommit: UInt8 = 0x31
   private static let opImeCancel: UInt8 = 0x32
+  private static let opShowDevTools: UInt8 = 0x33
 
   // Event callbacks (fired off the main thread). The registrar relays each to a
   // Dart channel message.
@@ -76,6 +80,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   var onChannelMsg: ((String) -> Void)?  // "name:message"
   var onDownload: ((String) -> Void)?  // suggested name
   var onImeBounds: ((Int, Int, Int, Int) -> Void)?  // caret rect x,y,w,h (DIP)
+  var onCookies: ((Int, String) -> Void)?  // request id, json array
 
   let sessionId: String
   private(set) var textureId: Int64 = 0
@@ -196,6 +201,19 @@ final class CefWebSession: NSObject, FlutterTexture {
   }
 
   func clearCookies() { sendFrame(Self.opClearCookies) }
+
+  func visitCookies(id: Int, url: String) {
+    var payload = [UInt8]()
+    appendU32(&payload, UInt32(truncatingIfNeeded: id))
+    payload.append(contentsOf: Array(url.utf8))
+    sendFrame(Self.opVisitCookies, payload)
+  }
+
+  func deleteCookie(url: String, name: String) {
+    sendFrame(Self.opDeleteCookie, Array((url + "\u{0}" + name).utf8))
+  }
+
+  func showDevTools() { sendFrame(Self.opShowDevTools) }
 
   func imeSetComposition(_ text: String) {
     sendFrame(Self.opImeSetComp, Array(text.utf8))
@@ -481,6 +499,11 @@ final class CefWebSession: NSObject, FlutterTexture {
         if body.count >= 17 {
           onImeBounds?(readU32(body, 1), readU32(body, 5),
                        readU32(body, 9), readU32(body, 13))
+        }
+      case Self.opCookies:
+        if body.count >= 5 {
+          onCookies?(readU32(body, 1),
+                     String(bytes: body[5...], encoding: .utf8) ?? "[]")
         }
       default:
         break

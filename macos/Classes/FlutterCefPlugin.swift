@@ -87,6 +87,21 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     case "clearCookies":
       withSession(args) { $0.clearCookies() }
       result(nil)
+    case "visitCookies":
+      withSession(args) {
+        $0.visitCookies(id: args["id"] as? Int ?? 0,
+                        url: args["url"] as? String ?? "")
+      }
+      result(nil)
+    case "deleteCookie":
+      withSession(args) {
+        $0.deleteCookie(url: args["url"] as? String ?? "",
+                        name: args["name"] as? String ?? "")
+      }
+      result(nil)
+    case "showDevTools":
+      withSession(args) { $0.showDevTools() }
+      result(nil)
     case "imeSetComposition":
       withSession(args) { $0.imeSetComposition(args["text"] as? String ?? "") }
       result(nil)
@@ -194,6 +209,9 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       self?.emit("imeCompositionBounds", [
         "sessionId": sessionId, "x": x, "y": y, "w": w, "h": h,
       ])
+    }
+    session.onCookies = { [weak self] id, json in
+      self?.emit("cookies", ["sessionId": sessionId, "id": id, "json": json])
     }
     sessions[sessionId] = session
     result(["textureId": session.textureId, "width": width, "height": height])

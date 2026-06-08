@@ -14,9 +14,13 @@
   `onJavaScriptTextInputDialog`.
 * Content zoom (`setZoomLevel`), find-in-page (`find` / `stopFind` /
   `onFindResult`), `loadHtmlString` / `loadFile`.
-* Cookies (`setCookie` / `clearCookies`), scrolling (`scrollTo` / `scrollBy` /
-  `getScrollPosition`), `getTitle` / `getUserAgent`, `clearLocalStorage`.
+* Cookies (`setCookie` / `clearCookies`, plus `getCookies` to read/enumerate —
+  optionally scoped to a URL — and `deleteCookie`), scrolling (`scrollTo` /
+  `scrollBy` / `getScrollPosition`), `getTitle` / `getUserAgent`,
+  `clearLocalStorage`.
 * Downloads (`onDownload` + the native Save panel).
+* `openDevTools` — opens the Chrome DevTools inspector for the view in its own
+  window (Elements / Console / Network / Sources, inspecting the live page).
 * Automatic IME / text input: while focused, `CefWebView` holds a platform
   `TextInputConnection`, so dead keys, CJK composition, and emoji all reach the
   page. Committed text is sent as full UTF-8 (fixes the prior surrogate-pair

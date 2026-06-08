@@ -71,3 +71,36 @@ class CefJsDialogRequest {
   @override
   String toString() => 'CefJsDialogRequest($message)';
 }
+
+/// A cookie returned by [CefWebController.getCookies].
+class CefCookie {
+  const CefCookie({
+    required this.name,
+    required this.value,
+    required this.domain,
+    required this.path,
+    required this.secure,
+    required this.httpOnly,
+  });
+
+  /// Parse one cookie from the host's JSON.
+  factory CefCookie.fromJson(Map<String, dynamic> j) => CefCookie(
+        name: j['name'] as String? ?? '',
+        value: j['value'] as String? ?? '',
+        domain: j['domain'] as String? ?? '',
+        path: j['path'] as String? ?? '',
+        secure: j['secure'] as bool? ?? false,
+        httpOnly: j['httpOnly'] as bool? ?? false,
+      );
+
+  final String name;
+  final String value;
+  final String domain;
+  final String path;
+  final bool secure;
+  final bool httpOnly;
+
+  @override
+  String toString() => 'CefCookie($name=$value; domain=$domain path=$path'
+      '${secure ? ' secure' : ''}${httpOnly ? ' httpOnly' : ''})';
+}

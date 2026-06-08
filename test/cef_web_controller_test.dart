@@ -402,4 +402,40 @@ void main() {
     expect(set['domain'], 'x.test');
     expect(log.any((m) => m.method == 'clearCookies'), true);
   });
+
+  test('getCookies resolves from a host cookies event', () async {
+    final c = CefWebController(sessionId: 'ckr');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    final future = c.getCookies(url: 'https://x.test/');
+    final visit =
+        log.firstWhere((m) => m.method == 'visitCookies').arguments as Map;
+    expect(visit['url'], 'https://x.test/');
+    await messenger.handlePlatformMessage(
+      channel.name,
+      channel.codec.encodeMethodCall(MethodCall('cookies', {
+        'sessionId': 'ckr',
+        'id': visit['id'],
+        'json': '[{"name":"sid","value":"abc","domain":"x.test","path":"/",'
+            '"secure":true,"httpOnly":false}]',
+      })),
+      (_) {},
+    );
+    final cookies = await future;
+    expect(cookies, hasLength(1));
+    expect(cookies.single.name, 'sid');
+    expect(cookies.single.value, 'abc');
+    expect(cookies.single.secure, isTrue);
+    await c.dispose();
+  });
+
+  test('deleteCookie + openDevTools forward to native', () async {
+    final c = CefWebController(sessionId: 'ckd');
+    await c.deleteCookie(url: 'https://x.test/', name: 'sid');
+    await c.openDevTools();
+    final del =
+        log.firstWhere((m) => m.method == 'deleteCookie').arguments as Map;
+    expect(del['url'], 'https://x.test/');
+    expect(del['name'], 'sid');
+    expect(log.any((m) => m.method == 'showDevTools'), isTrue);
+  });
 }
