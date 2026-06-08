@@ -47,6 +47,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -74,6 +75,7 @@
 #include "include/wrapper/cef_closure_task.h"
 #include "include/wrapper/cef_helpers.h"
 #include "include/wrapper/cef_library_loader.h"
+#include "include/wrapper/cef_message_router.h"
 
 namespace {
 
@@ -93,6 +95,8 @@ constexpr uint8_t kOpProgress = 0x0c;   // {u32 percent 0-100}
 constexpr uint8_t kOpNewWindow = 0x0d;  // {utf8 url} popup / target=_blank
 constexpr uint8_t kOpFindResult = 0x0e; // {u32 count}{u32 activeOrdinal}{u8 final}
 constexpr uint8_t kOpJsDialog = 0x0f;   // {u32 id}{u32 type}{u32 msgLen}{msg}{default}
+constexpr uint8_t kOpEvalResult = 0x16; // {utf8 "id:json"} runJavaScriptReturningResult
+constexpr uint8_t kOpChannelMsg = 0x17; // {utf8 "name:message"} JS channel -> host
 constexpr uint8_t kOpPointer = 0x10;
 constexpr uint8_t kOpResize = 0x11;
 constexpr uint8_t kOpKey = 0x12;
@@ -107,6 +111,8 @@ constexpr uint8_t kOpSetZoom = 0x26;    // {f64 level} (factor = 1.2^level)
 constexpr uint8_t kOpFind = 0x27;       // {u8 fwd}{u8 matchCase}{u8 findNext}{utf8}
 constexpr uint8_t kOpStopFind = 0x28;   // {u8 clearSelection}
 constexpr uint8_t kOpJsDialogResp = 0x29;  // {u32 id}{u8 ok}{utf8 text}
+constexpr uint8_t kOpEvalReturning = 0x2a;  // {u32 id}{utf8 code}
+constexpr uint8_t kOpAddChannel = 0x2b;     // {utf8 name} register a JS channel
 
 // ---- Shared runtime state ----
 int g_ipc_fd = -1;
@@ -124,6 +130,20 @@ CefRefPtr<CefBrowser> g_browser;
 // host's response both run on the CEF UI thread), so no lock is needed.
 std::map<uint32_t, CefRefPtr<CefJSDialogCallback>> g_dialogs;
 uint32_t g_dialog_next = 1;
+
+// Registered JS channel names (UI-thread-only). On each frame load we inject a
+// window.<name>.postMessage shim that routes to the host over window.cefQuery
+// (the CefMessageRouter channel — renderer half lives in process_helper.mm).
+std::set<std::string> g_channels;
+
+void InjectChannelShim(CefRefPtr<CefFrame> frame, const std::string& name) {
+  if (!frame) return;
+  std::string js = "window['" + name +
+                   "']={postMessage:function(m){window.cefQuery({request:'ch:" +
+                   name + ":'+String(m),persistent:false,"
+                   "onSuccess:function(){},onFailure:function(){}});}};";
+  frame->ExecuteJavaScript(js, "", 0);
+}
 
 // Popup widgets (<select> dropdowns, autofill) paint into a separate PET_POPUP
 // buffer that we composite over the view at the popup rect. Guarded by
@@ -380,8 +400,15 @@ class HostClient : public CefClient,
                    public CefLifeSpanHandler,
                    public CefFindHandler,
                    public CefJSDialogHandler,
-                   public CefRequestHandler {
+                   public CefRequestHandler,
+                   public CefMessageRouterBrowserSide::Handler {
  public:
+  HostClient() {
+    CefMessageRouterConfig config;  // default: window.cefQuery / cefQueryCancel
+    router_ = CefMessageRouterBrowserSide::Create(config);
+    router_->AddHandler(this, false);
+  }
+  CefRefPtr<CefMessageRouterBrowserSide> router_;
   CefRefPtr<CefRenderHandler> rh_ = new HostRenderHandler();
   CefRefPtr<CefRenderHandler> GetRenderHandler() override { return rh_; }
   CefRefPtr<CefLoadHandler> GetLoadHandler() override { return this; }
@@ -450,6 +477,7 @@ class HostClient : public CefClient,
                                  const CefString& /*error_string*/) override {
     SendLog("renderer terminated (status " + std::to_string(status) +
             ") — reloading");
+    if (router_) router_->OnRenderProcessTerminated(browser);
     if (browser) browser->ReloadIgnoreCache();
   }
 
@@ -460,8 +488,11 @@ class HostClient : public CefClient,
   }
   void OnLoadStart(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
                    TransitionType) override {
-    if (frame && frame->IsMain())
+    if (!frame) return;
+    if (frame->IsMain())
       SendUtf8(kOpPageStart, frame->GetURL().ToString());
+    // (Re)install JS-channel shims for this freshly-loaded frame.
+    for (const auto& name : g_channels) InjectChannelShim(frame, name);
   }
   void OnLoadEnd(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
                  int /*httpStatusCode*/) override {
@@ -527,6 +558,43 @@ class HostClient : public CefClient,
     SendFrame(kOpCursor, p, 4);
     return true;
   }
+
+  // CefMessageRouter wiring: the renderer half (process_helper.mm) injects
+  // window.cefQuery; queries land here. We forward the request string to the
+  // host: "eval:<id>:<json>" for a runJavaScriptReturningResult result,
+  // "ch:<name>:<message>" for a JS-channel post.
+  bool OnQuery(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, int64_t,
+               const CefString& request, bool,
+               CefRefPtr<Callback> callback) override {
+    std::string r = request.ToString();
+    if (r.rfind("eval:", 0) == 0) {
+      SendUtf8(kOpEvalResult, r.substr(5));
+      callback->Success(CefString());
+      return true;
+    }
+    if (r.rfind("ch:", 0) == 0) {
+      SendUtf8(kOpChannelMsg, r.substr(3));
+      callback->Success(CefString());
+      return true;
+    }
+    return false;
+  }
+  bool OnProcessMessageReceived(CefRefPtr<CefBrowser> browser,
+                                CefRefPtr<CefFrame> frame,
+                                CefProcessId source_process,
+                                CefRefPtr<CefProcessMessage> message) override {
+    return router_->OnProcessMessageReceived(browser, frame, source_process,
+                                             message);
+  }
+  void OnBeforeClose(CefRefPtr<CefBrowser> browser) override {
+    if (router_) router_->OnBeforeClose(browser);
+  }
+  bool OnBeforeBrowse(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame,
+                      CefRefPtr<CefRequest>, bool, bool) override {
+    if (router_) router_->OnBeforeBrowse(browser, frame);
+    return false;  // allow
+  }
+
   IMPLEMENT_REFCOUNTING(HostClient);
 };
 
@@ -654,6 +722,21 @@ void DoJsDialogResp(uint32_t id, bool ok, const std::string& text) {
   it->second->Continue(ok, text);
   g_dialogs.erase(it);
 }
+void DoEvalReturning(uint32_t id, const std::string& code) {
+  if (!g_browser) return;
+  // Evaluate the user expression and post its JSON result back via window.cefQuery
+  // (OnQuery -> kOpEvalResult). JSON.stringify omits the value on undefined.
+  std::string js =
+      "window.cefQuery({request:'eval:" + std::to_string(id) +
+      ":'+(function(){try{return JSON.stringify({ok:true,v:(" + code +
+      "\n)});}catch(e){return JSON.stringify({ok:false,v:String(e)});}})(),"
+      "persistent:false,onSuccess:function(){},onFailure:function(){}});";
+  g_browser->GetMainFrame()->ExecuteJavaScript(js, "", 0);
+}
+void DoAddChannel(const std::string& name) {
+  g_channels.insert(name);
+  if (g_browser) InjectChannelShim(g_browser->GetMainFrame(), name);
+}
 
 // type: 0=move 1=down 2=up 3=wheel; button: 0=left 1=middle 2=right.
 void DoPointer(int type, int button, int click_count, uint32_t modifiers,
@@ -777,6 +860,18 @@ void IpcReadLoop() {
         bool ok = p[4] != 0;
         std::string text(reinterpret_cast<const char*>(p + 5), plen - 5);
         CefPostTask(TID_UI, base::BindOnce(&DoJsDialogResp, id, ok, text));
+        break;
+      }
+      case kOpEvalReturning: {
+        if (plen < 4) break;
+        uint32_t id = ReadU32BE(p);
+        std::string code(reinterpret_cast<const char*>(p + 4), plen - 4);
+        CefPostTask(TID_UI, base::BindOnce(&DoEvalReturning, id, code));
+        break;
+      }
+      case kOpAddChannel: {
+        std::string name(reinterpret_cast<const char*>(p), plen);
+        CefPostTask(TID_UI, base::BindOnce(&DoAddChannel, name));
         break;
       }
       case kOpPointer: {

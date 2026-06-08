@@ -54,6 +54,22 @@ class _BrowserDemoState extends State<BrowserDemo> {
     _controller.setZoomLevel(_zoom);
   }
 
+  Future<void> _runJs() async {
+    try {
+      final r = await _controller
+          .runJavaScriptReturningResult('document.title + " @ " + location.host');
+      _snack('JS → $r');
+    } catch (e) {
+      _snack('JS error: $e');
+    }
+  }
+
+  void _snack(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(msg), duration: const Duration(seconds: 4)));
+  }
+
   void _go() => _controller.navigate(_normalize(_urlBar.text.trim()));
 
   String _normalize(String s) => s.isEmpty
@@ -92,6 +108,11 @@ class _BrowserDemoState extends State<BrowserDemo> {
                   IconButton(
                     icon: const Icon(Icons.zoom_in),
                     onPressed: () => _setZoom(_zoom + 0.5),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.code),
+                    tooltip: 'runJavaScriptReturningResult(document.title)',
+                    onPressed: _runJs,
                   ),
                   Expanded(
                     child: TextField(

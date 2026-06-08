@@ -63,6 +63,18 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
                            text: args["text"] as? String ?? "")
       }
       result(nil)
+    case "evalReturning":
+      if let code = args["code"] as? String {
+        withSession(args) {
+          $0.evalReturning(id: args["id"] as? Int ?? 0, code: code)
+        }
+      }
+      result(nil)
+    case "addJavaScriptChannel":
+      if let name = args["name"] as? String {
+        withSession(args) { $0.addChannel(name) }
+      }
+      result(nil)
     default: result(FlutterMethodNotImplemented)
     }
   }
@@ -147,6 +159,12 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
         "sessionId": sessionId, "id": id, "type": type,
         "message": message, "defaultText": defaultText,
       ])
+    }
+    session.onEvalResult = { [weak self] payload in
+      self?.emit("evalResult", ["sessionId": sessionId, "payload": payload])
+    }
+    session.onChannelMsg = { [weak self] payload in
+      self?.emit("channelMessage", ["sessionId": sessionId, "payload": payload])
     }
     sessions[sessionId] = session
     result(["textureId": session.textureId, "width": width, "height": height])

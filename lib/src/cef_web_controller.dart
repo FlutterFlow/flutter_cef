@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/services.dart';
@@ -85,6 +86,13 @@ class CefWebController {
       <String, CefWebController>{};
   static bool _handlerInstalled = false;
 
+  // runJavaScriptReturningResult: pending evals keyed by id, resolved by the
+  // 'evalResult' event. JS channels: name -> message handler.
+  final Map<int, Completer<Object?>> _evalPending = <int, Completer<Object?>>{};
+  int _evalNextId = 1;
+  final Map<String, void Function(String message)> _channels =
+      <String, void Function(String)>{};
+
   static void _installHandler() {
     if (_handlerInstalled) return;
     _handlerInstalled = true;
@@ -148,7 +156,39 @@ class CefWebController {
       case 'jsDialog':
         _handleJsDialog(a);
         break;
+      case 'evalResult':
+        _handleEvalResult(a['payload'] as String? ?? '');
+        break;
+      case 'channelMessage':
+        _handleChannelMessage(a['payload'] as String? ?? '');
+        break;
     }
+  }
+
+  /// Resolve a pending [runJavaScriptReturningResult]. Payload is `"id:json"`
+  /// where json is `{ok: bool, v: <value or error string>}`.
+  void _handleEvalResult(String payload) {
+    final i = payload.indexOf(':');
+    if (i < 0) return;
+    final completer = _evalPending.remove(int.tryParse(payload.substring(0, i)));
+    if (completer == null || completer.isCompleted) return;
+    try {
+      final decoded = jsonDecode(payload.substring(i + 1)) as Map;
+      if (decoded['ok'] == true) {
+        completer.complete(decoded['v']);
+      } else {
+        completer.completeError(Exception('${decoded['v']}'));
+      }
+    } catch (e) {
+      completer.completeError(e);
+    }
+  }
+
+  /// Deliver a JS-channel post. Payload is `"name:message"`.
+  void _handleChannelMessage(String payload) {
+    final i = payload.indexOf(':');
+    if (i < 0) return;
+    _channels[payload.substring(0, i)]?.call(payload.substring(i + 1));
   }
 
   /// Dispatch a JS dialog to the right callback, then send the result back so
@@ -202,6 +242,12 @@ class CefWebController {
       'dpr': dpr,
     });
     textureId = res?['textureId'] as int?;
+    // Re-register any JS channels added before the session existed, so call
+    // order (addJavaScriptChannel before the widget mounts) doesn't matter.
+    for (final name in _channels.keys) {
+      _channel.invokeMethod(
+          'addJavaScriptChannel', {'sessionId': sessionId, 'name': name});
+    }
     return textureId;
   }
 
@@ -222,6 +268,28 @@ class CefWebController {
   /// Run [code] in the main frame (fire-and-forget; no return value).
   Future<void> executeJavaScript(String code) => _channel
       .invokeMethod('executeJavaScript', {'sessionId': sessionId, 'code': code});
+
+  /// Evaluate [code] in the main frame and return its value (decoded from JSON,
+  /// so primitives, lists and maps all round-trip). Completes with an error if
+  /// the script throws.
+  Future<Object?> runJavaScriptReturningResult(String code) {
+    final id = _evalNextId++;
+    final completer = Completer<Object?>();
+    _evalPending[id] = completer;
+    _channel.invokeMethod(
+        'evalReturning', {'sessionId': sessionId, 'id': id, 'code': code});
+    return completer.future;
+  }
+
+  /// Register a JavaScript channel: the page can call `window.<name>.postMessage`
+  /// (string arg) to deliver a message to [onMessageReceived]. Re-injected on
+  /// every page load. Names should be unique JS identifiers.
+  Future<void> addJavaScriptChannel(String name,
+      {required void Function(String message) onMessageReceived}) {
+    _channels[name] = onMessageReceived;
+    return _channel.invokeMethod(
+        'addJavaScriptChannel', {'sessionId': sessionId, 'name': name});
+  }
 
   /// Load an HTML string. (`baseUrl` is accepted for API familiarity but not yet
   /// honoured — relative URLs resolve against the `data:` document.)
@@ -314,6 +382,11 @@ class CefWebController {
 
   Future<void> dispose() async {
     _bySession.remove(sessionId);
+    for (final c in _evalPending.values) {
+      if (!c.isCompleted) c.completeError(StateError('controller disposed'));
+    }
+    _evalPending.clear();
+    _channels.clear();
     cursor.dispose();
     isLoading.dispose();
     canGoBack.dispose();

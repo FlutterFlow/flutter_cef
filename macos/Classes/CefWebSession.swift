@@ -36,6 +36,8 @@ final class CefWebSession: NSObject, FlutterTexture {
   private static let opShutdown: UInt8 = 0x14
   private static let opFindResult: UInt8 = 0x0e
   private static let opJsDialog: UInt8 = 0x0f
+  private static let opEvalResult: UInt8 = 0x16
+  private static let opChannelMsg: UInt8 = 0x17
   private static let opNavigate: UInt8 = 0x20
   private static let opReload: UInt8 = 0x21
   private static let opStop: UInt8 = 0x22
@@ -46,6 +48,8 @@ final class CefWebSession: NSObject, FlutterTexture {
   private static let opFind: UInt8 = 0x27
   private static let opStopFind: UInt8 = 0x28
   private static let opJsDialogResp: UInt8 = 0x29
+  private static let opEvalReturning: UInt8 = 0x2a
+  private static let opAddChannel: UInt8 = 0x2b
 
   // Event callbacks (fired off the main thread). The registrar relays each to a
   // Dart channel message.
@@ -61,6 +65,8 @@ final class CefWebSession: NSObject, FlutterTexture {
   var onNewWindow: ((String) -> Void)?  // popup/target=_blank url
   var onFindResult: ((Int, Int, Bool) -> Void)?  // count, activeOrdinal, isFinal
   var onJsDialog: ((Int, Int, String, String) -> Void)?  // id, type, msg, default
+  var onEvalResult: ((String) -> Void)?  // "id:json"
+  var onChannelMsg: ((String) -> Void)?  // "name:message"
 
   let sessionId: String
   private(set) var textureId: Int64 = 0
@@ -158,6 +164,17 @@ final class CefWebSession: NSObject, FlutterTexture {
     p.append(ok ? 1 : 0)
     p.append(contentsOf: Array(text.utf8))
     sendFrame(Self.opJsDialogResp, p)
+  }
+
+  func evalReturning(id: Int, code: String) {
+    var p = [UInt8]()
+    appendU32(&p, UInt32(truncatingIfNeeded: id))
+    p.append(contentsOf: Array(code.utf8))
+    sendFrame(Self.opEvalReturning, p)
+  }
+
+  func addChannel(_ name: String) {
+    sendFrame(Self.opAddChannel, Array(name.utf8))
   }
 
   // type: 0=move 1=down 2=up 3=wheel; button: 0=left 1=middle 2=right.
@@ -383,6 +400,10 @@ final class CefWebSession: NSObject, FlutterTexture {
               : ""
           onJsDialog?(readU32(body, 1), type, msg, def)
         }
+      case Self.opEvalResult:
+        onEvalResult?(String(bytes: body[1...], encoding: .utf8) ?? "")
+      case Self.opChannelMsg:
+        onChannelMsg?(String(bytes: body[1...], encoding: .utf8) ?? "")
       default:
         break
       }

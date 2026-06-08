@@ -240,4 +240,43 @@ void main() {
     expect(resp['ok'], true);
     expect(resp['text'], 'typed-x');
   });
+
+  test('runJavaScriptReturningResult resolves from an evalResult event',
+      () async {
+    final c = CefWebController(sessionId: 'ev');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    final future = c.runJavaScriptReturningResult('1+1');
+    final call =
+        log.firstWhere((m) => m.method == 'evalReturning').arguments as Map;
+    expect(call['code'], '1+1');
+    await emit('ev', 'evalResult', {'payload': '${call['id']}:{"ok":true,"v":2}'});
+    expect(await future, 2);
+  });
+
+  test('runJavaScriptReturningResult surfaces script errors', () async {
+    final c = CefWebController(sessionId: 'ee');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    final future = c.runJavaScriptReturningResult('boom()');
+    final id = (log.firstWhere((m) => m.method == 'evalReturning').arguments
+        as Map)['id'];
+    // Attach the matcher before the error is delivered (else the errored future
+    // is briefly unhandled).
+    final expectation = expectLater(future, throwsA(isA<Exception>()));
+    await emit('ee', 'evalResult',
+        {'payload': '$id:{"ok":false,"v":"ReferenceError"}'});
+    await expectation;
+  });
+
+  test('addJavaScriptChannel delivers channel messages', () async {
+    final c = CefWebController(sessionId: 'ch');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    String? got;
+    await c.addJavaScriptChannel('Native', onMessageReceived: (m) => got = m);
+    final call = log
+        .firstWhere((m) => m.method == 'addJavaScriptChannel')
+        .arguments as Map;
+    expect(call['name'], 'Native');
+    await emit('ch', 'channelMessage', {'payload': 'Native:hello world'});
+    expect(got, 'hello world');
+  });
 }
