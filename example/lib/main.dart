@@ -116,6 +116,8 @@ and committed text — including emoji — should appear intact.</p>
   <option>Apple</option><option>Banana</option><option>Cherry</option>
   <option>Date</option><option>Elderberry</option><option>Fig</option>
 </select>
+<p><button id="btn" type="button">Button (Tab to it, Enter or Space)</button></p>
+<p><label><input type="checkbox" id="cb"> Checkbox (Tab to it, Space toggles)</label></p>
 <div class="echo">last value: <span id="e">—</span></div>
 <script>
   const e = document.getElementById('e');
@@ -123,6 +125,9 @@ and committed text — including emoji — should appear intact.</p>
     el.addEventListener('input', ev => { e.textContent = JSON.stringify(ev.target.value); });
   }
   s.addEventListener('change', ev => { e.textContent = 'select → ' + JSON.stringify(ev.target.value); });
+  let n = 0;
+  btn.addEventListener('click', () => { e.textContent = 'button clicked ×' + (++n); });
+  cb.addEventListener('change', () => { e.textContent = 'checkbox ' + (cb.checked ? 'on' : 'off'); });
 </script>''');
   }
 

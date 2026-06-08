@@ -208,4 +208,50 @@ void main() {
     expect(callsTo('key'), isNotEmpty);
     await tester.sendKeyUpEvent(LogicalKeyboardKey.keyA);
   });
+
+  // Enter is delivered by the IME as a command, not text, so its keypress CHAR
+  // (CR) comes from the key handler: RAWKEYDOWN → CHAR → KEYUP. That keypress is
+  // what activates a focused <button>/<a> and submits a single-line form.
+  testWidgets('Enter sends a CHAR keypress so a focused control activates',
+      (tester) async {
+    await focusedView(tester);
+    log.clear();
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.enter);
+    await tester.pump();
+    final keyCalls = callsTo('key');
+    final types = keyCalls.map((c) => (c.arguments as Map)['type'] as int);
+    expect(types, containsAllInOrder(<int>[0, 3])); // RAWKEYDOWN then CHAR
+    final charCall =
+        keyCalls.firstWhere((c) => (c.arguments as Map)['type'] == 3);
+    expect((charCall.arguments as Map)['character'], 0x0D);
+    expect(callsTo('imeCommitText'), isEmpty); // Enter is a command, not text
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.enter);
+  });
+
+  // A typed character (incl. Space) is delivered as a CHAR (keypress) key event,
+  // not an IME commit — so the page fires keypress and a focused button /
+  // checkbox / radio activates, like a browser. Multi-unit text (emoji, above)
+  // still commits via imeCommitText (no keypress).
+  for (final (name, text, cp) in <(String, String, int)>[
+    ('a letter', 'a', 0x61),
+    ('Space', ' ', 0x20),
+  ]) {
+    testWidgets('$name is sent as a CHAR keypress, not an IME commit',
+        (tester) async {
+      await focusedView(tester);
+      log.clear();
+      tester.testTextInput.updateEditingValue(
+        TextEditingValue(
+          text: text,
+          selection: const TextSelection.collapsed(offset: 1),
+        ),
+      );
+      await tester.pump();
+      final keyCalls = callsTo('key');
+      expect(keyCalls, hasLength(1));
+      expect((keyCalls.single.arguments as Map)['type'], 3); // KEYEVENT_CHAR
+      expect((keyCalls.single.arguments as Map)['character'], cp);
+      expect(callsTo('imeCommitText'), isEmpty);
+    });
+  }
 }

@@ -159,14 +159,22 @@ final Map<PhysicalKeyboardKey, int> kCefMacKeyCodesByPhysical =
 int? cefMacNativeKeyCode(PhysicalKeyboardKey key) =>
     kCefMacKeyCodesByPhysical[key];
 
-/// The `character` / `unmodified_character` a real macOS NSEvent carries for an
-/// editing or navigation key (the NSEvent function-key / control codepoints).
+/// The `character` / `unmodified_character` a real macOS NSEvent carries on the
+/// keydown / keyup of a key that has a default action — editing, navigation, or
+/// control activation. Two reasons it must be set:
 ///
-/// CEF off-screen rendering on macOS **double-applies** the edit action (one
-/// Backspace deletes two chars, one arrow moves two) when these fields are left
-/// 0; populating them with the real codepoint de-duplicates it. This is a known
-/// CEF OSR bug — see the CEF forum thread t=11650. Printable keys insert via the
-/// IME / CHAR path, so they return 0 here.
+///  * CEF off-screen rendering on macOS **double-applies** an edit/navigation
+///    action (one Backspace deletes two chars, one arrow moves two) when these
+///    are left 0; the real codepoint de-duplicates it (CEF forum t=11650).
+///  * Blink keys a control's keyboard activation off the event's `key` — Space
+///    toggles a checkbox/radio and clicks a focused button via `setActive` on
+///    keydown + a simulated click on keyup, all gated on `key == " "`. Without
+///    the codepoint here those default actions never fire (Enter, which carries
+///    0x0D, worked; Space, left 0, did not).
+///
+/// This is only the key-event character; the inserted text still rides the IME
+/// CHAR path, and a raw keydown/keyup inserts nothing (Enter emits one newline,
+/// not two), so a printable codepoint here is safe.
 final Map<LogicalKeyboardKey, int> kCefMacKeyChars = <LogicalKeyboardKey, int>{
   LogicalKeyboardKey.backspace: 0x7F, // NSDeleteCharacter
   LogicalKeyboardKey.delete: 0xF728, // NSDeleteFunctionKey
@@ -174,6 +182,7 @@ final Map<LogicalKeyboardKey, int> kCefMacKeyChars = <LogicalKeyboardKey, int>{
   LogicalKeyboardKey.enter: 0x0D,
   LogicalKeyboardKey.numpadEnter: 0x03, // NSEnterCharacter
   LogicalKeyboardKey.escape: 0x1B,
+  LogicalKeyboardKey.space: 0x20, // activates a focused button / checkbox / radio
   LogicalKeyboardKey.arrowUp: 0xF700, // NSUpArrowFunctionKey
   LogicalKeyboardKey.arrowDown: 0xF701,
   LogicalKeyboardKey.arrowLeft: 0xF702,

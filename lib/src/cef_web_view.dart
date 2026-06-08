@@ -299,6 +299,17 @@ class _CefWebViewState extends State<CefWebView>
     // Editing / navigation keys MUST carry the macOS NSEvent character or CEF
     // OSR double-applies them (one Backspace deletes two, one arrow moves two).
     final keyChar = cefMacCharForKey(event.logicalKey);
+    // The page should see keydown→keypress→keyup for every character, like a
+    // browser. We always send RAWKEYDOWN/KEYUP; the keypress (CHAR) comes from
+    // the IME's insertText callback for typed text ([_commitText]). Enter is the
+    // exception: the IME delivers it as the `insertNewline` command, never as
+    // text, so its keypress CHAR (CR) is sent here — that's what activates a
+    // focused <button>/<a> and submits a single-line form. (⌃⌘Space is handled
+    // above; ⌘/⌃+Enter is a shortcut, not activation.)
+    final isEnter = !keys.isMetaPressed &&
+        !keys.isControlPressed &&
+        (event.logicalKey == LogicalKeyboardKey.enter ||
+            event.logicalKey == LogicalKeyboardKey.numpadEnter);
     if (event is KeyDownEvent || event is KeyRepeatEvent) {
       _controller.sendKey(
           type: 0,
@@ -306,10 +317,19 @@ class _CefWebViewState extends State<CefWebView>
           windowsKeyCode: wkc,
           nativeKeyCode: nkc,
           character: keyChar);
-      // Fallback before the IME connection attaches: commit the character
-      // ourselves (whole string -> surrogate-safe, not codeUnitAt(0)).
+      if (isEnter) {
+        _controller.sendKey(
+            type: 3, // KEYEVENT_CHAR — the keypress that fires the page action
+            modifiers: mods,
+            windowsKeyCode: wkc,
+            nativeKeyCode: nkc,
+            character: 0x0D);
+        return KeyEventResult.handled;
+      }
+      // Before the IME connection attaches, deliver the character ourselves so
+      // early keystrokes aren't lost; once up, the IME's insertText takes over.
       if (isText && (_textInput == null || !_textInput!.attached)) {
-        _controller.imeCommitText(ch);
+        _commitText(ch);
       }
       return isText
           ? KeyEventResult.skipRemainingHandlers
@@ -322,6 +342,7 @@ class _CefWebViewState extends State<CefWebView>
           windowsKeyCode: wkc,
           nativeKeyCode: nkc,
           character: keyChar);
+      if (isEnter) return KeyEventResult.handled;
       return isText
           ? KeyEventResult.skipRemainingHandlers
           : KeyEventResult.handled;
@@ -334,6 +355,27 @@ class _CefWebViewState extends State<CefWebView>
     final c = ch.codeUnitAt(0);
     // Skip C0 controls and DEL — those ride the raw key event, not text.
     return c >= 0x20 && c != 0x7f;
+  }
+
+  /// Deliver committed (non-composing) text to the page. A single typed
+  /// character is sent as a real CHAR (keypress) key event, so the page sees
+  /// keydown→keypress→keyup exactly like a browser — which is what activates a
+  /// focused <button>, toggles a checkbox/radio on Space, and fires the page's
+  /// own keypress handlers. Multi-unit inserts (emoji, paste, autofill) and IME
+  /// composition commits ([composed]) have no keypress, so they use
+  /// imeCommitText (which also keeps astral characters surrogate-safe).
+  void _commitText(String text, {bool composed = false}) {
+    if (!composed && text.length == 1) {
+      final cp = text.codeUnitAt(0);
+      _controller.sendKey(
+          type: 3, // KEYEVENT_CHAR
+          modifiers: _cefModifiers(),
+          windowsKeyCode: cp,
+          nativeKeyCode: 0,
+          character: cp);
+    } else {
+      _controller.imeCommitText(text);
+    }
   }
 
   // ── IME plumbing ──────────────────────────────────────────────────
@@ -457,13 +499,16 @@ class _CefWebViewState extends State<CefWebView>
       // No active composition after this delta.
       if (delta is TextEditingDeltaInsertion) {
         if (delta.textInserted.isNotEmpty) {
-          _controller.imeCommitText(delta.textInserted);
+          // Direct typing fires a keypress; an insertion that resolves a
+          // composition is a commit (no keypress).
+          _commitText(delta.textInserted, composed: _composing);
         }
       } else if (delta is TextEditingDeltaReplacement) {
-        // A composition resolved to its final text (or was edited to plain
-        // text). Commit only the replacement so nothing double-commits.
+        // A composition resolved to its final text (or autocorrect replaced a
+        // word) — a commit, not a keypress. Commit only the replacement so
+        // nothing double-commits.
         if (delta.replacementText.isNotEmpty) {
-          _controller.imeCommitText(delta.replacementText);
+          _commitText(delta.replacementText, composed: true);
         } else if (_composing) {
           _controller.imeCancelComposition();
         }
@@ -492,8 +537,9 @@ class _CefWebViewState extends State<CefWebView>
       _controller.imeSetComposition(composing.textInside(value.text));
       return;
     }
+    final wasComposing = _composing;
     if (value.text.isNotEmpty) {
-      _controller.imeCommitText(value.text);
+      _commitText(value.text, composed: wasComposing);
     } else if (_composing) {
       _controller.imeCancelComposition();
     }

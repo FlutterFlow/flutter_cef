@@ -77,15 +77,19 @@ void main() {
     });
   });
 
-  group('cefMacCharForKey — editing/nav keys carry the NSEvent character', () {
+  group('cefMacCharForKey — keys with a default action carry the NSEvent char',
+      () {
     // A 0 here is the "Backspace deletes two / arrow moves two" CEF-OSR bug
-    // (forum t=11650): the host de-duplicates only when character is non-zero.
+    // (forum t=11650), and for Space the "focused button/checkbox won't
+    // activate" bug: the host de-duplicates / Blink derives the activation key
+    // only when character is non-zero.
     final expected = <LogicalKeyboardKey, int>{
       LogicalKeyboardKey.backspace: 0x7F,
       LogicalKeyboardKey.delete: 0xF728,
       LogicalKeyboardKey.tab: 0x09,
       LogicalKeyboardKey.enter: 0x0D,
       LogicalKeyboardKey.escape: 0x1B,
+      LogicalKeyboardKey.space: 0x20, // activates a focused control
       LogicalKeyboardKey.arrowUp: 0xF700,
       LogicalKeyboardKey.arrowDown: 0xF701,
       LogicalKeyboardKey.arrowLeft: 0xF702,

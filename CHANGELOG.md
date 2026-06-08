@@ -37,6 +37,14 @@
   now always pushed while focused (seeded at the last click), so the picker —
   and the candidate / accent popups — anchor at the text instead of the screen
   corner. New `showEmojiPicker()` opens the same picker programmatically.
+* Keyboard activation: typed characters now reach the page as real
+  `keydown → keypress → keyup` events (a CHAR key event) like a browser, instead
+  of an IME commit that fired no key events. So a focused control activates from
+  the keyboard: **Enter** clicks a button / submits a form, **Space** toggles a
+  checkbox / radio or clicks a button, and the page's own keypress handlers fire.
+  (Composition results and multi-unit inserts — emoji, paste — still commit via
+  the IME, which is correct: they have no keypress.) Space also now carries its
+  `character` on keydown/keyup so Blink resolves the activation key.
 * Input fidelity: editing / navigation keys (Backspace, arrows, …) no longer
   double-apply (one Backspace deleted two characters; one arrow moved two
   options in a `<select>`) — the host now sets the macOS `character` /
