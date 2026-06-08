@@ -46,6 +46,23 @@ class CefWebController {
   /// Called for each `console.*` message the page emits.
   void Function(CefConsoleMessage message)? onConsoleMessage;
 
+  /// Called when the main frame begins loading [url].
+  void Function(String url)? onPageStarted;
+
+  /// Called when the main frame finishes loading [url].
+  void Function(String url)? onPageFinished;
+
+  /// Load progress for the current navigation, 0–100.
+  void Function(int progress)? onProgress;
+
+  /// Called when the main-frame URL changes (navigation or SPA `pushState`).
+  void Function(String url)? onUrlChange;
+
+  /// Called when the page requests a new window (`window.open`,
+  /// `target="_blank"`). The native popup is suppressed; you decide what to do —
+  /// commonly [navigate] to load it in the same view, or hand it elsewhere.
+  void Function(String url)? onCreateWindow;
+
   static final Map<String, CefWebController> _bySession =
       <String, CefWebController>{};
   static bool _handlerInstalled = false;
@@ -76,6 +93,7 @@ class CefWebController {
         break;
       case 'url':
         url.value = a['url'] as String? ?? '';
+        onUrlChange?.call(a['url'] as String? ?? '');
         break;
       case 'loadError':
         onLoadError?.call(CefLoadError(
@@ -89,6 +107,18 @@ class CefWebController {
           level: a['level'] as int? ?? 0,
           message: a['message'] as String? ?? '',
         ));
+        break;
+      case 'pageStarted':
+        onPageStarted?.call(a['url'] as String? ?? '');
+        break;
+      case 'pageFinished':
+        onPageFinished?.call(a['url'] as String? ?? '');
+        break;
+      case 'progress':
+        onProgress?.call(a['progress'] as int? ?? 0);
+        break;
+      case 'newWindow':
+        onCreateWindow?.call(a['url'] as String? ?? '');
         break;
     }
   }

@@ -147,4 +147,35 @@ void main() {
     expect(got!.level, 4);
     expect(got!.message, 'app.js:3\tboom');
   });
+
+  test('page lifecycle events invoke their callbacks', () async {
+    final c = CefWebController(sessionId: 'pl');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    final events = <String>[];
+    c.onPageStarted = (u) => events.add('start:$u');
+    c.onPageFinished = (u) => events.add('finish:$u');
+    c.onProgress = (p) => events.add('progress:$p');
+    c.onUrlChange = (u) => events.add('urlChange:$u');
+    await emit('pl', 'pageStarted', {'url': 'https://a.test/'});
+    await emit('pl', 'progress', {'progress': 42});
+    await emit('pl', 'url', {'url': 'https://a.test/page'});
+    await emit('pl', 'pageFinished', {'url': 'https://a.test/'});
+    expect(events, [
+      'start:https://a.test/',
+      'progress:42',
+      'urlChange:https://a.test/page',
+      'finish:https://a.test/',
+    ]);
+    // The url event still drives the notifier too.
+    expect(c.url.value, 'https://a.test/page');
+  });
+
+  test('newWindow event routes the popup url to onCreateWindow', () async {
+    final c = CefWebController(sessionId: 'nw');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    String? opened;
+    c.onCreateWindow = (u) => opened = u;
+    await emit('nw', 'newWindow', {'url': 'https://popup.test/'});
+    expect(opened, 'https://popup.test/');
+  });
 }

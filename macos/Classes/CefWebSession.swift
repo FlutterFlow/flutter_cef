@@ -26,6 +26,10 @@ final class CefWebSession: NSObject, FlutterTexture {
   private static let opUrl: UInt8 = 0x07
   private static let opLoadErr: UInt8 = 0x08
   private static let opConsole: UInt8 = 0x09
+  private static let opPageStart: UInt8 = 0x0a
+  private static let opPageFinish: UInt8 = 0x0b
+  private static let opProgress: UInt8 = 0x0c
+  private static let opNewWindow: UInt8 = 0x0d
   private static let opPointer: UInt8 = 0x10
   private static let opResize: UInt8 = 0x11
   private static let opKey: UInt8 = 0x12
@@ -45,6 +49,10 @@ final class CefWebSession: NSObject, FlutterTexture {
   var onUrl: ((String) -> Void)?
   var onLoadError: ((Int, String, String) -> Void)?  // code, url, text
   var onConsole: ((Int, String) -> Void)?  // level, "source:line\tmsg"
+  var onPageStarted: ((String) -> Void)?  // url
+  var onPageFinished: ((String) -> Void)?  // url
+  var onProgress: ((Int) -> Void)?  // 0-100
+  var onNewWindow: ((String) -> Void)?  // popup/target=_blank url
 
   let sessionId: String
   private(set) var textureId: Int64 = 0
@@ -320,6 +328,14 @@ final class CefWebSession: NSObject, FlutterTexture {
           onConsole?(readU32(body, 1),
                      String(bytes: body[5...], encoding: .utf8) ?? "")
         }
+      case Self.opPageStart:
+        onPageStarted?(String(bytes: body[1...], encoding: .utf8) ?? "")
+      case Self.opPageFinish:
+        onPageFinished?(String(bytes: body[1...], encoding: .utf8) ?? "")
+      case Self.opProgress:
+        if body.count >= 5 { onProgress?(readU32(body, 1)) }
+      case Self.opNewWindow:
+        onNewWindow?(String(bytes: body[1...], encoding: .utf8) ?? "")
       default:
         break
       }

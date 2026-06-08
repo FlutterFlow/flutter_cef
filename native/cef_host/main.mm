@@ -64,6 +64,7 @@
 #include "include/cef_browser.h"
 #include "include/cef_client.h"
 #include "include/cef_command_line.h"
+#include "include/cef_life_span_handler.h"
 #include "include/cef_render_handler.h"
 #include "include/cef_request_handler.h"
 #include "include/cef_task.h"
@@ -83,6 +84,10 @@ constexpr uint8_t kOpTitle = 0x06;      // {utf8}
 constexpr uint8_t kOpUrl = 0x07;        // {utf8} main-frame address
 constexpr uint8_t kOpLoadErr = 0x08;    // {code:u32}{utf8 "url\ntext"}
 constexpr uint8_t kOpConsole = 0x09;    // {level:u32}{utf8 "source:line\tmsg"}
+constexpr uint8_t kOpPageStart = 0x0a;  // {utf8 url} main frame load started
+constexpr uint8_t kOpPageFinish = 0x0b; // {utf8 url} main frame load finished
+constexpr uint8_t kOpProgress = 0x0c;   // {u32 percent 0-100}
+constexpr uint8_t kOpNewWindow = 0x0d;  // {utf8 url} popup / target=_blank
 constexpr uint8_t kOpPointer = 0x10;
 constexpr uint8_t kOpResize = 0x11;
 constexpr uint8_t kOpKey = 0x12;
@@ -358,12 +363,14 @@ class HostRenderHandler : public CefRenderHandler {
 class HostClient : public CefClient,
                    public CefLoadHandler,
                    public CefDisplayHandler,
+                   public CefLifeSpanHandler,
                    public CefRequestHandler {
  public:
   CefRefPtr<CefRenderHandler> rh_ = new HostRenderHandler();
   CefRefPtr<CefRenderHandler> GetRenderHandler() override { return rh_; }
   CefRefPtr<CefLoadHandler> GetLoadHandler() override { return this; }
   CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
+  CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
   CefRefPtr<CefRequestHandler> GetRequestHandler() override { return this; }
 
   // Recover from a renderer crash (multi-process only): reload rather than show
@@ -381,6 +388,16 @@ class HostClient : public CefClient,
   void OnLoadingStateChange(CefRefPtr<CefBrowser>, bool isLoading,
                             bool canGoBack, bool canGoForward) override {
     SendLoadState(isLoading, canGoBack, canGoForward);
+  }
+  void OnLoadStart(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
+                   TransitionType) override {
+    if (frame && frame->IsMain())
+      SendUtf8(kOpPageStart, frame->GetURL().ToString());
+  }
+  void OnLoadEnd(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
+                 int /*httpStatusCode*/) override {
+    if (frame && frame->IsMain())
+      SendUtf8(kOpPageFinish, frame->GetURL().ToString());
   }
   void OnLoadError(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, ErrorCode code,
                    const CefString& text, const CefString& url) override {
@@ -404,6 +421,28 @@ class HostClient : public CefClient,
                      source.ToString() + ":" + std::to_string(line) + "\t" +
                          message.ToString());
     return false;  // also keep CEF's default console logging
+  }
+  void OnLoadingProgressChange(CefRefPtr<CefBrowser>, double progress) override {
+    uint32_t pct = static_cast<uint32_t>(progress * 100.0 + 0.5);
+    uint8_t p[4] = {static_cast<uint8_t>((pct >> 24) & 0xff),
+                    static_cast<uint8_t>((pct >> 16) & 0xff),
+                    static_cast<uint8_t>((pct >> 8) & 0xff),
+                    static_cast<uint8_t>(pct & 0xff)};
+    SendFrame(kOpProgress, p, 4);
+  }
+
+  // CefLifeSpanHandler: route popups (window.open / target=_blank) to the host
+  // instead of opening a native window. Returning true cancels the native popup;
+  // the host decides what to do (commonly load the URL in the same view). This
+  // mirrors webview_flutter, which surfaces new-window requests through its
+  // navigation delegate rather than a separate window.
+  bool OnBeforePopup(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, int,
+                     const CefString& target_url, const CefString&,
+                     WindowOpenDisposition, bool, const CefPopupFeatures&,
+                     CefWindowInfo&, CefRefPtr<CefClient>&, CefBrowserSettings&,
+                     CefRefPtr<CefDictionaryValue>&, bool*) override {
+    if (!target_url.empty()) SendUtf8(kOpNewWindow, target_url.ToString());
+    return true;
   }
 
   // The page's cursor (I-beam over text, hand over links, etc.). Forward the

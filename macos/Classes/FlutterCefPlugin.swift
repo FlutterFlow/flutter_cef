@@ -102,6 +102,18 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
         "sessionId": sessionId, "level": level, "message": message,
       ])
     }
+    session.onPageStarted = { [weak self] u in
+      self?.emit("pageStarted", ["sessionId": sessionId, "url": u])
+    }
+    session.onPageFinished = { [weak self] u in
+      self?.emit("pageFinished", ["sessionId": sessionId, "url": u])
+    }
+    session.onProgress = { [weak self] p in
+      self?.emit("progress", ["sessionId": sessionId, "progress": p])
+    }
+    session.onNewWindow = { [weak self] u in
+      self?.emit("newWindow", ["sessionId": sessionId, "url": u])
+    }
     sessions[sessionId] = session
     result(["textureId": session.textureId, "width": width, "height": height])
   }
