@@ -390,8 +390,10 @@ class HostRenderHandler : public CefRenderHandler {
         g_popup_rect = CefRect();
       }
     }
-    // Repaint the view to erase the dropdown's pixels when it closes.
-    if (!show && browser) browser->GetHost()->Invalidate(PET_VIEW);
+    // Repaint the view so the render path switches: on show, the next view paint
+    // takes the software-composite branch (to draw the popup on top); on hide, it
+    // returns to zero-copy and the dropdown's pixels are gone.
+    if (browser) browser->GetHost()->Invalidate(PET_VIEW);
   }
 
   void OnPopupSize(CefRefPtr<CefBrowser>, const CefRect& rect) override {
@@ -399,16 +401,72 @@ class HostRenderHandler : public CefRenderHandler {
     g_popup_rect = rect;
   }
 
-  // GPU zero-copy path — DORMANT. When shared_texture_enabled is true, CEF's
-  // GPU/Viz process hands us a shared IOSurface (rotating pool — valid only for
-  // this call, must not be cached) here instead of calling OnPaint. We keep
-  // shared_texture_enabled=false today because -67030 (ad-hoc signature
-  // validation) blocks the GPU→browser handoff, so this never fires and frames
-  // arrive via OnPaint. Re-enable once inside-out Developer-ID signing clears it.
+  // Copy a popup's GPU surface into the CPU popup buffer so the software
+  // composite can draw it over the view. Caller holds g_surface_mutex.
+  void CopyAccelToPopupBuf(IOSurfaceRef src) {
+    if (IOSurfaceLock(src, kIOSurfaceLockReadOnly, nullptr) != kIOReturnSuccess) {
+      return;
+    }
+    const int pw = static_cast<int>(IOSurfaceGetWidth(src));
+    const int ph = static_cast<int>(IOSurfaceGetHeight(src));
+    const size_t ss = IOSurfaceGetBytesPerRow(src);
+    const auto* s = static_cast<const uint8_t*>(IOSurfaceGetBaseAddress(src));
+    g_popup_w = pw;
+    g_popup_h = ph;
+    g_popup_buf.resize(static_cast<size_t>(pw) * ph * 4);
+    for (int y = 0; y < ph; ++y) {
+      memcpy(g_popup_buf.data() + static_cast<size_t>(y) * pw * 4,
+             s + static_cast<size_t>(y) * ss, static_cast<size_t>(pw) * 4);
+    }
+    IOSurfaceUnlock(src, kIOSurfaceLockReadOnly, nullptr);
+  }
+
+  // Software-composite the view (optional GPU surface, stride-aware) and the open
+  // popup into the host-allocated g_surface and present it. Used only while a
+  // <select> dropdown is open, since a popup can't ride the zero-copy texture.
+  // Caller holds g_surface_mutex.
+  void CompositeSoftwareLocked(IOSurfaceRef view_src) {
+    if (!g_surface) return;
+    if (IOSurfaceLock(g_surface, 0, nullptr) != kIOReturnSuccess) return;
+    auto* dst = static_cast<uint8_t*>(IOSurfaceGetBaseAddress(g_surface));
+    const size_t ds = IOSurfaceGetBytesPerRow(g_surface);
+    const int dw = static_cast<int>(IOSurfaceGetWidth(g_surface));
+    const int dh = static_cast<int>(IOSurfaceGetHeight(g_surface));
+    if (view_src &&
+        IOSurfaceLock(view_src, kIOSurfaceLockReadOnly, nullptr) ==
+            kIOReturnSuccess) {
+      const auto* s = static_cast<const uint8_t*>(IOSurfaceGetBaseAddress(view_src));
+      const size_t ss = IOSurfaceGetBytesPerRow(view_src);
+      const int rows = std::min<int>(dh, IOSurfaceGetHeight(view_src));
+      const size_t rb = std::min<size_t>(
+          static_cast<size_t>(dw) * 4,
+          static_cast<size_t>(IOSurfaceGetWidth(view_src)) * 4);
+      for (int y = 0; y < rows; ++y) {
+        memcpy(dst + static_cast<size_t>(y) * ds, s + static_cast<size_t>(y) * ss, rb);
+      }
+      IOSurfaceUnlock(view_src, kIOSurfaceLockReadOnly, nullptr);
+    }
+    if (g_popup_visible && !g_popup_buf.empty()) {
+      const int px = static_cast<int>(g_popup_rect.x * g_dpr);
+      const int py = static_cast<int>(g_popup_rect.y * g_dpr);
+      BlitBGRA(dst, ds, dw, dh, g_popup_buf.data(), g_popup_w, g_popup_h, px, py);
+    }
+    IOSurfaceUnlock(g_surface, 0, nullptr);
+    SendFrame(kOpPresent, nullptr, 0);
+  }
+
+  // GPU-accelerated OSR. With shared_texture_enabled, CEF's GPU/Viz process
+  // COMPOSITES the page on the GPU and hands us the result as a shared IOSurface
+  // (a rotating pool, valid only for this call). We copy it into the host-shared
+  // surface and present that. The win is that compositing moves OFF the CPU —
+  // software OSR's bottleneck for video / animation — while the copy itself is
+  // cheap on unified-memory Macs. (True zero-copy, handing the GPU surface to
+  // Flutter directly, would need cross-process Mach-port surface transfer since
+  // these surfaces aren't resolvable by global id from another process; a future
+  // optimization, mostly for discrete-GPU Macs where the copy is a real readback.)
   void OnAcceleratedPaint(CefRefPtr<CefBrowser>, PaintElementType type,
                           const RectList&,
                           const CefAcceleratedPaintInfo& info) override {
-    if (type != PET_VIEW) return;  // popups still TODO on this path
     IOSurfaceRef src =
         reinterpret_cast<IOSurfaceRef>(info.shared_texture_io_surface);
     if (!src) {
@@ -416,30 +474,12 @@ class HostRenderHandler : public CefRenderHandler {
       return;
     }
     std::lock_guard<std::mutex> lock(g_surface_mutex);
-    if (!g_surface) return;
-    if (IOSurfaceLock(src, kIOSurfaceLockReadOnly, nullptr) != kIOReturnSuccess) {
+    if (type == PET_POPUP) {
+      CopyAccelToPopupBuf(src);
+      CompositeSoftwareLocked(nullptr);  // popup over the latest view in g_surface
       return;
     }
-    if (IOSurfaceLock(g_surface, 0, nullptr) != kIOReturnSuccess) {
-      IOSurfaceUnlock(src, kIOSurfaceLockReadOnly, nullptr);
-      return;
-    }
-    auto* dst = static_cast<uint8_t*>(IOSurfaceGetBaseAddress(g_surface));
-    const auto* s = static_cast<const uint8_t*>(IOSurfaceGetBaseAddress(src));
-    const size_t dst_stride = IOSurfaceGetBytesPerRow(g_surface);
-    const size_t src_stride = IOSurfaceGetBytesPerRow(src);
-    const int rows = std::min<int>(IOSurfaceGetHeight(src),
-                                   IOSurfaceGetHeight(g_surface));
-    const size_t copy =
-        std::min<size_t>(static_cast<size_t>(IOSurfaceGetWidth(src)) * 4,
-                         static_cast<size_t>(IOSurfaceGetWidth(g_surface)) * 4);
-    for (int y = 0; y < rows; ++y) {
-      memcpy(dst + static_cast<size_t>(y) * dst_stride,
-             s + static_cast<size_t>(y) * src_stride, copy);
-    }
-    IOSurfaceUnlock(g_surface, 0, nullptr);
-    IOSurfaceUnlock(src, kIOSurfaceLockReadOnly, nullptr);
-    SendFrame(kOpPresent, nullptr, 0);
+    CompositeSoftwareLocked(src);  // GPU-composited view (+ any open popup)
   }
 
   // Report the composition caret rect (DIP, view coords) so the host can place
@@ -703,14 +743,16 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
         "MachPortRendezvousValidatePeerRequirements,"
         "MachPortRendezvousEnforcePeerRequirements");
 #else
-    // Multi-process SOFTWARE OSR: force software compositing so OnPaint's CPU
-    // readback receives the FULL composited frame. With the GPU/Viz process
-    // doing hardware compositing, the final frame stays in a GPU texture and the
-    // readback captures only the page background — a blank/white view. (Single
-    // process composites in-process, so it never hit this.) Only compositing
-    // moves to software; the renderer/utility processes stay separate, so
-    // heavy-page crash isolation (Google sign-in) is preserved.
-    command_line->AppendSwitch("disable-gpu-compositing");
+    // Multi-process GPU OSR: keep hardware compositing so the GPU/Viz process
+    // produces a shared-texture IOSurface for OnAcceleratedPaint, and disable the
+    // Mach-port peer-requirement validation that otherwise -67030s the GPU→
+    // browser handoff for an ad-hoc signature. These are the same flags the
+    // single-process path uses; together they let the GPU-accelerated path run
+    // multi-process (crash-isolated) WITHOUT Developer-ID signing.
+    command_line->AppendSwitchWithValue(
+        "disable-features",
+        "MachPortRendezvousValidatePeerRequirements,"
+        "MachPortRendezvousEnforcePeerRequirements");
 #endif
     // Verbose Chromium logging to /tmp only when explicitly debugging; off by
     // default so a shipped build doesn't write logs behind the user's back.
@@ -726,18 +768,15 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
     CefWindowInfo window_info;
     window_info.SetAsWindowless(0);
 #ifdef CEF_HOST_MULTIPROCESS
-    // Multi-process render path: SOFTWARE OSR (OnPaint readback over Mojo), NOT
-    // the GPU shared-IOSurface OnAcceleratedPaint. Why: Chromium 144 fails to
-    // validate this process's own ad-hoc signature (-67030 in
-    // base/mac/process_requirement.cc), and that self-validation gates the
-    // GPU/Viz process's ability to hand an IOSurface back to the browser — so
-    // OnAcceleratedPaint never gets a live surface and the view stays blank.
-    // Mojo (input, navigation, the OnPaint bitmap) is unaffected, so software
-    // OSR renders correctly while the helper subprocesses still isolate the
-    // renderer/utility crashes heavy SPAs (Google sign-in) trigger. The
-    // zero-copy GPU path is re-enabled by `shared_texture_enabled = true` once
-    // correct inside-out Developer-ID signing clears -67030.
-    window_info.shared_texture_enabled = false;
+    // Multi-process GPU OSR: the GPU/Viz process composites on the GPU and hands
+    // the frame to OnAcceleratedPaint as a shared IOSurface, which we copy into
+    // the host surface. This used to be gated by -67030 (process_requirement.cc
+    // peer validation of this process's ad-hoc signature), but disabling the
+    // MachPortRendezvous*PeerRequirements features above clears it — so the
+    // GPU-accelerated path runs multi-process (crash-isolated) without
+    // Developer-ID signing. (The software OnPaint path remains the fallback if a
+    // build leaves shared_texture_enabled off.)
+    window_info.shared_texture_enabled = true;
 #endif
     CefBrowserSettings settings;
     settings.windowless_frame_rate = 60;

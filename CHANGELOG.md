@@ -1,8 +1,13 @@
 ## 0.1.0
 
 * Multi-process CEF by default — crash-isolated, so heavy SPAs (e.g. Google
-  sign-in) render and survive. Software OSR (`OnPaint` readback +
-  `--disable-gpu-compositing`); the zero-copy GPU path is on the roadmap.
+  sign-in) render and survive. **GPU-accelerated OSR**: CEF's GPU process
+  composites the page and hands it to `OnAcceleratedPaint` as a shared IOSurface,
+  which moves compositing off the CPU (the bottleneck for video / animation).
+  This runs multi-process without Developer-ID signing by disabling the
+  MachPort peer-requirement validation that otherwise `-67030`s the GPU→browser
+  handoff. The composited surface is still copied into the shared surface (cheap
+  on unified-memory Macs); true zero-copy is on the roadmap.
 * Fixed a multi-process blank-render bug (resize-race: geometry is re-synced
   when the renderer connects) and hardened the IPC (pre-connect frame queue).
 * Page-lifecycle callbacks: `onPageStarted`, `onPageFinished`, `onProgress`,

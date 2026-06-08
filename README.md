@@ -2,7 +2,7 @@
 
 Embed a **live Chromium browser** (via the [Chromium Embedded Framework](https://bitbucket.org/chromiumembedded/cef/)) as a Flutter widget — rendered into a `Texture`, so it composites, transforms, clips, and zooms like any other widget, and **keeps rendering even when off-screen / not focused**. Pointer and scroll are forwarded by coordinate, and keyboard input reaches the page as real `keydown → keypress → keyup` events (Enter activates a focused button / submits a form, Space toggles a checkbox) — including platform IME composition for CJK / emoji and the ⌃⌘Space emoji picker; the page cursor drives a `MouseRegion`.
 
-> Status: **experimental, macOS 12+ only** (CEF 144 runtime floor). Real Chromium (any site — JS/CSS/WebGL/video). **Multi-process by default** (software OSR — `OnPaint` CPU readback into a shared IOSurface, Retina-crisp; renderer/utility crashes isolated, so heavy SPAs like Google sign-in render and survive); `-DCEF_MULTI_PROCESS=OFF` for the simpler single-process build. No mobile (iOS bans third-party engines); desktop by nature.
+> Status: **experimental, macOS 12+ only** (CEF 144 runtime floor). Real Chromium (any site — JS/CSS/WebGL/video). **Multi-process by default** (GPU-accelerated OSR — `OnAcceleratedPaint` GPU compositing into a shared IOSurface, Retina-crisp; renderer/utility crashes isolated, so heavy SPAs like Google sign-in render and survive); `-DCEF_MULTI_PROCESS=OFF` for the simpler single-process build. No mobile (iOS bans third-party engines); desktop by nature.
 
 ```dart
 import 'package:flutter_cef/flutter_cef.dart';
@@ -119,8 +119,9 @@ content with JIT. Treat any page you load as untrusted code. Specifically:
 
 Known limitation: the IOSurface is single-buffered, so very fast-updating pages
 can tear slightly under the compositor; double-buffering is planned. Working
-today: **multi-process** OSR render (on/off-screen, HiDPI/Retina-crisp,
-software `OnPaint` readback into a shared IOSurface, heavy SPAs render + survive),
+today: **multi-process, GPU-accelerated** OSR render (on/off-screen,
+HiDPI/Retina-crisp, GPU compositing via `OnAcceleratedPaint`, heavy SPAs render +
+survive),
 pointer/scroll/keyboard input, **IME text input** (CJK composition + emoji, the
 candidate window tracked under the caret, and the ⌃⌘Space emoji picker —
 `showEmojiPicker()`), `<select>` popups, page cursor;
@@ -135,15 +136,17 @@ title/user-agent getters, downloads, and a Chrome DevTools inspector window
 
 Next:
 
-- **Zero-copy GPU render (`OnAcceleratedPaint`).** Multi-process currently uses
-  software OSR (`OnPaint` CPU readback) + `--disable-gpu-compositing`, because the
-  GPU shared-texture path is blocked: Chromium 144 can't validate cef_host's
-  ad-hoc signature (`-67030`), which gates the GPU→browser IOSurface handoff.
-  Unblock it with **correct inside-out Developer-ID signing** (`--timestamp`, no
-  `get-task-allow`, sign every Mach-O depth-first — how OBS/JCEF satisfy the same
-  validation), then set `shared_texture_enabled = true` to switch on the
-  zero-copy path (the `OnAcceleratedPaint` handler is already in place). Then
-  notarize for distribution.
+- **True zero-copy GPU render.** Rendering is now GPU-accelerated:
+  `OnAcceleratedPaint` (GPU compositing) is on by default, multi-process and
+  crash-isolated. The `-67030` that used to gate the GPU→browser handoff (Chromium
+  144 validating cef_host's ad-hoc signature) is cleared by disabling the
+  `MachPortRendezvous*PeerRequirements` features — no Developer-ID signing needed.
+  We still **copy** the GPU surface into the shared surface (cheap on
+  unified-memory Macs, where compositing — not the copy — was the bottleneck).
+  TRUE zero-copy — handing the GPU IOSurface to Flutter with no copy — needs
+  cross-process Mach-port surface transfer (CEF's GPU surfaces aren't resolvable
+  by global id from another process), and mostly helps discrete-GPU Macs and
+  scenes with many simultaneously-animating webviews; deferred until measured.
 - **Double-buffer the IOSurface** to remove the residual tearing on
   fast-updating pages (JCEF's named-mutex 2-slot buffer is a good reference).
 - **The CEF feature tail** that CefSharp/JCEF expose: `loadRequest` with custom
