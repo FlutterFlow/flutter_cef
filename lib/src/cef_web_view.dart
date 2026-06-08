@@ -12,9 +12,12 @@ import 'cef_web_controller.dart';
 /// a platform view). Pointer + keyboard input is forwarded by coordinate, and
 /// the page's cursor drives a [MouseRegion]. macOS only.
 ///
-/// Text input goes through the platform IME: while the view is focused it holds
-/// a [TextInputConnection], so dead keys, CJK composition, and emoji all reach
-/// the page (committed text is sent as full UTF-8, not a single UTF-16 unit).
+/// Keyboard input reaches the page as real `keydown → keypress → keyup` events,
+/// so a focused control activates from the keyboard (Enter submits / clicks,
+/// Space toggles a checkbox) and the page's own key handlers fire. While focused
+/// the view holds a [TextInputConnection], so dead keys, CJK composition, and
+/// emoji work; composition commits and multi-unit inserts (emoji, paste) reach
+/// the page as full UTF-8 rather than a keypress.
 ///
 /// ```dart
 /// CefWebView(url: 'https://flutter.dev')
@@ -300,12 +303,12 @@ class _CefWebViewState extends State<CefWebView>
     // OSR double-applies them (one Backspace deletes two, one arrow moves two).
     final keyChar = cefMacCharForKey(event.logicalKey);
     // The page should see keydown→keypress→keyup for every character, like a
-    // browser. We always send RAWKEYDOWN/KEYUP; the keypress (CHAR) comes from
-    // the IME's insertText callback for typed text ([_commitText]). Enter is the
-    // exception: the IME delivers it as the `insertNewline` command, never as
-    // text, so its keypress CHAR (CR) is sent here — that's what activates a
-    // focused <button>/<a> and submits a single-line form. (⌃⌘Space is handled
-    // above; ⌘/⌃+Enter is a shortcut, not activation.)
+    // browser. We always send RAWKEYDOWN/KEYUP; the keypress (CHAR) is
+    // synthesized by [_commitText] when the IME's insertText delivers a typed
+    // character. Enter is the exception: the IME reports it as the `insertNewline`
+    // command, never as text, so its keypress CHAR (CR) is sent here — that's
+    // what activates a focused <button>/<a> and submits a single-line form.
+    // (⌃⌘Space is handled above; ⌘/⌃+Enter is a shortcut, not activation.)
     final isEnter = !keys.isMetaPressed &&
         !keys.isControlPressed &&
         (event.logicalKey == LogicalKeyboardKey.enter ||
@@ -327,7 +330,8 @@ class _CefWebViewState extends State<CefWebView>
         return KeyEventResult.handled;
       }
       // Before the IME connection attaches, deliver the character ourselves so
-      // early keystrokes aren't lost; once up, the IME's insertText takes over.
+      // early keystrokes aren't lost; once it's up, its insertText delta drives
+      // [_commitText] instead.
       if (isText && (_textInput == null || !_textInput!.attached)) {
         _commitText(ch);
       }

@@ -1,6 +1,6 @@
 # flutter_cef
 
-Embed a **live Chromium browser** (via the [Chromium Embedded Framework](https://bitbucket.org/chromiumembedded/cef/)) as a Flutter widget — rendered into a `Texture`, so it composites, transforms, clips, and zooms like any other widget, and **keeps rendering even when off-screen / not focused**. Pointer, scroll, and keyboard input are forwarded (including platform IME composition for CJK / emoji); the page cursor drives a `MouseRegion`.
+Embed a **live Chromium browser** (via the [Chromium Embedded Framework](https://bitbucket.org/chromiumembedded/cef/)) as a Flutter widget — rendered into a `Texture`, so it composites, transforms, clips, and zooms like any other widget, and **keeps rendering even when off-screen / not focused**. Pointer and scroll are forwarded by coordinate, and keyboard input reaches the page as real `keydown → keypress → keyup` events (Enter activates a focused button / submits a form, Space toggles a checkbox) — including platform IME composition for CJK / emoji and the ⌃⌘Space emoji picker; the page cursor drives a `MouseRegion`.
 
 > Status: **experimental, macOS 12+ only** (CEF 144 runtime floor). Real Chromium (any site — JS/CSS/WebGL/video). **Multi-process by default** (software OSR — `OnPaint` CPU readback into a shared IOSurface, Retina-crisp; renderer/utility crashes isolated, so heavy SPAs like Google sign-in render and survive); `-DCEF_MULTI_PROCESS=OFF` for the simpler single-process build. No mobile (iOS bans third-party engines); desktop by nature.
 

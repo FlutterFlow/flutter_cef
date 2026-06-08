@@ -17,7 +17,8 @@
 // hardened-runtime signed with one Developer-ID identity + notarized to clear
 // peer validation cleanly.
 //
-// Args: --url=<url> --width=<px> --height=<px> --iosurface-id=<id> --ipc=<path>
+// Args: --url=<url> --width=<px> --height=<px> --dpr=<scale> --iosurface-id=<id>
+//       --ipc=<path>
 //
 // IPC wire format: 4-byte big-endian length prefix, then [opcode][payload].
 //   host -> cef_host:  0x10 pointer {type:u8,button:u8,clicks:u8,_,mods:u32,
@@ -1270,6 +1271,7 @@ int main(int argc, char* argv[]) {
   if (!ws.empty()) g_width = atoi(ws.c_str());
   if (!hs.empty()) g_height = atoi(hs.c_str());
   if (!dprs.empty()) g_dpr = atof(dprs.c_str());
+  if (g_dpr <= 0.0 || g_dpr > 8.0) g_dpr = 1.0; // guard a bad/forged --dpr
   g_initial_url = url;
 
   if (!sid.empty()) {

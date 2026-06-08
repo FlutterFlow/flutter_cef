@@ -47,36 +47,6 @@ void main() {
     });
   });
 
-  group('cefMacKeyCode — editing keys resolve from the native macOS keycode',
-      () {
-    final expected = <LogicalKeyboardKey, int>{
-      LogicalKeyboardKey.backspace: 51,
-      LogicalKeyboardKey.delete: 117,
-      LogicalKeyboardKey.enter: 36,
-      LogicalKeyboardKey.numpadEnter: 76,
-      LogicalKeyboardKey.tab: 48,
-      LogicalKeyboardKey.escape: 53,
-      LogicalKeyboardKey.space: 49,
-      LogicalKeyboardKey.arrowLeft: 123,
-      LogicalKeyboardKey.arrowRight: 124,
-      LogicalKeyboardKey.arrowDown: 125,
-      LogicalKeyboardKey.arrowUp: 126,
-      LogicalKeyboardKey.home: 115,
-      LogicalKeyboardKey.end: 119,
-      LogicalKeyboardKey.pageUp: 116,
-      LogicalKeyboardKey.pageDown: 121,
-    };
-    expected.forEach((key, code) {
-      test('${key.debugName} -> $code', () {
-        expect(cefMacKeyCode(key), code);
-      });
-    });
-    test('a printable key has no native override (-> null)', () {
-      expect(cefMacKeyCode(LogicalKeyboardKey.keyA), isNull);
-      expect(cefMacKeyCode(LogicalKeyboardKey.digit5), isNull);
-    });
-  });
-
   group('cefMacCharForKey — keys with a default action carry the NSEvent char',
       () {
     // A 0 here is the "Backspace deletes two / arrow moves two" CEF-OSR bug

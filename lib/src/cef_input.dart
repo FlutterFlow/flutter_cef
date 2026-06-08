@@ -48,27 +48,6 @@ int clampCefClickCount(int n) => n < 1 ? 1 : (n > 3 ? 3 : n);
 
 // ── Keyboard ─────────────────────────────────────────────────────────────
 
-/// macOS virtual keycodes (`kVK_*`) for keys whose editing behavior CEF derives
-/// from the native code rather than the Windows VK. Printable characters ride
-/// the separate CHAR event and are not in this table.
-final Map<LogicalKeyboardKey, int> kCefMacKeyCodes = <LogicalKeyboardKey, int>{
-  LogicalKeyboardKey.backspace: 51,
-  LogicalKeyboardKey.delete: 117,
-  LogicalKeyboardKey.enter: 36,
-  LogicalKeyboardKey.numpadEnter: 76,
-  LogicalKeyboardKey.tab: 48,
-  LogicalKeyboardKey.escape: 53,
-  LogicalKeyboardKey.space: 49,
-  LogicalKeyboardKey.arrowLeft: 123,
-  LogicalKeyboardKey.arrowRight: 124,
-  LogicalKeyboardKey.arrowDown: 125,
-  LogicalKeyboardKey.arrowUp: 126,
-  LogicalKeyboardKey.home: 115,
-  LogicalKeyboardKey.end: 119,
-  LogicalKeyboardKey.pageUp: 116,
-  LogicalKeyboardKey.pageDown: 121,
-};
-
 /// Windows virtual-key codes for keys CEF resolves by VK (editing/navigation
 /// keys and the alphanumerics). DOM `KeyboardEvent.keyCode` follows these.
 final Map<LogicalKeyboardKey, int> kCefSpecialWindowsKeyCodes =
@@ -89,10 +68,6 @@ final Map<LogicalKeyboardKey, int> kCefSpecialWindowsKeyCodes =
   LogicalKeyboardKey.arrowDown: 0x28,
   LogicalKeyboardKey.delete: 0x2E,
 };
-
-/// The macOS native keycode for [key], or null if it's not an editing key whose
-/// behavior CEF derives natively.
-int? cefMacKeyCode(LogicalKeyboardKey key) => kCefMacKeyCodes[key];
 
 /// macOS virtual keycodes (`kVK_*`) keyed by **physical** key. CEF on macOS
 /// interprets `native_key_code` as a macOS keycode, so it must reflect the
@@ -172,9 +147,11 @@ int? cefMacNativeKeyCode(PhysicalKeyboardKey key) =>
 ///    the codepoint here those default actions never fire (Enter, which carries
 ///    0x0D, worked; Space, left 0, did not).
 ///
-/// This is only the key-event character; the inserted text still rides the IME
-/// CHAR path, and a raw keydown/keyup inserts nothing (Enter emits one newline,
-/// not two), so a printable codepoint here is safe.
+/// This is only the key-event character. Typed text reaches the page as a
+/// separate CHAR (keypress) event; a bare keydown/keyup carrying one of these
+/// codepoints inserts no text (Enter emits one newline, not two) — it only lets
+/// the key's default action fire (Enter → submit/newline, Space → activate), so
+/// a real codepoint here is safe.
 final Map<LogicalKeyboardKey, int> kCefMacKeyChars = <LogicalKeyboardKey, int>{
   LogicalKeyboardKey.backspace: 0x7F, // NSDeleteCharacter
   LogicalKeyboardKey.delete: 0xF728, // NSDeleteFunctionKey
@@ -182,7 +159,8 @@ final Map<LogicalKeyboardKey, int> kCefMacKeyChars = <LogicalKeyboardKey, int>{
   LogicalKeyboardKey.enter: 0x0D,
   LogicalKeyboardKey.numpadEnter: 0x03, // NSEnterCharacter
   LogicalKeyboardKey.escape: 0x1B,
-  LogicalKeyboardKey.space: 0x20, // activates a focused button / checkbox / radio
+  LogicalKeyboardKey.space:
+      0x20, // activates a focused button / checkbox / radio
   LogicalKeyboardKey.arrowUp: 0xF700, // NSUpArrowFunctionKey
   LogicalKeyboardKey.arrowDown: 0xF701,
   LogicalKeyboardKey.arrowLeft: 0xF702,

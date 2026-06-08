@@ -8,7 +8,7 @@
 // engine to re-sample the texture. Because the page renders off-screen, it keeps
 // updating even when the tile isn't engaged — the whole point of the CEF path.
 //
-// See packages/cef_host/ for the renderer and the IPC opcode definitions.
+// See native/cef_host/main.mm for the renderer and the IPC opcode definitions.
 
 import Cocoa
 import CoreVideo
