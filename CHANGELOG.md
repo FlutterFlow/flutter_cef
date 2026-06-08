@@ -16,6 +16,9 @@
   `onFindResult`), `loadHtmlString` / `loadFile`.
 * Cookies (`setCookie` / `clearCookies`), scrolling (`scrollTo` / `scrollBy` /
   `getScrollPosition`), `getTitle` / `getUserAgent`, `clearLocalStorage`.
+* Downloads (`onDownload` + the native Save panel) and a low-level IME
+  composition API (`imeSetComposition` / `imeCommitText` /
+  `imeCancelComposition`).
 * Verbose CEF logging is now gated behind the `FLUTTER_CEF_DEBUG` env var.
 
 ## 0.0.1
