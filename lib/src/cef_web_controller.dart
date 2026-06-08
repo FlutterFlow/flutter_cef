@@ -69,6 +69,10 @@ class CefWebController {
   /// Called with each find-in-page result update (see [find]).
   void Function(CefFindResult result)? onFindResult;
 
+  /// Called when a download begins. The user is shown a native Save panel; this
+  /// is informational (e.g. to surface a toast).
+  void Function(String suggestedName)? onDownload;
+
   /// Handle a page `alert(...)`. Show your UI, then return to dismiss it. If
   /// unset, alerts are auto-dismissed.
   Future<void> Function(CefJsDialogRequest request)? onJavaScriptAlertDialog;
@@ -161,6 +165,9 @@ class CefWebController {
         break;
       case 'channelMessage':
         _handleChannelMessage(a['payload'] as String? ?? '');
+        break;
+      case 'download':
+        onDownload?.call(a['suggestedName'] as String? ?? '');
         break;
     }
   }

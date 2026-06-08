@@ -313,6 +313,15 @@ void main() {
     expect(await f, const Offset(12, 34));
   });
 
+  test('download event invokes onDownload', () async {
+    final c = CefWebController(sessionId: 'dl');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    String? got;
+    c.onDownload = (n) => got = n;
+    await emit('dl', 'download', {'suggestedName': 'file.zip'});
+    expect(got, 'file.zip');
+  });
+
   test('cookie verbs forward to native', () async {
     final c = CefWebController(sessionId: 'ck');
     await c.setCookie(

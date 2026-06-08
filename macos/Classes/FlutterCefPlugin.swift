@@ -178,6 +178,9 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     session.onChannelMsg = { [weak self] payload in
       self?.emit("channelMessage", ["sessionId": sessionId, "payload": payload])
     }
+    session.onDownload = { [weak self] name in
+      self?.emit("download", ["sessionId": sessionId, "suggestedName": name])
+    }
     sessions[sessionId] = session
     result(["textureId": session.textureId, "width": width, "height": height])
   }

@@ -67,6 +67,7 @@
 #include "include/cef_client.h"
 #include "include/cef_command_line.h"
 #include "include/cef_cookie.h"
+#include "include/cef_download_handler.h"
 #include "include/cef_find_handler.h"
 #include "include/cef_jsdialog_handler.h"
 #include "include/cef_life_span_handler.h"
@@ -98,6 +99,7 @@ constexpr uint8_t kOpFindResult = 0x0e; // {u32 count}{u32 activeOrdinal}{u8 fin
 constexpr uint8_t kOpJsDialog = 0x0f;   // {u32 id}{u32 type}{u32 msgLen}{msg}{default}
 constexpr uint8_t kOpEvalResult = 0x16; // {utf8 "id:json"} runJavaScriptReturningResult
 constexpr uint8_t kOpChannelMsg = 0x17; // {utf8 "name:message"} JS channel -> host
+constexpr uint8_t kOpDownload = 0x18;   // {utf8 suggestedName} a download started
 constexpr uint8_t kOpPointer = 0x10;
 constexpr uint8_t kOpResize = 0x11;
 constexpr uint8_t kOpKey = 0x12;
@@ -403,6 +405,7 @@ class HostClient : public CefClient,
                    public CefLifeSpanHandler,
                    public CefFindHandler,
                    public CefJSDialogHandler,
+                   public CefDownloadHandler,
                    public CefRequestHandler,
                    public CefMessageRouterBrowserSide::Handler {
  public:
@@ -419,7 +422,19 @@ class HostClient : public CefClient,
   CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
   CefRefPtr<CefFindHandler> GetFindHandler() override { return this; }
   CefRefPtr<CefJSDialogHandler> GetJSDialogHandler() override { return this; }
+  CefRefPtr<CefDownloadHandler> GetDownloadHandler() override { return this; }
   CefRefPtr<CefRequestHandler> GetRequestHandler() override { return this; }
+
+  // CefDownloadHandler: allow downloads (CEF blocks them without a handler) and
+  // notify the host. Continue with an empty path + show_dialog so the user picks
+  // where to save via the native panel.
+  bool OnBeforeDownload(CefRefPtr<CefBrowser>, CefRefPtr<CefDownloadItem>,
+                        const CefString& suggested_name,
+                        CefRefPtr<CefBeforeDownloadCallback> callback) override {
+    SendUtf8(kOpDownload, suggested_name.ToString());
+    callback->Continue(CefString(), true);
+    return true;
+  }
 
   // CefFindHandler: report find-in-page results to the host.
   void OnFindResult(CefRefPtr<CefBrowser>, int /*identifier*/, int count,
