@@ -64,6 +64,7 @@
 #include "include/cef_client.h"
 #include "include/cef_command_line.h"
 #include "include/cef_render_handler.h"
+#include "include/cef_request_handler.h"
 #include "include/cef_task.h"
 #include "include/wrapper/cef_closure_task.h"
 #include "include/wrapper/cef_helpers.h"
@@ -312,12 +313,25 @@ class HostRenderHandler : public CefRenderHandler {
 
 class HostClient : public CefClient,
                    public CefLoadHandler,
-                   public CefDisplayHandler {
+                   public CefDisplayHandler,
+                   public CefRequestHandler {
  public:
   CefRefPtr<CefRenderHandler> rh_ = new HostRenderHandler();
   CefRefPtr<CefRenderHandler> GetRenderHandler() override { return rh_; }
   CefRefPtr<CefLoadHandler> GetLoadHandler() override { return this; }
   CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
+  CefRefPtr<CefRequestHandler> GetRequestHandler() override { return this; }
+
+  // Recover from a renderer crash (multi-process only): reload rather than show
+  // a dead page. In single-process a renderer CHECK kills the whole process, so
+  // this never fires — which is why heavy pages need multi-process.
+  void OnRenderProcessTerminated(CefRefPtr<CefBrowser> browser,
+                                 TerminationStatus status, int /*error_code*/,
+                                 const CefString& /*error_string*/) override {
+    SendLog("renderer terminated (status " + std::to_string(status) +
+            ") — reloading");
+    if (browser) browser->ReloadIgnoreCache();
+  }
 
   // CefLoadHandler: spinner + back/forward enablement.
   void OnLoadingStateChange(CefRefPtr<CefBrowser>, bool isLoading,
@@ -376,9 +390,12 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
     command_line->AppendSwitch("use-mock-keychain");
     command_line->AppendSwitchWithValue("password-store", "basic");
 #ifndef CEF_HOST_MULTIPROCESS
-    // Single-process (default): no child processes, so no Mach-port peer
-    // validation (Chromium 144's -67030). The trade-off vs multi-process is no
-    // GPU/Viz process — i.e. no OnAcceleratedPaint. See CEF_MULTI_PROCESS.
+    // Single-process (default): renderer + GPU + utility all share this process,
+    // so there are no Mach-port peers to validate (Chromium 144's -67030). The
+    // catch: heavy pages whose work lands on the in-process utility thread (e.g.
+    // Google sign-in probing WebAuthn/HID security keys) can CHECK-crash the
+    // whole process. It's best for simpler/first-party content; multi-process
+    // (-DCEF_MULTI_PROCESS=ON) isolates those crashes.
     command_line->AppendSwitch("single-process");
     command_line->AppendSwitchWithValue(
         "disable-features",

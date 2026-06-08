@@ -48,8 +48,13 @@ if [ ! -f "$CEF_ROOT/cmake/FindCEF.cmake" ]; then
 fi
 
 echo "[flutter_cef] building cef_host.app ..."
+MP_FLAG="-DCEF_MULTI_PROCESS=OFF"
+if [ "${CEF_MULTI_PROCESS:-}" = "1" ] || [ "${CEF_MULTI_PROCESS:-}" = "ON" ]; then
+  MP_FLAG="-DCEF_MULTI_PROCESS=ON"
+  echo "[flutter_cef] multi-process build (needs Developer ID + notarization for a clean -67030)"
+fi
 cmake -G Ninja -S "$HERE/cef_host" -B "$OUT" \
-  -DCEF_ROOT="$CEF_ROOT" -DCODESIGN_ID="$CODESIGN_ID" >/dev/null
+  -DCEF_ROOT="$CEF_ROOT" -DCODESIGN_ID="$CODESIGN_ID" "$MP_FLAG" >/dev/null
 ninja -C "$OUT" cef_host
 echo "[flutter_cef] -> $OUT/cef_host.app"
 echo "[flutter_cef] for dev, point the app at it:"
