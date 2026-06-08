@@ -319,6 +319,28 @@ class CefWebController {
   /// Clear the page's `localStorage`.
   Future<void> clearLocalStorage() => executeJavaScript('localStorage.clear()');
 
+  /// Set a cookie in the global (process-wide) cookie store. [url] scopes the
+  /// cookie; [domain] defaults to the url's host.
+  Future<void> setCookie({
+    required String url,
+    required String name,
+    required String value,
+    String domain = '',
+    String path = '/',
+  }) =>
+      _channel.invokeMethod('setCookie', {
+        'sessionId': sessionId,
+        'url': url,
+        'name': name,
+        'value': value,
+        'domain': domain,
+        'path': path,
+      });
+
+  /// Delete all cookies from the global cookie store.
+  Future<void> clearCookies() =>
+      _channel.invokeMethod('clearCookies', {'sessionId': sessionId});
+
   /// Load an HTML string. (`baseUrl` is accepted for API familiarity but not yet
   /// honoured — relative URLs resolve against the `data:` document.)
   Future<void> loadHtmlString(String html, {String? baseUrl}) {

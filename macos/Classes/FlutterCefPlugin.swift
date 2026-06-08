@@ -75,6 +75,18 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
         withSession(args) { $0.addChannel(name) }
       }
       result(nil)
+    case "setCookie":
+      withSession(args) {
+        $0.setCookie(url: args["url"] as? String ?? "",
+                     name: args["name"] as? String ?? "",
+                     value: args["value"] as? String ?? "",
+                     domain: args["domain"] as? String ?? "",
+                     path: args["path"] as? String ?? "/")
+      }
+      result(nil)
+    case "clearCookies":
+      withSession(args) { $0.clearCookies() }
+      result(nil)
     default: result(FlutterMethodNotImplemented)
     }
   }

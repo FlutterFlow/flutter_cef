@@ -303,4 +303,16 @@ void main() {
     await emit('gp', 'evalResult', {'payload': '$id:{"ok":true,"v":[12,34]}'});
     expect(await f, const Offset(12, 34));
   });
+
+  test('cookie verbs forward to native', () async {
+    final c = CefWebController(sessionId: 'ck');
+    await c.setCookie(
+        url: 'https://x.test/', name: 'sid', value: 'abc', domain: 'x.test');
+    await c.clearCookies();
+    final set = log.firstWhere((m) => m.method == 'setCookie').arguments as Map;
+    expect(set['name'], 'sid');
+    expect(set['value'], 'abc');
+    expect(set['domain'], 'x.test');
+    expect(log.any((m) => m.method == 'clearCookies'), true);
+  });
 }

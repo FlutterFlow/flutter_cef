@@ -66,6 +66,7 @@
 #include "include/cef_browser.h"
 #include "include/cef_client.h"
 #include "include/cef_command_line.h"
+#include "include/cef_cookie.h"
 #include "include/cef_find_handler.h"
 #include "include/cef_jsdialog_handler.h"
 #include "include/cef_life_span_handler.h"
@@ -113,6 +114,8 @@ constexpr uint8_t kOpStopFind = 0x28;   // {u8 clearSelection}
 constexpr uint8_t kOpJsDialogResp = 0x29;  // {u32 id}{u8 ok}{utf8 text}
 constexpr uint8_t kOpEvalReturning = 0x2a;  // {u32 id}{utf8 code}
 constexpr uint8_t kOpAddChannel = 0x2b;     // {utf8 name} register a JS channel
+constexpr uint8_t kOpSetCookie = 0x2c;      // {utf8 url\0name\0value\0domain\0path}
+constexpr uint8_t kOpClearCookies = 0x2d;   // {} delete all cookies
 
 // ---- Shared runtime state ----
 int g_ipc_fd = -1;
@@ -737,6 +740,23 @@ void DoAddChannel(const std::string& name) {
   g_channels.insert(name);
   if (g_browser) InjectChannelShim(g_browser->GetMainFrame(), name);
 }
+void DoSetCookie(const std::string& url, const std::string& name,
+                 const std::string& value, const std::string& domain,
+                 const std::string& path) {
+  CefRefPtr<CefCookieManager> mgr = CefCookieManager::GetGlobalManager(nullptr);
+  if (!mgr) return;
+  CefCookie cookie;
+  CefString(&cookie.name).FromString(name);
+  CefString(&cookie.value).FromString(value);
+  if (!domain.empty()) CefString(&cookie.domain).FromString(domain);
+  CefString(&cookie.path).FromString(path.empty() ? "/" : path);
+  cookie.has_expires = false;
+  mgr->SetCookie(url, cookie, nullptr);
+}
+void DoClearCookies() {
+  CefRefPtr<CefCookieManager> mgr = CefCookieManager::GetGlobalManager(nullptr);
+  if (mgr) mgr->DeleteCookies(CefString(), CefString(), nullptr);
+}
 
 // type: 0=move 1=down 2=up 3=wheel; button: 0=left 1=middle 2=right.
 void DoPointer(int type, int button, int click_count, uint32_t modifiers,
@@ -874,6 +894,24 @@ void IpcReadLoop() {
         CefPostTask(TID_UI, base::BindOnce(&DoAddChannel, name));
         break;
       }
+      case kOpSetCookie: {
+        std::string s(reinterpret_cast<const char*>(p), plen);
+        std::vector<std::string> f;
+        size_t start = 0;
+        for (size_t i = 0; i <= s.size(); ++i) {
+          if (i == s.size() || s[i] == '\0') {
+            f.push_back(s.substr(start, i - start));
+            start = i + 1;
+          }
+        }
+        while (f.size() < 5) f.push_back("");
+        CefPostTask(TID_UI, base::BindOnce(&DoSetCookie, f[0], f[1], f[2], f[3],
+                                           f[4]));
+        break;
+      }
+      case kOpClearCookies:
+        CefPostTask(TID_UI, base::BindOnce(&DoClearCookies));
+        break;
       case kOpPointer: {
         if (plen < 40) break;
         int type = p[0], button = p[1], clicks = p[2];

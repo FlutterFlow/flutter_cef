@@ -50,6 +50,8 @@ final class CefWebSession: NSObject, FlutterTexture {
   private static let opJsDialogResp: UInt8 = 0x29
   private static let opEvalReturning: UInt8 = 0x2a
   private static let opAddChannel: UInt8 = 0x2b
+  private static let opSetCookie: UInt8 = 0x2c
+  private static let opClearCookies: UInt8 = 0x2d
 
   // Event callbacks (fired off the main thread). The registrar relays each to a
   // Dart channel message.
@@ -176,6 +178,14 @@ final class CefWebSession: NSObject, FlutterTexture {
   func addChannel(_ name: String) {
     sendFrame(Self.opAddChannel, Array(name.utf8))
   }
+
+  func setCookie(url: String, name: String, value: String, domain: String,
+                 path: String) {
+    let payload = [url, name, value, domain, path].joined(separator: "\u{0}")
+    sendFrame(Self.opSetCookie, Array(payload.utf8))
+  }
+
+  func clearCookies() { sendFrame(Self.opClearCookies) }
 
   // type: 0=move 1=down 2=up 3=wheel; button: 0=left 1=middle 2=right.
   func sendPointer(type: Int, button: Int, clickCount: Int, modifiers: UInt32,
