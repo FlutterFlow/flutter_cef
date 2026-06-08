@@ -56,3 +56,18 @@ class CefFindResult {
   String toString() =>
       'CefFindResult($activeMatchOrdinal/$numberOfMatches, final: $isFinalUpdate)';
 }
+
+/// A JavaScript dialog (`alert` / `confirm` / `prompt`) the page raised. Passed
+/// to the [CefWebController] dialog callbacks; reply by returning from them.
+class CefJsDialogRequest {
+  const CefJsDialogRequest({required this.message, this.defaultText = ''});
+
+  /// The dialog message text.
+  final String message;
+
+  /// The pre-filled value for a `prompt()` dialog (empty otherwise).
+  final String defaultText;
+
+  @override
+  String toString() => 'CefJsDialogRequest($message)';
+}

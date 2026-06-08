@@ -56,6 +56,13 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     case "stopFind":
       withSession(args) { $0.stopFind(args["clearSelection"] as? Bool ?? true) }
       result(nil)
+    case "respondJsDialog":
+      withSession(args) {
+        $0.respondJsDialog(id: args["id"] as? Int ?? 0,
+                           ok: args["ok"] as? Bool ?? true,
+                           text: args["text"] as? String ?? "")
+      }
+      result(nil)
     default: result(FlutterMethodNotImplemented)
     }
   }
@@ -133,6 +140,12 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       self?.emit("findResult", [
         "sessionId": sessionId, "count": count,
         "activeMatchOrdinal": ordinal, "isFinal": isFinal,
+      ])
+    }
+    session.onJsDialog = { [weak self] id, type, message, defaultText in
+      self?.emit("jsDialog", [
+        "sessionId": sessionId, "id": id, "type": type,
+        "message": message, "defaultText": defaultText,
       ])
     }
     sessions[sessionId] = session

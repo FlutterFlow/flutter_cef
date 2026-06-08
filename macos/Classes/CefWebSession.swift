@@ -35,6 +35,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   private static let opKey: UInt8 = 0x12
   private static let opShutdown: UInt8 = 0x14
   private static let opFindResult: UInt8 = 0x0e
+  private static let opJsDialog: UInt8 = 0x0f
   private static let opNavigate: UInt8 = 0x20
   private static let opReload: UInt8 = 0x21
   private static let opStop: UInt8 = 0x22
@@ -44,6 +45,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   private static let opSetZoom: UInt8 = 0x26
   private static let opFind: UInt8 = 0x27
   private static let opStopFind: UInt8 = 0x28
+  private static let opJsDialogResp: UInt8 = 0x29
 
   // Event callbacks (fired off the main thread). The registrar relays each to a
   // Dart channel message.
@@ -58,6 +60,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   var onProgress: ((Int) -> Void)?  // 0-100
   var onNewWindow: ((String) -> Void)?  // popup/target=_blank url
   var onFindResult: ((Int, Int, Bool) -> Void)?  // count, activeOrdinal, isFinal
+  var onJsDialog: ((Int, Int, String, String) -> Void)?  // id, type, msg, default
 
   let sessionId: String
   private(set) var textureId: Int64 = 0
@@ -147,6 +150,14 @@ final class CefWebSession: NSObject, FlutterTexture {
 
   func stopFind(_ clearSelection: Bool) {
     sendFrame(Self.opStopFind, [clearSelection ? 1 : 0])
+  }
+
+  func respondJsDialog(id: Int, ok: Bool, text: String) {
+    var p = [UInt8]()
+    appendU32(&p, UInt32(truncatingIfNeeded: id))
+    p.append(ok ? 1 : 0)
+    p.append(contentsOf: Array(text.utf8))
+    sendFrame(Self.opJsDialogResp, p)
   }
 
   // type: 0=move 1=down 2=up 3=wheel; button: 0=left 1=middle 2=right.
@@ -360,6 +371,17 @@ final class CefWebSession: NSObject, FlutterTexture {
       case Self.opFindResult:
         if body.count >= 10 {
           onFindResult?(readU32(body, 1), readU32(body, 5), body[9] != 0)
+        }
+      case Self.opJsDialog:
+        if body.count >= 13 {
+          let type = readU32(body, 5)
+          let msgLen = readU32(body, 9)
+          let msgEnd = min(13 + msgLen, body.count)
+          let msg = String(bytes: body[13..<msgEnd], encoding: .utf8) ?? ""
+          let def = msgEnd < body.count
+              ? (String(bytes: body[msgEnd...], encoding: .utf8) ?? "")
+              : ""
+          onJsDialog?(readU32(body, 1), type, msg, def)
         }
       default:
         break

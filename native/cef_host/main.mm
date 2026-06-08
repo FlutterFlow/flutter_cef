@@ -45,6 +45,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -65,6 +66,7 @@
 #include "include/cef_client.h"
 #include "include/cef_command_line.h"
 #include "include/cef_find_handler.h"
+#include "include/cef_jsdialog_handler.h"
 #include "include/cef_life_span_handler.h"
 #include "include/cef_render_handler.h"
 #include "include/cef_request_handler.h"
@@ -90,6 +92,7 @@ constexpr uint8_t kOpPageFinish = 0x0b; // {utf8 url} main frame load finished
 constexpr uint8_t kOpProgress = 0x0c;   // {u32 percent 0-100}
 constexpr uint8_t kOpNewWindow = 0x0d;  // {utf8 url} popup / target=_blank
 constexpr uint8_t kOpFindResult = 0x0e; // {u32 count}{u32 activeOrdinal}{u8 final}
+constexpr uint8_t kOpJsDialog = 0x0f;   // {u32 id}{u32 type}{u32 msgLen}{msg}{default}
 constexpr uint8_t kOpPointer = 0x10;
 constexpr uint8_t kOpResize = 0x11;
 constexpr uint8_t kOpKey = 0x12;
@@ -103,6 +106,7 @@ constexpr uint8_t kOpExecuteJs = 0x25;  // {utf8 code}
 constexpr uint8_t kOpSetZoom = 0x26;    // {f64 level} (factor = 1.2^level)
 constexpr uint8_t kOpFind = 0x27;       // {u8 fwd}{u8 matchCase}{u8 findNext}{utf8}
 constexpr uint8_t kOpStopFind = 0x28;   // {u8 clearSelection}
+constexpr uint8_t kOpJsDialogResp = 0x29;  // {u32 id}{u8 ok}{utf8 text}
 
 // ---- Shared runtime state ----
 int g_ipc_fd = -1;
@@ -115,6 +119,11 @@ int g_height = 600;
 double g_dpr = 1.0;  // device pixel ratio; the IOSurface is logical*g_dpr px.
 
 CefRefPtr<CefBrowser> g_browser;
+
+// Pending JS dialog callbacks, keyed by id. UI-thread-only (OnJSDialog and the
+// host's response both run on the CEF UI thread), so no lock is needed.
+std::map<uint32_t, CefRefPtr<CefJSDialogCallback>> g_dialogs;
+uint32_t g_dialog_next = 1;
 
 // Popup widgets (<select> dropdowns, autofill) paint into a separate PET_POPUP
 // buffer that we composite over the view at the popup rect. Guarded by
@@ -370,6 +379,7 @@ class HostClient : public CefClient,
                    public CefDisplayHandler,
                    public CefLifeSpanHandler,
                    public CefFindHandler,
+                   public CefJSDialogHandler,
                    public CefRequestHandler {
  public:
   CefRefPtr<CefRenderHandler> rh_ = new HostRenderHandler();
@@ -378,6 +388,7 @@ class HostClient : public CefClient,
   CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
   CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
   CefRefPtr<CefFindHandler> GetFindHandler() override { return this; }
+  CefRefPtr<CefJSDialogHandler> GetJSDialogHandler() override { return this; }
   CefRefPtr<CefRequestHandler> GetRequestHandler() override { return this; }
 
   // CefFindHandler: report find-in-page results to the host.
@@ -396,6 +407,39 @@ class HostClient : public CefClient,
                     static_cast<uint8_t>(a & 0xff),
                     static_cast<uint8_t>(finalUpdate ? 1 : 0)};
     SendFrame(kOpFindResult, p, 9);
+  }
+
+  // CefJSDialogHandler: forward alert/confirm/prompt to the host, which shows a
+  // native dialog and answers back over the IPC (DoJsDialogResp -> Continue).
+  bool OnJSDialog(CefRefPtr<CefBrowser>, const CefString&,
+                  JSDialogType dialog_type, const CefString& message_text,
+                  const CefString& default_prompt_text,
+                  CefRefPtr<CefJSDialogCallback> callback,
+                  bool& /*suppress_message*/) override {
+    uint32_t id = g_dialog_next++;
+    g_dialogs[id] = callback;
+    uint32_t type = dialog_type == JSDIALOGTYPE_ALERT
+                        ? 0
+                        : (dialog_type == JSDIALOGTYPE_CONFIRM ? 1 : 2);
+    std::string msg = message_text.ToString();
+    std::string def = default_prompt_text.ToString();
+    std::vector<uint8_t> p(12 + msg.size() + def.size());
+    uint32_t ml = static_cast<uint32_t>(msg.size());
+    for (int i = 0; i < 4; ++i) {
+      p[i] = (id >> (24 - 8 * i)) & 0xff;
+      p[4 + i] = (type >> (24 - 8 * i)) & 0xff;
+      p[8 + i] = (ml >> (24 - 8 * i)) & 0xff;
+    }
+    memcpy(p.data() + 12, msg.data(), msg.size());
+    memcpy(p.data() + 12 + msg.size(), def.data(), def.size());
+    SendFrame(kOpJsDialog, p.data(), static_cast<uint32_t>(p.size()));
+    return true;  // we answer asynchronously via Continue()
+  }
+  bool OnBeforeUnloadDialog(CefRefPtr<CefBrowser>, const CefString&, bool,
+                            CefRefPtr<CefJSDialogCallback> callback) override {
+    // Always allow navigation away (don't block on "leave this page?").
+    callback->Continue(true, CefString());
+    return true;
   }
 
   // Recover from a renderer crash (multi-process only): reload rather than show
@@ -604,6 +648,12 @@ void DoFind(const std::string& text, bool forward, bool match_case,
 void DoStopFind(bool clear_selection) {
   if (g_browser) g_browser->GetHost()->StopFinding(clear_selection);
 }
+void DoJsDialogResp(uint32_t id, bool ok, const std::string& text) {
+  auto it = g_dialogs.find(id);
+  if (it == g_dialogs.end()) return;
+  it->second->Continue(ok, text);
+  g_dialogs.erase(it);
+}
 
 // type: 0=move 1=down 2=up 3=wheel; button: 0=left 1=middle 2=right.
 void DoPointer(int type, int button, int click_count, uint32_t modifiers,
@@ -719,6 +769,14 @@ void IpcReadLoop() {
       case kOpStopFind: {
         bool clear = plen >= 1 ? p[0] != 0 : true;
         CefPostTask(TID_UI, base::BindOnce(&DoStopFind, clear));
+        break;
+      }
+      case kOpJsDialogResp: {
+        if (plen < 5) break;
+        uint32_t id = ReadU32BE(p);
+        bool ok = p[4] != 0;
+        std::string text(reinterpret_cast<const char*>(p + 5), plen - 5);
+        CefPostTask(TID_UI, base::BindOnce(&DoJsDialogResp, id, ok, text));
         break;
       }
       case kOpPointer: {

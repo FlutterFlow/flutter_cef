@@ -214,4 +214,30 @@ void main() {
     expect(got!.activeMatchOrdinal, 2);
     expect(got!.isFinalUpdate, true);
   });
+
+  test('confirm dialog routes to the handler and responds', () async {
+    final c = CefWebController(sessionId: 'jd');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    c.onJavaScriptConfirmDialog = (req) async => false;
+    await emit('jd', 'jsDialog',
+        {'id': 11, 'type': 1, 'message': 'sure?', 'defaultText': ''});
+    await pumpEventQueue();
+    final resp =
+        log.firstWhere((m) => m.method == 'respondJsDialog').arguments as Map;
+    expect(resp['id'], 11);
+    expect(resp['ok'], false);
+  });
+
+  test('prompt dialog returns entered text via respondJsDialog', () async {
+    final c = CefWebController(sessionId: 'jp');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    c.onJavaScriptTextInputDialog = (req) async => 'typed-${req.defaultText}';
+    await emit('jp', 'jsDialog',
+        {'id': 12, 'type': 2, 'message': 'name?', 'defaultText': 'x'});
+    await pumpEventQueue();
+    final resp =
+        log.firstWhere((m) => m.method == 'respondJsDialog').arguments as Map;
+    expect(resp['ok'], true);
+    expect(resp['text'], 'typed-x');
+  });
 }

@@ -68,6 +68,19 @@ class CefWebController {
   /// Called with each find-in-page result update (see [find]).
   void Function(CefFindResult result)? onFindResult;
 
+  /// Handle a page `alert(...)`. Show your UI, then return to dismiss it. If
+  /// unset, alerts are auto-dismissed.
+  Future<void> Function(CefJsDialogRequest request)? onJavaScriptAlertDialog;
+
+  /// Handle a page `confirm(...)`. Return true for OK, false for Cancel. If
+  /// unset, confirms default to OK.
+  Future<bool> Function(CefJsDialogRequest request)? onJavaScriptConfirmDialog;
+
+  /// Handle a page `prompt(...)`. Return the entered text, or null to cancel. If
+  /// unset, prompts return their default value.
+  Future<String?> Function(CefJsDialogRequest request)?
+      onJavaScriptTextInputDialog;
+
   static final Map<String, CefWebController> _bySession =
       <String, CefWebController>{};
   static bool _handlerInstalled = false;
@@ -132,7 +145,43 @@ class CefWebController {
           isFinalUpdate: a['isFinal'] as bool? ?? false,
         ));
         break;
+      case 'jsDialog':
+        _handleJsDialog(a);
+        break;
     }
+  }
+
+  /// Dispatch a JS dialog to the right callback, then send the result back so
+  /// the page's `alert`/`confirm`/`prompt` call can return. type: 0=alert,
+  /// 1=confirm, 2=prompt.
+  Future<void> _handleJsDialog(Map<String, dynamic> a) async {
+    final id = a['id'] as int? ?? 0;
+    final req = CefJsDialogRequest(
+      message: a['message'] as String? ?? '',
+      defaultText: a['defaultText'] as String? ?? '',
+    );
+    var ok = true;
+    var text = '';
+    try {
+      switch (a['type'] as int? ?? 0) {
+        case 1:
+          ok = (await onJavaScriptConfirmDialog?.call(req)) ?? true;
+          break;
+        case 2:
+          final r = onJavaScriptTextInputDialog == null
+              ? req.defaultText
+              : await onJavaScriptTextInputDialog!(req);
+          ok = r != null;
+          text = r ?? '';
+          break;
+        default:
+          await onJavaScriptAlertDialog?.call(req);
+      }
+    } catch (_) {
+      ok = false;
+    }
+    await _channel.invokeMethod('respondJsDialog',
+        {'sessionId': sessionId, 'id': id, 'ok': ok, 'text': text});
   }
 
   /// Spawn the renderer for [url] at [width]×[height] logical px. Returns the
