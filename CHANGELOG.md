@@ -16,9 +16,23 @@
   `onFindResult`), `loadHtmlString` / `loadFile`.
 * Cookies (`setCookie` / `clearCookies`), scrolling (`scrollTo` / `scrollBy` /
   `getScrollPosition`), `getTitle` / `getUserAgent`, `clearLocalStorage`.
-* Downloads (`onDownload` + the native Save panel) and a low-level IME
-  composition API (`imeSetComposition` / `imeCommitText` /
-  `imeCancelComposition`).
+* Downloads (`onDownload` + the native Save panel).
+* Automatic IME / text input: while focused, `CefWebView` holds a platform
+  `TextInputConnection`, so dead keys, CJK composition, and emoji all reach the
+  page. Committed text is sent as full UTF-8 (fixes the prior surrogate-pair
+  truncation that mangled emoji / astral characters), composition is relayed and
+  visibly underlined, and the OS candidate window is positioned under the caret
+  (`OnImeCompositionRangeChanged` readback). The low-level
+  `imeSetComposition` / `imeCommitText` / `imeCancelComposition` controller verbs
+  remain for direct use.
+* Input fidelity: editing / navigation keys (Backspace, arrows, …) no longer
+  double-apply (one Backspace deleted two characters; one arrow moved two
+  options in a `<select>`) — the host now sets the macOS `character` /
+  `unmodified_character` on every key, which de-duplicates the edit command on
+  CEF's OSR path (known CEF behavior). `<select>` dropdowns now position and
+  click correctly on Retina — the popup composite offset is scaled by the device
+  pixel ratio. Key routing also stops Flutter's own shortcuts from eating arrow
+  keys while the view is focused.
 * Verbose CEF logging is now gated behind the `FLUTTER_CEF_DEBUG` env var.
 * Hardening (security/concurrency audit): validate JS channel names before
   injection; fail pending `runJavaScriptReturningResult` completers on

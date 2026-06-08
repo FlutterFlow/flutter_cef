@@ -111,4 +111,75 @@ void main() {
     await controller.dispose(); // caller's responsibility
     expect(callsTo('dispose'), hasLength(1));
   });
+
+  // ── IME / text input ───────────────────────────────────────────────
+  Future<FocusNode> focusedView(WidgetTester tester) async {
+    final focus = FocusNode();
+    addTearDown(focus.dispose);
+    await tester
+        .pumpWidget(boxed(CefWebView(url: 'about:blank', focusNode: focus)));
+    await tester.pumpAndSettle(); // session create resolves
+    focus.requestFocus();
+    await tester.pump(); // focus listener attaches the text-input connection
+    return focus;
+  }
+
+  testWidgets('opens a delta text-input connection when focused',
+      (tester) async {
+    await focusedView(tester);
+    final args = tester.testTextInput.setClientArgs;
+    expect(args, isNotNull);
+    expect(args!['enableDeltaModel'], isTrue);
+    expect((args['inputType'] as Map)['name'], 'TextInputType.text');
+  });
+
+  testWidgets('seeds the connection with a valid caret (CJK composition needs '
+      'a real insertion point, not the -1 of TextEditingValue.empty)',
+      (tester) async {
+    await focusedView(tester);
+    final state = tester.testTextInput.editingState;
+    expect(state, isNotNull);
+    expect(state!['selectionBase'], 0);
+    expect(state['selectionExtent'], 0);
+  });
+
+  testWidgets(
+      'composition relays to imeSetComposition, commit to imeCommitText',
+      (tester) async {
+    await focusedView(tester);
+    // Marked (composing) text — the in-progress, underlined region.
+    tester.testTextInput.updateEditingValue(const TextEditingValue(
+      text: 'ni',
+      selection: TextSelection.collapsed(offset: 2),
+      composing: TextRange(start: 0, end: 2),
+    ));
+    await tester.pump();
+    expect((callsTo('imeSetComposition').last.arguments as Map)['text'], 'ni');
+    expect(callsTo('imeCommitText'), isEmpty);
+
+    // The IME resolves it to the committed characters (composing collapsed).
+    tester.testTextInput.updateEditingValue(const TextEditingValue(text: '你好'));
+    await tester.pump();
+    expect((callsTo('imeCommitText').last.arguments as Map)['text'], '你好');
+  });
+
+  testWidgets('emoji commits as the whole string (no surrogate truncation)',
+      (tester) async {
+    await focusedView(tester);
+    tester.testTextInput.updateEditingValue(const TextEditingValue(text: '🎉'));
+    await tester.pump();
+    final committed =
+        (callsTo('imeCommitText').last.arguments as Map)['text'] as String;
+    expect(committed, '🎉');
+    expect(committed.runes.length, 1); // a single rune, not a half-pair
+  });
+
+  testWidgets('closes the text-input connection when unfocused',
+      (tester) async {
+    final focus = await focusedView(tester);
+    expect(tester.testTextInput.setClientArgs, isNotNull);
+    focus.unfocus();
+    await tester.pump();
+    expect(tester.testTextInput.hasAnyClients, isFalse);
+  });
 }

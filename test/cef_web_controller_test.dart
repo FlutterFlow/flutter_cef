@@ -329,6 +329,22 @@ void main() {
     expect(log.any((m) => m.method == 'imeCancelComposition'), true);
   });
 
+  test('a host imeCompositionBounds event fires onImeCompositionBounds',
+      () async {
+    final c = CefWebController(sessionId: 'imb');
+    await c.create(url: 'about:blank', width: 10, height: 10);
+    Rect? got;
+    c.onImeCompositionBounds = (r) => got = r;
+    await messenger.handlePlatformMessage(
+      channel.name,
+      channel.codec.encodeMethodCall(const MethodCall('imeCompositionBounds',
+          {'sessionId': 'imb', 'x': 12, 'y': 34, 'w': 2, 'h': 18})),
+      (_) {},
+    );
+    expect(got, const Rect.fromLTWH(12, 34, 2, 18));
+    await c.dispose();
+  });
+
   test('download event invokes onDownload', () async {
     final c = CefWebController(sessionId: 'dl');
     await c.create(url: 'about:blank', width: 1, height: 1);

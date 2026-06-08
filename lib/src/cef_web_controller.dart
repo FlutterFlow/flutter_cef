@@ -79,6 +79,11 @@ class CefWebController {
   /// is informational (e.g. to surface a toast).
   void Function(String suggestedName)? onDownload;
 
+  /// The caret rect (view-local logical px) of the active IME composition.
+  /// Wired by [CefWebView] to position the OS candidate window under the text;
+  /// you generally don't set this yourself.
+  void Function(Rect caretRect)? onImeCompositionBounds;
+
   /// Handle a page `alert(...)`. Show your UI, then return to dismiss it. If
   /// unset, alerts are auto-dismissed.
   Future<void> Function(CefJsDialogRequest request)? onJavaScriptAlertDialog;
@@ -179,6 +184,14 @@ class CefWebController {
         break;
       case 'download':
         onDownload?.call(a['suggestedName'] as String? ?? '');
+        break;
+      case 'imeCompositionBounds':
+        onImeCompositionBounds?.call(Rect.fromLTWH(
+          (a['x'] as num? ?? 0).toDouble(),
+          (a['y'] as num? ?? 0).toDouble(),
+          (a['w'] as num? ?? 0).toDouble(),
+          (a['h'] as num? ?? 0).toDouble(),
+        ));
         break;
     }
   }

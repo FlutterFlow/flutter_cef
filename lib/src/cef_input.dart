@@ -159,6 +159,35 @@ final Map<PhysicalKeyboardKey, int> kCefMacKeyCodesByPhysical =
 int? cefMacNativeKeyCode(PhysicalKeyboardKey key) =>
     kCefMacKeyCodesByPhysical[key];
 
+/// The `character` / `unmodified_character` a real macOS NSEvent carries for an
+/// editing or navigation key (the NSEvent function-key / control codepoints).
+///
+/// CEF off-screen rendering on macOS **double-applies** the edit action (one
+/// Backspace deletes two chars, one arrow moves two) when these fields are left
+/// 0; populating them with the real codepoint de-duplicates it. This is a known
+/// CEF OSR bug — see the CEF forum thread t=11650. Printable keys insert via the
+/// IME / CHAR path, so they return 0 here.
+final Map<LogicalKeyboardKey, int> kCefMacKeyChars = <LogicalKeyboardKey, int>{
+  LogicalKeyboardKey.backspace: 0x7F, // NSDeleteCharacter
+  LogicalKeyboardKey.delete: 0xF728, // NSDeleteFunctionKey
+  LogicalKeyboardKey.tab: 0x09,
+  LogicalKeyboardKey.enter: 0x0D,
+  LogicalKeyboardKey.numpadEnter: 0x03, // NSEnterCharacter
+  LogicalKeyboardKey.escape: 0x1B,
+  LogicalKeyboardKey.arrowUp: 0xF700, // NSUpArrowFunctionKey
+  LogicalKeyboardKey.arrowDown: 0xF701,
+  LogicalKeyboardKey.arrowLeft: 0xF702,
+  LogicalKeyboardKey.arrowRight: 0xF703,
+  LogicalKeyboardKey.home: 0xF729,
+  LogicalKeyboardKey.end: 0xF72B,
+  LogicalKeyboardKey.pageUp: 0xF72C,
+  LogicalKeyboardKey.pageDown: 0xF72D,
+};
+
+/// The macOS NSEvent character for an editing/navigation [key], or 0 for keys
+/// whose text rides the IME/CHAR path. See [kCefMacKeyChars].
+int cefMacCharForKey(LogicalKeyboardKey key) => kCefMacKeyChars[key] ?? 0;
+
 /// The Windows virtual-key code for [key]: the special-key table first, then
 /// a→VK_A..z→VK_Z, A–Z, and 0–9. 0 if unmapped (a printable that rides CHAR).
 int cefWindowsKeyCode(LogicalKeyboardKey key) {

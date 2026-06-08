@@ -101,6 +101,7 @@ constexpr uint8_t kOpJsDialog = 0x0f;   // {u32 id}{u32 type}{u32 msgLen}{msg}{d
 constexpr uint8_t kOpEvalResult = 0x16; // {utf8 "id:json"} runJavaScriptReturningResult
 constexpr uint8_t kOpChannelMsg = 0x17; // {utf8 "name:message"} JS channel -> host
 constexpr uint8_t kOpDownload = 0x18;   // {utf8 suggestedName} a download started
+constexpr uint8_t kOpImeBounds = 0x19;  // {u32 x}{u32 y}{u32 w}{u32 h} caret rect (DIP)
 constexpr uint8_t kOpPointer = 0x10;
 constexpr uint8_t kOpResize = 0x11;
 constexpr uint8_t kOpKey = 0x12;
@@ -260,6 +261,13 @@ uint32_t ReadU32BE(const uint8_t* p) {
          uint32_t(p[3]);
 }
 
+void WriteU32BE(uint8_t* p, uint32_t v) {
+  p[0] = static_cast<uint8_t>((v >> 24) & 0xff);
+  p[1] = static_cast<uint8_t>((v >> 16) & 0xff);
+  p[2] = static_cast<uint8_t>((v >> 8) & 0xff);
+  p[3] = static_cast<uint8_t>(v & 0xff);
+}
+
 uint64_t ReadU64BE(const uint8_t* p) {
   uint64_t v = 0;
   for (int i = 0; i < 8; ++i) v = (v << 8) | p[i];
@@ -343,19 +351,26 @@ class HostRenderHandler : public CefRenderHandler {
     const int surf_w = static_cast<int>(IOSurfaceGetWidth(g_surface));
     const int surf_h = static_cast<int>(IOSurfaceGetHeight(g_surface));
     const uint8_t* src = static_cast<const uint8_t*>(buffer);
+    // OnPopupSize reports the popup rect in LOGICAL (DIP) coords, but we blit
+    // into the physical (device-scaled) IOSurface — so the paint offset must be
+    // scaled by the device pixel ratio. Without this the dropdown paints at the
+    // wrong position on HiDPI and mouse clicks miss it (CEF hit-tests the popup
+    // against the logical rect, which no longer matches where it was drawn).
+    const int popup_px = static_cast<int>(g_popup_rect.x * g_dpr);
+    const int popup_py = static_cast<int>(g_popup_rect.y * g_dpr);
     if (type == PET_VIEW) {
       BlitBGRA(dst, dst_stride, surf_w, surf_h, src, width, height, 0, 0);
       // Keep an open popup (<select> dropdown) painted on top of the view.
       if (g_popup_visible && !g_popup_buf.empty()) {
         BlitBGRA(dst, dst_stride, surf_w, surf_h, g_popup_buf.data(), g_popup_w,
-                 g_popup_h, g_popup_rect.x, g_popup_rect.y);
+                 g_popup_h, popup_px, popup_py);
       }
     } else if (type == PET_POPUP) {
       g_popup_w = width;
       g_popup_h = height;
       g_popup_buf.assign(src, src + static_cast<size_t>(width) * height * 4);
-      BlitBGRA(dst, dst_stride, surf_w, surf_h, src, width, height,
-               g_popup_rect.x, g_popup_rect.y);
+      BlitBGRA(dst, dst_stride, surf_w, surf_h, src, width, height, popup_px,
+               popup_py);
     }
     IOSurfaceUnlock(g_surface, 0, nullptr);
     SendFrame(kOpPresent, nullptr, 0);
@@ -420,6 +435,19 @@ class HostRenderHandler : public CefRenderHandler {
     IOSurfaceUnlock(g_surface, 0, nullptr);
     IOSurfaceUnlock(src, kIOSurfaceLockReadOnly, nullptr);
     SendFrame(kOpPresent, nullptr, 0);
+  }
+
+  // Report the composition caret rect (DIP, view coords) so the host can place
+  // the OS IME candidate window under the text being composed.
+  void OnImeCompositionRangeChanged(CefRefPtr<CefBrowser>, const CefRange&,
+                                    const RectList& bounds) override {
+    CefRect r = bounds.empty() ? CefRect(0, 0, 0, 0) : bounds.front();
+    uint8_t p[16];
+    WriteU32BE(p + 0, static_cast<uint32_t>(std::max(0, r.x)));
+    WriteU32BE(p + 4, static_cast<uint32_t>(std::max(0, r.y)));
+    WriteU32BE(p + 8, static_cast<uint32_t>(std::max(0, r.width)));
+    WriteU32BE(p + 12, static_cast<uint32_t>(std::max(0, r.height)));
+    SendFrame(kOpImeBounds, p, 16);
   }
 
   IMPLEMENT_REFCOUNTING(HostRenderHandler);
@@ -828,7 +856,19 @@ void DoImeSetComposition(const std::string& text) {
   if (!g_browser) return;
   CefString t(text);
   uint32_t len = static_cast<uint32_t>(t.length());
+  // Mark the whole composition with a single underline so the in-progress text
+  // is visibly distinguished (transparent color -> Blink picks an adaptive
+  // default that reads on both light and dark pages). The caret sits at the end.
   std::vector<CefCompositionUnderline> underlines;
+  if (len > 0) {
+    CefCompositionUnderline u;
+    u.range = CefRange(0, len);
+    u.color = 0;             // transparent: let Blink choose a contrasting color
+    u.background_color = 0;  // transparent background
+    u.thick = 0;             // thin underline
+    u.style = CEF_CUS_SOLID;
+    underlines.push_back(u);
+  }
   g_browser->GetHost()->ImeSetComposition(t, underlines,
                                           CefRange::InvalidRange(),
                                           CefRange(len, len));
@@ -882,10 +922,13 @@ void DoKey(int type, uint32_t modifiers, int32_t windows_key_code,
   ev.modifiers = modifiers;
   ev.windows_key_code = windows_key_code;
   ev.native_key_code = native_key_code;
-  if (type == 3) {
-    ev.character = static_cast<char16_t>(character);
-    ev.unmodified_character = static_cast<char16_t>(character);
-  }
+  // ALWAYS set the character fields, not just for CHAR. On macOS OSR, an editing
+  // or navigation key (Backspace, arrows, …) with a zero character is applied
+  // TWICE inside Blink — populating it with the real NSEvent codepoint
+  // de-duplicates it (CEF forum t=11650). 0 for printable keys is fine: their
+  // text rides the IME ImeCommitText path, and a raw keydown inserts nothing.
+  ev.character = static_cast<char16_t>(character);
+  ev.unmodified_character = static_cast<char16_t>(character);
   g_browser->GetHost()->SendKeyEvent(ev);
 }
 

@@ -77,6 +77,32 @@ void main() {
     });
   });
 
+  group('cefMacCharForKey — editing/nav keys carry the NSEvent character', () {
+    // A 0 here is the "Backspace deletes two / arrow moves two" CEF-OSR bug
+    // (forum t=11650): the host de-duplicates only when character is non-zero.
+    final expected = <LogicalKeyboardKey, int>{
+      LogicalKeyboardKey.backspace: 0x7F,
+      LogicalKeyboardKey.delete: 0xF728,
+      LogicalKeyboardKey.tab: 0x09,
+      LogicalKeyboardKey.enter: 0x0D,
+      LogicalKeyboardKey.escape: 0x1B,
+      LogicalKeyboardKey.arrowUp: 0xF700,
+      LogicalKeyboardKey.arrowDown: 0xF701,
+      LogicalKeyboardKey.arrowLeft: 0xF702,
+      LogicalKeyboardKey.arrowRight: 0xF703,
+    };
+    expected.forEach((key, code) {
+      test('${key.debugName} -> 0x${code.toRadixString(16)}', () {
+        expect(cefMacCharForKey(key), code);
+        expect(cefMacCharForKey(key), isNonZero); // the whole point
+      });
+    });
+    test('printable keys carry no override char (-> 0; they ride the IME)', () {
+      expect(cefMacCharForKey(LogicalKeyboardKey.keyA), 0);
+      expect(cefMacCharForKey(LogicalKeyboardKey.digit5), 0);
+    });
+  });
+
   group('cefMacNativeKeyCode — physical key -> macOS keycode', () {
     test('digit 0 -> 29 (kVK_ANSI_0), NOT 48 (Tab) — the focus-move bug', () {
       expect(cefMacNativeKeyCode(PhysicalKeyboardKey.digit0), 29);

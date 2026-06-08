@@ -39,6 +39,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   private static let opEvalResult: UInt8 = 0x16
   private static let opChannelMsg: UInt8 = 0x17
   private static let opDownload: UInt8 = 0x18
+  private static let opImeBounds: UInt8 = 0x19
   private static let opNavigate: UInt8 = 0x20
   private static let opReload: UInt8 = 0x21
   private static let opStop: UInt8 = 0x22
@@ -74,6 +75,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   var onEvalResult: ((String) -> Void)?  // "id:json"
   var onChannelMsg: ((String) -> Void)?  // "name:message"
   var onDownload: ((String) -> Void)?  // suggested name
+  var onImeBounds: ((Int, Int, Int, Int) -> Void)?  // caret rect x,y,w,h (DIP)
 
   let sessionId: String
   private(set) var textureId: Int64 = 0
@@ -475,6 +477,11 @@ final class CefWebSession: NSObject, FlutterTexture {
         onChannelMsg?(String(bytes: body[1...], encoding: .utf8) ?? "")
       case Self.opDownload:
         onDownload?(String(bytes: body[1...], encoding: .utf8) ?? "")
+      case Self.opImeBounds:
+        if body.count >= 17 {
+          onImeBounds?(readU32(body, 1), readU32(body, 5),
+                       readU32(body, 9), readU32(body, 13))
+        }
       default:
         break
       }

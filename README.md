@@ -1,6 +1,6 @@
 # flutter_cef
 
-Embed a **live Chromium browser** (via the [Chromium Embedded Framework](https://bitbucket.org/chromiumembedded/cef/)) as a Flutter widget — rendered into a `Texture`, so it composites, transforms, clips, and zooms like any other widget, and **keeps rendering even when off-screen / not focused**. Pointer, scroll, and keyboard input are forwarded; the page cursor drives a `MouseRegion`.
+Embed a **live Chromium browser** (via the [Chromium Embedded Framework](https://bitbucket.org/chromiumembedded/cef/)) as a Flutter widget — rendered into a `Texture`, so it composites, transforms, clips, and zooms like any other widget, and **keeps rendering even when off-screen / not focused**. Pointer, scroll, and keyboard input are forwarded (including platform IME composition for CJK / emoji); the page cursor drives a `MouseRegion`.
 
 > Status: **experimental, macOS 12+ only** (CEF 144 runtime floor). Real Chromium (any site — JS/CSS/WebGL/video). **Multi-process by default** (software OSR — `OnPaint` CPU readback into a shared IOSurface, Retina-crisp; renderer/utility crashes isolated, so heavy SPAs like Google sign-in render and survive); `-DCEF_MULTI_PROCESS=OFF` for the simpler single-process build. No mobile (iOS bans third-party engines); desktop by nature.
 
@@ -113,14 +113,14 @@ Known limitation: the IOSurface is single-buffered, so very fast-updating pages
 can tear slightly under the compositor; double-buffering is planned. Working
 today: **multi-process** OSR render (on/off-screen, HiDPI/Retina-crisp,
 software `OnPaint` readback into a shared IOSurface, heavy SPAs render + survive),
-software `OnPaint` readback into a shared IOSurface, heavy SPAs render + survive),
-pointer/scroll/keyboard input, `<select>` popups, page cursor; navigation +
-history, page-lifecycle events (start/finish/progress/url-change), new-window
-routing (`onCreateWindow`), loading/title/url/error/console state; JS dialogs
-(alert/confirm/prompt), a JS bridge (`addJavaScriptChannel` +
+pointer/scroll/keyboard input, **IME text input** (CJK composition + emoji, the
+candidate window tracked under the caret), `<select>` popups, page cursor;
+navigation + history, page-lifecycle events (start/finish/progress/url-change),
+new-window routing (`onCreateWindow`), loading/title/url/error/console state; JS
+dialogs (alert/confirm/prompt), a JS bridge (`addJavaScriptChannel` +
 `runJavaScriptReturningResult` over `CefMessageRouter`), `executeJavaScript`;
-content zoom, find-in-page, `loadHtmlString`/`loadFile`, cookies, scroll, and
-title/user-agent getters.
+content zoom, find-in-page, `loadHtmlString`/`loadFile`, cookies, scroll,
+title/user-agent getters, and downloads.
 
 Next:
 
@@ -133,10 +133,12 @@ Next:
   validation), then set `shared_texture_enabled = true` to switch on the
   zero-copy path (the `OnAcceleratedPaint` handler is already in place). Then
   notarize for distribution.
-- **IME / composition** (CJK, emoji), **downloads**, `loadRequest` with
-  custom headers / POST body, `setUserAgent`, devtools, and Windows / Linux
-  hosts (the federated structure is ready; each needs its own shared-texture
-  path).
+- **Double-buffer the IOSurface** to remove the residual tearing on
+  fast-updating pages (JCEF's named-mutex 2-slot buffer is a good reference).
+- **The CEF feature tail** that CefSharp/JCEF expose: `loadRequest` with custom
+  headers / POST body, `setUserAgent`, request / resource interception, custom
+  scheme handlers, a typed DevTools/CDP client, and `CefPermissionHandler`
+  (WebRTC camera/mic prompts).
 - **Windows / Linux** — the federated structure is ready; each needs its own host
   + shared-texture path.
 

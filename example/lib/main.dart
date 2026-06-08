@@ -72,6 +72,42 @@ class _BrowserDemoState extends State<BrowserDemo> {
     );
   }
 
+  /// Load a tiny form to exercise text input: focus a field, switch to a CJK
+  /// input source (or press ⌃⌘Space for emoji), and the composition + committed
+  /// text should land in the page intact.
+  void _loadImeTest() {
+    _urlBar.text = 'IME test';
+    _controller.loadHtmlString('''
+<!doctype html><meta charset="utf-8">
+<style>
+  body{font:20px system-ui;margin:24px;color:#111;background:#fff}
+  h1{font-size:22px} label{display:block;margin:16px 0 4px;color:#444}
+  input,textarea{font:20px system-ui;width:100%;box-sizing:border-box;padding:8px}
+  .echo{margin-top:12px;color:#666;font-size:16px}
+</style>
+<h1>IME / text-input test</h1>
+<p>Switch to a CJK input source (or press ⌃⌘Space for emoji) and type. The
+composition should underline, the candidate window should sit under the caret,
+and committed text — including emoji — should appear intact.</p>
+<label>Single-line input</label>
+<input id="a" autofocus placeholder="type here…">
+<label>Textarea</label>
+<textarea id="b" rows="4" placeholder="type here…"></textarea>
+<label>Dropdown (focus it, then use arrow keys / type to select)</label>
+<select id="s">
+  <option>Apple</option><option>Banana</option><option>Cherry</option>
+  <option>Date</option><option>Elderberry</option><option>Fig</option>
+</select>
+<div class="echo">last value: <span id="e">—</span></div>
+<script>
+  const e = document.getElementById('e');
+  for (const el of [a, b]) {
+    el.addEventListener('input', ev => { e.textContent = JSON.stringify(ev.target.value); });
+  }
+  s.addEventListener('change', ev => { e.textContent = 'select → ' + JSON.stringify(ev.target.value); });
+</script>''');
+  }
+
   void _go() => _controller.navigate(_normalize(_urlBar.text.trim()));
 
   String _normalize(String s) => s.isEmpty
@@ -121,6 +157,11 @@ class _BrowserDemoState extends State<BrowserDemo> {
                     icon: const Icon(Icons.code),
                     tooltip: 'runJavaScriptReturningResult(document.title)',
                     onPressed: _runJs,
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.keyboard),
+                    tooltip: 'Load the IME / text-input test page',
+                    onPressed: _loadImeTest,
                   ),
                   Expanded(
                     child: TextField(

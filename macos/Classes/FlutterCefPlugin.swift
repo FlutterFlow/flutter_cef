@@ -190,6 +190,11 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     session.onDownload = { [weak self] name in
       self?.emit("download", ["sessionId": sessionId, "suggestedName": name])
     }
+    session.onImeBounds = { [weak self] x, y, w, h in
+      self?.emit("imeCompositionBounds", [
+        "sessionId": sessionId, "x": x, "y": y, "w": w, "h": h,
+      ])
+    }
     sessions[sessionId] = session
     result(["textureId": session.textureId, "width": width, "height": height])
   }
