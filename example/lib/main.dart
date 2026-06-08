@@ -29,6 +29,7 @@ class _BrowserDemoState extends State<BrowserDemo> {
   static const _startUrl = 'https://flutter.dev';
   final CefWebController _controller = CefWebController();
   final TextEditingController _urlBar = TextEditingController(text: _startUrl);
+  double _zoom = 0;
 
   @override
   void initState() {
@@ -40,6 +41,17 @@ class _BrowserDemoState extends State<BrowserDemo> {
     });
     _controller.onLoadError = (e) =>
         debugPrint('load error ${e.errorCode} ${e.url}: ${e.errorText}');
+    // Links that open a new window (target=_blank / window.open) load in place
+    // rather than spawning a separate native window.
+    _controller.onCreateWindow = (url) {
+      _urlBar.text = url;
+      _controller.navigate(url);
+    };
+  }
+
+  void _setZoom(double z) {
+    setState(() => _zoom = z.clamp(-3.0, 3.0));
+    _controller.setZoomLevel(_zoom);
   }
 
   void _go() => _controller.navigate(_normalize(_urlBar.text.trim()));
@@ -72,6 +84,14 @@ class _BrowserDemoState extends State<BrowserDemo> {
                   IconButton(
                     icon: const Icon(Icons.refresh),
                     onPressed: _controller.reload,
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.zoom_out),
+                    onPressed: () => _setZoom(_zoom - 0.5),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.zoom_in),
+                    onPressed: () => _setZoom(_zoom + 0.5),
                   ),
                   Expanded(
                     child: TextField(
