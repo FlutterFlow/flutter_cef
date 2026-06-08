@@ -338,6 +338,43 @@ void main() {
     expect(got, 'file.zip');
   });
 
+  test('dispose fails pending evals and ignores later events', () async {
+    final c = CefWebController(sessionId: 'dp');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    final f = c.runJavaScriptReturningResult('x');
+    final exp = expectLater(f, throwsA(isA<StateError>()));
+    await c.dispose();
+    await exp;
+    var called = false;
+    c.onPageStarted = (_) => called = true;
+    await emit('dp', 'pageStarted', {'url': 'https://late.test/'});
+    expect(called, false, reason: 'events after dispose must be ignored');
+  });
+
+  test('alert dialog routes to the handler and acks', () async {
+    final c = CefWebController(sessionId: 'al');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    String? msg;
+    c.onJavaScriptAlertDialog = (req) async {
+      msg = req.message;
+    };
+    await emit('al', 'jsDialog',
+        {'id': 7, 'type': 0, 'message': 'hi', 'defaultText': ''});
+    await pumpEventQueue();
+    expect(msg, 'hi');
+    final resp =
+        log.firstWhere((m) => m.method == 'respondJsDialog').arguments as Map;
+    expect(resp['ok'], true);
+  });
+
+  test('addJavaScriptChannel rejects a non-identifier name', () {
+    final c = CefWebController(sessionId: 'cv');
+    expect(
+        () =>
+            c.addJavaScriptChannel("x'];alert(1)//", onMessageReceived: (_) {}),
+        throwsArgumentError);
+  });
+
   test('cookie verbs forward to native', () async {
     final c = CefWebController(sessionId: 'ck');
     await c.setCookie(

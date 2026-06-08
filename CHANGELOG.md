@@ -20,6 +20,12 @@
   composition API (`imeSetComposition` / `imeCommitText` /
   `imeCancelComposition`).
 * Verbose CEF logging is now gated behind the `FLUTTER_CEF_DEBUG` env var.
+* Hardening (security/concurrency audit): validate JS channel names before
+  injection; fail pending `runJavaScriptReturningResult` completers on
+  navigation/dispose; deterministic session teardown that joins the reader
+  thread (no use-after-free on dispose); per-user/per-process CEF cache +
+  randomized IPC socket (off the world-readable `/tmp`); null main-frame and
+  resize-dimension guards in the host.
 
 ## 0.0.1
 

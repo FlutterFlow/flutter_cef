@@ -95,6 +95,9 @@ final class CefWebSession: NSObject, FlutterTexture {
   private let writeLock = NSLock()
   private var pendingFrames: [[UInt8]] = []  // queued until the pipe connects
   private var running = false
+  private var readerStarted = false
+  private let readerDone = DispatchSemaphore(value: 0)  // signaled when the
+  // acceptAndRead thread exits, so dispose() can join it before freeing state.
 
   init(sessionId: String, url: String, width: Int, height: Int, dpr: CGFloat,
        registry: FlutterTextureRegistry, cefHostPath: String) {
@@ -229,15 +232,47 @@ final class CefWebSession: NSObject, FlutterTexture {
   }
 
   func dispose() {
-    running = false
+    // Tell the host to quit (best-effort), then stop the reader thread *first*:
+    // flag it, wake its blocking accept()/read() by shutting down the fds, and
+    // wait for it to exit before freeing anything it touches. Closing an fd a
+    // thread is blocked on, or freeing buffers/texture under the reader, is a
+    // use-after-free — this join makes teardown deterministic.
     sendFrame(Self.opShutdown)
-    if connFd >= 0 { shutdown(connFd, SHUT_RDWR); close(connFd); connFd = -1 }
+    writeLock.lock()
+    let wasRunning = running
+    running = false
+    let c = connFd, l = listenFd
+    writeLock.unlock()
+    if c >= 0 { shutdown(c, SHUT_RDWR) }
+    if l >= 0 { shutdown(l, SHUT_RDWR) }
+    if readerStarted && wasRunning { _ = readerDone.wait(timeout: .now() + 2) }
+    writeLock.lock()
+    if connFd >= 0 { close(connFd); connFd = -1 }
     if listenFd >= 0 { close(listenFd); listenFd = -1 }
-    if !socketPath.isEmpty { unlink(socketPath) }
-    process?.terminate()
-    process = nil
+    writeLock.unlock()
+    if !socketPath.isEmpty { unlink(socketPath); socketPath = "" }
+    terminateProcess()
     if textureId != 0 { registry?.unregisterTexture(textureId); textureId = 0 }
     bufferLock.lock(); pixelBuffer = nil; ioSurface = nil; bufferLock.unlock()
+  }
+
+  private func terminateProcess() {
+    guard let p = process else { return }
+    process = nil
+    p.terminate()  // SIGTERM
+    // Escalate to SIGKILL if the host is wedged and ignores SIGTERM.
+    DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) {
+      if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+    }
+  }
+
+  deinit {
+    // Safety net if the session is dropped without dispose() (e.g. setup failed
+    // partway). dispose() zeroes the fds, so this is a no-op after a clean dispose.
+    if process?.isRunning == true { process?.terminate() }
+    if connFd >= 0 { close(connFd) }
+    if listenFd >= 0 { close(listenFd) }
+    if !socketPath.isEmpty { unlink(socketPath) }
   }
 
   // MARK: Buffers
@@ -285,7 +320,14 @@ final class CefWebSession: NSObject, FlutterTexture {
   // MARK: Subprocess + IPC
 
   private func setupSocketAndSpawn(url: String) {
-    socketPath = NSTemporaryDirectory() + "wccef-\(sessionId).sock"
+    // Randomized name (not just the predictable sequential sessionId) in the
+    // per-user 0700 temp dir, so another same-UID process can't pre-bind it.
+    let rnd = String(format: "%08x", UInt32.random(in: 0 ... UInt32.max))
+    socketPath = NSTemporaryDirectory() + "wccef-\(sessionId)-\(rnd).sock"
+    guard socketPath.utf8CString.count <= 104 else {
+      NSLog("[cef] socket path exceeds sun_path (104); aborting")
+      return
+    }
     unlink(socketPath)
     listenFd = socket(AF_UNIX, SOCK_STREAM, 0)
     guard listenFd >= 0 else { NSLog("[cef] socket() failed"); return }
@@ -324,10 +366,12 @@ final class CefWebSession: NSObject, FlutterTexture {
       NSLog("[cef] failed to spawn cef_host at \(cefHostPath): \(error)")
       return
     }
+    readerStarted = true
     Thread.detachNewThread { [weak self] in self?.acceptAndRead() }
   }
 
   private func acceptAndRead() {
+    defer { readerDone.signal() }  // let dispose() join us on every exit path
     let fd = accept(listenFd, nil, nil)
     guard fd >= 0 else { NSLog("[cef] accept() failed"); return }
     // Bring the pipe up and drain anything queued before it connected — all under

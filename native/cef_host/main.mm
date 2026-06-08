@@ -41,6 +41,7 @@
 #import <IOSurface/IOSurface.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -144,6 +145,25 @@ uint32_t g_dialog_next = 1;
 // (the CefMessageRouter channel — renderer half lives in process_helper.mm).
 std::set<std::string> g_channels;
 
+// A JS channel name is interpolated into the injected shim's source, so it MUST
+// be a plain JS identifier — otherwise a crafted name could break out of the
+// string literal and run arbitrary script on every page load. Reject anything
+// else (DoAddChannel drops invalid names).
+bool IsValidChannelName(const std::string& n) {
+  if (n.empty() || n.size() > 64) return false;
+  auto isFirst = [](unsigned char c) {
+    return std::isalpha(c) || c == '_' || c == '$';
+  };
+  auto isRest = [](unsigned char c) {
+    return std::isalnum(c) || c == '_' || c == '$';
+  };
+  if (!isFirst(static_cast<unsigned char>(n[0]))) return false;
+  for (size_t i = 1; i < n.size(); ++i) {
+    if (!isRest(static_cast<unsigned char>(n[i]))) return false;
+  }
+  return true;
+}
+
 void InjectChannelShim(CefRefPtr<CefFrame> frame, const std::string& name) {
   if (!frame) return;
   std::string js = "window['" + name +
@@ -196,13 +216,16 @@ void SendFrame(uint8_t opcode, const void* payload, uint32_t payload_len) {
   if (g_ipc_fd < 0) return;
   std::lock_guard<std::mutex> lock(g_ipc_write_mutex);
   uint32_t body_len = 1 + payload_len;
-  uint8_t hdr[4] = {static_cast<uint8_t>((body_len >> 24) & 0xff),
-                    static_cast<uint8_t>((body_len >> 16) & 0xff),
-                    static_cast<uint8_t>((body_len >> 8) & 0xff),
-                    static_cast<uint8_t>(body_len & 0xff)};
-  if (!WriteAll(g_ipc_fd, hdr, 4)) return;
-  if (!WriteAll(g_ipc_fd, &opcode, 1)) return;
-  if (payload_len) WriteAll(g_ipc_fd, payload, payload_len);
+  // Assemble the whole frame and write it in one WriteAll so a partial write
+  // never leaves the peer with a length prefix it can't satisfy (stream desync).
+  std::vector<uint8_t> frame(4 + body_len);
+  frame[0] = static_cast<uint8_t>((body_len >> 24) & 0xff);
+  frame[1] = static_cast<uint8_t>((body_len >> 16) & 0xff);
+  frame[2] = static_cast<uint8_t>((body_len >> 8) & 0xff);
+  frame[3] = static_cast<uint8_t>(body_len & 0xff);
+  frame[4] = opcode;
+  if (payload_len) memcpy(frame.data() + 5, payload, payload_len);
+  WriteAll(g_ipc_fd, frame.data(), frame.size());
 }
 
 void SendLog(const std::string& msg) {
@@ -489,6 +512,10 @@ class HostClient : public CefClient,
     callback->Continue(true, CefString());
     return true;
   }
+  // CEF calls this when a pending dialog is dismissed by navigation / reload /
+  // renderer death. Drop any held callbacks so they don't leak (the host may
+  // never send a response for a dialog the page already abandoned).
+  void OnResetDialogState(CefRefPtr<CefBrowser>) override { g_dialogs.clear(); }
 
   // Recover from a renderer crash (multi-process only): reload rather than show
   // a dead page. In single-process a renderer CHECK kills the whole process, so
@@ -533,7 +560,7 @@ class HostClient : public CefClient,
   }
   void OnAddressChange(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
                        const CefString& url) override {
-    if (frame->IsMain()) SendUtf8(kOpUrl, url.ToString());
+    if (frame && frame->IsMain()) SendUtf8(kOpUrl, url.ToString());
   }
   bool OnConsoleMessage(CefRefPtr<CefBrowser>, cef_log_severity_t level,
                         const CefString& message, const CefString& source,
@@ -692,6 +719,11 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
 
 // ---- CEF-thread task helpers (IPC reader runs off the UI thread) ----
 void DoResize(int w, int h, uint32_t surface_id) {
+  if (w < 1 || w > 16384 || h < 1 || h > 16384) {
+    SendLog("resize: out-of-range dims " + std::to_string(w) + "x" +
+            std::to_string(h));
+    return;
+  }
   IOSurfaceRef next = IOSurfaceLookup(surface_id);
   if (!next) {
     SendLog("resize: IOSurfaceLookup failed for id " + std::to_string(surface_id));
@@ -708,7 +740,9 @@ void DoResize(int w, int h, uint32_t surface_id) {
 }
 
 void DoNavigate(const std::string& url) {
-  if (g_browser) g_browser->GetMainFrame()->LoadURL(url);
+  if (!g_browser) return;
+  CefRefPtr<CefFrame> f = g_browser->GetMainFrame();
+  if (f) f->LoadURL(url);
 }
 
 void DoReload() {
@@ -724,7 +758,9 @@ void DoGoForward() {
   if (g_browser) g_browser->GoForward();
 }
 void DoExecuteJs(const std::string& code) {
-  if (g_browser) g_browser->GetMainFrame()->ExecuteJavaScript(code, "", 0);
+  if (!g_browser) return;
+  CefRefPtr<CefFrame> f = g_browser->GetMainFrame();
+  if (f) f->ExecuteJavaScript(code, "", 0);
 }
 void DoSetZoom(double level) {
   if (g_browser) g_browser->GetHost()->SetZoomLevel(level);
@@ -745,16 +781,27 @@ void DoJsDialogResp(uint32_t id, bool ok, const std::string& text) {
 }
 void DoEvalReturning(uint32_t id, const std::string& code) {
   if (!g_browser) return;
+  CefRefPtr<CefFrame> frame = g_browser->GetMainFrame();
+  if (!frame) return;
   // Evaluate the user expression and post its JSON result back via window.cefQuery
-  // (OnQuery -> kOpEvalResult). JSON.stringify omits the value on undefined.
+  // (OnQuery -> kOpEvalResult). `code` is the trusted host's JS (same trust level
+  // as executeJavaScript) and must be a single expression. We splice it rather
+  // than eval() it so it still works under a strict page CSP (eval would be
+  // blocked); the Dart side fails any pending result on navigation so a malformed
+  // expression that wedges this callback can't leak a completer forever.
   std::string js =
       "window.cefQuery({request:'eval:" + std::to_string(id) +
       ":'+(function(){try{return JSON.stringify({ok:true,v:(" + code +
       "\n)});}catch(e){return JSON.stringify({ok:false,v:String(e)});}})(),"
       "persistent:false,onSuccess:function(){},onFailure:function(){}});";
-  g_browser->GetMainFrame()->ExecuteJavaScript(js, "", 0);
+  frame->ExecuteJavaScript(js, "", 0);
 }
 void DoAddChannel(const std::string& name) {
+  if (!IsValidChannelName(name)) {
+    SendLog("addJavaScriptChannel: rejected invalid name '" + name +
+            "' (must be a JS identifier)");
+    return;
+  }
   g_channels.insert(name);
   if (g_browser) InjectChannelShim(g_browser->GetMainFrame(), name);
 }
@@ -769,7 +816,9 @@ void DoSetCookie(const std::string& url, const std::string& name,
   if (!domain.empty()) CefString(&cookie.domain).FromString(domain);
   CefString(&cookie.path).FromString(path.empty() ? "/" : path);
   cookie.has_expires = false;
-  mgr->SetCookie(url, cookie, nullptr);
+  if (!mgr->SetCookie(url, cookie, nullptr)) {
+    SendLog("setCookie rejected for " + url + " (name '" + name + "')");
+  }
 }
 void DoClearCookies() {
   CefRefPtr<CefCookieManager> mgr = CefCookieManager::GetGlobalManager(nullptr);
@@ -1099,7 +1148,13 @@ int main(int argc, char* argv[]) {
     settings.no_sandbox = true;
     settings.windowless_rendering_enabled = true;
     settings.log_severity = LOGSEVERITY_INFO;
-    CefString(&settings.root_cache_path) = "/tmp/cef_host_cache";
+    // Per-process cache under the per-user (0700) temp dir — NOT a fixed,
+    // world-readable /tmp path (cookies/localStorage are private), and a per-pid
+    // dir avoids the CEF cache lock colliding when several webviews run at once.
+    std::string cef_cache =
+        std::string([NSTemporaryDirectory() UTF8String]) + "flutter_cef_cache_" +
+        std::to_string([[NSProcessInfo processInfo] processIdentifier]);
+    CefString(&settings.root_cache_path) = cef_cache;
     // A plain (non-.app) executable can't auto-locate the framework Resources
     // (icudtl.dat, *.pak, locale .lproj), so point CEF at them explicitly via a
     // normalized (no "..") framework dir.

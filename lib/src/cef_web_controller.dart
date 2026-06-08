@@ -16,10 +16,16 @@ import 'cef_input.dart';
 /// Use it when you need to script a view.
 class CefWebController {
   CefWebController({String? sessionId})
-      : sessionId = sessionId ?? 'cef-${_counter++}';
+      : sessionId = sessionId ?? 'cef-${_counter++}' {
+    // Register + install the host->Dart handler at construction (not in create),
+    // so callbacks wired before create() can't miss early events.
+    _bySession[this.sessionId] = this;
+    _installHandler();
+  }
 
   static const MethodChannel _channel = MethodChannel('flutter_cef');
   static int _counter = 0;
+  bool _disposed = false;
 
   /// Stable id for this session, echoed in every host message.
   final String sessionId;
@@ -89,6 +95,7 @@ class CefWebController {
   static final Map<String, CefWebController> _bySession =
       <String, CefWebController>{};
   static bool _handlerInstalled = false;
+  static final RegExp _channelNameRe = RegExp(r'^[A-Za-z_$][A-Za-z0-9_$]*$');
 
   // runJavaScriptReturningResult: pending evals keyed by id, resolved by the
   // 'evalResult' event. JS channels: name -> message handler.
@@ -109,6 +116,7 @@ class CefWebController {
   }
 
   void _onEvent(String method, Map<String, dynamic> a) {
+    if (_disposed) return;
     switch (method) {
       case 'cursor':
         cursor.value = cefCursorForType(a['cursor'] as int? ?? 0);
@@ -139,6 +147,9 @@ class CefWebController {
         ));
         break;
       case 'pageStarted':
+        // A new main-frame load means any in-flight eval result won't arrive —
+        // fail those completers instead of leaking them on a long-lived view.
+        _failPendingEvals('navigated before the JavaScript result returned');
         onPageStarted?.call(a['url'] as String? ?? '');
         break;
       case 'pageFinished':
@@ -192,6 +203,17 @@ class CefWebController {
     }
   }
 
+  /// Fail every pending [runJavaScriptReturningResult] (called on navigation and
+  /// on dispose) so a result that can never arrive doesn't leak the completer.
+  void _failPendingEvals(String reason) {
+    if (_evalPending.isEmpty) return;
+    final pending = _evalPending.values.toList();
+    _evalPending.clear();
+    for (final c in pending) {
+      if (!c.isCompleted) c.completeError(StateError(reason));
+    }
+  }
+
   /// Deliver a JS-channel post. Payload is `"name:message"`.
   void _handleChannelMessage(String payload) {
     final i = payload.indexOf(':');
@@ -228,6 +250,7 @@ class CefWebController {
     } catch (_) {
       ok = false;
     }
+    if (_disposed) return; // controller torn down while the callback awaited
     await _channel.invokeMethod('respondJsDialog',
         {'sessionId': sessionId, 'id': id, 'ok': ok, 'text': text});
   }
@@ -240,8 +263,6 @@ class CefWebController {
     required int height,
     double dpr = 1.0,
   }) async {
-    _bySession[sessionId] = this;
-    _installHandler();
     final res = await _channel.invokeMapMethod<String, dynamic>('create', {
       'sessionId': sessionId,
       'url': url,
@@ -259,6 +280,7 @@ class CefWebController {
     return textureId;
   }
 
+  /// Navigate the main frame to [url].
   Future<void> navigate(String url) =>
       _channel.invokeMethod('navigate', {'sessionId': sessionId, 'url': url});
 
@@ -294,6 +316,9 @@ class CefWebController {
   /// every page load. Names should be unique JS identifiers.
   Future<void> addJavaScriptChannel(String name,
       {required void Function(String message) onMessageReceived}) {
+    if (!_channelNameRe.hasMatch(name)) {
+      throw ArgumentError.value(name, 'name', 'must be a JS identifier');
+    }
     _channels[name] = onMessageReceived;
     return _channel.invokeMethod(
         'addJavaScriptChannel', {'sessionId': sessionId, 'name': name});
@@ -402,6 +427,8 @@ class CefWebController {
   Future<void> _send(String method) =>
       _channel.invokeMethod(method, {'sessionId': sessionId});
 
+  /// Resize the off-screen surface to [width]x[height] logical px at [dpr].
+  /// Driven automatically by [CefWebView]; rarely called directly.
   Future<void> resize(int width, int height, {double dpr = 1.0}) =>
       _channel.invokeMethod('resize', {
         'sessionId': sessionId,
@@ -453,11 +480,9 @@ class CefWebController {
   }
 
   Future<void> dispose() async {
+    _disposed = true;
     _bySession.remove(sessionId);
-    for (final c in _evalPending.values) {
-      if (!c.isCompleted) c.completeError(StateError('controller disposed'));
-    }
-    _evalPending.clear();
+    _failPendingEvals('controller disposed');
     _channels.clear();
     cursor.dispose();
     isLoading.dispose();

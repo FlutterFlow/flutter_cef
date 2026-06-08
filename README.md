@@ -88,9 +88,31 @@ IOSurface, writes a cache); entitlements need
 one identity (framework → cef_host → app, inside-out) and library validation can
 stay on.
 
+## Security
+
+`flutter_cef` embeds a full, **non-sandboxed** Chromium that runs arbitrary web
+content with JIT. Treat any page you load as untrusted code. Specifically:
+
+- **Non-sandboxed host with hardened-runtime relaxations** (`disable-library-validation`,
+  `allow-jit`, `allow-unsigned-executable-memory` — required by CEF's renderer).
+  `get-task-allow` is on for dev and **must be removed + the app notarized** to
+  distribute.
+- **Multi-process Mach-port peer validation is disabled** for the process tree
+  (`MACH_PORT_RENDEZVOUS_PEER_VALDATION=0`) so ad-hoc signing works; the
+  production posture is inside-out Developer-ID signing so that can be dropped
+  (see below).
+- **JS channel names are validated** as JS identifiers before injection (so a
+  channel name can't break out and run script), and **`runJavaScriptReturningResult`
+  expects a single expression** from trusted app code.
+- **Per-user, per-process CEF cache** (under the 0700 temp dir, not a fixed
+  world-readable `/tmp` path) and a **randomized control-socket name**.
+
 ## Roadmap
 
-Working today: **multi-process** OSR render (on/off-screen, HiDPI/Retina-crisp,
+Known limitation: the IOSurface is single-buffered, so very fast-updating pages
+can tear slightly under the compositor; double-buffering is planned. Working
+today: **multi-process** OSR render (on/off-screen, HiDPI/Retina-crisp,
+software `OnPaint` readback into a shared IOSurface, heavy SPAs render + survive),
 software `OnPaint` readback into a shared IOSurface, heavy SPAs render + survive),
 pointer/scroll/keyboard input, `<select>` popups, page cursor; navigation +
 history, page-lifecycle events (start/finish/progress/url-change), new-window
