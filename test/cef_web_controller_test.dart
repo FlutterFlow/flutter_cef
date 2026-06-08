@@ -178,4 +178,40 @@ void main() {
     await emit('nw', 'newWindow', {'url': 'https://popup.test/'});
     expect(opened, 'https://popup.test/');
   });
+
+  test('zoom + find + load verbs are forwarded', () async {
+    final c = CefWebController(sessionId: 'b2');
+    await c.setZoomLevel(1.0);
+    await c.find('hello', forward: false, matchCase: true);
+    await c.stopFind();
+    await c.loadHtmlString('<h1>hi</h1>');
+    await c.loadFile('/tmp/x.html');
+    final zoom =
+        log.firstWhere((m) => m.method == 'setZoomLevel').arguments as Map;
+    expect(zoom['level'], 1.0);
+    final find = log.firstWhere((m) => m.method == 'find').arguments as Map;
+    expect(find['text'], 'hello');
+    expect(find['forward'], false);
+    expect(find['matchCase'], true);
+    expect(log.any((m) => m.method == 'stopFind'), true);
+    // loadHtmlString + loadFile route through navigate with data:/file: urls.
+    final navs = log
+        .where((m) => m.method == 'navigate')
+        .map((m) => (m.arguments as Map)['url'] as String)
+        .toList();
+    expect(navs.any((u) => u.startsWith('data:text/html')), true);
+    expect(navs, contains('file:///tmp/x.html'));
+  });
+
+  test('findResult event invokes onFindResult', () async {
+    final c = CefWebController(sessionId: 'fr');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    CefFindResult? got;
+    c.onFindResult = (r) => got = r;
+    await emit('fr', 'findResult',
+        {'count': 5, 'activeMatchOrdinal': 2, 'isFinal': true});
+    expect(got!.numberOfMatches, 5);
+    expect(got!.activeMatchOrdinal, 2);
+    expect(got!.isFinalUpdate, true);
+  });
 }

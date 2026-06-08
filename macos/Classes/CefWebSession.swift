@@ -34,12 +34,16 @@ final class CefWebSession: NSObject, FlutterTexture {
   private static let opResize: UInt8 = 0x11
   private static let opKey: UInt8 = 0x12
   private static let opShutdown: UInt8 = 0x14
+  private static let opFindResult: UInt8 = 0x0e
   private static let opNavigate: UInt8 = 0x20
   private static let opReload: UInt8 = 0x21
   private static let opStop: UInt8 = 0x22
   private static let opBack: UInt8 = 0x23
   private static let opForward: UInt8 = 0x24
   private static let opExecuteJs: UInt8 = 0x25
+  private static let opSetZoom: UInt8 = 0x26
+  private static let opFind: UInt8 = 0x27
+  private static let opStopFind: UInt8 = 0x28
 
   // Event callbacks (fired off the main thread). The registrar relays each to a
   // Dart channel message.
@@ -53,6 +57,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   var onPageFinished: ((String) -> Void)?  // url
   var onProgress: ((Int) -> Void)?  // 0-100
   var onNewWindow: ((String) -> Void)?  // popup/target=_blank url
+  var onFindResult: ((Int, Int, Bool) -> Void)?  // count, activeOrdinal, isFinal
 
   let sessionId: String
   private(set) var textureId: Int64 = 0
@@ -126,6 +131,22 @@ final class CefWebSession: NSObject, FlutterTexture {
   func goForward() { sendFrame(Self.opForward) }
   func executeJavaScript(_ code: String) {
     sendFrame(Self.opExecuteJs, Array(code.utf8))
+  }
+
+  func setZoomLevel(_ level: Double) {
+    var p = [UInt8]()
+    appendF64(&p, level)
+    sendFrame(Self.opSetZoom, p)
+  }
+
+  func find(_ text: String, forward: Bool, matchCase: Bool, findNext: Bool) {
+    var p: [UInt8] = [forward ? 1 : 0, matchCase ? 1 : 0, findNext ? 1 : 0]
+    p.append(contentsOf: Array(text.utf8))
+    sendFrame(Self.opFind, p)
+  }
+
+  func stopFind(_ clearSelection: Bool) {
+    sendFrame(Self.opStopFind, [clearSelection ? 1 : 0])
   }
 
   // type: 0=move 1=down 2=up 3=wheel; button: 0=left 1=middle 2=right.
@@ -336,6 +357,10 @@ final class CefWebSession: NSObject, FlutterTexture {
         if body.count >= 5 { onProgress?(readU32(body, 1)) }
       case Self.opNewWindow:
         onNewWindow?(String(bytes: body[1...], encoding: .utf8) ?? "")
+      case Self.opFindResult:
+        if body.count >= 10 {
+          onFindResult?(readU32(body, 1), readU32(body, 5), body[9] != 0)
+        }
       default:
         break
       }

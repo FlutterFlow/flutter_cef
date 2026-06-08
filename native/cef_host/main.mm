@@ -64,6 +64,7 @@
 #include "include/cef_browser.h"
 #include "include/cef_client.h"
 #include "include/cef_command_line.h"
+#include "include/cef_find_handler.h"
 #include "include/cef_life_span_handler.h"
 #include "include/cef_render_handler.h"
 #include "include/cef_request_handler.h"
@@ -88,6 +89,7 @@ constexpr uint8_t kOpPageStart = 0x0a;  // {utf8 url} main frame load started
 constexpr uint8_t kOpPageFinish = 0x0b; // {utf8 url} main frame load finished
 constexpr uint8_t kOpProgress = 0x0c;   // {u32 percent 0-100}
 constexpr uint8_t kOpNewWindow = 0x0d;  // {utf8 url} popup / target=_blank
+constexpr uint8_t kOpFindResult = 0x0e; // {u32 count}{u32 activeOrdinal}{u8 final}
 constexpr uint8_t kOpPointer = 0x10;
 constexpr uint8_t kOpResize = 0x11;
 constexpr uint8_t kOpKey = 0x12;
@@ -98,6 +100,9 @@ constexpr uint8_t kOpStop = 0x22;
 constexpr uint8_t kOpBack = 0x23;
 constexpr uint8_t kOpForward = 0x24;
 constexpr uint8_t kOpExecuteJs = 0x25;  // {utf8 code}
+constexpr uint8_t kOpSetZoom = 0x26;    // {f64 level} (factor = 1.2^level)
+constexpr uint8_t kOpFind = 0x27;       // {u8 fwd}{u8 matchCase}{u8 findNext}{utf8}
+constexpr uint8_t kOpStopFind = 0x28;   // {u8 clearSelection}
 
 // ---- Shared runtime state ----
 int g_ipc_fd = -1;
@@ -364,6 +369,7 @@ class HostClient : public CefClient,
                    public CefLoadHandler,
                    public CefDisplayHandler,
                    public CefLifeSpanHandler,
+                   public CefFindHandler,
                    public CefRequestHandler {
  public:
   CefRefPtr<CefRenderHandler> rh_ = new HostRenderHandler();
@@ -371,7 +377,26 @@ class HostClient : public CefClient,
   CefRefPtr<CefLoadHandler> GetLoadHandler() override { return this; }
   CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
   CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
+  CefRefPtr<CefFindHandler> GetFindHandler() override { return this; }
   CefRefPtr<CefRequestHandler> GetRequestHandler() override { return this; }
+
+  // CefFindHandler: report find-in-page results to the host.
+  void OnFindResult(CefRefPtr<CefBrowser>, int /*identifier*/, int count,
+                    const CefRect& /*selectionRect*/, int activeMatchOrdinal,
+                    bool finalUpdate) override {
+    uint32_t c = static_cast<uint32_t>(count);
+    uint32_t a = static_cast<uint32_t>(activeMatchOrdinal);
+    uint8_t p[9] = {static_cast<uint8_t>((c >> 24) & 0xff),
+                    static_cast<uint8_t>((c >> 16) & 0xff),
+                    static_cast<uint8_t>((c >> 8) & 0xff),
+                    static_cast<uint8_t>(c & 0xff),
+                    static_cast<uint8_t>((a >> 24) & 0xff),
+                    static_cast<uint8_t>((a >> 16) & 0xff),
+                    static_cast<uint8_t>((a >> 8) & 0xff),
+                    static_cast<uint8_t>(a & 0xff),
+                    static_cast<uint8_t>(finalUpdate ? 1 : 0)};
+    SendFrame(kOpFindResult, p, 9);
+  }
 
   // Recover from a renderer crash (multi-process only): reload rather than show
   // a dead page. In single-process a renderer CHECK kills the whole process, so
@@ -568,6 +593,17 @@ void DoGoForward() {
 void DoExecuteJs(const std::string& code) {
   if (g_browser) g_browser->GetMainFrame()->ExecuteJavaScript(code, "", 0);
 }
+void DoSetZoom(double level) {
+  if (g_browser) g_browser->GetHost()->SetZoomLevel(level);
+}
+void DoFind(const std::string& text, bool forward, bool match_case,
+            bool find_next) {
+  if (g_browser)
+    g_browser->GetHost()->Find(text, forward, match_case, find_next);
+}
+void DoStopFind(bool clear_selection) {
+  if (g_browser) g_browser->GetHost()->StopFinding(clear_selection);
+}
 
 // type: 0=move 1=down 2=up 3=wheel; button: 0=left 1=middle 2=right.
 void DoPointer(int type, int button, int click_count, uint32_t modifiers,
@@ -666,6 +702,23 @@ void IpcReadLoop() {
       case kOpExecuteJs: {
         std::string code(reinterpret_cast<const char*>(p), plen);
         CefPostTask(TID_UI, base::BindOnce(&DoExecuteJs, code));
+        break;
+      }
+      case kOpSetZoom: {
+        if (plen < 8) break;
+        CefPostTask(TID_UI, base::BindOnce(&DoSetZoom, ReadF64BE(p)));
+        break;
+      }
+      case kOpFind: {
+        if (plen < 3) break;
+        bool fwd = p[0] != 0, mc = p[1] != 0, fn = p[2] != 0;
+        std::string text(reinterpret_cast<const char*>(p + 3), plen - 3);
+        CefPostTask(TID_UI, base::BindOnce(&DoFind, text, fwd, mc, fn));
+        break;
+      }
+      case kOpStopFind: {
+        bool clear = plen >= 1 ? p[0] != 0 : true;
+        CefPostTask(TID_UI, base::BindOnce(&DoStopFind, clear));
         break;
       }
       case kOpPointer: {

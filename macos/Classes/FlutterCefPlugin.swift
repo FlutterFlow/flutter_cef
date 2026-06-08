@@ -41,6 +41,21 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
         withSession(args) { $0.executeJavaScript(code) }
       }
       result(nil)
+    case "setZoomLevel":
+      withSession(args) { $0.setZoomLevel(args["level"] as? Double ?? 0) }
+      result(nil)
+    case "find":
+      if let text = args["text"] as? String {
+        withSession(args) {
+          $0.find(text, forward: args["forward"] as? Bool ?? true,
+                  matchCase: args["matchCase"] as? Bool ?? false,
+                  findNext: args["findNext"] as? Bool ?? false)
+        }
+      }
+      result(nil)
+    case "stopFind":
+      withSession(args) { $0.stopFind(args["clearSelection"] as? Bool ?? true) }
+      result(nil)
     default: result(FlutterMethodNotImplemented)
     }
   }
@@ -113,6 +128,12 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     }
     session.onNewWindow = { [weak self] u in
       self?.emit("newWindow", ["sessionId": sessionId, "url": u])
+    }
+    session.onFindResult = { [weak self] count, ordinal, isFinal in
+      self?.emit("findResult", [
+        "sessionId": sessionId, "count": count,
+        "activeMatchOrdinal": ordinal, "isFinal": isFinal,
+      ])
     }
     sessions[sessionId] = session
     result(["textureId": session.textureId, "width": width, "height": height])

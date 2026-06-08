@@ -34,3 +34,25 @@ class CefConsoleMessage {
   @override
   String toString() => 'CefConsoleMessage($level, $message)';
 }
+
+/// A find-in-page result update (see [CefWebController.find]).
+class CefFindResult {
+  const CefFindResult({
+    required this.numberOfMatches,
+    required this.activeMatchOrdinal,
+    required this.isFinalUpdate,
+  });
+
+  /// Total matches for the current search.
+  final int numberOfMatches;
+
+  /// 1-based index of the currently highlighted match (0 if none).
+  final int activeMatchOrdinal;
+
+  /// True on the last update for a search (counts are stable).
+  final bool isFinalUpdate;
+
+  @override
+  String toString() =>
+      'CefFindResult($activeMatchOrdinal/$numberOfMatches, final: $isFinalUpdate)';
+}

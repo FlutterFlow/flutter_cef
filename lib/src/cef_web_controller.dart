@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
@@ -63,6 +65,9 @@ class CefWebController {
   /// commonly [navigate] to load it in the same view, or hand it elsewhere.
   void Function(String url)? onCreateWindow;
 
+  /// Called with each find-in-page result update (see [find]).
+  void Function(CefFindResult result)? onFindResult;
+
   static final Map<String, CefWebController> _bySession =
       <String, CefWebController>{};
   static bool _handlerInstalled = false;
@@ -120,6 +125,13 @@ class CefWebController {
       case 'newWindow':
         onCreateWindow?.call(a['url'] as String? ?? '');
         break;
+      case 'findResult':
+        onFindResult?.call(CefFindResult(
+          numberOfMatches: a['count'] as int? ?? 0,
+          activeMatchOrdinal: a['activeMatchOrdinal'] as int? ?? 0,
+          isFinalUpdate: a['isFinal'] as bool? ?? false,
+        ));
+        break;
     }
   }
 
@@ -161,6 +173,42 @@ class CefWebController {
   /// Run [code] in the main frame (fire-and-forget; no return value).
   Future<void> executeJavaScript(String code) => _channel
       .invokeMethod('executeJavaScript', {'sessionId': sessionId, 'code': code});
+
+  /// Load an HTML string. (`baseUrl` is accepted for API familiarity but not yet
+  /// honoured — relative URLs resolve against the `data:` document.)
+  Future<void> loadHtmlString(String html, {String? baseUrl}) {
+    final encoded = base64Encode(const Utf8Encoder().convert(html));
+    return navigate('data:text/html;charset=utf-8;base64,$encoded');
+  }
+
+  /// Load a local file by absolute path.
+  Future<void> loadFile(String absolutePath) =>
+      navigate('file://$absolutePath');
+
+  /// Set the page content zoom. `level` is a Chromium zoom *level*; the zoom
+  /// *factor* is `1.2^level` (0 = 100%, 1 ≈ 120%, -1 ≈ 83%).
+  Future<void> setZoomLevel(double level) => _channel
+      .invokeMethod('setZoomLevel', {'sessionId': sessionId, 'level': level});
+
+  /// Start (or advance) a find-in-page search for [text]. Results arrive on
+  /// [onFindResult]. Pass `findNext: true` to move to the next/previous match of
+  /// the same query; toggle [forward] for direction.
+  Future<void> find(String text,
+          {bool forward = true,
+          bool matchCase = false,
+          bool findNext = false}) =>
+      _channel.invokeMethod('find', {
+        'sessionId': sessionId,
+        'text': text,
+        'forward': forward,
+        'matchCase': matchCase,
+        'findNext': findNext,
+      });
+
+  /// Stop the current find-in-page search and (by default) clear the selection.
+  Future<void> stopFind({bool clearSelection = true}) =>
+      _channel.invokeMethod(
+          'stopFind', {'sessionId': sessionId, 'clearSelection': clearSelection});
 
   Future<void> _send(String method) =>
       _channel.invokeMethod(method, {'sessionId': sessionId});
