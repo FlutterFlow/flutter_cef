@@ -29,6 +29,14 @@
   (`OnImeCompositionRangeChanged` readback). The low-level
   `imeSetComposition` / `imeCommitText` / `imeCancelComposition` controller verbs
   remain for direct use.
+* The macOS emoji & symbols picker (⌃⌘Space) now opens cold over the page —
+  previously it only worked after the shortcut had been used in another (native)
+  text field first. Two fixes: the key router no longer swallows ⌃⌘Space (it
+  carries no `character`, so it was being treated as a consumed non-text key
+  instead of falling through to the platform input context), and a caret rect is
+  now always pushed while focused (seeded at the last click), so the picker —
+  and the candidate / accent popups — anchor at the text instead of the screen
+  corner. New `showEmojiPicker()` opens the same picker programmatically.
 * Input fidelity: editing / navigation keys (Backspace, arrows, …) no longer
   double-apply (one Backspace deleted two characters; one arrow moved two
   options in a `<select>`) — the host now sets the macOS `character` /

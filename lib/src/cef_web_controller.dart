@@ -430,6 +430,13 @@ class CefWebController {
   Future<void> openDevTools() =>
       _channel.invokeMethod('showDevTools', {'sessionId': sessionId});
 
+  /// Open the macOS Character Viewer (the emoji & symbols picker — the same
+  /// panel as ⌃⌘Space) targeting this view. The view must be focused so the
+  /// picked glyph is inserted into the page's focused field. The picker is
+  /// anchored at the composition caret (or the last click); see [CefWebView].
+  Future<void> showEmojiPicker() =>
+      _channel.invokeMethod('showEmojiPicker', {'sessionId': sessionId});
+
   /// Update the active IME composition with [text] (the in-progress, underlined
   /// text). Driven by [CefWebView]'s text-input integration for CJK/emoji
   /// composition; rarely called directly.

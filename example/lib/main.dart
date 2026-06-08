@@ -28,6 +28,7 @@ class BrowserDemo extends StatefulWidget {
 class _BrowserDemoState extends State<BrowserDemo> {
   static const _startUrl = 'https://flutter.dev';
   final CefWebController _controller = CefWebController();
+  final FocusNode _webFocus = FocusNode(debugLabel: 'web');
   final TextEditingController _urlBar = TextEditingController(text: _startUrl);
   double _zoom = 0;
 
@@ -74,7 +75,9 @@ class _BrowserDemoState extends State<BrowserDemo> {
           .take(3)
           .map((c) => '${c.name}=${c.value}')
           .join(', ');
-      _snack('${cookies.length} cookie(s)${preview.isEmpty ? '' : ' → $preview'}');
+      _snack(
+        '${cookies.length} cookie(s)${preview.isEmpty ? '' : ' → $preview'}',
+      );
     } catch (e) {
       _snack('cookies error: $e');
     }
@@ -129,8 +132,17 @@ and committed text — including emoji — should appear intact.</p>
       ? 'about:blank'
       : (s.startsWith('http') || s.contains(':') ? s : 'https://$s');
 
+  /// Re-focus the page (a toolbar tap moves focus to the button), then open the
+  /// macOS emoji picker — it targets whatever is focused, so the page must be.
+  Future<void> _emojiPicker() async {
+    _webFocus.requestFocus();
+    await Future<void>.delayed(const Duration(milliseconds: 120));
+    await _controller.showEmojiPicker();
+  }
+
   @override
   void dispose() {
+    _webFocus.dispose();
     _urlBar.dispose();
     _controller.dispose();
     super.dispose();
@@ -184,6 +196,11 @@ and committed text — including emoji — should appear intact.</p>
                     onPressed: _controller.openDevTools,
                   ),
                   IconButton(
+                    icon: const Icon(Icons.emoji_emotions_outlined),
+                    tooltip: 'showEmojiPicker() (focus a field first)',
+                    onPressed: _emojiPicker,
+                  ),
+                  IconButton(
                     icon: const Icon(Icons.keyboard),
                     tooltip: 'Load the IME / text-input test page',
                     onPressed: _loadImeTest,
@@ -229,7 +246,11 @@ and committed text — including emoji — should appear intact.</p>
               ),
             ),
             Expanded(
-              child: CefWebView(url: _startUrl, controller: _controller),
+              child: CefWebView(
+                url: _startUrl,
+                controller: _controller,
+                focusNode: _webFocus,
+              ),
             ),
           ],
         ),

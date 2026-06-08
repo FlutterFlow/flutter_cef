@@ -133,7 +133,8 @@ void main() {
     expect((args['inputType'] as Map)['name'], 'TextInputType.text');
   });
 
-  testWidgets('seeds the connection with a valid caret (CJK composition needs '
+  testWidgets(
+      'seeds the connection with a valid caret (CJK composition needs '
       'a real insertion point, not the -1 of TextEditingValue.empty)',
       (tester) async {
     await focusedView(tester);
@@ -181,5 +182,30 @@ void main() {
     focus.unfocus();
     await tester.pump();
     expect(tester.testTextInput.hasAnyClients, isFalse);
+  });
+
+  testWidgets(
+      '⌃⌘Space is not forwarded to the page so the emoji picker can '
+      'fall through to the platform', (tester) async {
+    await focusedView(tester);
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.metaLeft);
+    log.clear(); // ignore the modifier key-downs themselves
+    // ⌃⌘Space must NOT reach the page (no 'key' send) — it has to fall through
+    // to the platform input context, which opens the emoji & symbols picker.
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.space);
+    await tester.pump();
+    expect(callsTo('key'), isEmpty);
+
+    // Contrast: a plain key IS forwarded to the page, proving the harness sees
+    // 'key' sends at all.
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.space);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.metaLeft);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+    log.clear();
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.keyA);
+    await tester.pump();
+    expect(callsTo('key'), isNotEmpty);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.keyA);
   });
 }

@@ -438,4 +438,11 @@ void main() {
     expect(del['name'], 'sid');
     expect(log.any((m) => m.method == 'showDevTools'), isTrue);
   });
+
+  test('showEmojiPicker forwards to native', () async {
+    final c = CefWebController(sessionId: 'emo');
+    await c.showEmojiPicker();
+    final m = log.firstWhere((m) => m.method == 'showEmojiPicker');
+    expect((m.arguments as Map)['sessionId'], 'emo');
+  });
 }

@@ -200,7 +200,6 @@ class _CefWebViewState extends State<CefWebView>
   }
 
   void _onPointerDown(PointerDownEvent e) {
-    _focusNode.requestFocus();
     _lastButton = cefMouseButton(e.buttons);
     // Cycle 1→2→3→1 (caret→word→line) when clicks are quick and close, so the
     // page gets real double/triple clicks.
@@ -210,6 +209,12 @@ class _CefWebViewState extends State<CefWebView>
     _clickCount = (near && quick) ? (_clickCount % 3) + 1 : 1;
     _lastDownAt = e.timeStamp;
     _lastDownPos = e.localPosition;
+    // Record the click BEFORE focusing: a cold focus seeds the emoji/accent
+    // picker's anchor from _lastDownPos. Re-seed on later clicks (when not
+    // composing) so the picker follows where the user last clicked.
+    final wasFocused = _focusNode.hasFocus;
+    _focusNode.requestFocus();
+    if (wasFocused && !_composing) _pushEditableGeometry();
     _controller.sendPointer(
         type: 1,
         x: e.localPosition.dx,
@@ -266,6 +271,20 @@ class _CefWebViewState extends State<CefWebView>
       // While composing the IME owns the keystroke end-to-end (extend, candidate
       // navigation, confirm, cancel) — it must reach the platform IME, and we
       // must NOT also send a raw key (Enter would both confirm and submit).
+      return KeyEventResult.skipRemainingHandlers;
+    }
+
+    // ⌃⌘Space opens the macOS emoji & symbols picker. It MUST fall through to
+    // the platform text-input context (which shows the picker) — if we return
+    // `handled` (which we would, since the combo carries no `character`, so
+    // isText is false) the embedder never feeds it to NSTextInputContext and
+    // the picker never opens. Flutter's own plugin documents this exact case.
+    // skipRemainingHandlers stops Flutter ancestors from eating it but still
+    // hands it to the platform; don't forward it to the page either.
+    final keys = HardwareKeyboard.instance;
+    if (event.logicalKey == LogicalKeyboardKey.space &&
+        keys.isControlPressed &&
+        keys.isMetaPressed) {
       return KeyEventResult.skipRemainingHandlers;
     }
 
@@ -353,15 +372,22 @@ class _CefWebViewState extends State<CefWebView>
         .addPostFrameCallback((_) => _pushEditableGeometry());
   }
 
-  /// Tell the platform where the editable lives (and, when composing, where the
-  /// caret is) so the OS input context activates and positions the IME candidate
-  /// window. The whole view is the "editable"; the caret rect comes from the
-  /// page via [OnImeCompositionRangeChanged].
+  /// Tell the platform where the editable lives and where the caret is, so the
+  /// OS input context activates and positions the IME candidate window *and* the
+  /// cold-start emoji / accent pickers (⌃⌘Space, press-and-hold).
+  ///
+  /// The caret rect is what macOS reads for `firstRectForCharacterRange:` — and
+  /// Flutter's text-input plugin returns `CGRectZero` for it until a caret rect
+  /// has been pushed, which leaves the Character Viewer anchored at the screen
+  /// origin (so it appears not to open). So we ALWAYS push a caret: the real one
+  /// from the page during composition ([OnImeCompositionRangeChanged]), or a seed
+  /// at the last click otherwise. The whole view is the "editable".
   void _pushEditableGeometry([Rect? caret]) {
     final conn = _textInput;
     if (conn == null || !conn.attached || !mounted) return;
     final box = context.findRenderObject() as RenderBox?;
     if (box == null || !box.hasSize) return;
+    final c = caret ?? _seedCaretRect();
     conn
       ..setStyle(
         fontFamily: null,
@@ -370,12 +396,18 @@ class _CefWebViewState extends State<CefWebView>
         textDirection: TextDirection.ltr,
         textAlign: TextAlign.left,
       )
-      ..setEditableSizeAndTransform(box.size, box.getTransformTo(null));
-    if (caret != null) {
-      conn
-        ..setComposingRect(caret)
-        ..setCaretRect(caret);
-    }
+      ..setEditableSizeAndTransform(box.size, box.getTransformTo(null))
+      ..setComposingRect(c)
+      ..setCaretRect(c);
+  }
+
+  /// A best-effort caret rect (view-local logical px) for when the page hasn't
+  /// reported a real composition caret yet — anchored at the last click, so the
+  /// emoji / accent picker opens roughly where the user is about to type. Falls
+  /// back to the top-left for focus changes that didn't come from a click.
+  Rect _seedCaretRect() {
+    final p = _lastDownPos == Offset.zero ? const Offset(4, 16) : _lastDownPos;
+    return Rect.fromLTWH(p.dx, p.dy - 9, 2, 18);
   }
 
   void _closeTextInput() {

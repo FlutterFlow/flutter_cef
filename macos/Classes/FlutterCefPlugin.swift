@@ -102,6 +102,11 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     case "showDevTools":
       withSession(args) { $0.showDevTools() }
       result(nil)
+    case "showEmojiPicker":
+      // The Character Viewer targets the current first responder's input
+      // context — Flutter's text-input plugin while the CefWebView is focused.
+      NSApplication.shared.orderFrontCharacterPalette(nil)
+      result(nil)
     case "imeSetComposition":
       withSession(args) { $0.imeSetComposition(args["text"] as? String ?? "") }
       result(nil)

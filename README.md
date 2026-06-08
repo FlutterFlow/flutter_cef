@@ -45,6 +45,9 @@ c.scrollTo(0, 200); await c.getScrollPosition(); c.clearLocalStorage();
 
 // open the Chrome DevTools inspector for this view in its own window
 c.openDevTools();
+
+// open the macOS emoji & symbols picker over the focused page (same as ⌃⌘Space)
+c.showEmojiPicker();
 ```
 
 See `example/` for a full browser chrome (URL bar, back/forward/reload, loading
@@ -119,7 +122,8 @@ can tear slightly under the compositor; double-buffering is planned. Working
 today: **multi-process** OSR render (on/off-screen, HiDPI/Retina-crisp,
 software `OnPaint` readback into a shared IOSurface, heavy SPAs render + survive),
 pointer/scroll/keyboard input, **IME text input** (CJK composition + emoji, the
-candidate window tracked under the caret), `<select>` popups, page cursor;
+candidate window tracked under the caret, and the ⌃⌘Space emoji picker —
+`showEmojiPicker()`), `<select>` popups, page cursor;
 navigation + history, page-lifecycle events (start/finish/progress/url-change),
 new-window routing (`onCreateWindow`), loading/title/url/error/console state; JS
 dialogs (alert/confirm/prompt), a JS bridge (`addJavaScriptChannel` +
