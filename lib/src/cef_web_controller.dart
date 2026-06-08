@@ -291,6 +291,34 @@ class CefWebController {
         'addJavaScriptChannel', {'sessionId': sessionId, 'name': name});
   }
 
+  /// Scroll the page to an absolute pixel position.
+  Future<void> scrollTo(int x, int y) =>
+      executeJavaScript('window.scrollTo($x, $y)');
+
+  /// Scroll the page by a pixel delta.
+  Future<void> scrollBy(int x, int y) =>
+      executeJavaScript('window.scrollBy($x, $y)');
+
+  /// The current scroll offset from the top-left.
+  Future<Offset> getScrollPosition() async {
+    final r = await runJavaScriptReturningResult('[window.scrollX,window.scrollY]');
+    if (r is List && r.length >= 2 && r[0] is num && r[1] is num) {
+      return Offset((r[0] as num).toDouble(), (r[1] as num).toDouble());
+    }
+    return Offset.zero;
+  }
+
+  /// The current document title (live from the page).
+  Future<String?> getTitle() async =>
+      (await runJavaScriptReturningResult('document.title'))?.toString();
+
+  /// The page's user-agent string.
+  Future<String?> getUserAgent() async =>
+      (await runJavaScriptReturningResult('navigator.userAgent'))?.toString();
+
+  /// Clear the page's `localStorage`.
+  Future<void> clearLocalStorage() => executeJavaScript('localStorage.clear()');
+
   /// Load an HTML string. (`baseUrl` is accepted for API familiarity but not yet
   /// honoured — relative URLs resolve against the `data:` document.)
   Future<void> loadHtmlString(String html, {String? baseUrl}) {

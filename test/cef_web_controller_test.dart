@@ -279,4 +279,28 @@ void main() {
     await emit('ch', 'channelMessage', {'payload': 'Native:hello world'});
     expect(got, 'hello world');
   });
+
+  test('scroll + storage conveniences forward as JavaScript', () async {
+    final c = CefWebController(sessionId: 'sc');
+    await c.scrollTo(0, 100);
+    await c.scrollBy(5, 6);
+    await c.clearLocalStorage();
+    final js = log
+        .where((m) => m.method == 'executeJavaScript')
+        .map((m) => (m.arguments as Map)['code'] as String)
+        .toList();
+    expect(js, contains('window.scrollTo(0, 100)'));
+    expect(js, contains('window.scrollBy(5, 6)'));
+    expect(js, contains('localStorage.clear()'));
+  });
+
+  test('getScrollPosition decodes the eval result into an Offset', () async {
+    final c = CefWebController(sessionId: 'gp');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    final f = c.getScrollPosition();
+    final id = (log.firstWhere((m) => m.method == 'evalReturning').arguments
+        as Map)['id'];
+    await emit('gp', 'evalResult', {'payload': '$id:{"ok":true,"v":[12,34]}'});
+    expect(await f, const Offset(12, 34));
+  });
 }
