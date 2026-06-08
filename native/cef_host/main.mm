@@ -118,6 +118,9 @@ constexpr uint8_t kOpEvalReturning = 0x2a;  // {u32 id}{utf8 code}
 constexpr uint8_t kOpAddChannel = 0x2b;     // {utf8 name} register a JS channel
 constexpr uint8_t kOpSetCookie = 0x2c;      // {utf8 url\0name\0value\0domain\0path}
 constexpr uint8_t kOpClearCookies = 0x2d;   // {} delete all cookies
+constexpr uint8_t kOpImeSetComp = 0x30;     // {utf8 text} IME composition update
+constexpr uint8_t kOpImeCommit = 0x31;      // {utf8 text} commit composed text
+constexpr uint8_t kOpImeCancel = 0x32;      // {} cancel composition
 
 // ---- Shared runtime state ----
 int g_ipc_fd = -1;
@@ -772,6 +775,22 @@ void DoClearCookies() {
   CefRefPtr<CefCookieManager> mgr = CefCookieManager::GetGlobalManager(nullptr);
   if (mgr) mgr->DeleteCookies(CefString(), CefString(), nullptr);
 }
+void DoImeSetComposition(const std::string& text) {
+  if (!g_browser) return;
+  CefString t(text);
+  uint32_t len = static_cast<uint32_t>(t.length());
+  std::vector<CefCompositionUnderline> underlines;
+  g_browser->GetHost()->ImeSetComposition(t, underlines,
+                                          CefRange::InvalidRange(),
+                                          CefRange(len, len));
+}
+void DoImeCommitText(const std::string& text) {
+  if (g_browser)
+    g_browser->GetHost()->ImeCommitText(text, CefRange::InvalidRange(), 0);
+}
+void DoImeCancel() {
+  if (g_browser) g_browser->GetHost()->ImeCancelComposition();
+}
 
 // type: 0=move 1=down 2=up 3=wheel; button: 0=left 1=middle 2=right.
 void DoPointer(int type, int button, int click_count, uint32_t modifiers,
@@ -926,6 +945,19 @@ void IpcReadLoop() {
       }
       case kOpClearCookies:
         CefPostTask(TID_UI, base::BindOnce(&DoClearCookies));
+        break;
+      case kOpImeSetComp: {
+        std::string text(reinterpret_cast<const char*>(p), plen);
+        CefPostTask(TID_UI, base::BindOnce(&DoImeSetComposition, text));
+        break;
+      }
+      case kOpImeCommit: {
+        std::string text(reinterpret_cast<const char*>(p), plen);
+        CefPostTask(TID_UI, base::BindOnce(&DoImeCommitText, text));
+        break;
+      }
+      case kOpImeCancel:
+        CefPostTask(TID_UI, base::BindOnce(&DoImeCancel));
         break;
       case kOpPointer: {
         if (plen < 40) break;

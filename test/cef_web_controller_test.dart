@@ -313,6 +313,22 @@ void main() {
     expect(await f, const Offset(12, 34));
   });
 
+  test('IME verbs forward to native', () async {
+    final c = CefWebController(sessionId: 'im');
+    await c.imeSetComposition('文');
+    await c.imeCommitText('文字');
+    await c.imeCancelComposition();
+    expect(
+        (log.firstWhere((m) => m.method == 'imeSetComposition').arguments
+            as Map)['text'],
+        '文');
+    expect(
+        (log.firstWhere((m) => m.method == 'imeCommitText').arguments
+            as Map)['text'],
+        '文字');
+    expect(log.any((m) => m.method == 'imeCancelComposition'), true);
+  });
+
   test('download event invokes onDownload', () async {
     final c = CefWebController(sessionId: 'dl');
     await c.create(url: 'about:blank', width: 1, height: 1);

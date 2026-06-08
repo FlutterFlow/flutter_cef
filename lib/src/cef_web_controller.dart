@@ -350,6 +350,20 @@ class CefWebController {
   Future<void> clearCookies() =>
       _channel.invokeMethod('clearCookies', {'sessionId': sessionId});
 
+  /// Update the active IME composition with [text] (the in-progress, underlined
+  /// text). Driven by [CefWebView]'s text-input integration for CJK/emoji
+  /// composition; rarely called directly.
+  Future<void> imeSetComposition(String text) => _channel.invokeMethod(
+      'imeSetComposition', {'sessionId': sessionId, 'text': text});
+
+  /// Commit [text] to the focused input, ending any composition.
+  Future<void> imeCommitText(String text) => _channel
+      .invokeMethod('imeCommitText', {'sessionId': sessionId, 'text': text});
+
+  /// Cancel the active IME composition.
+  Future<void> imeCancelComposition() =>
+      _channel.invokeMethod('imeCancelComposition', {'sessionId': sessionId});
+
   /// Load an HTML string. (`baseUrl` is accepted for API familiarity but not yet
   /// honoured — relative URLs resolve against the `data:` document.)
   Future<void> loadHtmlString(String html, {String? baseUrl}) {

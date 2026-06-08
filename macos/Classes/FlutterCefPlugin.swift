@@ -87,6 +87,15 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     case "clearCookies":
       withSession(args) { $0.clearCookies() }
       result(nil)
+    case "imeSetComposition":
+      withSession(args) { $0.imeSetComposition(args["text"] as? String ?? "") }
+      result(nil)
+    case "imeCommitText":
+      withSession(args) { $0.imeCommitText(args["text"] as? String ?? "") }
+      result(nil)
+    case "imeCancelComposition":
+      withSession(args) { $0.imeCancelComposition() }
+      result(nil)
     default: result(FlutterMethodNotImplemented)
     }
   }
