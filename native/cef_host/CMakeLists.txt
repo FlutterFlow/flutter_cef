@@ -22,11 +22,15 @@ if(NOT DEFINED CODESIGN_ID)
 endif()
 set(ENT "${CMAKE_CURRENT_SOURCE_DIR}/entitlements.plist")
 
-# Multi-process is opt-in. It spawns the CEF helper subprocesses (enabling the
-# GPU/Viz process + OnAcceleratedPaint) but needs Developer-ID signing +
-# notarization to fully clear Chromium 144's Mach-port peer validation (-67030).
-# The default --single-process path has no children and signs/runs cleanly.
-option(CEF_MULTI_PROCESS "Spawn CEF helper subprocesses instead of --single-process" OFF)
+# Multi-process is the DEFAULT: it spawns the CEF helper subprocesses (GPU/Viz +
+# OnAcceleratedPaint shared-IOSurface render) and isolates renderer/utility
+# crashes, so heavy SPAs (e.g. Google sign-in) render and survive — single
+# process CHECK-crashes on them. Chromium 144's Mach-port peer validation is
+# disabled for the process tree via an env var in main.mm (works ad-hoc, no
+# notarization); the production-hardening is correct inside-out Developer-ID
+# signing so that env var can be dropped. Set -DCEF_MULTI_PROCESS=OFF for the
+# simpler single-process build (first-party content only).
+option(CEF_MULTI_PROCESS "Spawn CEF helper subprocesses (vs --single-process)" ON)
 
 # cef_host: the BROWSER process. A .app bundle (CEF needs a real bundle). The CEF
 # framework (and, in multi-process, the helper apps) live in Contents/Frameworks.

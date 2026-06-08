@@ -690,6 +690,16 @@ int ConnectUnixSocket(const std::string& path) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
+#ifdef CEF_HOST_MULTIPROCESS
+  // Disable Chromium 144's Mach-port peer-requirement validation for the whole
+  // process tree. The child processes read this policy from an env var (NOT the
+  // FeatureList, which isn't up yet when the rendezvous runs), and the browser
+  // injects it; pre-setting it here makes children inherit kNoValidation (0).
+  // (Note Chromium's misspelling "VALDATION".) On macOS 26 a failed validation
+  // TERMINATES children, so without this no paint callback ever fires. This is a
+  // dev/CI unblock; the production fix is correct inside-out Developer-ID signing.
+  setenv("MACH_PORT_RENDEZVOUS_PEER_VALDATION", "0", 1);
+#endif
   CefScopedLibraryLoader library_loader;
   if (!library_loader.LoadInMain()) {
     fprintf(stderr, "[cef_host] failed to load CEF framework\n");

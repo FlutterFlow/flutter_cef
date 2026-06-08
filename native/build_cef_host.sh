@@ -48,10 +48,10 @@ if [ ! -f "$CEF_ROOT/cmake/FindCEF.cmake" ]; then
 fi
 
 echo "[flutter_cef] building cef_host.app ..."
-MP_FLAG="-DCEF_MULTI_PROCESS=OFF"
-if [ "${CEF_MULTI_PROCESS:-}" = "1" ] || [ "${CEF_MULTI_PROCESS:-}" = "ON" ]; then
-  MP_FLAG="-DCEF_MULTI_PROCESS=ON"
-  echo "[flutter_cef] multi-process build (needs Developer ID + notarization for a clean -67030)"
+MP_FLAG="-DCEF_MULTI_PROCESS=ON"   # default: renders heavy SPAs + crash-isolated
+if [ "${CEF_MULTI_PROCESS:-}" = "0" ] || [ "${CEF_MULTI_PROCESS:-}" = "OFF" ]; then
+  MP_FLAG="-DCEF_MULTI_PROCESS=OFF"
+  echo "[flutter_cef] single-process build (simpler; first-party content only)"
 fi
 cmake -G Ninja -S "$HERE/cef_host" -B "$OUT" \
   -DCEF_ROOT="$CEF_ROOT" -DCODESIGN_ID="$CODESIGN_ID" "$MP_FLAG" >/dev/null
