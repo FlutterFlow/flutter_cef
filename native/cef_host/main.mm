@@ -905,6 +905,10 @@ void DoPointer(int type, int button, int click_count, uint32_t modifiers,
       host->SendMouseClickEvent(
           ev, static_cast<cef_mouse_button_type_t>(button), true, click_count);
       break;
+    case 4:
+      // Cursor left the view: a move with mouseLeave=true clears hover state.
+      host->SendMouseMoveEvent(ev, true);
+      break;
     case 3:
       host->SendMouseWheelEvent(ev, static_cast<int>(dx), static_cast<int>(dy));
       break;

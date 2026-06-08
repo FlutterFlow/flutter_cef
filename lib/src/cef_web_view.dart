@@ -156,8 +156,13 @@ class _CefWebViewState extends State<CefWebView>
         return ClipRect(
           child: ValueListenableBuilder<MouseCursor>(
             valueListenable: _controller.cursor,
-            builder: (context, cursor, child) =>
-                MouseRegion(cursor: cursor, child: child),
+            builder: (context, cursor, child) => MouseRegion(
+              cursor: cursor,
+              // Tell the page the cursor left so :hover / link highlights clear.
+              onExit: (e) => _controller.sendPointer(
+                  type: 4, x: e.localPosition.dx, y: e.localPosition.dy),
+              child: child,
+            ),
             child: Focus(
               focusNode: _focusNode,
               onKeyEvent: _onKeyEvent,
@@ -178,6 +183,11 @@ class _CefWebViewState extends State<CefWebView>
 
   // ── input forwarding ──────────────────────────────────────────────
   int _lastButton = 0;
+  // Multi-click tracking — the page keys word/line selection off clickCount,
+  // which Flutter's Listener doesn't surface.
+  Duration _lastDownAt = Duration.zero;
+  Offset _lastDownPos = Offset.zero;
+  int _clickCount = 1;
 
   int _cefModifiers([int buttons = 0]) {
     final keys = HardwareKeyboard.instance;
@@ -192,11 +202,20 @@ class _CefWebViewState extends State<CefWebView>
   void _onPointerDown(PointerDownEvent e) {
     _focusNode.requestFocus();
     _lastButton = cefMouseButton(e.buttons);
+    // Cycle 1→2→3→1 (caret→word→line) when clicks are quick and close, so the
+    // page gets real double/triple clicks.
+    final near = (e.localPosition - _lastDownPos).distanceSquared <= 25;
+    final quick =
+        (e.timeStamp - _lastDownAt) <= const Duration(milliseconds: 300);
+    _clickCount = (near && quick) ? (_clickCount % 3) + 1 : 1;
+    _lastDownAt = e.timeStamp;
+    _lastDownPos = e.localPosition;
     _controller.sendPointer(
         type: 1,
         x: e.localPosition.dx,
         y: e.localPosition.dy,
         button: _lastButton,
+        clickCount: _clickCount,
         modifiers: _cefModifiers(e.buttons));
   }
 
@@ -217,6 +236,7 @@ class _CefWebViewState extends State<CefWebView>
       x: e.localPosition.dx,
       y: e.localPosition.dy,
       button: _lastButton,
+      clickCount: _clickCount,
       modifiers: _cefModifiers());
 
   void _onPointerSignal(PointerSignalEvent e) {

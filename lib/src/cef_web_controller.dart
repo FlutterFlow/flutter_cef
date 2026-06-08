@@ -450,7 +450,7 @@ class CefWebController {
         'dpr': dpr,
       });
 
-  /// type: 0=move 1=down 2=up 3=wheel; button: 0=left 1=middle 2=right.
+  /// type: 0=move 1=down 2=up 3=wheel 4=leave; button: 0=left 1=middle 2=right.
   void sendPointer({
     required int type,
     required double x,
