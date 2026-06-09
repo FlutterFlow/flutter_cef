@@ -21,6 +21,11 @@
 // -DCEF_MULTI_PROCESS=OFF for the simpler single-process fallback (software
 // OnPaint, no helpers, no peer validation at all).
 //
+// Those Mach-port shortcuts plus a mock keychain are gated behind the
+// CEF_HOST_ADHOC compile flag (ON by default). A signed release builds with
+// -DCEF_HOST_ADHOC=OFF, which enforces peer validation and uses the real
+// Keychain (OSCrypt) — and so requires correct inside-out Developer-ID signing.
+//
 // Args: --url=<url> --width=<px> --height=<px> --dpr=<scale> --iosurface-id=<id>
 //       --ipc=<path>
 //
@@ -737,8 +742,14 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
   }
   void OnBeforeCommandLineProcessing(
       const CefString&, CefRefPtr<CefCommandLine> command_line) override {
+#ifdef CEF_HOST_ADHOC
+    // Dev / ad-hoc-only (CEF_HOST_ADHOC is ON by default; a signed release sets
+    // -DCEF_HOST_ADHOC=OFF). Mock keychain + basic password store so a launch
+    // doesn't raise the macOS Keychain access prompt every time. A signed
+    // release omits these and uses the real Keychain via OSCrypt.
     command_line->AppendSwitch("use-mock-keychain");
     command_line->AppendSwitchWithValue("password-store", "basic");
+#endif
 #ifndef CEF_HOST_MULTIPROCESS
     // Single-process (-DCEF_MULTI_PROCESS=OFF; NOT the default): renderer + GPU
     // + utility all share this process, so there are no Mach-port peers to
@@ -748,17 +759,16 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
     // simpler/first-party content; the default multi-process build isolates
     // those crashes.
     command_line->AppendSwitch("single-process");
-    command_line->AppendSwitchWithValue(
-        "disable-features",
-        "MachPortRendezvousValidatePeerRequirements,"
-        "MachPortRendezvousEnforcePeerRequirements");
-#else
-    // Multi-process GPU OSR: keep hardware compositing so the GPU/Viz process
-    // produces a shared-texture IOSurface for OnAcceleratedPaint, and disable the
-    // Mach-port peer-requirement validation that otherwise -67030s the GPU→
-    // browser handoff for an ad-hoc signature. These are the same flags the
-    // single-process path uses; together they let the GPU-accelerated path run
-    // multi-process (crash-isolated) WITHOUT Developer-ID signing.
+#endif
+#ifdef CEF_HOST_ADHOC
+    // Dev / ad-hoc-only: disable Chromium 144's Mach-port peer-requirement
+    // validation, which otherwise -67030s the multi-process GPU→browser handoff
+    // (OnAcceleratedPaint) under an ad-hoc signature. (Harmless in
+    // single-process, where there are no peers to validate.) Together with the
+    // shared-texture GPU OSR path this lets the accelerated path run
+    // multi-process (crash-isolated) WITHOUT Developer-ID signing. A signed
+    // release omits this and enforces validation, which then requires correct
+    // inside-out Developer-ID signing of the cef_host tree.
     command_line->AppendSwitchWithValue(
         "disable-features",
         "MachPortRendezvousValidatePeerRequirements,"
@@ -1294,14 +1304,15 @@ int ConnectUnixSocket(const std::string& path) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
-#ifdef CEF_HOST_MULTIPROCESS
+#if defined(CEF_HOST_MULTIPROCESS) && defined(CEF_HOST_ADHOC)
   // Disable Chromium 144's Mach-port peer-requirement validation for the whole
   // process tree. The child processes read this policy from an env var (NOT the
   // FeatureList, which isn't up yet when the rendezvous runs), and the browser
   // injects it; pre-setting it here makes children inherit kNoValidation (0).
   // (Note Chromium's misspelling "VALDATION".) On macOS 26 a failed validation
   // TERMINATES children, so without this no paint callback ever fires. This is a
-  // dev/CI unblock; the production fix is correct inside-out Developer-ID signing.
+  // dev/CI unblock (ad-hoc only — compiled out of a signed -DCEF_HOST_ADHOC=OFF
+  // release); the production fix is correct inside-out Developer-ID signing.
   setenv("MACH_PORT_RENDEZVOUS_PEER_VALDATION", "0", 1);
 #endif
   CefScopedLibraryLoader library_loader;

@@ -34,6 +34,15 @@ set(ENT "${CMAKE_CURRENT_SOURCE_DIR}/entitlements.plist")
 # simpler single-process build (first-party content only).
 option(CEF_MULTI_PROCESS "Spawn CEF helper subprocesses (vs --single-process)" ON)
 
+# CEF_HOST_ADHOC (default ON): compile in the dev-only Chromium security
+# shortcuts that let cef_host run under an ad-hoc signature — the mock keychain
+# + basic password store (no Keychain prompt on launch) and the Mach-port
+# peer-validation bypass (clears -67030 on the multi-process GPU handoff). A
+# signed release builds with -DCEF_HOST_ADHOC=OFF: the real Keychain via OSCrypt
+# and enforced peer validation, which then require correct inside-out
+# Developer-ID signing of the cef_host tree. Independent of CEF_MULTI_PROCESS.
+option(CEF_HOST_ADHOC "Compile in dev/ad-hoc-only Chromium security shortcuts" ON)
+
 # cef_host: the BROWSER process. A .app bundle (CEF needs a real bundle). The CEF
 # framework (and, in multi-process, the helper apps) live in Contents/Frameworks.
 add_executable(cef_host MACOSX_BUNDLE main.mm)
@@ -45,6 +54,9 @@ target_link_libraries(cef_host libcef_dll_wrapper ${CEF_STANDARD_LIBS}
   "-framework IOSurface" "-framework Metal" "-framework CoreVideo")
 if(CEF_MULTI_PROCESS)
   target_compile_definitions(cef_host PRIVATE CEF_HOST_MULTIPROCESS)
+endif()
+if(CEF_HOST_ADHOC)
+  target_compile_definitions(cef_host PRIVATE CEF_HOST_ADHOC)
 endif()
 
 set(APP_DIR "${CMAKE_CURRENT_BINARY_DIR}/cef_host.app")
