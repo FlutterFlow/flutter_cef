@@ -5,6 +5,11 @@ import 'package:flutter/widgets.dart';
 import 'cef_input.dart';
 import 'cef_web_controller.dart';
 
+/// Per-event gain applied to trackpad two-finger pan when forwarding it to the
+/// page as a scroll. OSR gets no OS scroll momentum, so a flat gain brings the
+/// swipe distance closer to a native browser. Tunable.
+const double _kTrackpadScrollGain = 3.0;
+
 /// A live Chromium (CEF) browser rendered into a Flutter [Texture].
 ///
 /// The page renders off-screen in a `cef_host` subprocess and is shown here as
@@ -175,6 +180,8 @@ class _CefWebViewState extends State<CefWebView>
                 onPointerHover: _onPointerHover,
                 onPointerUp: _onPointerUp,
                 onPointerSignal: _onPointerSignal,
+                onPointerPanZoomStart: _onPointerPanZoomStart,
+                onPointerPanZoomUpdate: _onPointerPanZoomUpdate,
                 child: Texture(textureId: id),
               ),
             ),
@@ -217,7 +224,23 @@ class _CefWebViewState extends State<CefWebView>
     // composing) so the picker follows where the user last clicked.
     final wasFocused = _focusNode.hasFocus;
     _focusNode.requestFocus();
-    if (wasFocused && !_composing) _pushEditableGeometry();
+    // On a RE-CLICK (the view was already focused) re-issue show() so the
+    // platform IME view reclaims macOS first responder. AppKit makes the
+    // clicked host view (e.g. an embedder's top-level FlutterView) the first
+    // responder on every mouse-down, which silently stops the IME from
+    // delivering insertText; an already-focused click never re-fires the focus
+    // listener, so without this the IME goes dead on the 2nd+ click (CJK/emoji/
+    // dead-keys and plain typing all fail). This mirrors EditableText, which
+    // calls requestKeyboard()->show() on every tap. The first focus
+    // (wasFocused == false) is owned by the focus listener -> _openTextInput.
+    if (wasFocused && !_composing) {
+      if (_textInput?.attached ?? false) {
+        _pushEditableGeometry(); // re-seed caret at the click for the picker
+        _textInput!.show();
+      } else {
+        _openTextInput();
+      }
+    }
     _controller.sendPointer(
         type: 1,
         x: e.localPosition.dx,
@@ -256,6 +279,24 @@ class _CefWebViewState extends State<CefWebView>
           dx: -e.scrollDelta.dx,
           dy: -e.scrollDelta.dy);
     }
+  }
+
+  // Trackpad two-finger pan. On macOS, Flutter delivers trackpad scroll as
+  // pan-zoom gesture events (not PointerScrollEvent) whenever any ancestor opts
+  // into the trackpad gesture API — which Campus's canvas does, so the swipe is
+  // routed here rather than to [_onPointerSignal]. Forward each incremental pan
+  // to the page as a scroll. (pan delta ≈ −scroll delta for the same intent, so
+  // we forward it un-negated to match the wheel path above.) The OS doesn't add
+  // momentum to OSR, so a per-event gain brings the distance closer to Chrome's.
+  void _onPointerPanZoomStart(PointerPanZoomStartEvent e) {}
+
+  void _onPointerPanZoomUpdate(PointerPanZoomUpdateEvent e) {
+    _controller.sendPointer(
+        type: 3,
+        x: e.localPosition.dx,
+        y: e.localPosition.dy,
+        dx: e.localPanDelta.dx * _kTrackpadScrollGain,
+        dy: e.localPanDelta.dy * _kTrackpadScrollGain);
   }
 
   KeyEventResult _onKeyEvent(FocusNode node, KeyEvent event) {
@@ -392,7 +433,14 @@ class _CefWebViewState extends State<CefWebView>
     _composing = false;
     final conn = TextInput.attach(
       this,
-      const TextInputConfiguration(
+      TextInputConfiguration(
+        // Bind the connection to the FlutterView that hosts this widget — as
+        // EditableText does. In a multi-view host (e.g. an app with secondary
+        // windows) the implicit view 0 does not exist; without this the engine
+        // binds the IME to a nil view, show() never makes the input view first
+        // responder, and the platform never delivers insertText (typing
+        // produces keydown/keyup but no characters).
+        viewId: View.maybeOf(context)?.viewId,
         // Single-line + no action so the IME composes but Enter/newline are not
         // captured as text — they reach the page via the raw key path instead.
         inputType: TextInputType.text,

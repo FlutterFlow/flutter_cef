@@ -1,3 +1,20 @@
+## 0.1.1
+
+* **Multi-view host support**: the IME connection now carries
+  `TextInputConfiguration.viewId` (as `EditableText` does). In a host that
+  enables Flutter's multi-view mode the implicit view 0 does not exist, so a
+  config without `viewId` bound the IME to a nil view and `show()` silently
+  failed — pages received keydown/keyup but never characters. Typing, CJK
+  composition, and the emoji picker now work in multi-view (multi-window) apps.
+* Re-issue `TextInput.show()` on every click into an already-focused view
+  (mirrors `EditableText.requestKeyboard`), so hosts that move macOS first
+  responder around between clicks can't strand the IME view; also re-seeds the
+  emoji/accent-picker caret anchor at the latest click.
+* Trackpad scrolling inside hosts that opt into Flutter's trackpad gesture API
+  (e.g. canvas apps): two-finger pans arrive as `PointerPanZoom*` events rather
+  than `PointerScrollEvent`s — they are now forwarded to the page as scrolls,
+  with a gain factor to approximate native browser scroll distance.
+
 ## 0.1.0
 
 * Multi-process CEF by default — crash-isolated, so heavy SPAs (e.g. Google
