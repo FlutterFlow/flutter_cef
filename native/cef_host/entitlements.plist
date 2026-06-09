@@ -7,8 +7,9 @@
        executable memory under hardened runtime. Library validation is relaxed
        because the framework is loaded by dlopen; when everything is signed with
        one identity it would pass anyway, but this keeps ad-hoc/dev builds
-       working too. get-task-allow is for local debugging — drop it (and notarize)
-       for distribution. -->
+       working too. get-task-allow is for local debugging; the signed-release
+       build drops it automatically by using entitlements.release.plist instead
+       (selected when CEF_HOST_ADHOC=OFF). -->
   <key>com.apple.security.cs.allow-jit</key><true/>
   <key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
   <key>com.apple.security.cs.disable-library-validation</key><true/>

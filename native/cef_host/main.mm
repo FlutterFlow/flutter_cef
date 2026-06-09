@@ -1420,7 +1420,18 @@ int main(int argc, char* argv[]) {
   @autoreleasepool {
     [CefHostApplication sharedApplication];
     CefSettings settings;
+#ifdef CEF_HOST_ADHOC
+    // Dev / ad-hoc: the Chromium renderer/GPU sandbox is OFF. It only *validates*
+    // under proper Developer-ID signing, so an ad-hoc build must run unsandboxed.
     settings.no_sandbox = true;
+#else
+    // Signed release (-DCEF_HOST_ADHOC=OFF): enable the Chromium renderer/GPU
+    // sandbox. The browser process itself is never sandboxed on macOS — only the
+    // helper subprocesses, which call CefScopedSandboxContext (process_helper.mm)
+    // before loading the framework. Requires correct inside-out Developer-ID
+    // signing of the cef_host tree (the libcef_sandbox.dylib + helpers + host).
+    settings.no_sandbox = false;
+#endif
     settings.windowless_rendering_enabled = true;
     settings.log_severity = LOGSEVERITY_INFO;
     // Per-process cache under the per-user (0700) temp dir — NOT a fixed,
