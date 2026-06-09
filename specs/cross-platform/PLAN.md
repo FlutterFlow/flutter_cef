@@ -69,10 +69,14 @@ flutter_cef/                         # repo root = app-facing package (unchanged
   CMake, FLUTTER_CEF_HOST resolution in the Swift plugin); add
   `lib/flutter_cef_macos.dart` + `dartPluginClass`. Root pubspec endorses it via
   `default_package`. Gate: example macOS build + signed-host smoke.
-- **P3 — native core/platform split.** Inside `flutter_cef_macos/native/cef_host`,
-  extract `core/` (protocol.h + CEF client/app + browser control + dispatch
-  loop, depending only on `core/platform.h`) and `platform/mac/` (the ~50
-  macOS-specific sites). Gate: rebuild cef_host (ad-hoc + signed) clean.
+- **P3 — native core/platform split. DEFERRED BY DESIGN.** A platform
+  abstraction designed without a second consumer tends to guess the seam wrong,
+  and a blind 1486-line teardown risks regressing the just-proven macOS build for
+  no validated benefit. Instead the seam is **mapped precisely in `PORTING.md`**
+  (surface / IPC transport / app loop / sandbox / framework-path, with
+  `main.mm` file:line references), and the `core/` + `platform/` code-split is
+  the documented first step of the first real non-macOS port — where two
+  consumers validate the abstraction.
 - **P4 — docs.** `PORTING.md`, README structure, CHANGELOG. Gate: `git diff --check`.
 
 ## Invariants

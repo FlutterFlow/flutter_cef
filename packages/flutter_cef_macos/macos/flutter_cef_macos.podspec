@@ -6,7 +6,7 @@
 #
 Pod::Spec.new do |s|
   s.name             = 'flutter_cef_macos'
-  s.version          = '0.1.2'
+  s.version          = '0.1.3'
   s.summary          = 'Live Chromium (CEF) browser as a Flutter Texture (macOS).'
   s.description      = <<-DESC
 Embed a live Chromium browser via CEF off-screen rendering, shown as a Flutter

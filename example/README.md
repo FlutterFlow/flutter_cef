@@ -11,10 +11,10 @@ CEF (~200 MB) is fetched, not vendored — build the renderer once, point the
 plugin at it, then run:
 
 ```sh
-cd ..                       # package root
-native/build_cef_host.sh    # fetches CEF + builds cef_host.app (one-time)
+cd ../packages/flutter_cef_macos          # the macOS implementation package
+native/build_cef_host.sh                  # fetches CEF + builds cef_host.app (one-time)
 export FLUTTER_CEF_HOST="$PWD/native/cef_host/build/cef_host.app/Contents/MacOS/cef_host"
-cd example && flutter run -d macos
+cd ../../example && flutter run -d macos
 ```
 
 Without `FLUTTER_CEF_HOST` (or a bundled `cef_host.app` — see the root
