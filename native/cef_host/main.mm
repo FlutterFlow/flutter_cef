@@ -131,6 +131,12 @@ double g_dpr = 1.0;  // device pixel ratio; the IOSurface is logical*g_dpr px.
 
 CefRefPtr<CefBrowser> g_browser;
 
+// Host-set navigation scheme allowlist (lowercased; `--allowed-schemes=a,b`).
+// Empty = allow all. `about` is always allowed (the blank placeholder).
+// Enforced in HostClient::OnBeforeBrowse so it covers the initial load,
+// programmatic navigation, in-page clicks, and redirects.
+std::set<std::string> g_allowed_schemes;
+
 // Pending JS dialog callbacks, keyed by id. UI-thread-only (OnJSDialog and the
 // host's response both run on the CEF UI thread), so no lock is needed.
 std::map<uint32_t, CefRefPtr<CefJSDialogCallback>> g_dialogs;
@@ -701,7 +707,20 @@ class HostClient : public CefClient,
     if (router_) router_->OnBeforeClose(browser);
   }
   bool OnBeforeBrowse(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame,
-                      CefRefPtr<CefRequest>, bool, bool) override {
+                      CefRefPtr<CefRequest> request, bool, bool) override {
+    if (!g_allowed_schemes.empty()) {
+      const std::string url = request->GetURL().ToString();
+      const size_t colon = url.find(':');
+      std::string scheme =
+          colon == std::string::npos ? std::string() : url.substr(0, colon);
+      std::transform(scheme.begin(), scheme.end(), scheme.begin(),
+                     [](unsigned char c) { return std::tolower(c); });
+      // `about:` (blank placeholder) is always allowed; anything else must be
+      // in the host allowlist or the navigation is refused.
+      if (scheme != "about" && g_allowed_schemes.count(scheme) == 0) {
+        return true;  // cancel
+      }
+    }
     if (router_) router_->OnBeforeBrowse(browser, frame);
     return false;  // allow
   }
@@ -1297,6 +1316,18 @@ int main(int argc, char* argv[]) {
   std::string hs = ArgValue(argc, argv, "height");
   std::string dprs = ArgValue(argc, argv, "dpr");
   std::string sid = ArgValue(argc, argv, "iosurface-id");
+  std::string allowed = ArgValue(argc, argv, "allowed-schemes");
+  for (size_t start = 0; start < allowed.size();) {
+    const size_t comma = allowed.find(',', start);
+    const size_t len =
+        comma == std::string::npos ? std::string::npos : comma - start;
+    std::string s = allowed.substr(start, len);
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    if (!s.empty()) g_allowed_schemes.insert(s);
+    if (comma == std::string::npos) break;
+    start = comma + 1;
+  }
   if (url.empty()) url = "about:blank";
   if (!ws.empty()) g_width = atoi(ws.c_str());
   if (!hs.empty()) g_height = atoi(hs.c_str());

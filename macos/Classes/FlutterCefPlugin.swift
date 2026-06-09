@@ -148,10 +148,11 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     let width = a["width"] as? Int ?? 800
     let height = a["height"] as? Int ?? 600
     let dpr = (a["dpr"] as? Double).map { CGFloat($0) } ?? 1.0
+    let allowedSchemes = a["allowedSchemes"] as? String ?? ""
     sessions[sessionId]?.dispose()
     let session = CefWebSession(
       sessionId: sessionId, url: url, width: width, height: height, dpr: dpr,
-      registry: registry, cefHostPath: cefHost)
+      allowedSchemes: allowedSchemes, registry: registry, cefHostPath: cefHost)
     session.onCursor = { [weak self] cursor in
       self?.emit("cursor", ["sessionId": sessionId, "cursor": cursor])
     }

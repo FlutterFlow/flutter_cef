@@ -282,6 +282,7 @@ class CefWebController {
     required int width,
     required int height,
     double dpr = 1.0,
+    Set<String>? allowedSchemes,
   }) async {
     final res = await _channel.invokeMapMethod<String, dynamic>('create', {
       'sessionId': sessionId,
@@ -289,6 +290,8 @@ class CefWebController {
       'width': width,
       'height': height,
       'dpr': dpr,
+      if (allowedSchemes != null && allowedSchemes.isNotEmpty)
+        'allowedSchemes': allowedSchemes.map((s) => s.toLowerCase()).join(','),
     });
     textureId = res?['textureId'] as int?;
     // Re-register any JS channels added before the session existed, so call

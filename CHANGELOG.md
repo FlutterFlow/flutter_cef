@@ -1,3 +1,14 @@
+## 0.1.2
+
+* **Navigation scheme allowlist**: `CefWebView(allowedSchemes: {...})` restricts
+  which URL schemes the page may navigate to — the initial load, programmatic
+  `navigate()`, in-page link clicks, and redirects are all gated in the
+  renderer's `OnBeforeBrowse`. `about:` is always permitted. Pass e.g.
+  `{'http', 'https'}` to keep an untrusted page off `file:` / `data:` /
+  `chrome:` schemes — important when a host can drive navigation
+  programmatically. Default (`null`) preserves the previous allow-all behavior,
+  so this is a non-breaking, opt-in addition.
+
 ## 0.1.1
 
 * **Multi-view host support**: the IME connection now carries

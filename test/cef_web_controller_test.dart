@@ -38,6 +38,32 @@ void main() {
     expect(args['width'], 100);
   });
 
+  test('create forwards allowedSchemes as a lowercased CSV', () async {
+    final c = CefWebController(sessionId: 's-allow');
+    await c.create(
+        url: 'https://example.com',
+        width: 10,
+        height: 10,
+        allowedSchemes: {'HTTP', 'https', 'about'});
+    final args = (log.firstWhere((m) => m.method == 'create').arguments as Map)
+        .cast<String, dynamic>();
+    expect(args['allowedSchemes'], 'http,https,about');
+  });
+
+  test('create omits allowedSchemes when unset or empty', () async {
+    final c = CefWebController(sessionId: 's-noallow');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    final none = (log.firstWhere((m) => m.method == 'create').arguments as Map);
+    expect(none.containsKey('allowedSchemes'), isFalse);
+
+    log.clear();
+    await c.create(
+        url: 'about:blank', width: 1, height: 1, allowedSchemes: const {});
+    final empty =
+        (log.firstWhere((m) => m.method == 'create').arguments as Map);
+    expect(empty.containsKey('allowedSchemes'), isFalse);
+  });
+
   test('navigate forwards the url for this session', () async {
     final c = CefWebController(sessionId: 's2');
     await c.navigate('https://flutter.dev');

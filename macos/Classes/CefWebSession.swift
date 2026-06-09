@@ -87,6 +87,7 @@ final class CefWebSession: NSObject, FlutterTexture {
 
   private weak var registry: FlutterTextureRegistry?
   private let cefHostPath: String
+  private let allowedSchemes: String  // CSV; "" = allow all
   private var width: Int
   private var height: Int
   private let dpr: CGFloat
@@ -107,11 +108,13 @@ final class CefWebSession: NSObject, FlutterTexture {
   // acceptAndRead thread exits, so dispose() can join it before freeing state.
 
   init(sessionId: String, url: String, width: Int, height: Int, dpr: CGFloat,
-       registry: FlutterTextureRegistry, cefHostPath: String) {
+       allowedSchemes: String = "", registry: FlutterTextureRegistry,
+       cefHostPath: String) {
     self.sessionId = sessionId
     self.width = max(1, width)
     self.height = max(1, height)
     self.dpr = dpr
+    self.allowedSchemes = allowedSchemes
     self.registry = registry
     self.cefHostPath = cefHostPath
     super.init()
@@ -371,7 +374,7 @@ final class CefWebSession: NSObject, FlutterTexture {
     let surfaceId = ioSurface.map { IOSurfaceGetID($0) } ?? 0
     let p = Process()
     p.executableURL = URL(fileURLWithPath: cefHostPath)
-    p.arguments = [
+    var args = [
       "--url=\(url)",
       "--width=\(width)",
       "--height=\(height)",
@@ -379,6 +382,10 @@ final class CefWebSession: NSObject, FlutterTexture {
       "--iosurface-id=\(surfaceId)",
       "--ipc=\(socketPath)",
     ]
+    if !allowedSchemes.isEmpty {
+      args.append("--allowed-schemes=\(allowedSchemes)")
+    }
+    p.arguments = args
     do {
       try p.run()
       process = p
