@@ -17,6 +17,13 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  # Federation members are wired as path deps: the repo is consumed from source
+  # (path / git), not pub.dev. PUBLISHING (when it happens): `pub publish`
+  # rejects path deps, so publish bottom-up — flutter_cef_platform_interface,
+  # then flutter_cef_macos, then this package — and at each step swap the sibling
+  # `path:` deps for hosted caret constraints (`^0.1.x`, the
+  # minor-compatible policy noted in the platform_interface pubspec), keeping the
+  # `path:` entries under `dependency_overrides` for local dev.
   flutter_cef_platform_interface:
     path: packages/flutter_cef_platform_interface
   # Endorsed default macOS implementation (see `default_package` below). Depended

@@ -14,7 +14,7 @@ Texture so it composites, transforms, and clips like any widget and keeps
 rendering when off-screen. macOS only.
                        DESC
   s.homepage         = 'https://github.com/FlutterFlow/flutter_cef'
-  s.license          = { :file => '../../../LICENSE' }
+  s.license          = { :file => '../LICENSE' }
   s.author           = { 'flutter_cef contributors' => '' }
   s.source           = { :path => '.' }
   s.source_files     = 'Classes/**/*'

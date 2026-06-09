@@ -14,6 +14,13 @@
 #                      native/cef_host/build/cef_host.app
 #   [signing-identity] default: "-" (ad-hoc). Pass your Developer ID / Apple
 #                      Development identity for a distributable build.
+#
+# Entitlements are chosen by signing posture: an ad-hoc ("-") signature is a dev
+# bundle and keeps entitlements.plist (with get-task-allow, for local debugging);
+# a real identity is a distributable build and uses entitlements.release.plist
+# (NO get-task-allow — it hard-fails notarization and is a task-port
+# privilege-escalation vector on a process running untrusted JIT'd web content).
+# Override the choice explicitly with CEF_HOST_ENTITLEMENTS=<path>.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
@@ -21,7 +28,14 @@ APP="${1:?usage: bundle_cef_host.sh <YourApp.app> [cef_host.app] [identity]}"
 HOST_APP="${2:-${FLUTTER_CEF_HOST_APP:-$HERE/../native/cef_host/build/cef_host.app}}"
 IDENTITY="${3:-${EXPANDED_CODE_SIGN_IDENTITY:-}}"
 [ -z "$IDENTITY" ] && IDENTITY="-"
-ENT="$HERE/../native/cef_host/entitlements.plist"
+if [ -n "${CEF_HOST_ENTITLEMENTS:-}" ]; then
+  ENT="$CEF_HOST_ENTITLEMENTS"
+elif [ "$IDENTITY" = "-" ]; then
+  ENT="$HERE/../native/cef_host/entitlements.plist"           # dev / ad-hoc
+else
+  ENT="$HERE/../native/cef_host/entitlements.release.plist"   # distributable
+fi
+echo "[flutter_cef] signing identity: $IDENTITY ; entitlements: $ENT"
 
 [ -d "$APP" ] || { echo "no such app bundle: $APP" >&2; exit 1; }
 [ -d "$HOST_APP" ] || {

@@ -1,4 +1,13 @@
 include: package:flutter_lints/flutter.yaml
 
+analyzer:
+  errors:
+    # Federation members are intentionally path deps: this repo is consumed from
+    # source (path / git), where path deps resolve the siblings automatically and
+    # hosted constraints would force every consumer to add dependency_overrides.
+    # `pub publish` still enforces the swap to hosted constraints — see the
+    # publish note in pubspec.yaml — so this only silences `flutter analyze`.
+    invalid_dependency: ignore
+
 # Additional information about this file can be found at
 # https://dart.dev/guides/language/analysis-options
