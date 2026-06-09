@@ -1,16 +1,26 @@
-# flutter_cef_example
+# flutter_cef example
 
-Demonstrates how to use the flutter_cef plugin.
+A small browser built on `CefWebView` + `CefWebController`: URL bar,
+back/forward/reload, loading bar, live page title, content zoom, JS eval,
+a cookies dump, DevTools, and the emoji picker — a manual test bed for every
+input path (typing, CJK composition, ⌃⌘Space, trackpad scrolling).
 
-## Getting Started
+## Run it
 
-This project is a starting point for a Flutter application.
+CEF (~200 MB) is fetched, not vendored — build the renderer once, point the
+plugin at it, then run:
 
-A few resources to get you started if this is your first Flutter project:
+```sh
+cd ..                       # package root
+native/build_cef_host.sh    # fetches CEF + builds cef_host.app (one-time)
+export FLUTTER_CEF_HOST="$PWD/native/cef_host/build/cef_host.app/Contents/MacOS/cef_host"
+cd example && flutter run -d macos
+```
 
-- [Lab: Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Cookbook: Useful Flutter samples](https://docs.flutter.dev/cookbook)
+Without `FLUTTER_CEF_HOST` (or a bundled `cef_host.app` — see the root
+README's "Bundling into a distributable app"), the view stays on its
+placeholder: the plugin has no renderer to spawn.
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+macOS only. The Runner is not App-Sandboxed and carries the CEF-required
+entitlements (`disable-library-validation`, JIT) — see
+`macos/Runner/*.entitlements` for the reference set.

@@ -14,9 +14,11 @@ set(USE_SANDBOX OFF CACHE BOOL "" FORCE)  # runtime no_sandbox (non-sandboxed ho
 find_package(CEF REQUIRED)
 add_subdirectory("${CEF_ROOT}/libcef_dll" libcef_dll_wrapper)
 
-# Default ad-hoc. Pass a real Apple Development / Developer ID identity via
-# -DCODESIGN_ID=<hash|name> (required for multi-process: the Mach-port peer
-# validator wants a hardened-runtime signature on every nested process).
+# Default ad-hoc — multi-process works ad-hoc because main.mm disables the
+# Mach-port peer validation (env var + --disable-features). Pass a real Apple
+# Development / Developer ID identity via -DCODESIGN_ID=<hash|name> for the
+# production-hardening posture (correct inside-out signing lets the bypass
+# be dropped).
 if(NOT DEFINED CODESIGN_ID)
   set(CODESIGN_ID "-")
 endif()

@@ -6,14 +6,14 @@
 #
 Pod::Spec.new do |s|
   s.name             = 'flutter_cef'
-  s.version          = '0.1.0'
+  s.version          = '0.1.1'
   s.summary          = 'Live Chromium (CEF) browser as a Flutter Texture (macOS).'
   s.description      = <<-DESC
 Embed a live Chromium browser via CEF off-screen rendering, shown as a Flutter
 Texture so it composites, transforms, and clips like any widget and keeps
 rendering when off-screen. macOS only.
                        DESC
-  s.homepage         = 'https://github.com/wenkaifan0720/flutter_cef'
+  s.homepage         = 'https://github.com/FlutterFlow/flutter_cef'
   s.license          = { :file => '../LICENSE' }
   s.author           = { 'flutter_cef contributors' => '' }
   s.source           = { :path => '.' }

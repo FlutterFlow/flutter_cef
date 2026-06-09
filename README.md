@@ -1,8 +1,8 @@
 # flutter_cef
 
-Embed a **live Chromium browser** (via the [Chromium Embedded Framework](https://bitbucket.org/chromiumembedded/cef/)) as a Flutter widget — rendered into a `Texture`, so it composites, transforms, clips, and zooms like any other widget, and **keeps rendering even when off-screen / not focused**. Pointer and scroll are forwarded by coordinate, and keyboard input reaches the page as real `keydown → keypress → keyup` events (Enter activates a focused button / submits a form, Space toggles a checkbox) — including platform IME composition for CJK / emoji and the ⌃⌘Space emoji picker; the page cursor drives a `MouseRegion`.
+Embed a **live Chromium browser** (via the [Chromium Embedded Framework](https://bitbucket.org/chromiumembedded/cef/)) as a Flutter widget — rendered into a `Texture`, so it composites, transforms, clips, and zooms like any other widget, and **keeps rendering even when off-screen / not focused**. Pointer, scroll, and trackpad two-finger pans are forwarded by coordinate (pans are caught even when an ancestor opts into Flutter's trackpad gesture API, as canvas hosts do), and keyboard input reaches the page as real `keydown → keypress → keyup` events (Enter activates a focused button / submits a form, Space toggles a checkbox) — including platform IME composition for CJK / emoji and the ⌃⌘Space emoji picker. Text input is bound to the hosting `FlutterView` (as `EditableText` does), so it **works in multi-view / multi-window apps**; the page cursor drives a `MouseRegion`.
 
-> Status: **experimental, macOS 12+ only** (CEF 144 runtime floor). Real Chromium (any site — JS/CSS/WebGL/video). **Multi-process by default** (GPU-accelerated OSR — `OnAcceleratedPaint` GPU compositing into a shared IOSurface, Retina-crisp; renderer/utility crashes isolated, so heavy SPAs like Google sign-in render and survive); `-DCEF_MULTI_PROCESS=OFF` for the simpler single-process build. No mobile (iOS bans third-party engines); desktop by nature.
+> Status: **experimental, macOS 12+ only** (CEF 144 runtime floor). Real Chromium (any site — JS/CSS/WebGL/video). **Multi-process by default** (GPU-accelerated OSR — `OnAcceleratedPaint` GPU compositing into a shared IOSurface, Retina-crisp; renderer/utility crashes isolated, so heavy SPAs like Google sign-in render and survive); `CEF_MULTI_PROCESS=OFF native/build_cef_host.sh` for the simpler single-process build. No mobile (iOS bans third-party engines); desktop by nature.
 
 ```dart
 import 'package:flutter_cef/flutter_cef.dart';
@@ -40,8 +40,10 @@ c.onJavaScriptConfirmDialog = (req) async => askUser(req.message); // alert/conf
 // cookies + scroll + storage
 c.setCookie(url: 'https://example.com/', name: 'sid', value: 'abc');
 final cookies = await c.getCookies(); // read/enumerate; pass url: to scope
-c.deleteCookie(url: 'https://example.com/', name: 'sid');
-c.scrollTo(0, 200); await c.getScrollPosition(); c.clearLocalStorage();
+c.deleteCookie(url: 'https://example.com/', name: 'sid'); c.clearCookies();
+c.scrollTo(0, 200); c.scrollBy(0, -50); await c.getScrollPosition();
+c.clearLocalStorage(); await c.getTitle(); await c.getUserAgent();
+c.onDownload = (suggestedName) {}; // downloads land in ~/Downloads
 
 // open the Chrome DevTools inspector for this view in its own window
 c.openDevTools();
@@ -60,8 +62,11 @@ Dart  CefWebView + CefWebController   (MethodChannel "flutter_cef")
   → macOS plugin (FlutterCefPlugin / CefWebSession):
       allocates a global IOSurface + CVPixelBuffer, registers a FlutterTexture,
       spawns one cef_host.app per view, relays input + cursor over a Unix socket
-  → cef_host.app: CEF windowless (OSR) → OnPaint copies the frame into the
-      shared IOSurface → "present" → the texture re-samples
+  → cef_host.app: CEF windowless (OSR), multi-process — the GPU/Viz process
+      composites the page and hands OnAcceleratedPaint a shared-texture
+      IOSurface, which cef_host copies into the host-shared IOSurface →
+      "present" → the texture re-samples. (OnPaint software blit is the
+      single-process fallback.)
 ```
 
 Same pattern JCEF (JetBrains) and CefSharp use to render Chromium into a non-native toolkit — adapted to Flutter's `Texture` + `IOSurface`.
@@ -106,9 +111,11 @@ content with JIT. Treat any page you load as untrusted code. Specifically:
   `get-task-allow` is on for dev and **must be removed + the app notarized** to
   distribute.
 - **Multi-process Mach-port peer validation is disabled** for the process tree
-  (`MACH_PORT_RENDEZVOUS_PEER_VALDATION=0`) so ad-hoc signing works; the
-  production posture is inside-out Developer-ID signing so that can be dropped
-  (see below).
+  (the `MACH_PORT_RENDEZVOUS_PEER_VALDATION=0` env var for child inheritance,
+  plus `--disable-features=MachPortRendezvousValidatePeerRequirements,`
+  `MachPortRendezvousEnforcePeerRequirements` in the browser process) so ad-hoc
+  signing works; the production posture is inside-out Developer-ID signing so
+  both can be dropped (see below).
 - **JS channel names are validated** as JS identifiers before injection (so a
   channel name can't break out and run script), and **`runJavaScriptReturningResult`
   expects a single expression** from trusted app code.
@@ -122,9 +129,11 @@ can tear slightly under the compositor; double-buffering is planned. Working
 today: **multi-process, GPU-accelerated** OSR render (on/off-screen,
 HiDPI/Retina-crisp, GPU compositing via `OnAcceleratedPaint`, heavy SPAs render +
 survive),
-pointer/scroll/keyboard input, **IME text input** (CJK composition + emoji, the
-candidate window tracked under the caret, and the ⌃⌘Space emoji picker —
-`showEmojiPicker()`), `<select>` popups, page cursor;
+pointer/scroll/trackpad-pan/keyboard input, **IME text input** (CJK composition
++ emoji, the candidate window tracked under the caret, and the ⌃⌘Space emoji
+picker — `showEmojiPicker()`) **in single- and multi-view (multi-window) hosts**
+(the connection carries `TextInputConfiguration.viewId` and is re-shown on every
+click, EditableText-style), `<select>` popups, page cursor;
 navigation + history, page-lifecycle events (start/finish/progress/url-change),
 new-window routing (`onCreateWindow`), loading/title/url/error/console state; JS
 dialogs (alert/confirm/prompt), a JS bridge (`addJavaScriptChannel` +

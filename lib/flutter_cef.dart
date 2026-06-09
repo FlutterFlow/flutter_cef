@@ -7,6 +7,11 @@
 library;
 
 export 'src/cef_events.dart'
-    show CefLoadError, CefConsoleMessage, CefFindResult, CefJsDialogRequest;
+    show
+        CefCookie,
+        CefConsoleMessage,
+        CefFindResult,
+        CefJsDialogRequest,
+        CefLoadError;
 export 'src/cef_web_controller.dart' show CefWebController;
 export 'src/cef_web_view.dart' show CefWebView;

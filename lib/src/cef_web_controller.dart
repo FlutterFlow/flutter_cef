@@ -541,6 +541,9 @@ class CefWebController {
     });
   }
 
+  /// Tear down the native session (the per-view `cef_host` process tree and
+  /// texture). Pending [runJavaScriptReturningResult] / [getCookies] futures
+  /// fail with a [StateError], and the controller is unusable afterwards.
   Future<void> dispose() async {
     _disposed = true;
     _bySession.remove(sessionId);

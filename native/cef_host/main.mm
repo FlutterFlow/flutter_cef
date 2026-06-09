@@ -8,35 +8,25 @@
 // (no NSWindow), it keeps rendering live even when the view is off-screen — the
 // whole point of the CEF path.
 //
-// By default CEF runs --single-process: renderer + GPU live in this process, so
-// there are no child processes and thus no Mach-port peer validation (Chromium
-// 144's process_requirement.cc -67030). Define CEF_HOST_MULTIPROCESS (CMake
-// -DCEF_MULTI_PROCESS=ON) to instead spawn the CEF helper subprocesses
-// (GPU/Renderer/Plugin/Alerts) from Contents/Frameworks — required for the
-// GPU/Viz process and OnAcceleratedPaint, but the whole bundle then needs to be
-// hardened-runtime signed with one Developer-ID identity + notarized to clear
-// peer validation cleanly.
+// Multi-process is the default (CMake option CEF_MULTI_PROCESS, ON by default,
+// defines CEF_HOST_MULTIPROCESS): the CEF helper subprocesses
+// (GPU/Renderer/Plugin/Alerts) spawn from Contents/Frameworks, the GPU/Viz
+// process composites the page, and OnAcceleratedPaint delivers it as a
+// shared-texture IOSurface — crash-isolated, so heavy SPAs survive. Chromium
+// 144's Mach-port peer validation (process_requirement.cc -67030) is cleared
+// WITHOUT Developer-ID signing: the MACH_PORT_RENDEZVOUS_PEER_VALDATION=0 env
+// var (inherited by children) plus
+// --disable-features=MachPortRendezvousValidatePeerRequirements,
+// MachPortRendezvousEnforcePeerRequirements in the browser process. Build with
+// -DCEF_MULTI_PROCESS=OFF for the simpler single-process fallback (software
+// OnPaint, no helpers, no peer validation at all).
 //
 // Args: --url=<url> --width=<px> --height=<px> --dpr=<scale> --iosurface-id=<id>
 //       --ipc=<path>
 //
 // IPC wire format: 4-byte big-endian length prefix, then [opcode][payload].
-//   host -> cef_host:  0x10 pointer {type:u8,button:u8,clicks:u8,_,mods:u32,
-//                                    x,y,dx,dy:f64}
-//                      0x11 resize {w:u32,h:u32,iosurfaceId:u32}
-//                      0x12 key {type:u8,_,_,_,mods:u32,wkc:u32,nkc:u32,char:u32}
-//                      0x14 shutdown {}
-//                      0x20 navigate {utf8 url}
-//                      0x21 reload / 0x22 stop / 0x23 back / 0x24 forward {}
-//                      0x25 executeJs {utf8 code}
-//   cef_host -> host:  0x01 present {}
-//                      0x02 ready {}
-//                      0x03 cursor {type:u32}
-//                      0x04 log {utf8}
-//                      0x05 loadState {loading,back,forward : u8}
-//                      0x06 title {utf8} / 0x07 url {utf8}
-//                      0x08 loadError {code:u32}{utf8 "url\ntext"}
-//                      0x09 console {level:u32}{utf8 "source:line\tmsg"}
+// The full opcode table lives in the `kOp*` constants below — each carries its
+// payload layout; cef_host -> host are 0x01-0x1a, host -> cef_host 0x10-0x33.
 
 #import <Cocoa/Cocoa.h>
 #import <IOSurface/IOSurface.h>
@@ -731,12 +721,13 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
     command_line->AppendSwitch("use-mock-keychain");
     command_line->AppendSwitchWithValue("password-store", "basic");
 #ifndef CEF_HOST_MULTIPROCESS
-    // Single-process (default): renderer + GPU + utility all share this process,
-    // so there are no Mach-port peers to validate (Chromium 144's -67030). The
-    // catch: heavy pages whose work lands on the in-process utility thread (e.g.
-    // Google sign-in probing WebAuthn/HID security keys) can CHECK-crash the
-    // whole process. It's best for simpler/first-party content; multi-process
-    // (-DCEF_MULTI_PROCESS=ON) isolates those crashes.
+    // Single-process (-DCEF_MULTI_PROCESS=OFF; NOT the default): renderer + GPU
+    // + utility all share this process, so there are no Mach-port peers to
+    // validate (Chromium 144's -67030). The catch: heavy pages whose work lands
+    // on the in-process utility thread (e.g. Google sign-in probing WebAuthn/HID
+    // security keys) can CHECK-crash the whole process. It's best for
+    // simpler/first-party content; the default multi-process build isolates
+    // those crashes.
     command_line->AppendSwitch("single-process");
     command_line->AppendSwitchWithValue(
         "disable-features",

@@ -22,7 +22,15 @@ const double _kTrackpadScrollGain = 3.0;
 /// Space toggles a checkbox) and the page's own key handlers fire. While focused
 /// the view holds a [TextInputConnection], so dead keys, CJK composition, and
 /// emoji work; composition commits and multi-unit inserts (emoji, paste) reach
-/// the page as full UTF-8 rather than a keypress.
+/// the page as full UTF-8 rather than a keypress. The connection is bound to
+/// the [View] hosting this widget (as `EditableText` does), so text input works
+/// in multi-view / multi-window apps — where the implicit view doesn't exist —
+/// and it is re-shown on every click into the already-focused view, so a host
+/// that moves macOS first responder around can't strand the IME.
+///
+/// Trackpad two-finger pans are forwarded to the page as scrolls even when an
+/// ancestor opts into Flutter's trackpad gesture API (which reroutes them from
+/// [PointerScrollEvent] to pan-zoom events — e.g. canvas hosts).
 ///
 /// ```dart
 /// CefWebView(url: 'https://flutter.dev')

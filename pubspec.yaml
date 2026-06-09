@@ -1,9 +1,9 @@
 name: flutter_cef
 description: "Embed a live Chromium (CEF) browser as a Flutter Texture on macOS: composites and clips like any widget, with input forwarding, a JS bridge, navigation and page events."
 version: 0.1.1
-homepage: https://github.com/wenkaifan0720/flutter_cef
-repository: https://github.com/wenkaifan0720/flutter_cef
-issue_tracker: https://github.com/wenkaifan0720/flutter_cef/issues
+homepage: https://github.com/FlutterFlow/flutter_cef
+repository: https://github.com/FlutterFlow/flutter_cef
+issue_tracker: https://github.com/FlutterFlow/flutter_cef/issues
 topics:
   - webview
   - chromium
