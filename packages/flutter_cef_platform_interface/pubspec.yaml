@@ -1,0 +1,23 @@
+name: flutter_cef_platform_interface
+description: "A common platform interface for the flutter_cef plugin: the shared Dart types and the method-channel contract that each platform implementation (macOS, and future Windows/Linux) speaks."
+version: 0.1.2
+homepage: https://github.com/FlutterFlow/flutter_cef
+repository: https://github.com/FlutterFlow/flutter_cef
+# NOTE: We strongly prefer a constraint that allows the current version and
+# future patch/minor releases of the interface so federated implementations
+# stay compatible. Breaking changes to this package require a major bump and a
+# coordinated update of all implementations.
+
+environment:
+  sdk: ^3.4.0
+  flutter: '>=3.22.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  plugin_platform_interface: ^2.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0

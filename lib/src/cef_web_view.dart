@@ -2,7 +2,8 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
-import 'cef_input.dart';
+import 'package:flutter_cef_platform_interface/flutter_cef_platform_interface.dart';
+
 import 'cef_web_controller.dart';
 
 /// Per-event gain applied to trackpad two-finger pan when forwarding it to the

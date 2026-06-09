@@ -35,3 +35,6 @@ migrate_working_dir/
 # Native CEF host: build output + fetched CEF SDK (see native/build_cef_host.sh).
 native/cef_host/build/
 native/**/cef_binary_*/
+
+# Federated sub-packages are libraries too — no pubspec.lock.
+/packages/*/pubspec.lock

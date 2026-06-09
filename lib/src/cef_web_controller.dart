@@ -4,8 +4,7 @@ import 'dart:convert';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
-import 'cef_events.dart';
-import 'cef_input.dart';
+import 'package:flutter_cef_platform_interface/flutter_cef_platform_interface.dart';
 
 /// Controls one CEF browser session: navigate, drive history, run JavaScript,
 /// forward input, and observe page state (loading, title, url, cursor). Backed
@@ -23,7 +22,10 @@ class CefWebController {
     _installHandler();
   }
 
-  static const MethodChannel _channel = MethodChannel('flutter_cef');
+  // The method channel of the endorsed platform implementation (the default
+  // MethodChannelFlutterCef on macOS). A platform plugin may swap the instance
+  // in its registerWith; this reflects whatever is current.
+  static MethodChannel get _channel => FlutterCefPlatform.instance.channel;
   static int _counter = 0;
   bool _disposed = false;
 

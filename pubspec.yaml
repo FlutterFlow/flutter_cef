@@ -17,6 +17,8 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  flutter_cef_platform_interface:
+    path: packages/flutter_cef_platform_interface
 
 dev_dependencies:
   flutter_test:
