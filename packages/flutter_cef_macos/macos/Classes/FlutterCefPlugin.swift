@@ -1,14 +1,13 @@
 import Cocoa
 import FlutterMacOS
 
-/// macOS plugin entry point. Channel `flutter_cef`. Verbs:
-///   create  {sessionId, url, width, height, dpr} -> {textureId, width, height}
-///   navigate{sessionId, url}
-///   resize  {sessionId, width, height, dpr}
-///   dispose {sessionId}
-///   pointer {sessionId, type, button, clickCount, modifiers, x, y, dx, dy}
-///   key     {sessionId, type, modifiers, windowsKeyCode, nativeKeyCode, character}
-/// Host -> Dart: invokeMethod("cursor", {sessionId, cursor}).
+/// macOS plugin entry point. Channel `flutter_cef`. The host->native verbs (the
+/// `case` labels in `handle(_:result:)`) and the native->Dart events (the
+/// `emit(...)` calls in `create`) together form the cross-platform method-channel
+/// protocol — see PORTING.md for the authoritative list. Each verb carries a
+/// `sessionId`; `create` returns `{textureId, width, height}`. The Swift side
+/// only relays: it spawns and talks to a per-view `cef_host` subprocess (see
+/// `CefWebSession`) over the IPC opcode protocol.
 public class FlutterCefPlugin: NSObject, FlutterPlugin {
   private weak var textureRegistry: FlutterTextureRegistry?
   private var channel: FlutterMethodChannel?

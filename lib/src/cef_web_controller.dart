@@ -116,6 +116,10 @@ class CefWebController {
       <String, void Function(String)>{};
 
   static void _installHandler() {
+    // Process-global, installed once on the first controller and never torn
+    // down; it fans events out to live controllers by sessionId and is a no-op
+    // for disposed ones. It binds the channel of whatever FlutterCefPlatform
+    // instance is current at first install (one channel in practice).
     if (_handlerInstalled) return;
     _handlerInstalled = true;
     _channel.setMethodCallHandler((call) async {

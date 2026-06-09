@@ -142,6 +142,11 @@ class _CefWebViewState extends State<CefWebView>
   }
 
   Future<void> _ensureSession(Size size) async {
+    // Scheduled via a post-frame callback, which can fire after this State was
+    // disposed (same-frame removal). Bail before touching context / the
+    // controller so we don't read a deactivated MediaQuery or resize a
+    // torn-down session.
+    if (!mounted) return;
     final dpr = MediaQuery.maybeOf(context)?.devicePixelRatio ?? 1.0;
     final w = size.width.round();
     final h = size.height.round();
@@ -317,6 +322,8 @@ class _CefWebViewState extends State<CefWebView>
   // to the page as a scroll. (pan delta ≈ −scroll delta for the same intent, so
   // we forward it un-negated to match the wheel path above.) The OS doesn't add
   // momentum to OSR, so a per-event gain brings the distance closer to Chrome's.
+  // Required to make the Listener route pan-zoom *update* events; nothing to do
+  // on the start of a trackpad gesture.
   void _onPointerPanZoomStart(PointerPanZoomStartEvent e) {}
 
   void _onPointerPanZoomUpdate(PointerPanZoomUpdateEvent e) {
@@ -629,6 +636,10 @@ class _CefWebViewState extends State<CefWebView>
     _textInput?.setEditingState(_editingState);
   }
 
+  // Deliberately returns the empty scratch state, never a real buffer: the page
+  // (not Flutter) owns the text, so we keep `_editingState` as a fixed insertion
+  // point for composition and never mirror the page's content back to the
+  // framework. See `_editingState` / `_pushEditableGeometry`.
   @override
   TextEditingValue? get currentTextEditingValue => _editingState;
 
