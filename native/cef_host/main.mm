@@ -123,6 +123,7 @@ constexpr uint8_t kOpImeSetComp = 0x30;     // {utf8 text} IME composition updat
 constexpr uint8_t kOpImeCommit = 0x31;      // {utf8 text} commit composed text
 constexpr uint8_t kOpImeCancel = 0x32;      // {} cancel composition
 constexpr uint8_t kOpShowDevTools = 0x33;   // {} open DevTools in a window
+constexpr uint8_t kOpLoadTrusted = 0x34;    // {utf8 url} host content-load, exempt from allowlist
 
 // ---- Shared runtime state ----
 int g_ipc_fd = -1;
@@ -139,8 +140,16 @@ CefRefPtr<CefBrowser> g_browser;
 // Host-set navigation scheme allowlist (lowercased; `--allowed-schemes=a,b`).
 // Empty = allow all. `about` is always allowed (the blank placeholder).
 // Enforced in HostClient::OnBeforeBrowse so it covers the initial load,
-// programmatic navigation, in-page clicks, and redirects.
+// programmatic navigation (navigate), in-page clicks, and redirects. The host's
+// explicit content-injection APIs (loadHtmlString -> data:, loadFile -> file:)
+// are NOT subject to it — they arrive as kOpLoadTrusted and set the one-shot
+// g_skip_allowlist_once below so their load isn't refused.
 std::set<std::string> g_allowed_schemes;
+
+// One-shot bypass for a host-trusted content load (kOpLoadTrusted). Set on the
+// CEF UI thread immediately before LoadURL and consumed by the very next
+// OnBeforeBrowse (also UI thread), so there is no cross-thread race.
+bool g_skip_allowlist_once = false;
 
 // Pending JS dialog callbacks, keyed by id. UI-thread-only (OnJSDialog and the
 // host's response both run on the CEF UI thread), so no lock is needed.
@@ -713,7 +722,13 @@ class HostClient : public CefClient,
   }
   bool OnBeforeBrowse(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame,
                       CefRefPtr<CefRequest> request, bool, bool) override {
-    if (!g_allowed_schemes.empty()) {
+    // A host content-injection load (loadHtmlString/loadFile) sets this one-shot
+    // flag right before its LoadURL; consume it here so its data:/file: URL is
+    // not refused by the page allowlist. Every other navigation — navigate(),
+    // the initial load, in-page clicks, redirects — is gated below.
+    const bool host_trusted = g_skip_allowlist_once;
+    g_skip_allowlist_once = false;
+    if (!host_trusted && !g_allowed_schemes.empty()) {
       const std::string url = request->GetURL().ToString();
       const size_t colon = url.find(':');
       std::string scheme =
@@ -835,6 +850,15 @@ void DoNavigate(const std::string& url) {
   if (!g_browser) return;
   CefRefPtr<CefFrame> f = g_browser->GetMainFrame();
   if (f) f->LoadURL(url);
+}
+
+// A host content-injection load (loadHtmlString -> data:, loadFile -> file:).
+// Runs on the CEF UI thread; set the one-shot bypass right before LoadURL so the
+// load's OnBeforeBrowse (next UI task) skips the scheme allowlist. Trusted
+// because the host explicitly chose this content, not the page.
+void DoNavigateTrusted(const std::string& url) {
+  g_skip_allowlist_once = true;
+  DoNavigate(url);
 }
 
 void DoReload() {
@@ -1113,6 +1137,11 @@ void IpcReadLoop() {
       case kOpNavigate: {
         std::string url(reinterpret_cast<const char*>(p), plen);
         CefPostTask(TID_UI, base::BindOnce(&DoNavigate, url));
+        break;
+      }
+      case kOpLoadTrusted: {
+        std::string url(reinterpret_cast<const char*>(p), plen);
+        CefPostTask(TID_UI, base::BindOnce(&DoNavigateTrusted, url));
         break;
       }
       case kOpReload:

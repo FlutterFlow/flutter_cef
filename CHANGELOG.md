@@ -7,7 +7,10 @@
   `{'http', 'https'}` to keep an untrusted page off `file:` / `data:` /
   `chrome:` schemes — important when a host can drive navigation
   programmatically. Default (`null`) preserves the previous allow-all behavior,
-  so this is a non-breaking, opt-in addition.
+  so this is a non-breaking, opt-in addition. The host's explicit
+  content-injection APIs — `loadHtmlString` (a `data:` URL) and `loadFile` (a
+  `file:` URL) — are exempt from the allowlist, since the host (not the page)
+  chose that content; only navigation (the page's, and `navigate()`) is gated.
 
 ## 0.1.1
 

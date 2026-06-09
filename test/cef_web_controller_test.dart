@@ -228,13 +228,17 @@ void main() {
     expect(find['forward'], false);
     expect(find['matchCase'], true);
     expect(log.any((m) => m.method == 'stopFind'), true);
-    // loadHtmlString + loadFile route through navigate with data:/file: urls.
-    final navs = log
-        .where((m) => m.method == 'navigate')
+    // loadHtmlString + loadFile are host-trusted content loads: they route
+    // through `loadTrusted` (NOT `navigate`), so they bypass the scheme
+    // allowlist with their data:/file: urls.
+    final loads = log
+        .where((m) => m.method == 'loadTrusted')
         .map((m) => (m.arguments as Map)['url'] as String)
         .toList();
-    expect(navs.any((u) => u.startsWith('data:text/html')), true);
-    expect(navs, contains('file:///tmp/x.html'));
+    expect(loads.any((u) => u.startsWith('data:text/html')), true);
+    expect(loads, contains('file:///tmp/x.html'));
+    // ...and specifically NOT through the gated navigate path.
+    expect(log.any((m) => m.method == 'navigate'), false);
   });
 
   test('findResult event invokes onFindResult', () async {

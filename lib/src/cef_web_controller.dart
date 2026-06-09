@@ -304,8 +304,19 @@ class CefWebController {
   }
 
   /// Navigate the main frame to [url].
+  ///
+  /// Subject to the view's `allowedSchemes` (if set): a navigation to a scheme
+  /// outside the allowlist is refused. Use [loadHtmlString] / [loadFile] for
+  /// trusted local content you want to render regardless of the allowlist.
   Future<void> navigate(String url) =>
       _channel.invokeMethod('navigate', {'sessionId': sessionId, 'url': url});
+
+  /// Load host-trusted content, bypassing the navigation scheme allowlist.
+  /// Backs [loadHtmlString] (data:) and [loadFile] (file:): the host explicitly
+  /// chose this content, so it isn't subject to `allowedSchemes` the way page
+  /// navigation and [navigate] are.
+  Future<void> _loadTrusted(String url) => _channel
+      .invokeMethod('loadTrusted', {'sessionId': sessionId, 'url': url});
 
   /// Reload the current page.
   Future<void> reload() => _send('reload');
@@ -456,14 +467,19 @@ class CefWebController {
 
   /// Load an HTML string. (`baseUrl` is accepted for API familiarity but not yet
   /// honoured — relative URLs resolve against the `data:` document.)
+  ///
+  /// Host-trusted content: rendered regardless of the view's `allowedSchemes`.
   Future<void> loadHtmlString(String html, {String? baseUrl}) {
     final encoded = base64Encode(const Utf8Encoder().convert(html));
-    return navigate('data:text/html;charset=utf-8;base64,$encoded');
+    return _loadTrusted('data:text/html;charset=utf-8;base64,$encoded');
   }
 
   /// Load a local file by absolute path.
+  ///
+  /// Host-trusted content: rendered regardless of the view's `allowedSchemes`
+  /// (so `file:` need not be in the allowlist to use this).
   Future<void> loadFile(String absolutePath) =>
-      navigate('file://$absolutePath');
+      _loadTrusted('file://$absolutePath');
 
   /// Set the page content zoom. `level` is a Chromium zoom *level*; the zoom
   /// *factor* is `1.2^level` (0 = 100%, 1 ≈ 120%, -1 ≈ 83%).

@@ -61,6 +61,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   private static let opImeCommit: UInt8 = 0x31
   private static let opImeCancel: UInt8 = 0x32
   private static let opShowDevTools: UInt8 = 0x33
+  private static let opLoadTrusted: UInt8 = 0x34
 
   // Event callbacks (fired off the main thread). The registrar relays each to a
   // Dart channel message.
@@ -152,6 +153,12 @@ final class CefWebSession: NSObject, FlutterTexture {
 
   func navigate(_ url: String) {
     sendFrame(Self.opNavigate, Array(url.utf8))
+  }
+
+  /// A host content-injection load (loadHtmlString -> data:, loadFile -> file:):
+  /// exempt from the navigation scheme allowlist, unlike `navigate`.
+  func loadTrusted(_ url: String) {
+    sendFrame(Self.opLoadTrusted, Array(url.utf8))
   }
 
   func reload() { sendFrame(Self.opReload) }

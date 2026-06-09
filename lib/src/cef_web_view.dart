@@ -67,6 +67,11 @@ class CefWebView extends StatefulWidget {
   /// untrusted page off `file:` / `data:` / `chrome:` etc. — important when a
   /// host can be driven to navigate the view programmatically. Null (the
   /// default) allows all schemes, matching a plain browser.
+  ///
+  /// The host's explicit content-injection APIs — [CefWebController.loadHtmlString]
+  /// (a `data:` URL) and [CefWebController.loadFile] (a `file:` URL) — are NOT
+  /// subject to this allowlist: the host chose that content, so it always loads.
+  /// Only navigation (the page's, and [CefWebController.navigate]) is gated.
   final Set<String>? allowedSchemes;
 
   @override
