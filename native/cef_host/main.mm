@@ -146,10 +146,15 @@ CefRefPtr<CefBrowser> g_browser;
 // g_skip_allowlist_once below so their load isn't refused.
 std::set<std::string> g_allowed_schemes;
 
-// One-shot bypass for a host-trusted content load (kOpLoadTrusted). Set on the
-// CEF UI thread immediately before LoadURL and consumed by the very next
-// OnBeforeBrowse (also UI thread), so there is no cross-thread race.
-bool g_skip_allowlist_once = false;
+// Exact URLs armed for a host-trusted content load (kOpLoadTrusted). The
+// exemption is bound to the specific URL, NOT to a moment in time: LoadURL does
+// not deliver OnBeforeBrowse synchronously (it enqueues the nav; the callback
+// arrives as a later UI task), so a global one-shot flag could be consumed by a
+// page-initiated navigation queued in the gap — an allowlist bypass. Matching on
+// the exact URL (and main frame) in OnBeforeBrowse means a page nav to a
+// different URL can never steal another load's exemption. A multiset tolerates
+// identical concurrent trusted loads. UI-thread only, so no lock.
+std::multiset<std::string> g_trusted_pending;
 
 // Pending JS dialog callbacks, keyed by id. UI-thread-only (OnJSDialog and the
 // host's response both run on the CEF UI thread), so no lock is needed.
@@ -722,23 +727,37 @@ class HostClient : public CefClient,
   }
   bool OnBeforeBrowse(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame,
                       CefRefPtr<CefRequest> request, bool, bool) override {
-    // A host content-injection load (loadHtmlString/loadFile) sets this one-shot
-    // flag right before its LoadURL; consume it here so its data:/file: URL is
-    // not refused by the page allowlist. Every other navigation — navigate(),
-    // the initial load, in-page clicks, redirects — is gated below.
-    const bool host_trusted = g_skip_allowlist_once;
-    g_skip_allowlist_once = false;
-    if (!host_trusted && !g_allowed_schemes.empty()) {
+    if (!g_allowed_schemes.empty()) {
       const std::string url = request->GetURL().ToString();
-      const size_t colon = url.find(':');
-      std::string scheme =
-          colon == std::string::npos ? std::string() : url.substr(0, colon);
-      std::transform(scheme.begin(), scheme.end(), scheme.begin(),
-                     [](unsigned char c) { return std::tolower(c); });
-      // `about:` (blank placeholder) is always allowed; anything else must be
-      // in the host allowlist or the navigation is refused.
-      if (scheme != "about" && g_allowed_schemes.count(scheme) == 0) {
-        return true;  // cancel
+      // Only gate MAIN-frame navigations. A subframe can't change the view's
+      // top-level origin (it's already same-policy-constrained by Chromium), and
+      // gating subframes would cancel legitimate cross-scheme embeds — blob: /
+      // data: iframes, PDF/video viewers, ad frames — breaking real pages.
+      const bool main_frame = !frame || frame->IsMain();
+      // A host content-injection load (loadHtmlString -> data:, loadFile ->
+      // file:) armed an exact-URL exemption in DoNavigateTrusted. Honor it only
+      // for the matching main-frame request, and consume that one entry, so a
+      // page navigation to a different URL can't steal it. A redirect of a
+      // trusted load carries a different URL and so remains gated.
+      bool host_trusted = false;
+      if (main_frame) {
+        auto it = g_trusted_pending.find(url);
+        if (it != g_trusted_pending.end()) {
+          g_trusted_pending.erase(it);
+          host_trusted = true;
+        }
+      }
+      if (main_frame && !host_trusted) {
+        const size_t colon = url.find(':');
+        std::string scheme =
+            colon == std::string::npos ? std::string() : url.substr(0, colon);
+        std::transform(scheme.begin(), scheme.end(), scheme.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        // `about:` (blank placeholder) is always allowed; anything else must be
+        // in the host allowlist or the navigation is refused.
+        if (scheme != "about" && g_allowed_schemes.count(scheme) == 0) {
+          return true;  // cancel
+        }
       }
     }
     if (router_) router_->OnBeforeBrowse(browser, frame);
@@ -853,11 +872,14 @@ void DoNavigate(const std::string& url) {
 }
 
 // A host content-injection load (loadHtmlString -> data:, loadFile -> file:).
-// Runs on the CEF UI thread; set the one-shot bypass right before LoadURL so the
-// load's OnBeforeBrowse (next UI task) skips the scheme allowlist. Trusted
+// Runs on the CEF UI thread. Arm an exact-URL exemption so this specific load's
+// OnBeforeBrowse (a later UI task) skips the scheme allowlist, while a page nav
+// to any other URL stays gated. Only arm when an allowlist is actually set —
+// g_allowed_schemes is immutable after startup, so when the feature is off this
+// is a plain navigate and we don't accumulate unconsumed entries. Trusted
 // because the host explicitly chose this content, not the page.
 void DoNavigateTrusted(const std::string& url) {
-  g_skip_allowlist_once = true;
+  if (!g_allowed_schemes.empty()) g_trusted_pending.insert(url);
   DoNavigate(url);
 }
 
