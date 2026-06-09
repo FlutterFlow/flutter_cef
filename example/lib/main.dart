@@ -27,6 +27,11 @@ class BrowserDemo extends StatefulWidget {
 
 class _BrowserDemoState extends State<BrowserDemo> {
   static const _startUrl = 'https://flutter.dev';
+  // Demonstrates the navigation scheme allowlist: this view may only navigate
+  // to http(s) (and about:, which is always permitted). Try the "block test"
+  // toolbar button — a file:// navigation is refused in the renderer's
+  // OnBeforeBrowse and the page stays put. Pass `null` to allow every scheme.
+  static const _allowedSchemes = {'http', 'https'};
   final CefWebController _controller = CefWebController();
   final FocusNode _webFocus = FocusNode(debugLabel: 'web');
   final TextEditingController _urlBar = TextEditingController(text: _startUrl);
@@ -133,6 +138,16 @@ and committed text — including emoji — should appear intact.</p>
 
   void _go() => _controller.navigate(_normalize(_urlBar.text.trim()));
 
+  /// Exercise [_allowedSchemes]: attempt a file:// navigation, which is not in
+  /// the allowlist and so should be refused in the renderer's OnBeforeBrowse —
+  /// the page should NOT change to the file listing.
+  void _tryBlockedScheme() {
+    const blocked = 'file:///etc/hosts';
+    _snack('Navigating to $blocked — should be REFUSED (allowed: '
+        '${_allowedSchemes.join(", ")}). The page should not change.');
+    _controller.navigate(blocked);
+  }
+
   String _normalize(String s) => s.isEmpty
       ? 'about:blank'
       : (s.startsWith('http') || s.contains(':') ? s : 'https://$s');
@@ -210,6 +225,11 @@ and committed text — including emoji — should appear intact.</p>
                     tooltip: 'Load the IME / text-input test page',
                     onPressed: _loadImeTest,
                   ),
+                  IconButton(
+                    icon: const Icon(Icons.block),
+                    tooltip: 'Try a blocked file:// navigation (allowedSchemes)',
+                    onPressed: _tryBlockedScheme,
+                  ),
                   Expanded(
                     child: TextField(
                       controller: _urlBar,
@@ -255,6 +275,7 @@ and committed text — including emoji — should appear intact.</p>
                 url: _startUrl,
                 controller: _controller,
                 focusNode: _webFocus,
+                allowedSchemes: _allowedSchemes,
               ),
             ),
           ],

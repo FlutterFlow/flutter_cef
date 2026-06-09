@@ -103,22 +103,37 @@ stay on.
 
 ## Security
 
-`flutter_cef` embeds a full, **non-sandboxed** Chromium that runs arbitrary web
-content with JIT. Treat any page you load as untrusted code. Specifically:
+`flutter_cef` embeds a full Chromium that runs arbitrary web content with JIT.
+Treat any page you load as untrusted code. The security posture is driven by one
+build flag, `CEF_HOST_ADHOC` (default `ON`):
 
-- **Non-sandboxed host with hardened-runtime relaxations** (`disable-library-validation`,
-  `allow-jit`, `allow-unsigned-executable-memory` — required by CEF's renderer).
-  `get-task-allow` is on for dev and **must be removed + the app notarized** to
-  distribute.
-- **Multi-process Mach-port peer validation is disabled** for the process tree
-  (the `MACH_PORT_RENDEZVOUS_PEER_VALDATION=0` env var for child inheritance,
-  plus `--disable-features=MachPortRendezvousValidatePeerRequirements,`
-  `MachPortRendezvousEnforcePeerRequirements` in the browser process) so ad-hoc
-  signing works; the production posture is inside-out Developer-ID signing so
-  both can be dropped (see below).
-- **JS channel names are validated** as JS identifiers before injection (so a
-  channel name can't break out and run script), and **`runJavaScriptReturningResult`
-  expects a single expression** from trusted app code.
+| | `CEF_HOST_ADHOC=ON` (default, dev/CI) | `CEF_HOST_ADHOC=OFF` (signed release) |
+| --- | --- | --- |
+| Chromium renderer/GPU sandbox | off (`no_sandbox=true`) | **on** — helper calls `CefScopedSandboxContext` |
+| Mach-port peer validation | bypassed (env var + `--disable-features`) | **enforced** |
+| Cookie-at-rest encryption | mock keychain / `password-store=basic` | **real Keychain / OSCrypt** |
+| `get-task-allow` entitlement | present (local debugging) | **absent** (`entitlements.release.plist`) |
+
+The `OFF` posture only *validates* under correct **inside-out Developer-ID
+signing** of the `cef_host` tree (deepest helper → `libcef_sandbox.dylib` + CEF
+framework → host, depth-first, Hardened Runtime + trusted timestamp). Build it
+with `CEF_HOST_ADHOC=OFF CODESIGN_ID="<Developer ID>" native/build_cef_host.sh`,
+or — when bundled into a host app — let the app's own signing re-sign the tree
+with those entitlements. Ad-hoc/dev builds run unsandboxed by necessity (the
+sandbox can't validate without proper signing), which is why `ON` is the default.
+
+Other always-on protections:
+
+- **Hardened-runtime relaxations** (`disable-library-validation`, `allow-jit`,
+  `allow-unsigned-executable-memory`) are kept in both entitlements files — CEF's
+  JIT renderer + dlopen'd framework require them.
+- **Navigation scheme allowlist** (`CefWebView(allowedSchemes:)`) — gate which
+  schemes a page may navigate to (main-frame nav, programmatic `navigate()`,
+  clicks, redirects); host content-injection (`loadHtmlString`/`loadFile`) is
+  exempt. Off by default (allow-all).
+- **JS channel names are validated** as JS identifiers before injection, and
+  **`runJavaScriptReturningResult` expects a single expression** from trusted
+  app code.
 - **Per-user, per-process CEF cache** (under the 0700 temp dir, not a fixed
   world-readable `/tmp` path) and a **randomized control-socket name**.
 

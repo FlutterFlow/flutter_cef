@@ -42,6 +42,7 @@ class CefWebView extends StatefulWidget {
     this.controller,
     this.focusNode,
     this.placeholder,
+    this.allowedSchemes,
   });
 
   /// Page to load. Changing it on an existing view navigates.
@@ -57,6 +58,21 @@ class CefWebView extends StatefulWidget {
 
   /// Shown until the first frame arrives. Defaults to a dark blank box.
   final Widget? placeholder;
+
+  /// If non-null, the page may only navigate to URLs whose scheme is in this
+  /// set (case-insensitive) — every other navigation, including the initial
+  /// load, programmatic [CefWebController.navigate], in-page clicks, and
+  /// redirects, is refused by the renderer ([CefClient.OnBeforeBrowse]). The
+  /// `about` scheme (e.g. `about:blank`) is always allowed. Use this to keep an
+  /// untrusted page off `file:` / `data:` / `chrome:` etc. — important when a
+  /// host can be driven to navigate the view programmatically. Null (the
+  /// default) allows all schemes, matching a plain browser.
+  ///
+  /// The host's explicit content-injection APIs — [CefWebController.loadHtmlString]
+  /// (a `data:` URL) and [CefWebController.loadFile] (a `file:` URL) — are NOT
+  /// subject to this allowlist: the host chose that content, so it always loads.
+  /// Only navigation (the page's, and [CefWebController.navigate]) is gated.
+  final Set<String>? allowedSchemes;
 
   @override
   State<CefWebView> createState() => _CefWebViewState();
@@ -133,7 +149,11 @@ class _CefWebViewState extends State<CefWebView>
       _creating = true;
       try {
         final id = await _controller.create(
-            url: widget.url, width: w, height: h, dpr: dpr);
+            url: widget.url,
+            width: w,
+            height: h,
+            dpr: dpr,
+            allowedSchemes: widget.allowedSchemes);
         _lastSize = size;
         if (mounted) setState(() => _textureId = id);
       } finally {

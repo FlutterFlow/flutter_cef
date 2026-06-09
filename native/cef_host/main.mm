@@ -21,6 +21,11 @@
 // -DCEF_MULTI_PROCESS=OFF for the simpler single-process fallback (software
 // OnPaint, no helpers, no peer validation at all).
 //
+// Those Mach-port shortcuts plus a mock keychain are gated behind the
+// CEF_HOST_ADHOC compile flag (ON by default). A signed release builds with
+// -DCEF_HOST_ADHOC=OFF, which enforces peer validation and uses the real
+// Keychain (OSCrypt) — and so requires correct inside-out Developer-ID signing.
+//
 // Args: --url=<url> --width=<px> --height=<px> --dpr=<scale> --iosurface-id=<id>
 //       --ipc=<path>
 //
@@ -118,6 +123,7 @@ constexpr uint8_t kOpImeSetComp = 0x30;     // {utf8 text} IME composition updat
 constexpr uint8_t kOpImeCommit = 0x31;      // {utf8 text} commit composed text
 constexpr uint8_t kOpImeCancel = 0x32;      // {} cancel composition
 constexpr uint8_t kOpShowDevTools = 0x33;   // {} open DevTools in a window
+constexpr uint8_t kOpLoadTrusted = 0x34;    // {utf8 url} host content-load, exempt from allowlist
 
 // ---- Shared runtime state ----
 int g_ipc_fd = -1;
@@ -130,6 +136,25 @@ int g_height = 600;
 double g_dpr = 1.0;  // device pixel ratio; the IOSurface is logical*g_dpr px.
 
 CefRefPtr<CefBrowser> g_browser;
+
+// Host-set navigation scheme allowlist (lowercased; `--allowed-schemes=a,b`).
+// Empty = allow all. `about` is always allowed (the blank placeholder).
+// Enforced in HostClient::OnBeforeBrowse so it covers the initial load,
+// programmatic navigation (navigate), in-page clicks, and redirects. The host's
+// explicit content-injection APIs (loadHtmlString -> data:, loadFile -> file:)
+// are NOT subject to it — they arrive as kOpLoadTrusted and set the one-shot
+// g_skip_allowlist_once below so their load isn't refused.
+std::set<std::string> g_allowed_schemes;
+
+// Exact URLs armed for a host-trusted content load (kOpLoadTrusted). The
+// exemption is bound to the specific URL, NOT to a moment in time: LoadURL does
+// not deliver OnBeforeBrowse synchronously (it enqueues the nav; the callback
+// arrives as a later UI task), so a global one-shot flag could be consumed by a
+// page-initiated navigation queued in the gap — an allowlist bypass. Matching on
+// the exact URL (and main frame) in OnBeforeBrowse means a page nav to a
+// different URL can never steal another load's exemption. A multiset tolerates
+// identical concurrent trusted loads. UI-thread only, so no lock.
+std::multiset<std::string> g_trusted_pending;
 
 // Pending JS dialog callbacks, keyed by id. UI-thread-only (OnJSDialog and the
 // host's response both run on the CEF UI thread), so no lock is needed.
@@ -701,7 +726,40 @@ class HostClient : public CefClient,
     if (router_) router_->OnBeforeClose(browser);
   }
   bool OnBeforeBrowse(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame,
-                      CefRefPtr<CefRequest>, bool, bool) override {
+                      CefRefPtr<CefRequest> request, bool, bool) override {
+    if (!g_allowed_schemes.empty()) {
+      const std::string url = request->GetURL().ToString();
+      // Only gate MAIN-frame navigations. A subframe can't change the view's
+      // top-level origin (it's already same-policy-constrained by Chromium), and
+      // gating subframes would cancel legitimate cross-scheme embeds — blob: /
+      // data: iframes, PDF/video viewers, ad frames — breaking real pages.
+      const bool main_frame = !frame || frame->IsMain();
+      // A host content-injection load (loadHtmlString -> data:, loadFile ->
+      // file:) armed an exact-URL exemption in DoNavigateTrusted. Honor it only
+      // for the matching main-frame request, and consume that one entry, so a
+      // page navigation to a different URL can't steal it. A redirect of a
+      // trusted load carries a different URL and so remains gated.
+      bool host_trusted = false;
+      if (main_frame) {
+        auto it = g_trusted_pending.find(url);
+        if (it != g_trusted_pending.end()) {
+          g_trusted_pending.erase(it);
+          host_trusted = true;
+        }
+      }
+      if (main_frame && !host_trusted) {
+        const size_t colon = url.find(':');
+        std::string scheme =
+            colon == std::string::npos ? std::string() : url.substr(0, colon);
+        std::transform(scheme.begin(), scheme.end(), scheme.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        // `about:` (blank placeholder) is always allowed; anything else must be
+        // in the host allowlist or the navigation is refused.
+        if (scheme != "about" && g_allowed_schemes.count(scheme) == 0) {
+          return true;  // cancel
+        }
+      }
+    }
     if (router_) router_->OnBeforeBrowse(browser, frame);
     return false;  // allow
   }
@@ -718,8 +776,14 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
   }
   void OnBeforeCommandLineProcessing(
       const CefString&, CefRefPtr<CefCommandLine> command_line) override {
+#ifdef CEF_HOST_ADHOC
+    // Dev / ad-hoc-only (CEF_HOST_ADHOC is ON by default; a signed release sets
+    // -DCEF_HOST_ADHOC=OFF). Mock keychain + basic password store so a launch
+    // doesn't raise the macOS Keychain access prompt every time. A signed
+    // release omits these and uses the real Keychain via OSCrypt.
     command_line->AppendSwitch("use-mock-keychain");
     command_line->AppendSwitchWithValue("password-store", "basic");
+#endif
 #ifndef CEF_HOST_MULTIPROCESS
     // Single-process (-DCEF_MULTI_PROCESS=OFF; NOT the default): renderer + GPU
     // + utility all share this process, so there are no Mach-port peers to
@@ -729,17 +793,16 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
     // simpler/first-party content; the default multi-process build isolates
     // those crashes.
     command_line->AppendSwitch("single-process");
-    command_line->AppendSwitchWithValue(
-        "disable-features",
-        "MachPortRendezvousValidatePeerRequirements,"
-        "MachPortRendezvousEnforcePeerRequirements");
-#else
-    // Multi-process GPU OSR: keep hardware compositing so the GPU/Viz process
-    // produces a shared-texture IOSurface for OnAcceleratedPaint, and disable the
-    // Mach-port peer-requirement validation that otherwise -67030s the GPU→
-    // browser handoff for an ad-hoc signature. These are the same flags the
-    // single-process path uses; together they let the GPU-accelerated path run
-    // multi-process (crash-isolated) WITHOUT Developer-ID signing.
+#endif
+#ifdef CEF_HOST_ADHOC
+    // Dev / ad-hoc-only: disable Chromium 144's Mach-port peer-requirement
+    // validation, which otherwise -67030s the multi-process GPU→browser handoff
+    // (OnAcceleratedPaint) under an ad-hoc signature. (Harmless in
+    // single-process, where there are no peers to validate.) Together with the
+    // shared-texture GPU OSR path this lets the accelerated path run
+    // multi-process (crash-isolated) WITHOUT Developer-ID signing. A signed
+    // release omits this and enforces validation, which then requires correct
+    // inside-out Developer-ID signing of the cef_host tree.
     command_line->AppendSwitchWithValue(
         "disable-features",
         "MachPortRendezvousValidatePeerRequirements,"
@@ -806,6 +869,18 @@ void DoNavigate(const std::string& url) {
   if (!g_browser) return;
   CefRefPtr<CefFrame> f = g_browser->GetMainFrame();
   if (f) f->LoadURL(url);
+}
+
+// A host content-injection load (loadHtmlString -> data:, loadFile -> file:).
+// Runs on the CEF UI thread. Arm an exact-URL exemption so this specific load's
+// OnBeforeBrowse (a later UI task) skips the scheme allowlist, while a page nav
+// to any other URL stays gated. Only arm when an allowlist is actually set —
+// g_allowed_schemes is immutable after startup, so when the feature is off this
+// is a plain navigate and we don't accumulate unconsumed entries. Trusted
+// because the host explicitly chose this content, not the page.
+void DoNavigateTrusted(const std::string& url) {
+  if (!g_allowed_schemes.empty()) g_trusted_pending.insert(url);
+  DoNavigate(url);
 }
 
 void DoReload() {
@@ -1086,6 +1161,11 @@ void IpcReadLoop() {
         CefPostTask(TID_UI, base::BindOnce(&DoNavigate, url));
         break;
       }
+      case kOpLoadTrusted: {
+        std::string url(reinterpret_cast<const char*>(p), plen);
+        CefPostTask(TID_UI, base::BindOnce(&DoNavigateTrusted, url));
+        break;
+      }
       case kOpReload:
         CefPostTask(TID_UI, base::BindOnce(&DoReload));
         break;
@@ -1275,14 +1355,15 @@ int ConnectUnixSocket(const std::string& path) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
-#ifdef CEF_HOST_MULTIPROCESS
+#if defined(CEF_HOST_MULTIPROCESS) && defined(CEF_HOST_ADHOC)
   // Disable Chromium 144's Mach-port peer-requirement validation for the whole
   // process tree. The child processes read this policy from an env var (NOT the
   // FeatureList, which isn't up yet when the rendezvous runs), and the browser
   // injects it; pre-setting it here makes children inherit kNoValidation (0).
   // (Note Chromium's misspelling "VALDATION".) On macOS 26 a failed validation
   // TERMINATES children, so without this no paint callback ever fires. This is a
-  // dev/CI unblock; the production fix is correct inside-out Developer-ID signing.
+  // dev/CI unblock (ad-hoc only — compiled out of a signed -DCEF_HOST_ADHOC=OFF
+  // release); the production fix is correct inside-out Developer-ID signing.
   setenv("MACH_PORT_RENDEZVOUS_PEER_VALDATION", "0", 1);
 #endif
   CefScopedLibraryLoader library_loader;
@@ -1297,6 +1378,18 @@ int main(int argc, char* argv[]) {
   std::string hs = ArgValue(argc, argv, "height");
   std::string dprs = ArgValue(argc, argv, "dpr");
   std::string sid = ArgValue(argc, argv, "iosurface-id");
+  std::string allowed = ArgValue(argc, argv, "allowed-schemes");
+  for (size_t start = 0; start < allowed.size();) {
+    const size_t comma = allowed.find(',', start);
+    const size_t len =
+        comma == std::string::npos ? std::string::npos : comma - start;
+    std::string s = allowed.substr(start, len);
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    if (!s.empty()) g_allowed_schemes.insert(s);
+    if (comma == std::string::npos) break;
+    start = comma + 1;
+  }
   if (url.empty()) url = "about:blank";
   if (!ws.empty()) g_width = atoi(ws.c_str());
   if (!hs.empty()) g_height = atoi(hs.c_str());
@@ -1327,7 +1420,18 @@ int main(int argc, char* argv[]) {
   @autoreleasepool {
     [CefHostApplication sharedApplication];
     CefSettings settings;
+#ifdef CEF_HOST_ADHOC
+    // Dev / ad-hoc: the Chromium renderer/GPU sandbox is OFF. It only *validates*
+    // under proper Developer-ID signing, so an ad-hoc build must run unsandboxed.
     settings.no_sandbox = true;
+#else
+    // Signed release (-DCEF_HOST_ADHOC=OFF): enable the Chromium renderer/GPU
+    // sandbox. The browser process itself is never sandboxed on macOS — only the
+    // helper subprocesses, which call CefScopedSandboxContext (process_helper.mm)
+    // before loading the framework. Requires correct inside-out Developer-ID
+    // signing of the cef_host tree (the libcef_sandbox.dylib + helpers + host).
+    settings.no_sandbox = false;
+#endif
     settings.windowless_rendering_enabled = true;
     settings.log_severity = LOGSEVERITY_INFO;
     // Per-process cache under the per-user (0700) temp dir — NOT a fixed,

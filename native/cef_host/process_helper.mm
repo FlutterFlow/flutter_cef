@@ -14,6 +14,7 @@
 
 #include "include/cef_app.h"
 #include "include/cef_render_process_handler.h"
+#include "include/cef_sandbox_mac.h"
 #include "include/cef_v8.h"
 #include "include/wrapper/cef_library_loader.h"
 #include "include/wrapper/cef_message_router.h"
@@ -58,6 +59,20 @@ class HelperApp : public CefApp, public CefRenderProcessHandler {
 }  // namespace
 
 int main(int argc, char* argv[]) {
+#ifndef CEF_HOST_ADHOC
+  // Signed release (-DCEF_HOST_ADHOC=OFF): bring this sub-process into the
+  // Chromium sandbox before anything else. CefScopedSandboxContext dlopens
+  // libcef_sandbox.dylib from the framework Libraries (path resolved relative to
+  // this helper executable) and calls cef_sandbox_initialize. Must run before
+  // LoadInHelper and stay in scope for the process lifetime (it does — main()
+  // blocks in CefExecuteProcess until the process exits). Sandbox enforcement
+  // only validates under proper Developer-ID signing, so it is compiled out of
+  // ad-hoc/dev builds (CEF_HOST_ADHOC), which run unsandboxed.
+  CefScopedSandboxContext sandbox_context;
+  if (!sandbox_context.Initialize(argc, argv)) {
+    return 1;
+  }
+#endif
   // Load the CEF framework from cef_host.app/Contents/Frameworks, resolved
   // relative to this helper's executable.
   CefScopedLibraryLoader library_loader;

@@ -61,6 +61,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   private static let opImeCommit: UInt8 = 0x31
   private static let opImeCancel: UInt8 = 0x32
   private static let opShowDevTools: UInt8 = 0x33
+  private static let opLoadTrusted: UInt8 = 0x34
 
   // Event callbacks (fired off the main thread). The registrar relays each to a
   // Dart channel message.
@@ -87,6 +88,7 @@ final class CefWebSession: NSObject, FlutterTexture {
 
   private weak var registry: FlutterTextureRegistry?
   private let cefHostPath: String
+  private let allowedSchemes: String  // CSV; "" = allow all
   private var width: Int
   private var height: Int
   private let dpr: CGFloat
@@ -107,11 +109,13 @@ final class CefWebSession: NSObject, FlutterTexture {
   // acceptAndRead thread exits, so dispose() can join it before freeing state.
 
   init(sessionId: String, url: String, width: Int, height: Int, dpr: CGFloat,
-       registry: FlutterTextureRegistry, cefHostPath: String) {
+       allowedSchemes: String = "", registry: FlutterTextureRegistry,
+       cefHostPath: String) {
     self.sessionId = sessionId
     self.width = max(1, width)
     self.height = max(1, height)
     self.dpr = dpr
+    self.allowedSchemes = allowedSchemes
     self.registry = registry
     self.cefHostPath = cefHostPath
     super.init()
@@ -149,6 +153,12 @@ final class CefWebSession: NSObject, FlutterTexture {
 
   func navigate(_ url: String) {
     sendFrame(Self.opNavigate, Array(url.utf8))
+  }
+
+  /// A host content-injection load (loadHtmlString -> data:, loadFile -> file:):
+  /// exempt from the navigation scheme allowlist, unlike `navigate`.
+  func loadTrusted(_ url: String) {
+    sendFrame(Self.opLoadTrusted, Array(url.utf8))
   }
 
   func reload() { sendFrame(Self.opReload) }
@@ -371,7 +381,7 @@ final class CefWebSession: NSObject, FlutterTexture {
     let surfaceId = ioSurface.map { IOSurfaceGetID($0) } ?? 0
     let p = Process()
     p.executableURL = URL(fileURLWithPath: cefHostPath)
-    p.arguments = [
+    var args = [
       "--url=\(url)",
       "--width=\(width)",
       "--height=\(height)",
@@ -379,6 +389,10 @@ final class CefWebSession: NSObject, FlutterTexture {
       "--iosurface-id=\(surfaceId)",
       "--ipc=\(socketPath)",
     ]
+    if !allowedSchemes.isEmpty {
+      args.append("--allowed-schemes=\(allowedSchemes)")
+    }
+    p.arguments = args
     do {
       try p.run()
       process = p

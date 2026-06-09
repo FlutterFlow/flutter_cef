@@ -6,7 +6,10 @@
 #
 # Env: FLUTTER_CEF_CACHE (default ~/.cache/flutter_cef), CODESIGN_ID (default
 # ad-hoc; pass a Developer ID / Apple Development identity for standalone use —
-# when bundled into an app, the app's own signing re-signs it).
+# when bundled into an app, the app's own signing re-signs it),
+# CEF_MULTI_PROCESS (default ON; OFF for the single-process fallback),
+# CEF_HOST_ADHOC (default ON; OFF for a signed release — drops the mock
+# keychain + Mach-port peer-validation bypass, so it needs Developer-ID signing).
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
@@ -53,8 +56,17 @@ if [ "${CEF_MULTI_PROCESS:-}" = "0" ] || [ "${CEF_MULTI_PROCESS:-}" = "OFF" ]; t
   MP_FLAG="-DCEF_MULTI_PROCESS=OFF"
   echo "[flutter_cef] single-process build (simpler; first-party content only)"
 fi
+# Ad-hoc shortcuts (mock keychain + Mach-port peer-validation bypass) ON by
+# default so a dev/CI build runs without Developer-ID signing. A signed release
+# sets CEF_HOST_ADHOC=OFF: real Keychain + enforced validation, which then
+# require correct inside-out Developer-ID signing of the cef_host tree.
+ADHOC_FLAG="-DCEF_HOST_ADHOC=ON"
+if [ "${CEF_HOST_ADHOC:-}" = "0" ] || [ "${CEF_HOST_ADHOC:-}" = "OFF" ]; then
+  ADHOC_FLAG="-DCEF_HOST_ADHOC=OFF"
+  echo "[flutter_cef] release build: ad-hoc shortcuts OFF (needs Developer-ID signing)"
+fi
 cmake -G Ninja -S "$HERE/cef_host" -B "$OUT" \
-  -DCEF_ROOT="$CEF_ROOT" -DCODESIGN_ID="$CODESIGN_ID" "$MP_FLAG" >/dev/null
+  -DCEF_ROOT="$CEF_ROOT" -DCODESIGN_ID="$CODESIGN_ID" "$MP_FLAG" "$ADHOC_FLAG" >/dev/null
 ninja -C "$OUT" cef_host
 echo "[flutter_cef] -> $OUT/cef_host.app"
 echo "[flutter_cef] for dev, point the app at it:"

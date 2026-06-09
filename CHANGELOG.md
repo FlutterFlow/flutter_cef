@@ -1,3 +1,26 @@
+## 0.1.2
+
+* **Navigation scheme allowlist**: `CefWebView(allowedSchemes: {...})` restricts
+  which URL schemes the page may navigate to — the initial load, programmatic
+  `navigate()`, in-page link clicks, and redirects are all gated in the
+  renderer's `OnBeforeBrowse`. `about:` is always permitted. Pass e.g.
+  `{'http', 'https'}` to keep an untrusted page off `file:` / `data:` /
+  `chrome:` schemes — important when a host can drive navigation
+  programmatically. Default (`null`) preserves the previous allow-all behavior,
+  so this is a non-breaking, opt-in addition. The host's explicit
+  content-injection APIs — `loadHtmlString` (a `data:` URL) and `loadFile` (a
+  `file:` URL) — are exempt from the allowlist, since the host (not the page)
+  chose that content; only navigation (the page's, and `navigate()`) is gated.
+* **Production hardening (build-time, `-DCEF_HOST_ADHOC=OFF`)**: a signed release
+  build now enables the **Chromium renderer/GPU sandbox** (the helper calls
+  `CefScopedSandboxContext` before loading the framework; `settings.no_sandbox`
+  is false), drops the ad-hoc-only Mach-port peer-validation bypass + mock
+  keychain (so cookies encrypt at rest via the real Keychain/OSCrypt), and signs
+  with a stripped entitlements file that omits `get-task-allow`. All of this is
+  off by default (`CEF_HOST_ADHOC=ON`) so dev/CI builds are byte-identical and
+  run unsandboxed under ad-hoc signing; the release posture only *validates*
+  under correct inside-out Developer-ID signing of the `cef_host` tree.
+
 ## 0.1.1
 
 * **Multi-view host support**: the IME connection now carries

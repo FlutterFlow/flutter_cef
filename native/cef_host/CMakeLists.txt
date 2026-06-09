@@ -22,7 +22,6 @@ add_subdirectory("${CEF_ROOT}/libcef_dll" libcef_dll_wrapper)
 if(NOT DEFINED CODESIGN_ID)
   set(CODESIGN_ID "-")
 endif()
-set(ENT "${CMAKE_CURRENT_SOURCE_DIR}/entitlements.plist")
 
 # Multi-process is the DEFAULT: it spawns the CEF helper subprocesses (GPU/Viz +
 # OnAcceleratedPaint shared-IOSurface render) and isolates renderer/utility
@@ -33,6 +32,27 @@ set(ENT "${CMAKE_CURRENT_SOURCE_DIR}/entitlements.plist")
 # signing so that env var can be dropped. Set -DCEF_MULTI_PROCESS=OFF for the
 # simpler single-process build (first-party content only).
 option(CEF_MULTI_PROCESS "Spawn CEF helper subprocesses (vs --single-process)" ON)
+
+# CEF_HOST_ADHOC (default ON): compile in the dev-only Chromium security
+# shortcuts that let cef_host run under an ad-hoc signature — the mock keychain
+# + basic password store (no Keychain prompt on launch) and the Mach-port
+# peer-validation bypass (clears -67030 on the multi-process GPU handoff). A
+# signed release builds with -DCEF_HOST_ADHOC=OFF: the real Keychain via OSCrypt
+# and enforced peer validation, which then require correct inside-out
+# Developer-ID signing of the cef_host tree. Independent of CEF_MULTI_PROCESS.
+option(CEF_HOST_ADHOC "Compile in dev/ad-hoc-only Chromium security shortcuts" ON)
+
+# Codesign entitlements: dev/ad-hoc carries get-task-allow (local debugging); a
+# signed release (CEF_HOST_ADHOC=OFF) uses a stripped variant without it
+# (notarization hard-fails with get-task-allow, and it's a local task-port
+# privilege-escalation vector). Both keep allow-jit / allow-unsigned-executable-
+# memory / disable-library-validation, which the JIT renderer + dlopen'd
+# framework need.
+if(CEF_HOST_ADHOC)
+  set(ENT "${CMAKE_CURRENT_SOURCE_DIR}/entitlements.plist")
+else()
+  set(ENT "${CMAKE_CURRENT_SOURCE_DIR}/entitlements.release.plist")
+endif()
 
 # cef_host: the BROWSER process. A .app bundle (CEF needs a real bundle). The CEF
 # framework (and, in multi-process, the helper apps) live in Contents/Frameworks.
@@ -45,6 +65,9 @@ target_link_libraries(cef_host libcef_dll_wrapper ${CEF_STANDARD_LIBS}
   "-framework IOSurface" "-framework Metal" "-framework CoreVideo")
 if(CEF_MULTI_PROCESS)
   target_compile_definitions(cef_host PRIVATE CEF_HOST_MULTIPROCESS)
+endif()
+if(CEF_HOST_ADHOC)
+  target_compile_definitions(cef_host PRIVATE CEF_HOST_ADHOC)
 endif()
 
 set(APP_DIR "${CMAKE_CURRENT_BINARY_DIR}/cef_host.app")
@@ -70,6 +93,11 @@ if(CEF_MULTI_PROCESS)
     SET_EXECUTABLE_TARGET_PROPERTIES(${_helper_target})
     add_dependencies(${_helper_target} libcef_dll_wrapper)
     target_link_libraries(${_helper_target} libcef_dll_wrapper ${CEF_STANDARD_LIBS})
+    # Helper needs the flag too: it gates the CefScopedSandboxContext init in
+    # process_helper.mm (sandbox on only in a signed -DCEF_HOST_ADHOC=OFF build).
+    if(CEF_HOST_ADHOC)
+      target_compile_definitions(${_helper_target} PRIVATE CEF_HOST_ADHOC)
+    endif()
     set_target_properties(${_helper_target} PROPERTIES
       MACOSX_BUNDLE_INFO_PLIST "${_helper_plist}"
       OUTPUT_NAME "${_helper_output_name}")

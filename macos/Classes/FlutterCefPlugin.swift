@@ -28,6 +28,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     switch call.method {
     case "create": create(args, result)
     case "navigate": navigate(args, result)
+    case "loadTrusted": loadTrusted(args, result)
     case "resize": resize(args, result)
     case "dispose": destroy(args, result)
     case "pointer": pointer(args, result)
@@ -148,10 +149,11 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     let width = a["width"] as? Int ?? 800
     let height = a["height"] as? Int ?? 600
     let dpr = (a["dpr"] as? Double).map { CGFloat($0) } ?? 1.0
+    let allowedSchemes = a["allowedSchemes"] as? String ?? ""
     sessions[sessionId]?.dispose()
     let session = CefWebSession(
       sessionId: sessionId, url: url, width: width, height: height, dpr: dpr,
-      registry: registry, cefHostPath: cefHost)
+      allowedSchemes: allowedSchemes, registry: registry, cefHostPath: cefHost)
     session.onCursor = { [weak self] cursor in
       self?.emit("cursor", ["sessionId": sessionId, "cursor": cursor])
     }
@@ -225,6 +227,15 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   private func navigate(_ a: [String: Any], _ result: @escaping FlutterResult) {
     if let id = a["sessionId"] as? String, let url = a["url"] as? String {
       sessions[id]?.navigate(url)
+    }
+    result(nil)
+  }
+
+  /// Host content-injection load (loadHtmlString/loadFile) — bypasses the
+  /// navigation scheme allowlist in cef_host.
+  private func loadTrusted(_ a: [String: Any], _ result: @escaping FlutterResult) {
+    if let id = a["sessionId"] as? String, let url = a["url"] as? String {
+      sessions[id]?.loadTrusted(url)
     }
     result(nil)
   }
