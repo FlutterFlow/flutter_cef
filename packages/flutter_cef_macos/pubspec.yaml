@@ -1,0 +1,31 @@
+name: flutter_cef_macos
+description: "macOS implementation of the flutter_cef plugin: a live Chromium (CEF) browser rendered off-screen in a cef_host subprocess and shown as a Flutter Texture."
+version: 0.1.2
+homepage: https://github.com/FlutterFlow/flutter_cef
+repository: https://github.com/FlutterFlow/flutter_cef
+
+environment:
+  sdk: ^3.4.0
+  flutter: '>=3.22.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_cef_platform_interface:
+    path: ../flutter_cef_platform_interface
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  plugin:
+    # Endorsed implementation of the app-facing `flutter_cef` plugin.
+    implements: flutter_cef
+    platforms:
+      macos:
+        # Swift host plugin (spawns + talks to the cef_host subprocess).
+        pluginClass: FlutterCefPlugin
+        # Dart entrypoint: endorses the default method-channel platform instance.
+        dartPluginClass: FlutterCefMacos

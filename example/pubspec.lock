@@ -77,6 +77,13 @@ packages:
       relative: true
     source: path
     version: "0.1.2"
+  flutter_cef_macos:
+    dependency: transitive
+    description:
+      path: "../packages/flutter_cef_macos"
+      relative: true
+    source: path
+    version: "0.1.2"
   flutter_cef_platform_interface:
     dependency: transitive
     description:

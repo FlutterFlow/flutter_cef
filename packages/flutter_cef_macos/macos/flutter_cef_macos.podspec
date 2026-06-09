@@ -5,7 +5,7 @@
 # that with native/build_cef_host.sh; see the README for bundling/signing.
 #
 Pod::Spec.new do |s|
-  s.name             = 'flutter_cef'
+  s.name             = 'flutter_cef_macos'
   s.version          = '0.1.2'
   s.summary          = 'Live Chromium (CEF) browser as a Flutter Texture (macOS).'
   s.description      = <<-DESC
@@ -14,7 +14,7 @@ Texture so it composites, transforms, and clips like any widget and keeps
 rendering when off-screen. macOS only.
                        DESC
   s.homepage         = 'https://github.com/FlutterFlow/flutter_cef'
-  s.license          = { :file => '../LICENSE' }
+  s.license          = { :file => '../../../LICENSE' }
   s.author           = { 'flutter_cef contributors' => '' }
   s.source           = { :path => '.' }
   s.source_files     = 'Classes/**/*'
