@@ -1,0 +1,12 @@
+include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  errors:
+    # Depends on flutter_cef_platform_interface via a path dep on purpose: this
+    # repo is consumed from source (path / git). `pub publish` still enforces the
+    # swap to a hosted constraint — see the publish note in the root pubspec — so
+    # this only silences `flutter analyze`.
+    invalid_dependency: ignore
+
+# Additional information about this file can be found at
+# https://dart.dev/guides/language/analysis-options

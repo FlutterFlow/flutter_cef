@@ -2,7 +2,7 @@
 
 Embed a **live Chromium browser** (via the [Chromium Embedded Framework](https://bitbucket.org/chromiumembedded/cef/)) as a Flutter widget — rendered into a `Texture`, so it composites, transforms, clips, and zooms like any other widget, and **keeps rendering even when off-screen / not focused**. Pointer, scroll, and trackpad two-finger pans are forwarded by coordinate (pans are caught even when an ancestor opts into Flutter's trackpad gesture API, as canvas hosts do), and keyboard input reaches the page as real `keydown → keypress → keyup` events (Enter activates a focused button / submits a form, Space toggles a checkbox) — including platform IME composition for CJK / emoji and the ⌃⌘Space emoji picker. Text input is bound to the hosting `FlutterView` (as `EditableText` does), so it **works in multi-view / multi-window apps**; the page cursor drives a `MouseRegion`.
 
-> Status: **experimental, macOS 12+ only** (CEF 144 runtime floor). Real Chromium (any site — JS/CSS/WebGL/video). **Multi-process by default** (GPU-accelerated OSR — `OnAcceleratedPaint` GPU compositing into a shared IOSurface, Retina-crisp; renderer/utility crashes isolated, so heavy SPAs like Google sign-in render and survive); `CEF_MULTI_PROCESS=OFF native/build_cef_host.sh` for the simpler single-process build. No mobile (iOS bans third-party engines); desktop by nature.
+> Status: **experimental, macOS 12+ only** (CEF 144 runtime floor). Real Chromium (any site — JS/CSS/WebGL/video). **Multi-process by default** (GPU-accelerated OSR — `OnAcceleratedPaint` GPU compositing into a shared IOSurface, Retina-crisp; renderer/utility crashes isolated, so heavy SPAs like Google sign-in render and survive); `CEF_MULTI_PROCESS=OFF packages/flutter_cef_macos/native/build_cef_host.sh` for the simpler single-process build. No mobile (iOS bans third-party engines); desktop by nature.
 
 ```dart
 import 'package:flutter_cef/flutter_cef.dart';
@@ -76,9 +76,11 @@ Same pattern JCEF (JetBrains) and CefSharp use to render Chromium into a non-nat
 CEF (~200 MB) is **fetched**, not vendored. Build the renderer once:
 
 ```sh
+# The macOS implementation lives in packages/flutter_cef_macos.
+cd packages/flutter_cef_macos
 native/build_cef_host.sh            # fetches CEF + builds cef_host.app
 export FLUTTER_CEF_HOST="$PWD/native/cef_host/build/cef_host.app/Contents/MacOS/cef_host"
-cd example && flutter run -d macos
+cd ../../example && flutter run -d macos
 ```
 
 ### Bundling into a distributable app
@@ -89,11 +91,12 @@ automatically (`$FLUTTER_CEF_HOST` → pod resources → `Contents/Frameworks` �
 `Contents/Helpers`). After `flutter build macos`, run:
 
 ```sh
-path/to/flutter_cef/tool/bundle_cef_host.sh "build/macos/.../YourApp.app" "" "<signing-identity>"
+packages/flutter_cef_macos/tool/bundle_cef_host.sh "build/macos/.../YourApp.app" "" "<signing-identity>"
 ```
 
 or wire it as a Run Script build phase on your Runner target (snippet in
-`tool/bundle_cef_host.sh`) so it runs before Xcode's code-sign phase. Your host
+`packages/flutter_cef_macos/tool/bundle_cef_host.sh`) so it runs before Xcode's
+code-sign phase. Your host
 app **must not be App-Sandboxed** (CEF spawns the helper, shares a global
 IOSurface, writes a cache); entitlements need
 `com.apple.security.cs.disable-library-validation` + JIT — see
@@ -117,7 +120,8 @@ build flag, `CEF_HOST_ADHOC` (default `ON`):
 The `OFF` posture only *validates* under correct **inside-out Developer-ID
 signing** of the `cef_host` tree (deepest helper → `libcef_sandbox.dylib` + CEF
 framework → host, depth-first, Hardened Runtime + trusted timestamp). Build it
-with `CEF_HOST_ADHOC=OFF CODESIGN_ID="<Developer ID>" native/build_cef_host.sh`,
+with `CEF_HOST_ADHOC=OFF CODESIGN_ID="<Developer ID>"
+packages/flutter_cef_macos/native/build_cef_host.sh`,
 or — when bundled into a host app — let the app's own signing re-sign the tree
 with those entitlements. Ad-hoc/dev builds run unsandboxed by necessity (the
 sandbox can't validate without proper signing), which is why `ON` is the default.
@@ -178,8 +182,11 @@ Next:
   scheme handlers, a typed DevTools/CDP client (the inspector window already
   ships via `openDevTools`; this is the programmatic CDP surface), and `CefPermissionHandler`
   (WebRTC camera/mic prompts).
-- **Windows / Linux** — the federated structure is ready; each needs its own host
-  + shared-texture path.
+- **Windows / Linux** — the package is **federated** (`flutter_cef` +
+  `flutter_cef_platform_interface` + `flutter_cef_macos`); a new platform is a
+  sibling `flutter_cef_<os>` package. The CEF logic + IPC protocol are portable;
+  each OS supplies its own host plugin + shared-texture / transport / sandbox
+  glue. See [`PORTING.md`](PORTING.md) for the full contract and seam map.
 
 ## Credits
 

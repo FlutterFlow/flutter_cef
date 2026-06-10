@@ -2,7 +2,7 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:flutter_cef/src/cef_input.dart';
+import 'package:flutter_cef_platform_interface/flutter_cef_platform_interface.dart';
 
 void main() {
   group('cefWindowsKeyCode — editing/navigation keys resolve to Windows VK',

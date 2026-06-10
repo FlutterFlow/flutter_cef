@@ -1,3 +1,14 @@
+## 0.1.3
+
+* **Federated package structure** (no API change): `flutter_cef` is now a
+  federated plugin — the app-facing package plus
+  `flutter_cef_platform_interface` (the shared Dart types + method-channel
+  contract) and the endorsed `flutter_cef_macos` (Swift plugin + `cef_host`).
+  Consumers keep depending on `flutter_cef` and importing
+  `package:flutter_cef/flutter_cef.dart` exactly as before. A Windows or Linux
+  implementation can now be added as a sibling `flutter_cef_<os>` package — see
+  [`PORTING.md`](PORTING.md) for the contract and the platform-seam map.
+
 ## 0.1.2
 
 * **Navigation scheme allowlist**: `CefWebView(allowedSchemes: {...})` restricts

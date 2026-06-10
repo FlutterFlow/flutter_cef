@@ -27,11 +27,11 @@
 // Keychain (OSCrypt) — and so requires correct inside-out Developer-ID signing.
 //
 // Args: --url=<url> --width=<px> --height=<px> --dpr=<scale> --iosurface-id=<id>
-//       --ipc=<path>
+//       --ipc=<path> --allowed-schemes=<csv>
 //
 // IPC wire format: 4-byte big-endian length prefix, then [opcode][payload].
 // The full opcode table lives in the `kOp*` constants below — each carries its
-// payload layout; cef_host -> host are 0x01-0x1a, host -> cef_host 0x10-0x33.
+// payload layout; cef_host -> host are 0x01-0x1a, host -> cef_host 0x10-0x34.
 
 #import <Cocoa/Cocoa.h>
 #import <IOSurface/IOSurface.h>
@@ -154,6 +154,9 @@ std::set<std::string> g_allowed_schemes;
 // the exact URL (and main frame) in OnBeforeBrowse means a page nav to a
 // different URL can never steal another load's exemption. A multiset tolerates
 // identical concurrent trusted loads. UI-thread only, so no lock.
+// (A page racing the host to the EXACT same data:/file: URL could consume one
+// armed entry, but that is benign — it loads the same content the host chose —
+// so it is not defended beyond exact-URL matching.)
 std::multiset<std::string> g_trusted_pending;
 
 // Pending JS dialog callbacks, keyed by id. UI-thread-only (OnJSDialog and the
@@ -818,7 +821,8 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
   }
   void OnContextInitialized() override {
     CEF_REQUIRE_UI_THREAD();
-    fprintf(stderr, "[cef_host] OnContextInitialized\n");
+    if (std::getenv("FLUTTER_CEF_DEBUG"))
+      fprintf(stderr, "[cef_host] OnContextInitialized\n");
     CefWindowInfo window_info;
     window_info.SetAsWindowless(0);
 #ifdef CEF_HOST_MULTIPROCESS
@@ -837,7 +841,8 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
     g_browser = CefBrowserHost::CreateBrowserSync(
         window_info, new HostClient(), g_initial_url, settings, nullptr,
         nullptr);
-    fprintf(stderr, "[cef_host] browser=%p\n", (void*)g_browser.get());
+    if (std::getenv("FLUTTER_CEF_DEBUG"))
+      fprintf(stderr, "[cef_host] browser=%p\n", (void*)g_browser.get());
     SendFrame(kOpReady, nullptr, 0);
   }
   IMPLEMENT_REFCOUNTING(HostApp);
@@ -1470,15 +1475,25 @@ int main(int argc, char* argv[]) {
       fprintf(stderr, "[cef_host] CefInitialize failed\n");
       return 1;
     }
-    fprintf(stderr, "[cef_host] CefInitialize OK (fd=%d surface=%p)\n", g_ipc_fd,
-            (void*)g_surface);
+    if (std::getenv("FLUTTER_CEF_DEBUG"))
+      fprintf(stderr, "[cef_host] CefInitialize OK (fd=%d surface=%p)\n",
+              g_ipc_fd, (void*)g_surface);
     std::thread reader;
     if (g_ipc_fd >= 0) reader = std::thread(&IpcReadLoop);
     std::thread(&WatchParentDeath, getppid()).detach();
     CefRunMessageLoop();
     if (reader.joinable()) {
-      shutdown(g_ipc_fd, SHUT_RDWR);
+      shutdown(g_ipc_fd, SHUT_RDWR);  // unblock the reader's blocking read
       reader.join();
+    }
+    // Reader is joined (no more reads); close the socket under the write mutex
+    // (no concurrent SendFrame) and clear the fd so any late write is a no-op.
+    {
+      std::lock_guard<std::mutex> lock(g_ipc_write_mutex);
+      if (g_ipc_fd >= 0) {
+        close(g_ipc_fd);
+        g_ipc_fd = -1;
+      }
     }
     CefShutdown();
   }
