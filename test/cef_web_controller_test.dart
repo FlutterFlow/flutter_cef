@@ -536,7 +536,11 @@ void main() {
 
   test('create() throttles concurrent spawns to maxConcurrentCreates', () async {
     CefWebController.maxConcurrentCreates = 1;
-    addTearDown(() => CefWebController.maxConcurrentCreates = 3);
+    CefWebController.spawnSpacing = Duration.zero; // deterministic: no spacing
+    addTearDown(() {
+      CefWebController.maxConcurrentCreates = 3;
+      CefWebController.spawnSpacing = const Duration(milliseconds: 120);
+    });
     var creates = 0;
     final gate = Completer<void>();
     messenger.setMockMethodCallHandler(channel, (call) async {
@@ -556,5 +560,47 @@ void main() {
     gate.complete();
     await Future.wait([f1, f2]);
     expect(creates, 2, reason: 'the 2nd spawn proceeds once a slot frees');
+  });
+
+  test('under contention a queued spawn is spaced after the prior one frees',
+      () async {
+    CefWebController.maxConcurrentCreates = 1;
+    CefWebController.spawnSpacing = const Duration(milliseconds: 80);
+    addTearDown(() {
+      CefWebController.maxConcurrentCreates = 3;
+      CefWebController.spawnSpacing = const Duration(milliseconds: 120);
+    });
+    final starts = <int>[];
+    final sw = Stopwatch()..start();
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      if (call.method == 'create') {
+        starts.add(sw.elapsedMilliseconds);
+        return <String, dynamic>{'textureId': 1};
+      }
+      return null;
+    });
+    // First create resolves immediately; the second is queued (cap=1) and must
+    // wait ~spawnSpacing after the first frees before it starts.
+    await Future.wait([
+      CefWebController(sessionId: 'x')
+          .create(url: 'about:blank', width: 1, height: 1),
+      CefWebController(sessionId: 'y')
+          .create(url: 'about:blank', width: 1, height: 1),
+    ]);
+    expect(starts, hasLength(2));
+    expect(starts[1] - starts[0], greaterThanOrEqualTo(70),
+        reason: 'the 2nd spawn is spaced (~80ms) after the 1st, not back-to-back');
+  });
+
+  test('a lone create() (no contention) is never delayed by spacing', () async {
+    CefWebController.spawnSpacing = const Duration(seconds: 5); // huge, but…
+    addTearDown(
+        () => CefWebController.spawnSpacing = const Duration(milliseconds: 120));
+    final sw = Stopwatch()..start();
+    await CefWebController(sessionId: 'solo')
+        .create(url: 'about:blank', width: 1, height: 1);
+    expect(sw.elapsedMilliseconds, lessThan(1000),
+        reason: 'spacing only applies under contention — a single spawn returns '
+            'immediately and never waits the gap');
   });
 }

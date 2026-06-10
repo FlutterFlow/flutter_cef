@@ -291,6 +291,15 @@ class CefWebController {
   // instead of storming; the excess queue and proceed as slots free up. Tunable;
   // set to <= 0 to disable the cap.
   static int maxConcurrentCreates = 3;
+
+  /// Minimum gap between one spawn finishing and the next queued spawn starting,
+  /// applied only under contention (waiters present). The costly part of a spawn
+  /// — GPU-process init + first paint — is async *after* create() resolves, so a
+  /// pure concurrency cap lets those overlap anyway; this staggers their starts
+  /// so the work spreads instead of spiking. A lone create() (no waiters) is
+  /// never delayed. Set to [Duration.zero] to disable spacing.
+  static Duration spawnSpacing = const Duration(milliseconds: 120);
+
   static int _activeCreates = 0;
   static final List<Completer<void>> _createQueue = <Completer<void>>[];
 
@@ -302,6 +311,17 @@ class CefWebController {
     final waiter = Completer<void>();
     _createQueue.add(waiter);
     return waiter.future; // the slot is handed over (active count preserved).
+  }
+
+  // Frees this spawn's slot. Under contention, waits [spawnSpacing] first so the
+  // next spawn's GPU-init doesn't pile onto this one's. Non-blocking: it does not
+  // delay the current create()'s own return.
+  static void _scheduleSlotRelease() {
+    if (spawnSpacing <= Duration.zero || _createQueue.isEmpty) {
+      _releaseCreateSlot();
+    } else {
+      Future<void>.delayed(spawnSpacing, _releaseCreateSlot);
+    }
   }
 
   static void _releaseCreateSlot() {
@@ -333,7 +353,7 @@ class CefWebController {
               allowedSchemes.map((s) => s.toLowerCase()).join(','),
       });
     } finally {
-      _releaseCreateSlot();
+      _scheduleSlotRelease();
     }
     textureId = res?['textureId'] as int?;
     // Re-register any JS channels added before the session existed, so call
