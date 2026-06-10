@@ -283,6 +283,35 @@ class CefWebController {
 
   /// Spawn the renderer for [url] at [width]×[height] logical px. Returns the
   /// [Texture] id to display, or null on failure.
+  // ── Spawn throttle ──────────────────────────────────────────────────────
+  // Each create() spawns a cef_host Chromium process tree (GPU + renderer +
+  // helper subprocesses). Mounting many CefWebViews in one frame would fork/exec
+  // them all at once — a CPU/IO storm that janks the host's render thread on
+  // open. Cap the number of in-flight native create() calls so spawns ramp
+  // instead of storming; the excess queue and proceed as slots free up. Tunable;
+  // set to <= 0 to disable the cap.
+  static int maxConcurrentCreates = 3;
+  static int _activeCreates = 0;
+  static final List<Completer<void>> _createQueue = <Completer<void>>[];
+
+  static Future<void> _acquireCreateSlot() {
+    if (maxConcurrentCreates <= 0 || _activeCreates < maxConcurrentCreates) {
+      _activeCreates++;
+      return Future<void>.value();
+    }
+    final waiter = Completer<void>();
+    _createQueue.add(waiter);
+    return waiter.future; // the slot is handed over (active count preserved).
+  }
+
+  static void _releaseCreateSlot() {
+    if (_createQueue.isNotEmpty) {
+      _createQueue.removeAt(0).complete(); // pass our slot to the next waiter.
+    } else if (_activeCreates > 0) {
+      _activeCreates--;
+    }
+  }
+
   Future<int?> create({
     required String url,
     required int width,
@@ -290,15 +319,22 @@ class CefWebController {
     double dpr = 1.0,
     Set<String>? allowedSchemes,
   }) async {
-    final res = await _channel.invokeMapMethod<String, dynamic>('create', {
-      'sessionId': sessionId,
-      'url': url,
-      'width': width,
-      'height': height,
-      'dpr': dpr,
-      if (allowedSchemes != null && allowedSchemes.isNotEmpty)
-        'allowedSchemes': allowedSchemes.map((s) => s.toLowerCase()).join(','),
-    });
+    await _acquireCreateSlot();
+    Map<String, dynamic>? res;
+    try {
+      res = await _channel.invokeMapMethod<String, dynamic>('create', {
+        'sessionId': sessionId,
+        'url': url,
+        'width': width,
+        'height': height,
+        'dpr': dpr,
+        if (allowedSchemes != null && allowedSchemes.isNotEmpty)
+          'allowedSchemes':
+              allowedSchemes.map((s) => s.toLowerCase()).join(','),
+      });
+    } finally {
+      _releaseCreateSlot();
+    }
     textureId = res?['textureId'] as int?;
     // Re-register any JS channels added before the session existed, so call
     // order (addJavaScriptChannel before the widget mounts) doesn't matter.

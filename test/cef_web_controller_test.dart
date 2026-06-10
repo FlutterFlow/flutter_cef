@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/services.dart';
@@ -531,5 +532,29 @@ void main() {
     await emit('chc', 'channelMessage', {'payload': 'Bridge:ts=12:30:00'});
     expect(got, 'ts=12:30:00',
         reason: 'split-once on ":" — a split-all would truncate to "ts=12"');
+  });
+
+  test('create() throttles concurrent spawns to maxConcurrentCreates', () async {
+    CefWebController.maxConcurrentCreates = 1;
+    addTearDown(() => CefWebController.maxConcurrentCreates = 3);
+    var creates = 0;
+    final gate = Completer<void>();
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      if (call.method == 'create') {
+        creates++;
+        await gate.future; // hold the first spawn open
+        return <String, dynamic>{'textureId': 1};
+      }
+      return null;
+    });
+    final f1 =
+        CefWebController(sessionId: 'a').create(url: 'about:blank', width: 1, height: 1);
+    final f2 =
+        CefWebController(sessionId: 'b').create(url: 'about:blank', width: 1, height: 1);
+    await pumpEventQueue();
+    expect(creates, 1, reason: 'the 2nd spawn waits behind the 1st (cap = 1)');
+    gate.complete();
+    await Future.wait([f1, f2]);
+    expect(creates, 2, reason: 'the 2nd spawn proceeds once a slot frees');
   });
 }
