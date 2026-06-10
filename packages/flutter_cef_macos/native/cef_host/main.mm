@@ -124,6 +124,7 @@ constexpr uint8_t kOpImeCommit = 0x31;      // {utf8 text} commit composed text
 constexpr uint8_t kOpImeCancel = 0x32;      // {} cancel composition
 constexpr uint8_t kOpShowDevTools = 0x33;   // {} open DevTools in a window
 constexpr uint8_t kOpLoadTrusted = 0x34;    // {utf8 url} host content-load, exempt from allowlist
+constexpr uint8_t kOpSetVisible = 0x35;     // {u8 visible} -> CefBrowserHost::WasHidden(!visible)
 
 // ---- Shared runtime state ----
 int g_ipc_fd = -1;
@@ -908,6 +909,13 @@ void DoExecuteJs(const std::string& code) {
 void DoSetZoom(double level) {
   if (g_browser) g_browser->GetHost()->SetZoomLevel(level);
 }
+// Off-screen render gating. WasHidden(true) makes CEF stop producing frames
+// (no OnPaint, the compositor idles) until WasHidden(false); the browser stays
+// alive, so this is a cheap pause/resume — not a teardown. The host pauses a
+// tile that scrolls fully out of the canvas viewport and resumes it on return.
+void DoSetVisible(bool visible) {
+  if (g_browser) g_browser->GetHost()->WasHidden(!visible);
+}
 void DoFind(const std::string& text, bool forward, bool match_case,
             bool find_next) {
   if (g_browser)
@@ -1191,6 +1199,11 @@ void IpcReadLoop() {
       case kOpSetZoom: {
         if (plen < 8) break;
         CefPostTask(TID_UI, base::BindOnce(&DoSetZoom, ReadF64BE(p)));
+        break;
+      }
+      case kOpSetVisible: {
+        bool vis = plen >= 1 ? p[0] != 0 : true;
+        CefPostTask(TID_UI, base::BindOnce(&DoSetVisible, vis));
         break;
       }
       case kOpFind: {

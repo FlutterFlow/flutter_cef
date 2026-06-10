@@ -548,6 +548,15 @@ class CefWebController {
   Future<void> setZoomLevel(double level) => _channel
       .invokeMethod('setZoomLevel', {'sessionId': sessionId, 'level': level});
 
+  /// Pause or resume frame production. `setVisible(false)` calls CEF's
+  /// `WasHidden(true)` so the page stops painting (no `OnPaint`, the compositor
+  /// idles) — the browser stays alive, so it's a cheap pause/resume, not a
+  /// teardown. Use it to stop an off-screen view from burning GPU while keeping
+  /// its DOM, scroll position, and JS state intact; call `setVisible(true)` to
+  /// resume (CEF repaints the current frame). Visibility defaults to shown.
+  Future<void> setVisible(bool visible) => _channel.invokeMethod(
+      'setVisible', {'sessionId': sessionId, 'visible': visible});
+
   /// Start (or advance) a find-in-page search for [text]. Results arrive on
   /// [onFindResult]. Pass `findNext: true` to move to the next/previous match of
   /// the same query; toggle [forward] for direction.

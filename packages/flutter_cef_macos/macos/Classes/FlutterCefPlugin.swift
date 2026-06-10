@@ -44,6 +44,9 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     case "setZoomLevel":
       withSession(args) { $0.setZoomLevel(args["level"] as? Double ?? 0) }
       result(nil)
+    case "setVisible":
+      withSession(args) { $0.setVisible(args["visible"] as? Bool ?? true) }
+      result(nil)
     case "find":
       if let text = args["text"] as? String {
         withSession(args) {

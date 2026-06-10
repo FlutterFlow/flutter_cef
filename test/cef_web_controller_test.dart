@@ -216,6 +216,19 @@ void main() {
     expect(opened, 'https://popup.test/');
   });
 
+  test('setVisible forwards the visible flag to native (pause/resume)',
+      () async {
+    final c = CefWebController(sessionId: 'vis');
+    await c.setVisible(false);
+    await c.setVisible(true);
+    final calls =
+        log.where((m) => m.method == 'setVisible').toList(growable: false);
+    expect(calls, hasLength(2));
+    expect((calls[0].arguments as Map)['visible'], false);
+    expect((calls[1].arguments as Map)['visible'], true);
+    expect((calls[0].arguments as Map)['sessionId'], 'vis');
+  });
+
   test('zoom + find + load verbs are forwarded', () async {
     final c = CefWebController(sessionId: 'b2');
     await c.setZoomLevel(1.0);

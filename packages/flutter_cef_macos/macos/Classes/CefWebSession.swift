@@ -62,6 +62,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   private static let opImeCancel: UInt8 = 0x32
   private static let opShowDevTools: UInt8 = 0x33
   private static let opLoadTrusted: UInt8 = 0x34
+  private static let opSetVisible: UInt8 = 0x35
 
   // Event callbacks (fired off the main thread). The registrar relays each to a
   // Dart channel message.
@@ -173,6 +174,13 @@ final class CefWebSession: NSObject, FlutterTexture {
     var p = [UInt8]()
     appendF64(&p, level)
     sendFrame(Self.opSetZoom, p)
+  }
+
+  /// Pause/resume frame production in the cef_host subprocess. `false` calls
+  /// CefBrowserHost::WasHidden(true) so an off-screen tile stops rendering; the
+  /// session and browser stay alive, so it's a cheap toggle, not a teardown.
+  func setVisible(_ visible: Bool) {
+    sendFrame(Self.opSetVisible, [visible ? 1 : 0])
   }
 
   func find(_ text: String, forward: Bool, matchCase: Bool, findNext: Bool) {
