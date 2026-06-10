@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_cef/flutter_cef.dart';
@@ -474,5 +476,60 @@ void main() {
     await c.showEmojiPicker();
     final m = log.firstWhere((m) => m.method == 'showEmojiPicker');
     expect((m.arguments as Map)['sessionId'], 'emo');
+  });
+
+  // ── Added coverage: UTF-8 trusted load + defensive decode/fan-out paths.
+  //    All headless (mock channel + emit). ──
+
+  test('loadHtmlString base64-encodes via UTF-8 and round-trips intact',
+      () async {
+    final c = CefWebController(sessionId: 'html');
+    const html = '<p>héllo 世界 🎉</p>';
+    await c.loadHtmlString(html);
+    final url = (log.firstWhere((m) => m.method == 'loadTrusted').arguments
+        as Map)['url'] as String;
+    expect(url, startsWith('data:text/html'));
+    expect(url, contains('base64,'));
+    final b64 = url.split('base64,').last;
+    expect(utf8.decode(base64Decode(b64)), html,
+        reason: 'Latin-1 encoding would mangle non-ASCII before the data: URL');
+  });
+
+  test('getScrollPosition falls back to Offset.zero on a non-list result',
+      () async {
+    final c = CefWebController(sessionId: 'gpz');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    final f = c.getScrollPosition();
+    final id = (log.firstWhere((m) => m.method == 'evalReturning').arguments
+        as Map)['id'];
+    await emit('gpz', 'evalResult', {'payload': '$id:{"ok":true,"v":"nope"}'});
+    expect(await f, Offset.zero);
+  });
+
+  test('a navigation (pageStarted) fails any in-flight eval future', () async {
+    final c = CefWebController(sessionId: 'nav-fail');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    final f = c.runJavaScriptReturningResult('slow()');
+    final pending = expectLater(f, throwsA(anything));
+    await emit('nav-fail', 'pageStarted', {'url': 'https://next.test/'});
+    await pending;
+  });
+
+  test('an event for an unknown / disposed session is dropped, not thrown',
+      () async {
+    // No controller is registered for 'ghost'; the global handler must ignore
+    // it rather than crash (which would break every other live controller).
+    await expectLater(emit('ghost', 'title', {'title': 'x'}), completes);
+  });
+
+  test('channel message body keeps colons after the first separator',
+      () async {
+    final c = CefWebController(sessionId: 'chc');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    String? got;
+    await c.addJavaScriptChannel('Bridge', onMessageReceived: (m) => got = m);
+    await emit('chc', 'channelMessage', {'payload': 'Bridge:ts=12:30:00'});
+    expect(got, 'ts=12:30:00',
+        reason: 'split-once on ":" — a split-all would truncate to "ts=12"');
   });
 }
