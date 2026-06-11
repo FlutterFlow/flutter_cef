@@ -286,8 +286,6 @@ class CefWebController {
         {'sessionId': sessionId, 'id': id, 'ok': ok, 'text': text});
   }
 
-  /// Spawn the renderer for [url] at [width]×[height] logical px. Returns the
-  /// [Texture] id to display, or null on failure.
   // ── Spawn throttle ──────────────────────────────────────────────────────
   // Each create() spawns a cef_host Chromium process tree (GPU + renderer +
   // helper subprocesses). Mounting many CefWebViews in one frame would fork/exec
@@ -337,14 +335,52 @@ class CefWebController {
     }
   }
 
+  // The single in-flight create() (null when none is running). Memoized so a
+  // concurrent create() adopts the running spawn instead of forking a second
+  // cef_host (the native handler disposes + cold-starts on a re-create). This is
+  // what makes a host's eager warm-spawn and the view's own mount-time create()
+  // converge on ONE process even when the warm create() is still parked in the
+  // spawn throttle when the view mounts.
+  Future<int?>? _createInFlight;
+
+  /// Spawn the renderer for [url] at [width]×[height] logical px. Returns the
+  /// [Texture] id to display, or null on failure.
+  ///
+  /// Idempotent under concurrency: if a session already exists ([isCreated]) the
+  /// existing [textureId] is returned, and if a create() is already in flight
+  /// this call adopts it (same future, no second spawn) — [url]/[width]/[height]
+  /// of the second call are ignored in that case (navigate / resize afterward).
   Future<int?> create({
     required String url,
     required int width,
     required int height,
     double dpr = 1.0,
     Set<String>? allowedSchemes,
+  }) {
+    if (textureId != null) return Future<int?>.value(textureId);
+    return _createInFlight ??= _createSession(
+      url: url,
+      width: width,
+      height: height,
+      dpr: dpr,
+      allowedSchemes: allowedSchemes,
+    ).whenComplete(() => _createInFlight = null);
+  }
+
+  Future<int?> _createSession({
+    required String url,
+    required int width,
+    required int height,
+    required double dpr,
+    required Set<String>? allowedSchemes,
   }) async {
     await _acquireCreateSlot();
+    // Disposed while parked in the spawn-throttle queue — never fork for a dead
+    // controller (its slot must still be released so waiters proceed).
+    if (_disposed) {
+      _scheduleSlotRelease();
+      return null;
+    }
     Map<String, dynamic>? res;
     try {
       res = await _channel.invokeMapMethod<String, dynamic>('create', {
@@ -359,6 +395,14 @@ class CefWebController {
       });
     } finally {
       _scheduleSlotRelease();
+    }
+    // Disposed during the native spawn — tear down the just-created session so
+    // it isn't orphaned (its cef_host would otherwise run with no owner).
+    if (_disposed) {
+      if (res?['textureId'] != null) {
+        _channel.invokeMethod('dispose', {'sessionId': sessionId});
+      }
+      return null;
     }
     textureId = res?['textureId'] as int?;
     // Re-register any JS channels added before the session existed, so call

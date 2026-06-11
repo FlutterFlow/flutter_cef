@@ -131,6 +131,58 @@ void main() {
     expect(find.byType(Texture), findsOneWidget);
   });
 
+  testWidgets('a create() while one is in flight adopts it (one native create)',
+      (tester) async {
+    createDelay = const Duration(milliseconds: 50);
+    final controller = CefWebController(sessionId: 'inflight');
+    addTearDown(controller.dispose);
+    // Two creates fire before the first resolves (e.g. a host eager-spawn and
+    // the view's own mount-time create). The second must adopt the first's
+    // in-flight spawn, not fork a second cef_host.
+    final f1 = controller.create(url: 'https://a.test', width: 320, height: 240);
+    final f2 = controller.create(url: 'https://b.test', width: 400, height: 300);
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(await f1, 1);
+    expect(await f2, 1); // same session id, same texture
+    expect(callsTo('create'), hasLength(1));
+    expect(controller.isCreated, isTrue);
+  });
+
+  testWidgets(
+      'mounting the view while a host create() is in flight adopts it '
+      '(no second cef_host)', (tester) async {
+    createDelay = const Duration(milliseconds: 50);
+    final controller = CefWebController(sessionId: 'warm');
+    addTearDown(controller.dispose);
+    // Host eager-spawns and does NOT await — the create is still parked when the
+    // view mounts, so isCreated is false and the old adopt-by-textureId check
+    // alone would miss it; the in-flight memo is what prevents a second create.
+    final warm = controller.create(url: 'about:blank', width: 100, height: 100);
+    await tester.pumpWidget(
+        boxed(CefWebView(url: 'about:blank', controller: controller)));
+    await tester.pump(const Duration(milliseconds: 100)); // warm resolves
+    await warm;
+    await tester.pumpAndSettle();
+    expect(callsTo('create'), hasLength(1));
+    expect(find.byType(Texture), findsOneWidget);
+  });
+
+  testWidgets('disposing while the native create is in flight tears down the orphan',
+      (tester) async {
+    createDelay = const Duration(milliseconds: 50);
+    final controller = CefWebController(sessionId: 'race');
+    final f = controller.create(url: 'about:blank', width: 100, height: 100);
+    await tester.pump(); // let _createSession pass the throttle into invokeMethod('create')
+    await controller.dispose(); // disposed while the native spawn is in flight
+    await tester.pump(const Duration(milliseconds: 100)); // native create resolves
+    expect(await f, isNull); // never adopted onto a dead controller
+    expect(controller.isCreated, isFalse);
+    expect(callsTo('create'), hasLength(1)); // the native spawn did start
+    // One dispose for the controller, one to tear down the session the native
+    // create returned after dispose — no orphaned cef_host.
+    expect(callsTo('dispose'), hasLength(2));
+  });
+
   // ── IME / text input ───────────────────────────────────────────────
   Future<FocusNode> focusedView(WidgetTester tester) async {
     final focus = FocusNode();

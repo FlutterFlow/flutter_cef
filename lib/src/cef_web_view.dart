@@ -166,7 +166,11 @@ class _CefWebViewState extends State<CefWebView>
             height: h,
             dpr: dpr,
             allowedSchemes: widget.allowedSchemes);
-        _lastSize = size;
+        // Don't record `_lastSize` here: create() may have ADOPTED an in-flight
+        // session a host eager-spawned at a different (tile snapshot) size, so
+        // we can't assume the live surface is `size`. Leaving `_lastSize` null
+        // makes the resize branch below reconcile to the real laid-out size on
+        // the next frame (a no-op resize when create() did size to `size`).
         if (mounted) setState(() => _textureId = id);
       } finally {
         _creating = false;
