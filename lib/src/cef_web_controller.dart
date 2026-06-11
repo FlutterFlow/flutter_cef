@@ -35,6 +35,11 @@ class CefWebController {
   /// The registered [Texture] id once [create] has resolved, else null.
   int? textureId;
 
+  /// Whether [create] has already resolved (a live `cef_host` session exists).
+  /// Lets a host pre-create a controller (e.g. eager-spawn) and have the
+  /// [CefWebView] adopt it instead of calling [create] again.
+  bool get isCreated => textureId != null;
+
   /// The page's current cursor (I-beam over text, hand over links, …), driven
   /// by host cursor events. Feed it to a [MouseRegion].
   final ValueNotifier<MouseCursor> cursor =
@@ -554,8 +559,8 @@ class CefWebController {
   /// teardown. Use it to stop an off-screen view from burning GPU while keeping
   /// its DOM, scroll position, and JS state intact; call `setVisible(true)` to
   /// resume (CEF repaints the current frame). Visibility defaults to shown.
-  Future<void> setVisible(bool visible) => _channel.invokeMethod(
-      'setVisible', {'sessionId': sessionId, 'visible': visible});
+  Future<void> setVisible(bool visible) => _channel
+      .invokeMethod('setVisible', {'sessionId': sessionId, 'visible': visible});
 
   /// Start (or advance) a find-in-page search for [text]. Results arrive on
   /// [onFindResult]. Pass `findNext: true` to move to the next/previous match of

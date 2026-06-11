@@ -112,6 +112,25 @@ void main() {
     expect(callsTo('dispose'), hasLength(1));
   });
 
+  testWidgets('adopts a pre-created controller instead of re-creating',
+      (tester) async {
+    final controller = CefWebController(sessionId: 'ext');
+    addTearDown(controller.dispose);
+    // Host eager-spawns the session before the view mounts.
+    await controller.create(url: 'https://a.test', width: 320, height: 240);
+    expect(callsTo('create'), hasLength(1));
+    expect(controller.isCreated, isTrue);
+
+    // Mounting the view must NOT call create() again — the native handler
+    // disposes + cold-starts a fresh session on a second create(). It adopts
+    // the live textureId and shows the texture immediately.
+    await tester.pumpWidget(
+        boxed(CefWebView(url: 'https://a.test', controller: controller)));
+    await tester.pumpAndSettle();
+    expect(callsTo('create'), hasLength(1)); // still one — adopted, not re-made
+    expect(find.byType(Texture), findsOneWidget);
+  });
+
   // ── IME / text input ───────────────────────────────────────────────
   Future<FocusNode> focusedView(WidgetTester tester) async {
     final focus = FocusNode();

@@ -112,6 +112,12 @@ class _CefWebViewState extends State<CefWebView>
   void initState() {
     super.initState();
     _ownsController = widget.controller == null;
+    // Adopt an externally-pre-created controller (e.g. one a host eager-spawned
+    // before this view mounted) instead of calling create() again: the native
+    // create handler disposes + recreates the session, which would throw away
+    // the warm process and cold-start fresh. With textureId already set,
+    // _ensureSession skips create() and just reconciles size via resize().
+    _textureId = _controller.textureId;
     _controller.onImeCompositionBounds = _onImeCompositionBounds;
     _attachFocusListener();
   }
