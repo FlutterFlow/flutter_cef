@@ -126,7 +126,15 @@ class _CefWebViewState extends State<CefWebView>
   void didUpdateWidget(CefWebView old) {
     super.didUpdateWidget(old);
     _attachFocusListener();
-    if (old.url != widget.url && _textureId != null) {
+    // Navigate only when the [url] prop changes to a page we're NOT already on.
+    // A host that mirrors the live URL back into [url] (e.g. binding the prop to
+    // the controller's own onUrlChange) would otherwise re-issue navigate() to
+    // the page's CURRENT location on the next rebuild — a redundant reload that
+    // throws away scroll position and page state. Navigating to the current URL
+    // is a reload; that's what reload() is for.
+    if (old.url != widget.url &&
+        _textureId != null &&
+        widget.url != _controller.url.value) {
       _controller.navigate(widget.url);
     }
   }

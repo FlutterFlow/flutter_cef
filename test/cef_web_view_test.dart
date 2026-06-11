@@ -91,6 +91,50 @@ void main() {
     expect((navs.single.arguments as Map)['url'], 'https://b.test');
   });
 
+  testWidgets(
+      'does not re-navigate to the URL the page is already on '
+      '(no reload-on-rebuild feedback loop)', (tester) async {
+    final controller = CefWebController(sessionId: 'feedback');
+    addTearDown(controller.dispose);
+    const key = ValueKey('v');
+    // Simulate a host->Dart 'url' event (what cef_host emits on navigation).
+    Future<void> emitHostUrl(String url) => messenger.handlePlatformMessage(
+          'flutter_cef',
+          const StandardMethodCodec().encodeMethodCall(
+            MethodCall('url', {'sessionId': 'feedback', 'url': url}),
+          ),
+          (_) {},
+        );
+
+    await tester.pumpWidget(boxed(
+        CefWebView(key: key, url: 'https://a.test', controller: controller)));
+    await tester.pumpAndSettle();
+    log.clear();
+
+    // The page navigates ITSELF (SPA pushState / link). The host reports the new
+    // URL via controller.url — and a host commonly mirrors that back into the
+    // `url` prop on the next rebuild (e.g. the cefWebview tile binds the prop to
+    // its persisted URL, which onUrlChange updates).
+    await emitHostUrl('https://a.test/sub');
+    expect(controller.url.value, 'https://a.test/sub');
+
+    // Rebuild with the drifted URL (what the tile does on an unrelated rebuild,
+    // e.g. losing focus / disengage). It must NOT reload the page — reloading
+    // throws away scroll position.
+    await tester.pumpWidget(boxed(CefWebView(
+        key: key, url: 'https://a.test/sub', controller: controller)));
+    await tester.pumpAndSettle();
+    expect(callsTo('navigate'), isEmpty);
+
+    // A genuinely different URL still navigates.
+    await tester.pumpWidget(boxed(
+        CefWebView(key: key, url: 'https://b.test', controller: controller)));
+    await tester.pumpAndSettle();
+    final navs = callsTo('navigate');
+    expect(navs, hasLength(1));
+    expect((navs.single.arguments as Map)['url'], 'https://b.test');
+  });
+
   testWidgets('disposes the session it owns when removed', (tester) async {
     await tester.pumpWidget(boxed(const CefWebView(url: 'about:blank')));
     await tester.pumpAndSettle();
