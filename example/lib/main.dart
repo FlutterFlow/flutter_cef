@@ -276,6 +276,9 @@ and committed text — including emoji — should appear intact.</p>
                 controller: _controller,
                 focusNode: _webFocus,
                 allowedSchemes: _allowedSchemes,
+                // Demo: expose CDP so the page can be driven by a CDP client.
+                // The bound port is on _controller.cdpPort.
+                enableCdp: true,
               ),
             ),
           ],

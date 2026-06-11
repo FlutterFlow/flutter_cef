@@ -44,6 +44,7 @@ class CefWebView extends StatefulWidget {
     this.focusNode,
     this.placeholder,
     this.allowedSchemes,
+    this.enableCdp = false,
   });
 
   /// Page to load. Changing it on an existing view navigates.
@@ -74,6 +75,14 @@ class CefWebView extends StatefulWidget {
   /// subject to this allowlist: the host chose that content, so it always loads.
   /// Only navigation (the page's, and [CefWebController.navigate]) is gated.
   final Set<String>? allowedSchemes;
+
+  /// Enable the Chrome DevTools Protocol (CDP) for this session: CEF binds a
+  /// DevTools server on a free `127.0.0.1` port (read it from
+  /// [CefWebController.cdpPort]). UNAUTHENTICATED — any local client that
+  /// reaches the port fully drives the page — so opt in deliberately. Only
+  /// honoured when this view creates the session (not when it adopts an already
+  /// pre-created controller).
+  final bool enableCdp;
 
   @override
   State<CefWebView> createState() => _CefWebViewState();
@@ -173,7 +182,8 @@ class _CefWebViewState extends State<CefWebView>
             width: w,
             height: h,
             dpr: dpr,
-            allowedSchemes: widget.allowedSchemes);
+            allowedSchemes: widget.allowedSchemes,
+            enableCdp: widget.enableCdp);
         // Don't record `_lastSize` here: create() may have ADOPTED an in-flight
         // session a host eager-spawned at a different (tile snapshot) size, so
         // we can't assume the live surface is `size`. Leaving `_lastSize` null

@@ -227,6 +227,38 @@ void main() {
     expect(callsTo('dispose'), hasLength(2));
   });
 
+  testWidgets('create(enableCdp:) requests CDP and exposes the bound port',
+      (tester) async {
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      log.add(call);
+      if (call.method == 'create') {
+        // The host picks a free port only when CDP is requested.
+        final args = (call.arguments as Map);
+        return <String, dynamic>{
+          'textureId': 1,
+          if (args['enableCdp'] == true) 'cdpPort': 54321,
+        };
+      }
+      return null;
+    });
+
+    final withCdp = CefWebController(sessionId: 'cdp');
+    addTearDown(withCdp.dispose);
+    await withCdp.create(
+        url: 'about:blank', width: 100, height: 100, enableCdp: true);
+    expect((callsTo('create').single.arguments as Map)['enableCdp'], true);
+    expect(withCdp.cdpPort.value, 54321);
+
+    // Default: no flag sent, port stays 0 (CDP off).
+    log.clear();
+    final noCdp = CefWebController(sessionId: 'no-cdp');
+    addTearDown(noCdp.dispose);
+    await noCdp.create(url: 'about:blank', width: 100, height: 100);
+    expect((callsTo('create').single.arguments as Map).containsKey('enableCdp'),
+        isFalse);
+    expect(noCdp.cdpPort.value, 0);
+  });
+
   // ── IME / text input ───────────────────────────────────────────────
   Future<FocusNode> focusedView(WidgetTester tester) async {
     final focus = FocusNode();

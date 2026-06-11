@@ -152,10 +152,12 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     let height = a["height"] as? Int ?? 600
     let dpr = (a["dpr"] as? Double).map { CGFloat($0) } ?? 1.0
     let allowedSchemes = a["allowedSchemes"] as? String ?? ""
+    let enableCdp = a["enableCdp"] as? Bool ?? false
     sessions[sessionId]?.dispose()
     let session = CefWebSession(
       sessionId: sessionId, url: url, width: width, height: height, dpr: dpr,
-      allowedSchemes: allowedSchemes, registry: registry, cefHostPath: cefHost)
+      allowedSchemes: allowedSchemes, enableCdp: enableCdp, registry: registry,
+      cefHostPath: cefHost)
     session.onCursor = { [weak self] cursor in
       self?.emit("cursor", ["sessionId": sessionId, "cursor": cursor])
     }
@@ -223,7 +225,10 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       self?.emit("cookies", ["sessionId": sessionId, "id": id, "json": json])
     }
     sessions[sessionId] = session
-    result(["textureId": session.textureId, "width": width, "height": height])
+    result([
+      "textureId": session.textureId, "width": width, "height": height,
+      "cdpPort": session.cdpPort,
+    ])
   }
 
   private func navigate(_ a: [String: Any], _ result: @escaping FlutterResult) {

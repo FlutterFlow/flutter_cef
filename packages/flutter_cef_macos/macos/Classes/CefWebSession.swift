@@ -86,10 +86,15 @@ final class CefWebSession: NSObject, FlutterTexture {
 
   let sessionId: String
   private(set) var textureId: Int64 = 0
+  // The 127.0.0.1 port CEF's DevTools (CDP) server bound for this session, or 0
+  // when CDP wasn't requested. Chosen here (free-port pick) and reported back to
+  // Dart in the create() result.
+  private(set) var cdpPort: Int = 0
 
   private weak var registry: FlutterTextureRegistry?
   private let cefHostPath: String
   private let allowedSchemes: String  // CSV; "" = allow all
+  private let enableCdp: Bool
   private var width: Int
   private var height: Int
   private let dpr: CGFloat
@@ -110,13 +115,14 @@ final class CefWebSession: NSObject, FlutterTexture {
   // acceptAndRead thread exits, so dispose() can join it before freeing state.
 
   init(sessionId: String, url: String, width: Int, height: Int, dpr: CGFloat,
-       allowedSchemes: String = "", registry: FlutterTextureRegistry,
-       cefHostPath: String) {
+       allowedSchemes: String = "", enableCdp: Bool = false,
+       registry: FlutterTextureRegistry, cefHostPath: String) {
     self.sessionId = sessionId
     self.width = max(1, width)
     self.height = max(1, height)
     self.dpr = dpr
     self.allowedSchemes = allowedSchemes
+    self.enableCdp = enableCdp
     self.registry = registry
     self.cefHostPath = cefHostPath
     super.init()
@@ -357,6 +363,34 @@ final class CefWebSession: NSObject, FlutterTexture {
 
   // MARK: Subprocess + IPC
 
+  /// Ask the OS for a free TCP port on 127.0.0.1 (bind :0, read it back, close).
+  /// Brief TOCTOU window until cef_host's CEF binds it — acceptable on loopback.
+  /// Returns 0 on failure.
+  private static func pickFreeTcpPort() -> Int {
+    let fd = socket(AF_INET, SOCK_STREAM, 0)
+    guard fd >= 0 else { return 0 }
+    defer { close(fd) }
+    var addr = sockaddr_in()
+    addr.sin_family = sa_family_t(AF_INET)
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+    addr.sin_port = 0
+    let bound = withUnsafePointer(to: &addr) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+      }
+    }
+    guard bound == 0 else { return 0 }
+    var assigned = sockaddr_in()
+    var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+    let got = withUnsafeMutablePointer(to: &assigned) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        getsockname(fd, $0, &len)
+      }
+    }
+    guard got == 0 else { return 0 }
+    return Int(UInt16(bigEndian: assigned.sin_port))
+  }
+
   private func setupSocketAndSpawn(url: String) {
     // Randomized name (not just the predictable sequential sessionId) in the
     // per-user 0700 temp dir, so another same-UID process can't pre-bind it.
@@ -399,6 +433,19 @@ final class CefWebSession: NSObject, FlutterTexture {
     ]
     if !allowedSchemes.isEmpty {
       args.append("--allowed-schemes=\(allowedSchemes)")
+    }
+    // Chrome DevTools Protocol (CDP): when enabled for this session, pick a free
+    // 127.0.0.1 port and pass it via --cdp-port; cef_host sets
+    // CefSettings.remote_debugging_port and CEF binds it (localhost-only, M113+).
+    // UNAUTHENTICATED — any local client that reaches the port fully drives the
+    // page — so this is opt-in, never on by default. The port is reported back
+    // to Dart in the create() result.
+    if enableCdp {
+      let port = Self.pickFreeTcpPort()
+      if port >= 1024 {
+        cdpPort = port
+        args.append("--cdp-port=\(port)")
+      }
     }
     p.arguments = args
     do {

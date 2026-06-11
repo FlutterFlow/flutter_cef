@@ -56,6 +56,13 @@ class CefWebController {
   final ValueNotifier<String> title = ValueNotifier<String>('');
   final ValueNotifier<String> url = ValueNotifier<String>('');
 
+  /// The 127.0.0.1 port CEF's DevTools (CDP) server bound for this session when
+  /// [create] was called with `enableCdp: true`, else 0. Connect a CDP client to
+  /// `http://127.0.0.1:<port>` (e.g. `/json/list` for the page target's
+  /// `webSocketDebuggerUrl`). UNAUTHENTICATED — anyone local who reaches the
+  /// port fully drives the page — so only enable it deliberately.
+  final ValueNotifier<int> cdpPort = ValueNotifier<int>(0);
+
   /// Called when a navigation fails (DNS failure, offline, blocked, …).
   void Function(CefLoadError error)? onLoadError;
 
@@ -356,6 +363,7 @@ class CefWebController {
     required int height,
     double dpr = 1.0,
     Set<String>? allowedSchemes,
+    bool enableCdp = false,
   }) {
     if (textureId != null) return Future<int?>.value(textureId);
     return _createInFlight ??= _createSession(
@@ -364,6 +372,7 @@ class CefWebController {
       height: height,
       dpr: dpr,
       allowedSchemes: allowedSchemes,
+      enableCdp: enableCdp,
     ).whenComplete(() => _createInFlight = null);
   }
 
@@ -373,6 +382,7 @@ class CefWebController {
     required int height,
     required double dpr,
     required Set<String>? allowedSchemes,
+    required bool enableCdp,
   }) async {
     await _acquireCreateSlot();
     // Disposed while parked in the spawn-throttle queue — never fork for a dead
@@ -392,6 +402,7 @@ class CefWebController {
         if (allowedSchemes != null && allowedSchemes.isNotEmpty)
           'allowedSchemes':
               allowedSchemes.map((s) => s.toLowerCase()).join(','),
+        if (enableCdp) 'enableCdp': true,
       });
     } finally {
       _scheduleSlotRelease();
@@ -405,6 +416,9 @@ class CefWebController {
       return null;
     }
     textureId = res?['textureId'] as int?;
+    // The 127.0.0.1 CDP port CEF bound for this session (0 if CDP wasn't
+    // requested). The server comes up shortly after; a CDP client should retry.
+    cdpPort.value = res?['cdpPort'] as int? ?? 0;
     // Re-register any JS channels added before the session existed, so call
     // order (addJavaScriptChannel before the widget mounts) doesn't matter.
     for (final name in _channels.keys) {
@@ -693,6 +707,7 @@ class CefWebController {
     _cookiePending.clear();
     _channels.clear();
     cursor.dispose();
+    cdpPort.dispose();
     isLoading.dispose();
     canGoBack.dispose();
     canGoForward.dispose();

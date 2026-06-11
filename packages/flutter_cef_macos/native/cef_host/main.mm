@@ -772,6 +772,10 @@ class HostClient : public CefClient,
 };
 
 std::string g_initial_url;
+// The CDP port for this session (0 = CDP disabled). Set from --cdp-port before
+// CefInitialize; read in OnBeforeCommandLineProcessing to allow CDP WebSocket
+// origins (Chromium M113+ rejects them by default).
+int g_cdp_port = 0;
 
 class HostApp : public CefApp, public CefBrowserProcessHandler {
  public:
@@ -818,6 +822,14 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
       command_line->AppendSwitch("enable-logging");
       command_line->AppendSwitchWithValue("log-file", "/tmp/cef_host_chromium.log");
       command_line->AppendSwitchWithValue("v", "1");
+    }
+    // CDP WebSocket origin allow-list: Chromium M113+ rejects DevTools WS
+    // connections whose Origin isn't allow-listed (anti-CSRF on the local debug
+    // port). For local automation we allow all origins so any CDP client
+    // (Playwright, chrome-remote-interface) connects; the endpoint is still
+    // bound to 127.0.0.1 only and CDP is opt-in, so exposure is unchanged.
+    if (g_cdp_port > 0) {
+      command_line->AppendSwitchWithValue("remote-allow-origins", "*");
     }
   }
   void OnContextInitialized() override {
@@ -1397,6 +1409,7 @@ int main(int argc, char* argv[]) {
   std::string dprs = ArgValue(argc, argv, "dpr");
   std::string sid = ArgValue(argc, argv, "iosurface-id");
   std::string allowed = ArgValue(argc, argv, "allowed-schemes");
+  std::string cdp = ArgValue(argc, argv, "cdp-port");
   for (size_t start = 0; start < allowed.size();) {
     const size_t comma = allowed.find(',', start);
     const size_t len =
@@ -1452,6 +1465,19 @@ int main(int argc, char* argv[]) {
 #endif
     settings.windowless_rendering_enabled = true;
     settings.log_severity = LOGSEVERITY_INFO;
+    // Chrome DevTools Protocol (CDP): the host picks a free port and passes it
+    // via --cdp-port; CEF stands up the DevTools HTTP/WebSocket server on
+    // 127.0.0.1:<port> (M113+ forces localhost-only). UNAUTHENTICATED — any local
+    // client that reaches the port fully drives the page — so this is opt-in,
+    // never set by default. CEF treats 0 as "disabled" (no auto-assign), so the
+    // host must choose a real port (1024-65535).
+    if (!cdp.empty()) {
+      int port = atoi(cdp.c_str());
+      if (port >= 1024 && port <= 65535) {
+        settings.remote_debugging_port = port;
+        g_cdp_port = port;  // OnBeforeCommandLineProcessing allows WS origins
+      }
+    }
     // Per-process cache under the per-user (0700) temp dir — NOT a fixed,
     // world-readable /tmp path (cookies/localStorage are private), and a per-pid
     // dir avoids the CEF cache lock colliding when several webviews run at once.
