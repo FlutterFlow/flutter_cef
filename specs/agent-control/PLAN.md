@@ -190,19 +190,23 @@ crux, the CEF side itself lands in two increments:
 - **CEF-2 — token-gated, tile-scoped relay** + the `enableAgentControl()/
   disableAgentControl()` API. Itself staged, to de-risk the new server subsystem
   before the isolation boundary:
-  - **CEF-2a — transport:** a minimal, dependency-free localhost HTTP+WebSocket
-    server (`NWListener` on `127.0.0.1:0`, hand-rolled RFC-6455 server framing — no
-    SwiftNIO/Starscream, to keep the supply-chain surface the security review
-    demanded). Serves `GET /json/version` advertising a **token-free**
-    `webSocketDebuggerUrl: ws://127.0.0.1:<port>/devtools/browser` (discovery is
-    unauthenticated — see token transport below), REQUIRES a `?token=<secret>` query
-    on the ws upgrade and rejects otherwise, and bridges that ws ⇄ the CEF-1 pipe
-    (full browser-level passthrough,
-    **no** target filter yet). `enableAgentControl()→{wsUrl, token}` /
-    `disableAgentControl()` threaded Swift→Dart→controller. Validation gate:
-    `agent-browser` connects via the advertised discovery URL+token and drives a tile
-    through relay→pipe→cef_host. (No-filter relay is dev-validation-only — never
-    shipped — since it would expose sibling tiles in the process.)
+  - **CEF-2a — transport (DONE, validated):** a minimal, dependency-free localhost
+    HTTP+WebSocket server (`CdpRelay.swift`: a raw loopback BSD socket on
+    `127.0.0.1:0` + accept/handler threads + hand-rolled RFC-6455 server framing —
+    no SwiftNIO/Starscream, matching the codebase's raw-socket/blocking-thread style
+    and keeping the supply-chain surface the security review demanded). Serves `GET
+    /json/version` (trailing-slash-tolerant — Playwright fetches `/json/version/`)
+    advertising a token-free `webSocketDebuggerUrl: ws://127.0.0.1:<port>/devtools/
+    browser`, accepts the ws upgrade, and bridges it ⇄ the CEF-1 pipe (full
+    browser-level passthrough, **no** target filter yet).
+    `enableAgentControl()→{wsUrl, token, port}` / `disableAgentControl()` threaded
+    Swift→Dart→controller. Security (see the token-transport note): per-tile opt-in +
+    ephemeral loopback port + relay-exists-only-during-grant + single active client;
+    the token is validated-if-present defense-in-depth. Validated end-to-end: the
+    real `agent-browser` CLI (`--cdp <port>`) drove the live tile — read url/title,
+    navigated to a new page, read the DOM snapshot — through relay→pipe→cef_host.
+    (The no-filter relay is dev-validation-only — never shipped — since a connected
+    client could reach sibling tiles in the process.)
   - **CEF-2b — isolation:** resolve `browserId`→CDP `targetId` (new IPC op:
     cef_host `ExecuteDevToolsMethod(browser, "Target.getTargetInfo", {})` → the
     browser's own `targetId`), then add the Target-domain filter so each token's ws
@@ -215,20 +219,23 @@ Then the Campus consumer (Layer C).
 
 ## Open questions / to resolve in P2
 
-- **`agent-browser` token transport — RESOLVED (spike, agent-browser `cli/src/
-  native/cdp/discovery.rs`):** agent-browser does standard CDP discovery — GETs
-  `http://host:port/json/version`, reads `webSocketDebuggerUrl`, then
-  `rewrite_ws_host` (rewrites host/port only, **preserves the path**) +
-  `append_query` (preserves user query). Crucially the `/json/version` GET is made
-  **without** the query — only the final ws-url gets `append_query`. So the SECURE
-  transport is: `/json/version` advertises a **token-free** ws-url (anything reading
-  discovery learns no secret), and the token rides in the **Campus-supplied
-  `?token=` query** on the `--cdp`/connect string — `append_query` puts it on the ws
-  connection, the relay validates it on upgrade. A local CDP port-scanner can read
-  discovery but cannot connect (no token). Residual: the token is visible via `ps`
-  to same-UID processes (Campus passes it on agent-browser's argv) — acceptable for
-  the "not random local CDP clients" goal; tighten later via env/stdin if needed.
-  Campus already mints the connect string, so this is minimal plumbing.
+- **`agent-browser` token transport — RESOLVED (empirically, against the installed
+  CLI):** the installed `agent-browser` (v0.6.0, via npm) is **Playwright-based**
+  (the CDP client UA is `Playwright/1.57.0`), NOT the Rust `cli/src/native/cdp`
+  path. Its `--cdp <port>` parses a **bare integer** (it rejected `host:port?token`)
+  and the CDP connection attaches **no** secret — Playwright's `connectOverCDP`
+  fetches `GET /json/version/` (trailing slash) for the ws-url and upgrades with no
+  token/auth header. So a client-supplied token **cannot** gate agent-browser. The
+  achievable security is therefore NOT a token but: **per-tile opt-in + ephemeral
+  loopback port + relay-exists-only-during-grant + single active client** (a second
+  concurrent upgrade is rejected, so the agent's connection holds the slot). This is
+  strictly better than raw Chrome's fixed, always-open, multi-client
+  `--remote-debugging-port`. The relay still mints a token and validates it
+  **if present** (defense-in-depth for a token-capable client or a future Campus-side
+  forwarder that injects it), but does not require it. Residual: a same-UID process
+  could race the ephemeral port in the sub-second gap before the agent connects —
+  documented; tighten later with a Campus-side forwarder (relay stays strict, the
+  unauth surface confined to Campus) or a token-capable client.
 - **Relay lifecycle:** when does a grant expire? Tied to the `agentControllable`
   flag + an explicit `disableAgentControl()`; revoking the toggle kills live relay
   connections (closes the ws + invalidates the token).

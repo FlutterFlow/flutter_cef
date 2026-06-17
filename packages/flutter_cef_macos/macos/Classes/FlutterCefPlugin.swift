@@ -111,6 +111,20 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     case "showDevTools":
       withSession(args) { $0.showDevTools() }
       result(nil)
+    case "enableAgentControl":
+      // CEF-2a: broker a token-gated CDP endpoint for this session's host. Requires
+      // the session to have been created with agentControl (pipe) mode.
+      guard let sid = args["sessionId"] as? String, let host = sessionHost[sid],
+            let info = host.enableAgentControl() else {
+        result(FlutterError(code: "agent_control",
+                            message: "enableAgentControl failed: session not in agent-control mode, or host down",
+                            details: nil))
+        return
+      }
+      result(["wsUrl": info.wsUrl, "token": info.token, "port": info.port])
+    case "disableAgentControl":
+      if let sid = args["sessionId"] as? String { sessionHost[sid]?.disableAgentControl() }
+      result(nil)
     case "showEmojiPicker":
       // The Character Viewer targets the current first responder's input
       // context — Flutter's text-input plugin while the CefWebView is focused.

@@ -58,6 +58,16 @@ final class CefProfileHost {
   // NUL-delimited UTF-8 JSON line, NUL stripped). Set by the plugin/relay; the
   // CEF-1 validation hook installs a temporary one to prove the round-trip.
   var onCdpMessage: ((String) -> Void)?
+  // CEF-2a: the token-gated localhost CDP relay (created lazily on the first
+  // enableAgentControl()). Bridges a CDP client's WebSocket ⇄ this host's pipe.
+  // Held strongly here; its pipe-send closure captures self weakly (no cycle).
+  private var cdpRelay: CdpRelay?
+  // Guards onCdpMessage and cdpRelay. CEF-2a mutates onCdpMessage LIVE (enable/
+  // disable on the main thread) while the CDP reader thread reads it per message,
+  // so — unlike CEF-1, which only set it before the reader started — both must be
+  // synchronized. A plain closure property is a fat (ptr+context) value; a concurrent
+  // read during a write can tear it and call into freed context.
+  private let cdpHandlerLock = NSLock()
 
   // Process + IPC machinery (hoisted from CefWebSession).
   // `process` backs the default Foundation.Process launch; `spawnedPid` backs
@@ -495,6 +505,14 @@ final class CefProfileHost {
     let wasRunning = running
     running = false
     writeLock.unlock()
+    // CEF-2a: drop the relay (listener + any client) before tearing down the pipe,
+    // so it stops bridging into a closing fd.
+    cdpHandlerLock.lock()
+    let relay = cdpRelay
+    cdpRelay = nil
+    onCdpMessage = nil
+    cdpHandlerLock.unlock()
+    relay?.stop()
     send(0, Self.opShutdown, [])
     writeLock.lock()
     let c = connFd, l = listenFd
@@ -827,6 +845,42 @@ final class CefProfileHost {
     cdpWriteLock.unlock()
   }
 
+  /// CEF-2a: start (lazily) the token-gated CDP relay and return the brokered
+  /// endpoint Campus hands an agent. Requires agent-control (pipe) mode and a live
+  /// host. Wires the relay both ways: client ws → sendCdp(pipe), pipe →
+  /// deliverToClient(ws). Idempotent — returns the existing relay's endpoint.
+  func enableAgentControl() -> (wsUrl: String, token: String, port: Int)? {
+    writeLock.lock(); let alive = running && !crashed; writeLock.unlock()
+    guard agentControl, alive else { return nil }
+    cdpHandlerLock.lock()
+    defer { cdpHandlerLock.unlock() }
+    if cdpRelay == nil {
+      let relay = CdpRelay(sendToPipe: { [weak self] in self?.sendCdp($0) })
+      guard relay.start() else { return nil }
+      cdpRelay = relay
+      // Route pipe → relay. Capture the relay directly (weakly) so the reader thread
+      // never dereferences self.cdpRelay (which mutates across threads). In
+      // FLUTTER_CEF_DEBUG this replaces the CEF-1 one-shot validation hook, already
+      // completed by the time Campus calls this.
+      onCdpMessage = { [weak relay] msg in relay?.deliverToClient(msg) }
+    }
+    let r = cdpRelay!
+    // Token-free discovery url + the secret as a query (see CdpRelay security model).
+    let ws = "ws://127.0.0.1:\(r.port)/devtools/browser?token=\(r.token)"
+    return (ws, r.token, Int(r.port))
+  }
+
+  /// CEF-2a: tear down the relay (closes the listener + any client, invalidates the
+  /// token). Idempotent. The pipe itself stays up (the tile keeps running).
+  func disableAgentControl() {
+    cdpHandlerLock.lock()
+    let relay = cdpRelay
+    cdpRelay = nil
+    onCdpMessage = nil
+    cdpHandlerLock.unlock()
+    relay?.stop()  // outside the lock: stop() may block briefly on a stuck client
+  }
+
   /// CDP reader thread: drain cdpReadFd (parent end of out_pipe; child writes CDP
   /// on fd 4) and split the byte stream on 0x00 into complete UTF-8 JSON messages,
   /// delivering each (NUL stripped) to `onCdpMessage`. Exits on EOF/error (the
@@ -848,7 +902,10 @@ final class CefProfileHost {
         if chunk[i] == 0 {
           acc.append(contentsOf: chunk[start ..< i])
           if let msg = String(bytes: acc, encoding: .utf8) {
-            onCdpMessage?(msg)
+            // Snapshot the handler under the lock, then invoke OUTSIDE it (the
+            // handler may run for a while / take other locks).
+            cdpHandlerLock.lock(); let handler = onCdpMessage; cdpHandlerLock.unlock()
+            handler?(msg)
           }
           acc.removeAll(keepingCapacity: true)
           start = i + 1
@@ -873,6 +930,7 @@ final class CefProfileHost {
     guard agentControl,
           ProcessInfo.processInfo.environment["FLUTTER_CEF_DEBUG"] != nil
     else { return }
+    cdpHandlerLock.lock()
     let prior = onCdpMessage
     var logged = false
     onCdpMessage = { [weak self] msg in
@@ -885,9 +943,10 @@ final class CefProfileHost {
         NSLog("[cef][cdp-pipe:\(self.profileId)] Browser.getVersion round-trip OK: \(msg)")
         // Restore the prior handler now that the gate has passed, so the probe
         // wiring doesn't linger on the hot path.
-        self.onCdpMessage = prior
+        self.cdpHandlerLock.lock(); self.onCdpMessage = prior; self.cdpHandlerLock.unlock()
       }
     }
+    cdpHandlerLock.unlock()
     // Retry a few times in case DevToolsPipeHandler isn't reading fd 3 yet.
     let probe = "{\"id\":1,\"method\":\"Browser.getVersion\"}"
     DispatchQueue.global().async { [weak self] in

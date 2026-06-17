@@ -474,6 +474,41 @@ class CefWebController {
   Future<void> navigate(String url) =>
       _channel.invokeMethod('navigate', {'sessionId': sessionId, 'url': url});
 
+  /// CEF-2a — enable agent control for this tile and return a brokered, token-gated
+  /// CDP endpoint a standard CDP client (e.g. `agent-browser`) can connect to.
+  ///
+  /// Requires the controller to have been created with `agentControl: true` (the
+  /// CDP-over-pipe mode); otherwise the platform throws a [PlatformException]. The
+  /// relay binds loopback only and exists only while enabled. Point a CDP client at
+  /// `--cdp <port>` (Playwright/agent-browser discover the ws-url via
+  /// `/json/version`). Idempotent: repeated calls return the same live endpoint.
+  /// Tear down with [disableAgentControl].
+  ///
+  /// Security: vanilla agent-browser can't attach a secret to a CDP connection, so
+  /// the gate is the ephemeral loopback port + grant lifecycle + single active
+  /// client, not the token. The returned [token] is validated only **if** a client
+  /// passes `?token=` (defense-in-depth for a token-capable client); it's embedded
+  /// in [wsUrl] for that case.
+  ///
+  /// NOTE (CEF-2a): the relay passes CDP through browser-wide — per-tile isolation
+  /// (the Target-domain filter) lands in CEF-2b, so this must not be exposed in
+  /// production until then.
+  Future<({String wsUrl, String token, int port})?> enableAgentControl() async {
+    final res = await _channel.invokeMapMethod<String, dynamic>(
+        'enableAgentControl', {'sessionId': sessionId});
+    if (res == null) return null;
+    return (
+      wsUrl: res['wsUrl'] as String,
+      token: res['token'] as String,
+      port: res['port'] as int,
+    );
+  }
+
+  /// CEF-2a — tear down the agent-control relay (closes the listener and any client,
+  /// invalidates the token). The tile itself keeps running. Idempotent.
+  Future<void> disableAgentControl() =>
+      _channel.invokeMethod('disableAgentControl', {'sessionId': sessionId});
+
   /// Load host-trusted content, bypassing the navigation scheme allowlist.
   /// Backs [loadHtmlString] (data:) and [loadFile] (file:): the host explicitly
   /// chose this content, so it isn't subject to `allowedSchemes` the way page
