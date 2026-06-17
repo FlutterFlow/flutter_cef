@@ -13,5 +13,17 @@
   <key>NSHighResolutionCapable</key><true/>
   <!-- Agent process: no Dock icon, no menu bar. -->
   <key>LSUIElement</key><true/>
+  <!-- Privacy usage descriptions: like any real browser, the embedded Chromium
+       can touch TCC-gated hardware on behalf of the web page. macOS SIGABRTs the
+       process the instant it accesses one of these WITHOUT a usage string (e.g.
+       Google sign-in probing WebAuthn/FIDO security keys reaches CoreBluetooth
+       for BLE/hybrid passkeys). These strings let the access prompt instead of
+       crash; deny is safe (the feature just fails and the page falls back). -->
+  <key>NSBluetoothAlwaysUsageDescription</key>
+  <string>A web page is requesting Bluetooth to use a security key or passkey.</string>
+  <key>NSCameraUsageDescription</key>
+  <string>A web page is requesting camera access.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>A web page is requesting microphone access.</string>
 </dict>
 </plist>
