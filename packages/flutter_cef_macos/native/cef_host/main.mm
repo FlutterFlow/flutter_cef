@@ -194,28 +194,15 @@ struct Slot {
   uint32_t dialog_next = 1;
 };
 
-// Routing maps from a browser identity to its Slot. MUTATED ONLY ON THE CEF UI
-// THREAD (insert in DoCreateBrowser, erase in OnBeforeClose). Readers (the IPC
-// reader thread for inbound routing, paint threads for display lookup) take
-// g_slots_mutex, copy the shared_ptr, release the lock, then operate — so a slot
-// stays alive for the duration of an in-flight op even if it's disposed.
+// Routing map from a wire browser id to its Slot. MUTATED ONLY ON THE CEF UI
+// THREAD (insert in DoCreateBrowser, erase in OnBeforeClose). The IPC reader
+// thread takes g_slots_mutex, copies the shared_ptr, releases the lock, then
+// operates — so a slot stays alive for the duration of an in-flight op even if
+// it's disposed. Paint/display handlers don't consult this map: each HostClient
+// / HostRenderHandler holds its slot_ shared_ptr directly (no hot-path lookup).
 std::mutex g_slots_mutex;
-std::map<int /*cef GetIdentifier()*/, std::shared_ptr<Slot>>
-    g_slots_by_cef_id;  // paint / display callbacks -> slot
 std::map<uint32_t /*wire id*/, std::shared_ptr<Slot>>
     g_slots_by_wire_id;  // inbound IPC routing -> slot
-
-// Look up a slot by CEF's per-process browser identifier (the g_slots_by_cef_id
-// map's reader). Provided for display/paint callbacks that only have a
-// CefBrowser*; the current handlers instead hold their slot_ shared_ptr directly
-// (no map lookup on the hot paint path — see HostRenderHandler), so this is
-// presently unused but kept as the canonical by-cef-id resolver.
-[[maybe_unused]] std::shared_ptr<Slot> SlotForBrowser(CefBrowser* b) {
-  if (!b) return nullptr;
-  std::lock_guard<std::mutex> lock(g_slots_mutex);
-  auto it = g_slots_by_cef_id.find(b->GetIdentifier());
-  return it == g_slots_by_cef_id.end() ? nullptr : it->second;
-}
 
 // Look up a slot by its Swift-assigned wire id (used by the IPC reader to route
 // an inbound per-browser op). Null for wire id 0 or an unknown/disposed id.
@@ -831,7 +818,6 @@ class HostClient : public CefClient,
     if (router_) router_->OnBeforeClose(browser);
     {
       std::lock_guard<std::mutex> lock(g_slots_mutex);
-      if (browser) g_slots_by_cef_id.erase(browser->GetIdentifier());
       g_slots_by_wire_id.erase(slot_->browser_id);
     }
     {
@@ -1013,10 +999,7 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr, uint32_t sid,
   CefRefPtr<CefBrowser> browser = CefBrowserHost::CreateBrowserSync(
       window_info, client, url, settings, nullptr, nullptr);
   slot->browser = browser;
-  if (browser) {
-    std::lock_guard<std::mutex> lock(g_slots_mutex);
-    g_slots_by_cef_id[browser->GetIdentifier()] = slot;
-  } else {
+  if (!browser) {
     // CreateBrowserSync failed: OnBeforeClose (the only path that erases the
     // wire-id entry and releases slot->surface) can never fire without a
     // browser, so reclaim here or the slot + the looked-up IOSurface (+1 ref)
