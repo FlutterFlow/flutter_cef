@@ -55,12 +55,15 @@ lives in the Flutter app's process and:
 - Registers a **platform texture** (a `FlutterTexture` on macOS) backed by a
   shared GPU surface, and hands its id to the page.
 - Spawns **one `cef_host` subprocess per profile** (`--ipc --cdp-port
-  --profile-dir --allowed-schemes` as argv), then creates **N browsers in that
-  process** via `opCreateBrowser` frames carrying `url, width, height, dpr,
-  iosurface-id` + a `browserId`. A null/empty `--profile-dir` is an ephemeral,
-  throwaway profile (a unique temp dir); a non-empty one is a persistent,
-  shared cache. `--profile-dir` is per-process — the shared cache is what makes
-  one login (cookies, storage) shared across the browsers in the profile.
+  --profile-dir --allowed-schemes --ephemeral` as argv), then creates **N
+  browsers in that process** via `opCreateBrowser` frames carrying `url, width,
+  height, dpr, iosurface-id` + a `browserId`. `--profile-dir` is always passed; a
+  persistent (named) profile points it at a stable cache dir, while an ephemeral
+  profile points it at a unique throwaway temp dir and adds `--ephemeral` (so the
+  host's CDP / mock-keychain guards fire only for a real persistent profile —
+  `--profile-dir` alone can't distinguish the two). `--profile-dir` is per-process
+  — the shared cache is what makes one login (cookies, storage) shared across the
+  browsers in the profile.
 - Relays method-channel calls → IPC opcodes to `cef_host`, and IPC events from
   `cef_host` → `invokeMethod` back to Dart.
 

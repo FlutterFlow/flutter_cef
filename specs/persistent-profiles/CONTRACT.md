@@ -116,6 +116,7 @@ All existing ops are byte-identical to today; the only change is the new `browse
 | `--cdp-port=<port>` | process | **STAYS** | `settings.remote_debugging_port` (ephemeral-only; rejected with named profile in Swift) |
 | `--allowed-schemes=<csv>` | process | **STAYS** | `g_allowed_schemes` (shared by all browsers in the process) |
 | `--profile-dir=<abs path>` | process | **NEW** | `settings.root_cache_path` (empty/omitted → ephemeral temp; see below) |
+| `--ephemeral` | process | **NEW (review fix)** | marks the throwaway-temp case so the CDP / mock-keychain guards fire only for a real persistent profile (`--profile-dir` is set for both, so it can't distinguish them) |
 | `--url=<url>` | per-view | **REMOVED** → moves into opCreateBrowser |
 | `--width=<px>` | per-view | **REMOVED** → opCreateBrowser |
 | `--height=<px>` | per-view | **REMOVED** → opCreateBrowser |
@@ -129,8 +130,8 @@ All existing ops are byte-identical to today; the only change is the new `browse
 - cef_host unconditionally sets `settings.persist_session_cookies = true` (harmless for ephemeral; required for "stay signed in").
 
 **Defense-in-depth (advisory, non-authoritative — Swift is the gate):**
-- If both `--cdp-port` and `--profile-dir` (non-empty) arrive, cef_host ignores `--cdp-port` and `SendLog(0, ...)`. (Swift already rejects this combination; this is belt-and-suspenders.)
-- In a `CEF_HOST_ADHOC` build, if `--profile-dir` is set and `FLUTTER_CEF_ALLOW_INSECURE_PROFILE` is absent in env, `SendLog(0, "warning: persistent profile under mock keychain")`. Advisory only.
+- CORRECTED IN REVIEW: these guards must key off `!is_ephemeral`, NOT `--profile-dir` presence (which is always set). The original "both `--cdp-port` and `--profile-dir`" form disabled CDP for *every* ephemeral session — the only sessions where CDP is legal. Now: if `--cdp-port` arrives with a **non-ephemeral** `--profile-dir`, cef_host drops `--cdp-port` and `SendLog(0, ...)`. (Swift already rejects CDP+named before spawn; belt-and-suspenders.)
+- In a `CEF_HOST_ADHOC` build, if a **non-ephemeral** `--profile-dir` is set and `FLUTTER_CEF_ALLOW_INSECURE_PROFILE` is absent, `SendLog(0, "warning: persistent profile under mock keychain")`. Advisory only (an ephemeral throwaway dir is never at risk, so it must not warn).
 
 ---
 
