@@ -2,6 +2,21 @@
 
 # CEF PERSISTENT-PROFILES — RESEARCH + SECURITY/ROBUSTNESS VERDICT
 
+## STATUS (updated as fixes land)
+
+**Addressed** (the block-shipping set — see §5 items 1–7; verified by build + an adversarial re-review of the diff):
+- **C1** — a `cef_host` crash is no longer silently absorbed: it surfaces a `processGone` event to Dart and clears the maps so the named profile *unbricks* (re-openable). Auto-respawn still deferred.
+- **C2** — cross-process cache lock: cef_host takes `flock(LOCK_EX|LOCK_NB)` on `<profileDir>/.flutter_cef.lock` before `CefInitialize`; contention surfaces as a distinct "locked" `processGone`.
+- **#3 (claim)** — corrected the false README "ACL-scoped" keychain claim. *(Per-product item NAME still deferred — needs a from-source CEF rebrand.)*
+- **#4** — deny-default `CefPermissionHandler` (gates camera/mic/geolocation for untrusted content; does NOT touch caBLE).
+- **#5** — release entitlements trimmed to `allow-jit` + `device.bluetooth` (dropped `disable-library-validation`, `allow-unsigned-executable-memory`, `device.camera`, `device.audio-input`).
+- **#6** — `SO_NOSIGPIPE` + `writeAll` failure now triggers the host-died path.
+- **#7** — dropped the CDP `remote-allow-origins=*` wildcard. Plus M2 (`g_ipc_fd` atomic) and H3 (main-thread `dispatchPrecondition` asserts).
+
+**Deferred (backlog):** per-product OSCrypt keychain item name (from-source CEF build); browser-process **auto-respawn** (C1 surfaces+unbricks today, but doesn't relaunch); socket **peer authentication** (H9 — `getpeereid`/`socketpair`); reload-storm backoff (H1); M3/M4/M5; and two re-review nits rated *benign / can't-fire-in-practice*: the `onHostDied`/`onInsecureProfileRefused` assignment happens-before edge (read paths are lock-guarded; the write race can't fire before the host connects) and an imprecise media-deny comment.
+
+---
+
 **Subject:** `feat/persistent-profiles` @ `/Users/wenkaifan/Dev/flutter_cef` (macOS Flutter plugin embedding CEF via windowless OSR; one `cef_host` process per profile multiplexing N CefBrowsers over one Unix socket).
 **Method:** four prior-art research threads (CEF core, JCEF/CefSharp, Electron/Chromium, macOS security) + five adversarial code reviews (process model, IPC/untrusted input, concurrency, security posture), with the highest-leverage claims re-verified directly against source. Verdict-level confidence; research rests on WebSearch extracts (WebFetch was unavailable), code findings are confirmed at file:line.
 

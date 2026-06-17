@@ -43,6 +43,11 @@ final class CefProfileHost {
   private let writeLock = NSLock()
   private var pendingFrames: [[UInt8]] = []  // queued until the pipe connects
   private var running = false
+  // C1: set true (under writeLock) when the host dies unexpectedly — reader EOF
+  // while running, or a writeAll to a dead pipe. Distinct from `running=false`
+  // (clean shutdown()): `crashed` forces hasLiveBrowser false so the named
+  // profile reopens, and gates onHostDied to fire once.
+  private var crashed = false
   private var readerStarted = false
   private let readerDone = DispatchSemaphore(value: 0)  // signaled when the
   // acceptAndRead thread exits, so shutdown() can join it before freeing state.
@@ -62,6 +67,15 @@ final class CefProfileHost {
   // profile (no creds were written — see F.5). The plugin tears this host down
   // and respawns an ephemeral one for the same session.
   var onInsecureProfileRefused: (() -> Void)?
+
+  // C1: invoked ON THE MAIN THREAD when the reader loop exits UNEXPECTEDLY
+  // (cef_host died: EOF/ECONNRESET while running, or a writeAll to a dead pipe)
+  // — NOT on a clean shutdown(). Carries the process exit status so the plugin
+  // can distinguish a cache-lock loss (status 2 — see the C2 cross-group
+  // contract) from a generic crash, emit `processGone` to Dart, and drop the
+  // host so the profile_in_use guard unblocks. Fires at most once per host.
+  var onHostDied: ((Int32) -> Void)?
+  private var diedFired = false  // guarded by writeLock; one onHostDied per host
 
   init(profileId: String, profileDir: String, isEphemeral: Bool) {
     self.profileId = profileId
@@ -188,7 +202,6 @@ final class CefProfileHost {
   /// is NOT here — it's a process arg fixed at spawn (A.4).
   private func sendCreate(_ id: UInt32, _ session: CefWebSession, _ url: String) {
     writeLock.lock()
-    defer { writeLock.unlock() }
     // Read the session's LIVE geometry + surfaceId AND write the create frame in a
     // single writeLock section, so a racing resize can neither slip between the
     // surfaceId read and the create write, nor order its opResize ahead of the
@@ -204,11 +217,15 @@ final class CefProfileHost {
     payload.append(contentsOf: Array(url.utf8))
     createEnqueued.insert(id)
     let frame = frameBytes(id, Self.opCreateBrowser, payload)
+    var ok = true
     if connFd < 0 {
       pendingFrames.append(frame)
     } else {
-      _ = frame.withUnsafeBytes { writeAll(connFd, $0.baseAddress!, frame.count) }
+      ok = frame.withUnsafeBytes { writeAll(connFd, $0.baseAddress!, frame.count) }
     }
+    writeLock.unlock()
+    // H2: surface a dead pipe (unlocked first — handleHostDeath re-takes writeLock).
+    if !ok { handleHostDeath() }
   }
 
   /// Frame `[u32 bodyLen=4+1+payload.count][u32 browserId][op][payload]` and
@@ -219,18 +236,34 @@ final class CefProfileHost {
   func send(_ browserId: UInt32, _ op: UInt8, _ payload: [UInt8]) {
     let frame = frameBytes(browserId, op, payload)
     writeLock.lock()
-    defer { writeLock.unlock() }
     if connFd < 0 {
-      if op == Self.opResize && !createEnqueued.contains(browserId) { return }
+      if op == Self.opResize && !createEnqueued.contains(browserId) {
+        writeLock.unlock()
+        return
+      }
       pendingFrames.append(frame)
+      writeLock.unlock()
       return
     }
-    _ = frame.withUnsafeBytes { writeAll(connFd, $0.baseAddress!, frame.count) }
+    let ok = frame.withUnsafeBytes { writeAll(connFd, $0.baseAddress!, frame.count) }
+    writeLock.unlock()
+    // H2: a failed write means the pipe is dead — until now the return was
+    // discarded and a dead pipe was indistinguishable from success. Surface it
+    // (unlocked first: handleHostDeath re-takes writeLock).
+    if !ok { handleHostDeath() }
   }
 
-  /// Whether this host currently has any registered browser. Used by the P1
-  /// single-view-per-named-profile guard.
+  /// Whether this host currently has a LIVE browser — a registered browser AND
+  /// a host that hasn't died. Used by the P1 single-view-per-named-profile
+  /// guard (`FlutterCefPlugin.create`). Consulting liveness (not just map
+  /// emptiness) is what lets a named profile reopen after a `cef_host` crash:
+  /// C1's onHostDied path clears `browsers` on main, but the `crashed` flag is
+  /// the belt-and-suspenders guard against any racing teardown ordering (M1).
   var hasLiveBrowser: Bool {
+    writeLock.lock()
+    let dead = crashed
+    writeLock.unlock()
+    if dead { return false }
     browsersLock.lock(); defer { browsersLock.unlock() }
     return !browsers.isEmpty
   }
@@ -257,10 +290,17 @@ final class CefProfileHost {
   /// terminate cef_host. Closing an fd a thread is blocked on, or freeing state
   /// under the reader, is a use-after-free — the join makes teardown deterministic.
   func shutdown() {
-    send(0, Self.opShutdown, [])
+    // Clear `running` FIRST (before the opShutdown write and before closing the
+    // fds): this is a CLEAN teardown, so neither the reader's read-EOF nor a
+    // failed opShutdown write should be mistaken for a crash — handleHostDeath()
+    // guards on `running`, so flipping it false here keeps onHostDied from firing
+    // on the shutdown path (C1).
     writeLock.lock()
     let wasRunning = running
     running = false
+    writeLock.unlock()
+    send(0, Self.opShutdown, [])
+    writeLock.lock()
     let c = connFd, l = listenFd
     writeLock.unlock()
     // Darwin.shutdown — disambiguate from this class's own shutdown() method,
@@ -331,7 +371,24 @@ final class CefProfileHost {
   private func acceptAndRead() {
     defer { readerDone.signal() }  // let shutdown() join us on every exit path
     let fd = accept(listenFd, nil, nil)
-    guard fd >= 0 else { NSLog("[cef] accept() failed"); return }
+    guard fd >= 0 else {
+      // A failed accept() with no clean shutdown in flight is a dead host too
+      // (cef_host exited before connecting — e.g. a crash during CefInitialize
+      // that never reached the IPC). handleHostDeath() no-ops on a clean
+      // shutdown (running==false, which wakes accept() via the listen-fd
+      // shutdown). The C2 cache-lock loss connects first (it SendLogs
+      // "profile-locked" then exits 2), so it surfaces via the read-loop EOF
+      // below with a real terminationStatus, not here.
+      NSLog("[cef] accept() failed")
+      handleHostDeath()
+      return
+    }
+    // After accept(), guard the conn fd against SIGPIPE (H2): a write() to a
+    // peer-closed socket would otherwise raise SIGPIPE and kill the whole host
+    // APP, not just fail the write. With SO_NOSIGPIPE the write returns -1/EPIPE
+    // and writeAll() reports failure, which we route to handleHostDeath().
+    var one: Int32 = 1
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
     // Bring the pipe up and drain anything queued before it connected — all under
     // writeLock so a concurrent send can't interleave with the flush. Unlike the
     // old per-view path, geometry is NOT re-synced here: each browser's
@@ -340,11 +397,18 @@ final class CefProfileHost {
     // that fall through after opReady.
     writeLock.lock()
     connFd = fd
+    var flushOk = true
     for f in pendingFrames {
-      _ = f.withUnsafeBytes { writeAll(fd, $0.baseAddress!, f.count) }
+      if !(f.withUnsafeBytes { writeAll(fd, $0.baseAddress!, f.count) }) {
+        flushOk = false
+        break
+      }
     }
     pendingFrames.removeAll()
     writeLock.unlock()
+    // A flush write that failed means the pipe is already dead (H2) — treat it
+    // as a host death rather than spinning into the read loop on a broken fd.
+    if !flushOk { handleHostDeath(); return }
     while running {
       var hdr = [UInt8](repeating: 0, count: 4)
       if !readAll(fd, &hdr, 4) { break }
@@ -364,6 +428,48 @@ final class CefProfileHost {
         browsersLock.unlock()
         session?.handleFrame(op, payload)
       }
+    }
+    // C1: the loop exited. If `running` is still true this was NOT a clean
+    // shutdown() (which clears `running` BEFORE shutting the fds down) — the
+    // host died (EOF/ECONNRESET on the peer, or a malformed frame). Surface it.
+    // shutdown() flips `running` false first, so its fd-close-driven read EOF
+    // lands here with `running==false` and is correctly ignored.
+    handleHostDeath()
+  }
+
+  /// C1/H2: the host has (apparently) died — the reader hit EOF while running,
+  /// accept()/the pre-ready flush failed, or a send's writeAll failed. Fire
+  /// `onHostDied` ONCE on the main thread (the plugin's maps are main-thread
+  /// confined — H3), passing the process exit status so the plugin can tell a
+  /// cache-lock loss (status 2 — C2 contract) from a generic crash. A clean
+  /// shutdown() (running==false) is not a death and is ignored.
+  private func handleHostDeath() {
+    writeLock.lock()
+    // Ignore clean teardown, and fire at most once: both the reader-exit path
+    // and a writeAll-failure (possibly concurrent, on the main thread) can land
+    // here. Set `crashed` synchronously so hasLiveBrowser flips immediately.
+    guard running, !diedFired else { writeLock.unlock(); return }
+    diedFired = true
+    crashed = true  // forces hasLiveBrowser false so the named profile reopens
+    let p = process
+    let died = onHostDied
+    writeLock.unlock()
+    // Resolve the exit status + invoke onHostDied off the caller's thread: this
+    // can be the MAIN thread (a writeAll failure in send()/sendCreate()), and
+    // terminationStatus traps if read while the process is still running — so we
+    // must not busy-wait here. Hop to a background queue, wait briefly for the
+    // process to actually exit (EOF usually means it already has), then deliver
+    // on main (the plugin's maps are main-thread confined — H3). Generic-crash
+    // status (-1) if it outlives the grace window.
+    DispatchQueue.global().async {
+      var status: Int32 = -1
+      if let p = p {
+        for _ in 0 ..< 20 {  // up to ~1s
+          if !p.isRunning { status = p.terminationStatus; break }
+          usleep(50_000)
+        }
+      }
+      DispatchQueue.main.async { died?(status) }
     }
   }
 

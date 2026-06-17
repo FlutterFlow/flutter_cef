@@ -152,13 +152,22 @@ sandbox can't validate without proper signing), which is why `ON` is the default
 
 Other always-on protections:
 
-- **Hardened-runtime relaxations** (`disable-library-validation`, `allow-jit`,
-  `allow-unsigned-executable-memory`) are kept in both entitlements files — CEF's
-  JIT renderer + dlopen'd framework require them.
+- **Hardened-runtime relaxations.** The signed-release set
+  (`entitlements.release.plist`) is intentionally minimal: only `allow-jit`
+  (CEF's V8 JIT, via MAP_JIT) plus `device.bluetooth` (caBLE passkeys). The
+  dev/ad-hoc set (`entitlements.plist`) additionally relaxes
+  `disable-library-validation` and `allow-unsigned-executable-memory` for
+  convenience, but neither is load-bearing under correct inside-out single-identity
+  signing, so release drops both (see the hardening backlog and
+  `entitlements.release.plist` for the rationale).
 - **Navigation scheme allowlist** (`CefWebView(allowedSchemes:)`) — gate which
   schemes a page may navigate to (main-frame nav, programmatic `navigate()`,
   clicks, redirects); host content-injection (`loadHtmlString`/`loadFile`) is
-  exempt. Off by default (allow-all).
+  exempt. Off by default (allow-all). This is a **navigation policy knob, not a
+  content-isolation boundary**: it gates *main-frame navigations only* — it does
+  **not** restrict subframes, subresources, or `fetch`/XHR/`<img>`/`ws:` loads,
+  so a page can still issue requests over any scheme. Use it to constrain where
+  the top-level frame can go, not to sandbox what content can load.
 - **JS channel names are validated** as JS identifiers before injection, and
   **`runJavaScriptReturningResult` expects a single expression** from trusted
   app code.
@@ -166,6 +175,21 @@ Other always-on protections:
   world-readable `/tmp` path) and a **randomized control-socket name** — a named
   `profile:` instead uses a stable 0700 dir under Application Support (see
   [Profiles](#profiles)).
+
+### Known limitations / hardening backlog
+
+This is a competent CEF embedding with honestly-labeled deferrals, not a fully
+hardened browser. Notable items still open — see
+[`specs/persistent-profiles/SECURITY-REVIEW.md`](specs/persistent-profiles/SECURITY-REVIEW.md)
+for the full punch list (file:line) and prioritization:
+
+- **Per-product keychain item name** for OSCrypt (true at-rest isolation from
+  other CEF apps) — needs a from-source CEF build to override the hardcoded
+  `"Chromium Safe Storage"` name (see [Secrets at rest](#secrets-at-rest)).
+- **Browser-process auto-respawn** — a `cef_host` crash surfaces and unbricks
+  the profile, but does not yet automatically restart it.
+- **Socket peer authentication** — the control socket is first-connector-wins
+  with no `getpeereid()` check on the spawned process.
 
 ## Profiles
 
@@ -198,11 +222,18 @@ CefWebView(url: startUrl, controller: c);
 Cookies (and Chromium's password / OSCrypt-encrypted data) are only encrypted
 at rest under a **signed release build** (`CEF_HOST_ADHOC=OFF` — see
 [Security](#security)), where `cef_host` uses the real macOS Keychain /
-OSCrypt. The encryption key is stored in a login-Keychain item named
-**"Chromium Safe Storage"**, ACL-scoped so only the signing identity's binary
-can read it (you'll see a **one-time Keychain prompt** the first time a profile
-is created). **FileVault** is the backstop for the at-rest bytes the key
-protects.
+OSCrypt. The encryption key is stored in the default OSCrypt login-Keychain
+item named **"Chromium Safe Storage"** (you'll see a **one-time Keychain
+prompt** the first time a profile is created). This item is **shared** with
+every CEF/Chromium-based app that resolves the same default name — it is *not*
+ACL-scoped to one signing identity, so it does not isolate our key from other
+CEF apps the user has approved. At-rest protection therefore comes from
+**FileVault** (full-disk encryption) plus the **login keychain** being locked
+when the user is logged out — not from a per-binary keychain ACL. True per-app
+isolation needs a **per-product keychain item name**, but that name is a
+hardcoded literal baked into the prebuilt CEF framework; overriding it requires
+a from-source CEF build and is tracked as a follow-up (see the hardening
+backlog).
 
 The default ad-hoc / dev build (`CEF_HOST_ADHOC=ON`) has only a **mock keychain**
 — it cannot encrypt cookies at rest. To avoid silently writing a "persistent"

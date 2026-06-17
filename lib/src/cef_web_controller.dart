@@ -100,6 +100,14 @@ class CefWebController {
   /// is informational (e.g. to surface a toast).
   void Function(String suggestedName)? onDownload;
 
+  /// Called when the backing `cef_host` process is gone — it died unexpectedly
+  /// (crash) or lost the profile's cross-process cache lock. The texture is
+  /// frozen on its last frame and the session is no longer usable; recreate the
+  /// view (or controller) to recover. [reason] is `"locked"` when the profile is
+  /// already open in another process (show "already open elsewhere") or
+  /// `"crashed"` for a generic process death.
+  void Function(String reason)? onProcessGone;
+
   /// The caret rect (view-local logical px) of the active IME composition.
   /// Wired by [CefWebView] to position the OS candidate window under the text;
   /// you generally don't set this yourself.
@@ -224,6 +232,11 @@ class CefWebController {
           (a['w'] as num? ?? 0).toDouble(),
           (a['h'] as num? ?? 0).toDouble(),
         ));
+        break;
+      case 'processGone':
+        // The native host dropped this session (crash or cache-lock loss). The
+        // texture is dead; let the consumer react (show a reload affordance).
+        onProcessGone?.call(a['reason'] as String? ?? 'crashed');
         break;
     }
   }

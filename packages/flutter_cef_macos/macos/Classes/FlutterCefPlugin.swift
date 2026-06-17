@@ -141,6 +141,11 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   }
 
   private func create(_ a: [String: Any], _ result: @escaping FlutterResult) {
+    // The session/profile dictionaries below are unlocked and rely on being
+    // touched only from the main thread (H3) — the method-channel handler always
+    // runs here. Assert it so a future off-main caller fails loudly, not silently
+    // corrupting the maps.
+    dispatchPrecondition(condition: .onQueue(.main))
     guard let sessionId = a["sessionId"] as? String,
           let registry = textureRegistry else {
       result(FlutterError(code: "bad_args", message: "missing sessionId/registry",
@@ -315,8 +320,44 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
                      allowedSchemes: allowedSchemes) else {
       return nil
     }
+    wireHostDied(host)
     profiles[key] = host
     return host
+  }
+
+  /// C1: install the host-died handler. When `cef_host` dies unexpectedly (its
+  /// reader hit EOF while running, or a write hit a dead pipe — see
+  /// CefProfileHost.handleHostDeath), tell every session on this host that its
+  /// process is gone, drop those sessions and the host so the profile_in_use
+  /// guard unblocks (hasLiveBrowser also goes false via the host's crashed flag),
+  /// and reap the process. `onHostDied` is dispatched on the main thread by the
+  /// host, so the unlocked dictionaries are touched only here on main (H3).
+  private func wireHostDied(_ host: CefProfileHost) {
+    host.onHostDied = { [weak self, weak host] status in
+      dispatchPrecondition(condition: .onQueue(.main))
+      guard let self = self, let host = host else { return }
+      // C2 cross-group contract: cef_host exits 2 (after SendLog "profile-locked")
+      // when it loses the cache singleton lock to another process. Surface that as
+      // a distinct reason so the widget can say "already open elsewhere" instead of
+      // a generic crash.
+      let reason = (status == 2) ? "locked" : "crashed"
+      // Every session still routed to this host loses its browser. Snapshot first
+      // (we mutate the maps in the loop).
+      let goneSessions = self.sessionHost.compactMap { $0.value === host ? $0.key : nil }
+      for sid in goneSessions {
+        self.emit("processGone", ["sessionId": sid, "reason": reason])
+        self.sessions[sid] = nil
+        self.sessionHost[sid] = nil
+        self.sessionKey[sid] = nil
+      }
+      // Drop the host from the profile registry so a re-create spawns a fresh
+      // one. Snapshot the matching keys first — never mutate a Dictionary while
+      // iterating it.
+      let goneKeys = self.profiles.compactMap { $0.value === host ? $0.key : nil }
+      for k in goneKeys { self.profiles[k] = nil }
+      // Reap: idempotent SIGTERM(+SIGKILL escalation), a no-op if already exited.
+      host.shutdown()
+    }
   }
 
   /// F.5: the running cef_host turned out to be an ad-hoc (mock-keychain) build
@@ -326,6 +367,9 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   /// persistent dir, no creds leak.
   private func respawnEphemeral(sessionId: String, url: String,
                                 allowedSchemes: String) {
+    // The unlocked session/profile dictionaries are confined to the main thread
+    // (H3); this is reached from onInsecureProfileRefused via DispatchQueue.main.
+    dispatchPrecondition(condition: .onQueue(.main))
     guard let session = sessions[sessionId],
           let cefHost = resolveCefHostPath() else { return }
     // Tear down the refused (named) host and forget it.
@@ -345,6 +389,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       NSLog("[cef] respawn ephemeral host failed for \(sessionId)")
       return
     }
+    wireHostDied(host)
     profiles[key] = host
     _ = host.createBrowser(session, url: url, allowedSchemes: allowedSchemes)
     sessionHost[sessionId] = host
@@ -388,6 +433,9 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   /// has already unregistered this browser under lock, so `session.dispose()`
   /// runs safely while the shared reader keeps serving the siblings.
   private func disposeSession(_ id: String) {
+    // Unlocked session/profile dictionaries — main-thread confined (H3). Reached
+    // from create()/destroy() (channel handler, on main) and never off-main.
+    dispatchPrecondition(condition: .onQueue(.main))
     guard let session = sessions[id] else { return }
     let host = sessionHost[id]
     let key = sessionKey[id]

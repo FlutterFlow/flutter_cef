@@ -33,6 +33,13 @@ const double _kTrackpadScrollGain = 3.0;
 /// ancestor opts into Flutter's trackpad gesture API (which reroutes them from
 /// [PointerScrollEvent] to pan-zoom events — e.g. canvas hosts).
 ///
+/// If the backing `cef_host` process dies (crash, or the profile's cache lock
+/// was taken by another process), the texture freezes on its last frame. Wire
+/// [CefWebController.onProcessGone] to detect it and recreate the view — this
+/// widget surfaces the event through the controller rather than handling it
+/// itself, so the host decides what UI to show (a reload affordance, an
+/// "already open elsewhere" message for the `"locked"` reason, etc.).
+///
 /// ```dart
 /// CefWebView(url: 'https://flutter.dev')
 /// ```

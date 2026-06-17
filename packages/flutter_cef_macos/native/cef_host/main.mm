@@ -48,6 +48,7 @@
 #import <IOSurface/IOSurface.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
@@ -64,6 +65,7 @@
 #include <libgen.h>
 #include <mach-o/dyld.h>
 #include <sys/event.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -80,6 +82,7 @@
 #include "include/cef_find_handler.h"
 #include "include/cef_jsdialog_handler.h"
 #include "include/cef_life_span_handler.h"
+#include "include/cef_permission_handler.h"
 #include "include/cef_render_handler.h"
 #include "include/cef_request_handler.h"
 #include "include/cef_task.h"
@@ -141,7 +144,11 @@ constexpr uint8_t kOpLoadTrusted = 0x34;    // {utf8 url} host content-load, exe
 constexpr uint8_t kOpSetVisible = 0x35;     // {u8 visible} -> CefBrowserHost::WasHidden(!visible)
 
 // ---- Shared runtime state ----
-int g_ipc_fd = -1;
+// Atomic: the reader thread reads it (ReadAll), SendFrame on any thread reads it,
+// and main() stores the connected fd then -1 on teardown. A plain int would tear
+// the SendFrame `< 0` check against the teardown `= -1` store (UB, and benign
+// only because a closed-fd write is a safe no-op); the atomic makes it defined.
+std::atomic<int> g_ipc_fd{-1};
 std::mutex g_ipc_write_mutex;
 
 // Per-browser state. One cef_host process now multiplexes N browsers (one per
@@ -590,6 +597,38 @@ class HostRenderHandler : public CefRenderHandler {
   IMPLEMENT_REFCOUNTING(HostRenderHandler);
 };
 
+// Deny-default permission gate. With NO permission handler, CEF/Chromium has no
+// per-site gate, so untrusted web content (including a third-party iframe on a
+// trusted page) could reach camera/mic (getUserMedia), geolocation,
+// notifications, etc. We deny every permission prompt and every media-access
+// request up front. This is deliberately deny-ONLY: there is no host round-trip
+// and no allow path. It does NOT touch WebAuthn / caBLE — passkeys are not a
+// CefPermissionHandler permission type (they go through the authenticator /
+// Bluetooth stack, gated by the OS + the bluetooth entitlement), so denying
+// media/geo here leaves the passkey-over-Bluetooth flow untouched.
+class HostPermissionHandler : public CefPermissionHandler {
+ public:
+  // getUserMedia (camera/mic) and any other media-access request: grant NOTHING.
+  // Returning true means we handled it; Continue(CEF_MEDIA_PERMISSION_NONE)
+  // denies (allowed must be a subset of required, and the empty set is valid).
+  bool OnRequestMediaAccessPermission(
+      CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, const CefString&, uint32_t,
+      CefRefPtr<CefMediaAccessCallback> callback) override {
+    callback->Continue(CEF_MEDIA_PERMISSION_NONE);
+    return true;
+  }
+  // Geolocation, notifications, clipboard, etc. all arrive as a permission
+  // prompt: deny without ever showing UI.
+  bool OnShowPermissionPrompt(
+      CefRefPtr<CefBrowser>, uint64_t, const CefString&, uint32_t,
+      CefRefPtr<CefPermissionPromptCallback> callback) override {
+    callback->Continue(CEF_PERMISSION_RESULT_DENY);
+    return true;
+  }
+
+  IMPLEMENT_REFCOUNTING(HostPermissionHandler);
+};
+
 class HostClient : public CefClient,
                    public CefLoadHandler,
                    public CefDisplayHandler,
@@ -605,10 +644,13 @@ class HostClient : public CefClient,
     router_ = CefMessageRouterBrowserSide::Create(config);
     router_->AddHandler(this, false);
     rh_ = new HostRenderHandler(slot_);
+    ph_ = new HostPermissionHandler();  // deny-default permission gate
   }
   CefRefPtr<CefMessageRouterBrowserSide> router_;
   CefRefPtr<CefRenderHandler> rh_;
+  CefRefPtr<CefPermissionHandler> ph_;
   CefRefPtr<CefRenderHandler> GetRenderHandler() override { return rh_; }
+  CefRefPtr<CefPermissionHandler> GetPermissionHandler() override { return ph_; }
   CefRefPtr<CefLoadHandler> GetLoadHandler() override { return this; }
   CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
   CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
@@ -873,11 +915,6 @@ class HostClient : public CefClient,
   IMPLEMENT_REFCOUNTING(HostClient);
 };
 
-// The CDP port for this session (0 = CDP disabled). Set from --cdp-port before
-// CefInitialize; read in OnBeforeCommandLineProcessing to allow CDP WebSocket
-// origins (Chromium M113+ rejects them by default).
-int g_cdp_port = 0;
-
 class HostApp : public CefApp, public CefBrowserProcessHandler {
  public:
   CefRefPtr<CefBrowserProcessHandler> GetBrowserProcessHandler() override {
@@ -926,12 +963,11 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
     }
     // CDP WebSocket origin allow-list: Chromium M113+ rejects DevTools WS
     // connections whose Origin isn't allow-listed (anti-CSRF on the local debug
-    // port). For local automation we allow all origins so any CDP client
-    // (Playwright, chrome-remote-interface) connects; the endpoint is still
-    // bound to 127.0.0.1 only and CDP is opt-in, so exposure is unchanged.
-    if (g_cdp_port > 0) {
-      command_line->AppendSwitchWithValue("remote-allow-origins", "*");
-    }
+    // port). We do NOT widen it with "*": the wildcard would disable that only
+    // origin/CSRF guard on the unauthenticated localhost debugger. CDP stays
+    // 127.0.0.1-bound and ephemeral-only (rejected on a persistent profile), and
+    // clients that need WS access pass their own --remote-allow-origins out of
+    // band; the default (no Origin / same-origin) still connects.
   }
   // No browser is created here. We only announce readiness; the host then drives
   // browser creation on demand via kOpCreateBrowser (one per CefWebView sharing
@@ -1703,6 +1739,42 @@ int main(int argc, char* argv[]) {
   }
 #endif
 
+  // Cross-process single-writer lock on a PERSISTENT profile dir (C2). Swift's
+  // in-memory dedup only covers one plugin instance; two app instances (or two
+  // FlutterEngines in one process) would resolve the same root_cache_path and
+  // spawn two cef_host on it. Chromium's own profile singleton then fails the
+  // SECOND CefInitialize (-> EOF, silent dead profile) with possible cache
+  // corruption if the lock races. Take an advisory exclusive flock on
+  // <profile_dir>/.flutter_cef.lock FIRST; on contention (or any failure
+  // opening/locking it) report a distinct, machine-parseable signal and exit
+  // with code 2 so Swift surfaces a real "profile already in use" error instead
+  // of the generic crash/EOF path. Only for a real persistent profile — an
+  // ephemeral throwaway dir is per-pid, so it can never contend. The fd is held
+  // open (never closed) for the process lifetime: the lock releases when the
+  // process exits (closing it early, or letting an RAII guard close it, would
+  // drop the lock while the profile is still live). Intentionally leaked.
+  if (!profile_dir.empty() && !is_ephemeral) {
+    const std::string lock_path = profile_dir + "/.flutter_cef.lock";
+    int lock_fd = open(lock_path.c_str(), O_CREAT | O_RDWR, 0600);
+    if (lock_fd < 0) {
+      SendLog(0, "profile-locked");
+      fprintf(stderr, "[cef_host] cannot open profile lock %s: %s\n",
+              lock_path.c_str(), strerror(errno));
+      return 2;
+    }
+    if (flock(lock_fd, LOCK_EX | LOCK_NB) != 0) {
+      SendLog(0, "profile-locked");
+      fprintf(stderr,
+              "[cef_host] profile already in use by another process (%s): %s\n",
+              lock_path.c_str(), strerror(errno));
+      close(lock_fd);
+      return 2;
+    }
+    // Held for the process lifetime — never closed (the OS drops the lock on
+    // exit). Suppress the unused-variable warning without releasing the lock.
+    (void)lock_fd;
+  }
+
   // Hand Chromium ONLY the program name. Our custom switches (--ipc,
   // --cdp-port, --allowed-schemes, --profile-dir) are parsed by us above; if
   // they reach Chromium's CommandLine, cef_initialize CHECK-crashes on them.
@@ -1735,7 +1807,6 @@ int main(int argc, char* argv[]) {
       int port = atoi(cdp.c_str());
       if (port >= 1024 && port <= 65535) {
         settings.remote_debugging_port = port;
-        g_cdp_port = port;  // OnBeforeCommandLineProcessing allows WS origins
       }
     }
     // Per-profile cache. The host supplies --profile-dir: a stable 0700 dir
@@ -1784,7 +1855,7 @@ int main(int argc, char* argv[]) {
       return 1;
     }
     if (std::getenv("FLUTTER_CEF_DEBUG"))
-      fprintf(stderr, "[cef_host] CefInitialize OK (fd=%d)\n", g_ipc_fd);
+      fprintf(stderr, "[cef_host] CefInitialize OK (fd=%d)\n", g_ipc_fd.load());
     std::thread reader;
     if (g_ipc_fd >= 0) reader = std::thread(&IpcReadLoop);
     std::thread(&WatchParentDeath, getppid()).detach();
