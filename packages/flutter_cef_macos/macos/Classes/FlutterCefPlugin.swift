@@ -164,6 +164,12 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     let dpr = (a["dpr"] as? Double).map { CGFloat($0) } ?? 1.0
     let allowedSchemes = a["allowedSchemes"] as? String ?? ""
     let enableCdp = a["enableCdp"] as? Bool ?? false
+    // Agent-control / pipe mode (CEF-1): CDP rides cef_host's inherited fds 3/4
+    // (a private, NUL-framed pipe) instead of a TCP port. Because there's no
+    // listening socket, the open-port cookie-exfil rationale doesn't apply, so
+    // (unlike TCP enableCdp) it's permitted on a named profile — see below. Omit-
+    // when-false from Dart, like enableCdp.
+    let agentControl = a["agentControl"] as? Bool ?? false
     // A non-empty `profile` => a persistent, shared host; absent/empty => an
     // ephemeral throwaway host. Backward-compat is structural: no `profile`
     // behaves exactly as before.
@@ -175,15 +181,22 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     // single-view guard below on itself.
     disposeSession(sessionId)
 
-    // Safety rail (a): CDP is an unauthenticated localhost port that could read
-    // the shared cookie jar, so it's incompatible with a named profile. Reject
-    // before spawn, so --cdp-port and --profile-dir never co-arrive at cef_host.
-    if enableCdp && namedProfile {
+    // Safety rail (a): TCP CDP is an unauthenticated localhost port that could
+    // read the shared cookie jar, so it's incompatible with a named profile.
+    // Reject before spawn, so --cdp-port and --profile-dir never co-arrive at
+    // cef_host. The agent-control PIPE path is exempt: it exposes no listening
+    // socket (CDP rides inherited fds 3/4, private to this app), so the exfil
+    // rationale doesn't apply — and when agentControl is set, spawn() passes
+    // --cdp-pipe and never --cdp-port even if enableCdp was also requested, so no
+    // TCP port opens. Hence the rejection gates only the plain-TCP case
+    // (enableCdp && !agentControl). The TCP enableCdp+named lockdown is unchanged.
+    if enableCdp && namedProfile && !agentControl {
       result(FlutterError(
         code: "cdp_with_profile",
         message: "enableCdp cannot be combined with a named profile: CDP exposes "
           + "an unauthenticated localhost port that could read the profile's "
-          + "shared cookie jar.",
+          + "shared cookie jar. (Agent-control pipe mode is exempt — it opens no "
+          + "port.)",
         details: nil))
       return
     }
@@ -204,7 +217,8 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
 
     guard let host = resolveOrSpawnHost(
       key: key, profileDir: profileDir, isEphemeral: isEphemeral,
-      cefHostPath: cefHost, enableCdp: enableCdp, allowedSchemes: allowedSchemes)
+      cefHostPath: cefHost, enableCdp: enableCdp, allowedSchemes: allowedSchemes,
+      agentControl: agentControl)
     else {
       result(FlutterError(code: "spawn_failed",
                           message: "failed to spawn cef_host", details: nil))
@@ -308,16 +322,21 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   }
 
   /// Resolve an existing host for `key`, or spawn a fresh one. Returns nil if the
-  /// spawn fails.
+  /// spawn fails. `agentControl` switches the launch to posix_spawn (CDP over
+  /// inherited fds 3/4) — see CefProfileHost.spawn. Only meaningful when this call
+  /// actually spawns; an EXISTING host keeps its original transport (a named
+  /// profile is single-view in this build, so an agent-control create() resolving
+  /// to a pre-existing host is not a normal path).
   private func resolveOrSpawnHost(
     key: String, profileDir: String, isEphemeral: Bool, cefHostPath: String,
-    enableCdp: Bool, allowedSchemes: String
+    enableCdp: Bool, allowedSchemes: String, agentControl: Bool
   ) -> CefProfileHost? {
     if let existing = profiles[key] { return existing }
     let host = CefProfileHost(
       profileId: key, profileDir: profileDir, isEphemeral: isEphemeral)
     guard host.spawn(cefHostPath: cefHostPath, enableCdp: enableCdp,
-                     allowedSchemes: allowedSchemes) else {
+                     allowedSchemes: allowedSchemes, agentControl: agentControl)
+    else {
       return nil
     }
     wireHostDied(host)

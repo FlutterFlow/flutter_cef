@@ -384,10 +384,17 @@ class CefWebController {
     double dpr = 1.0,
     Set<String>? allowedSchemes,
     bool enableCdp = false,
+    bool agentControl = false,
   }) {
-    assert(!(enableCdp && profile != null && profile!.isNotEmpty),
-        'enableCdp cannot be combined with a named profile (CDP is an '
-        'unauthenticated localhost port that could read the shared cookie jar).');
+    // The TCP enableCdp+named-profile combination is rejected because CDP-over-TCP
+    // is an unauthenticated localhost port that could read the shared cookie jar.
+    // Agent-control (pipe) mode is exempt: CDP rides cef_host's inherited fds 3/4
+    // (no listening socket), so it's allowed on a named profile — the gate only
+    // covers the plain-TCP case.
+    assert(!(enableCdp && !agentControl && profile != null && profile!.isNotEmpty),
+        'enableCdp cannot be combined with a named profile (CDP-over-TCP is an '
+        'unauthenticated localhost port that could read the shared cookie jar). '
+        'Use agentControl for a private CDP-over-pipe channel instead.');
     if (textureId != null) return Future<int?>.value(textureId);
     return _createInFlight ??= _createSession(
       url: url,
@@ -396,6 +403,7 @@ class CefWebController {
       dpr: dpr,
       allowedSchemes: allowedSchemes,
       enableCdp: enableCdp,
+      agentControl: agentControl,
     ).whenComplete(() => _createInFlight = null);
   }
 
@@ -406,6 +414,7 @@ class CefWebController {
     required double dpr,
     required Set<String>? allowedSchemes,
     required bool enableCdp,
+    required bool agentControl,
   }) async {
     await _acquireCreateSlot();
     // Disposed while parked in the spawn-throttle queue — never fork for a dead
@@ -426,6 +435,11 @@ class CefWebController {
           'allowedSchemes':
               allowedSchemes.map((s) => s.toLowerCase()).join(','),
         if (enableCdp) 'enableCdp': true,
+        // Agent-control / pipe mode (CEF-1): when set, the native side launches
+        // cef_host via posix_spawn with CDP over inherited fds 3/4 (--cdp-pipe)
+        // instead of a TCP --cdp-port. Omit-when-false so the OFF path is
+        // byte-identical to today's create args.
+        if (agentControl) 'agentControl': true,
         if (profile != null && profile!.isNotEmpty) 'profile': profile,
       });
     } finally {

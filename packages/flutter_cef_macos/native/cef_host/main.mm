@@ -229,6 +229,15 @@ std::shared_ptr<Slot> LookupWireId(uint32_t wire_id) {
 // exemption in the browser's Slot::trusted_pending so their load isn't refused.
 std::set<std::string> g_allowed_schemes;
 
+// Agent-control opt-in: when true (set from main() via --cdp-pipe BEFORE
+// CefInitialize, read back in OnBeforeCommandLineProcessing), cef_host exposes
+// CDP over inherited fds (3=read / 4=write, Chromium's DevToolsPipeHandler)
+// instead of a TCP port. The argv-scrub below hands CEF only argv[0], so the
+// "remote-debugging-pipe" Chromium switch can ONLY be injected through the
+// OnBeforeCommandLineProcessing hook — hence this file-scope flag. Off by
+// default; when off, behavior is byte-identical to the pre-pipe path.
+bool g_cdp_pipe = false;
+
 // Registered JS channel names (UI-thread-only). On each frame load we inject a
 // window.<name>.postMessage shim that routes to the host over window.cefQuery
 // (the CefMessageRouter channel — renderer half lives in process_helper.mm).
@@ -968,6 +977,21 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
     // 127.0.0.1-bound and ephemeral-only (rejected on a persistent profile), and
     // clients that need WS access pass their own --remote-allow-origins out of
     // band; the default (no Origin / same-origin) still connects.
+
+    // Agent-control / pipe mode (opt-in via --cdp-pipe, gated by g_cdp_pipe).
+    // This hook only runs for the browser process (process_type empty), so no
+    // explicit process_type check is needed. Inject "remote-debugging-pipe" so
+    // Chromium's DevToolsPipeHandler speaks CDP over inherited fds (3=read /
+    // 4=write) instead of a TCP port — there is no listening socket, so the
+    // ONLY CDP client is the process that launched cef_host with those fds (the
+    // Swift plugin). Default (ASCIIZ) framing: each CDP message is UTF-8 JSON
+    // followed by a single 0x00 NUL byte, both directions (Puppeteer
+    // PipeTransport). Deliberately NOT "remote-debugging-pipe=cbor". This MUST
+    // go through this hook: the argv-scrub in main() hands CEF only argv[0], so
+    // the switch can't ride in via clean_argv.
+    if (g_cdp_pipe) {
+      command_line->AppendSwitch("remote-debugging-pipe");
+    }
   }
   // No browser is created here. We only announce readiness; the host then drives
   // browser creation on demand via kOpCreateBrowser (one per CefWebView sharing
@@ -1644,6 +1668,21 @@ std::string ArgValue(int argc, char** argv, const char* key) {
   return std::string();
 }
 
+// Presence-only flag (no value), e.g. bare "--cdp-pipe". ArgValue only matches
+// "--key=value", so a value-less flag needs this. Accepts both "--key" and
+// "--key=..." forms so the caller can pass either.
+bool HasFlag(int argc, char** argv, const char* key) {
+  const std::string bare = std::string("--") + key;
+  const std::string prefix = bare + "=";
+  for (int i = 1; i < argc; ++i) {
+    if (argv[i] == bare ||
+        strncmp(argv[i], prefix.c_str(), prefix.size()) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 std::string ExecutableDir() {
   char buf[4096];
   uint32_t sz = sizeof(buf);
@@ -1692,6 +1731,14 @@ int main(int argc, char* argv[]) {
   std::string ipc_path = ArgValue(argc, argv, "ipc");
   std::string allowed = ArgValue(argc, argv, "allowed-schemes");
   std::string cdp = ArgValue(argc, argv, "cdp-port");
+  // Agent-control / pipe mode opt-in (presence = true, no value). When set, CDP
+  // goes over inherited fds 3/4 instead of the TCP --cdp-port; stashed in the
+  // file-scope g_cdp_pipe so OnBeforeCommandLineProcessing can inject the
+  // Chromium switch (set BEFORE CefInitialize, below). Mutually independent of
+  // --cdp-port; the pipe path never touches the TCP `cdp` string above, so the
+  // persistent-profile guard below (which strips only the TCP port) doesn't
+  // fire for it — a pipe on a named profile is naturally allowed.
+  const bool want_pipe = HasFlag(argc, argv, "cdp-pipe");
   std::string profile_dir = ArgValue(argc, argv, "profile-dir");
   // Swift always passes --profile-dir (even for an ephemeral host, whose dir is a
   // throwaway temp dir), so profile_dir alone can't tell "persistent" from
@@ -1723,6 +1770,10 @@ int main(int argc, char* argv[]) {
   // profile must never expose it. CDP IS allowed on an ephemeral host, so gate
   // on !is_ephemeral — not on profile_dir alone, which is always set. Swift
   // already rejects CDP+named before spawn; this is belt-and-suspenders.
+  // NOTE: this gates the TCP --cdp-port (`cdp`) ONLY. The agent-control pipe
+  // path (--cdp-pipe / g_cdp_pipe) never sets `cdp`, so this guard does not fire
+  // for it — a pipe on a named profile is allowed by construction (no listening
+  // socket means the cookie-exfil rationale above doesn't apply).
   if (!cdp.empty() && !profile_dir.empty() && !is_ephemeral) {
     SendLog(0,
             "ignoring --cdp-port: refusing CDP on a persistent --profile-dir");
@@ -1775,9 +1826,21 @@ int main(int argc, char* argv[]) {
     (void)lock_fd;
   }
 
+  // Stash the agent-control / pipe opt-in for OnBeforeCommandLineProcessing,
+  // which runs during CefInitialize below. That hook is the ONLY place the
+  // "remote-debugging-pipe" Chromium switch can be injected (the argv-scrub just
+  // below hands CEF argv[0] only, so it can't ride in via clean_argv). When
+  // false, nothing is injected and behavior is byte-identical to the pre-pipe
+  // path. Note: --cdp-pipe is independent of the TCP --cdp-port and is NOT
+  // subject to the persistent-profile guard above (which strips only the TCP
+  // `cdp` string); a pipe has no listening socket, so a pipe on a named profile
+  // is allowed by construction.
+  g_cdp_pipe = want_pipe;
+
   // Hand Chromium ONLY the program name. Our custom switches (--ipc,
-  // --cdp-port, --allowed-schemes, --profile-dir) are parsed by us above; if
-  // they reach Chromium's CommandLine, cef_initialize CHECK-crashes on them.
+  // --cdp-port, --allowed-schemes, --profile-dir, --cdp-pipe) are parsed by us
+  // above; if they reach Chromium's CommandLine, cef_initialize CHECK-crashes
+  // on them.
   char* clean_argv[] = {argv[0]};
   CefMainArgs main_args(1, clean_argv);
   @autoreleasepool {

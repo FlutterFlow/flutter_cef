@@ -52,11 +52,13 @@ class CefWebView extends StatefulWidget {
     this.placeholder,
     this.allowedSchemes,
     this.enableCdp = false,
+    this.agentControl = false,
     this.profile,
-  }) : assert(!(enableCdp && profile != null),
-            'enableCdp cannot be combined with a named profile: CDP exposes an '
-            'unauthenticated localhost port that could read the profile\'s shared '
-            'cookie jar. Use one or the other.');
+  }) : assert(!(enableCdp && !agentControl && profile != null),
+            'enableCdp cannot be combined with a named profile: CDP-over-TCP '
+            'exposes an unauthenticated localhost port that could read the '
+            'profile\'s shared cookie jar. Use agentControl (CDP-over-pipe, no '
+            'open port) for a named profile instead.');
 
   /// Page to load. Changing it on an existing view navigates.
   final String url;
@@ -95,10 +97,21 @@ class CefWebView extends StatefulWidget {
   /// pre-created controller).
   final bool enableCdp;
 
+  /// Enable agent-control / pipe mode: cef_host exposes CDP over inherited file
+  /// descriptors (a private, NUL-framed JSON pipe) instead of a TCP port, so
+  /// there is no listening socket and the only possible CDP client is this app.
+  /// Because nothing is exposed to other local processes, this is permitted on a
+  /// named [profile] (unlike [enableCdp]). Only honoured when this view creates
+  /// the session (not when it adopts a pre-created controller). In this build the
+  /// pipe is private to the app; brokering it to an external agent is a later
+  /// increment.
+  final bool agentControl;
+
   /// The persistent, shared browser profile this view's login lives in. Views with
   /// the same non-null [profile] share one signed-in profile that survives relaunch.
   /// Null (default) is ephemeral. Ignored when an external [controller] is supplied
-  /// (that controller carries its own profile). Mutually exclusive with [enableCdp].
+  /// (that controller carries its own profile). Mutually exclusive with the TCP
+  /// [enableCdp] (open port), but compatible with [agentControl] (private pipe).
   final String? profile;
 
   @override
@@ -200,7 +213,8 @@ class _CefWebViewState extends State<CefWebView>
             height: h,
             dpr: dpr,
             allowedSchemes: widget.allowedSchemes,
-            enableCdp: widget.enableCdp);
+            enableCdp: widget.enableCdp,
+            agentControl: widget.agentControl);
         // Don't record `_lastSize` here: create() may have ADOPTED an in-flight
         // session a host eager-spawned at a different (tile snapshot) size, so
         // we can't assume the live surface is `size`. Leaving `_lastSize` null

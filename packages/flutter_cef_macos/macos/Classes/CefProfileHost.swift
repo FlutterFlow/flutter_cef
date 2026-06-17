@@ -32,11 +32,42 @@ final class CefProfileHost {
   // The 127.0.0.1 port CEF's DevTools (CDP) server bound for this host, or 0
   // when CDP wasn't requested. Chosen here (free-port pick); CDP is only ever
   // requested for ephemeral hosts (named+CDP is rejected upstream). Reported
-  // back to Dart in each create() result.
+  // back to Dart in each create() result. NOT used by the pipe (agent-control)
+  // path — that speaks CDP over inherited fds 3/4, not a TCP port.
   private(set) var cdpPort: Int = 0
 
+  // Agent-control / pipe mode (CEF-1). When true, cef_host was launched via
+  // posix_spawn so it inherits two CDP pipes (child reads CDP on fd 3, writes on
+  // fd 4) and was passed --cdp-pipe; the Chromium "remote-debugging-pipe" switch
+  // makes it speak NUL-delimited JSON over those fds instead of a TCP port. Off
+  // by default; when off, spawn() takes the existing Foundation.Process launch
+  // and behavior is byte-identical to the pre-pipe path.
+  private(set) var agentControl = false
+  // Parent-side CDP pipe ends (valid only when agentControl). cdpWriteFd =
+  // cmd_pipe[1] (we write CDP here; child reads it on fd 3). cdpReadFd =
+  // out_pipe[0] (we read CDP here; child writes it on fd 4). -1 when unused.
+  private var cdpWriteFd: Int32 = -1
+  private var cdpReadFd: Int32 = -1
+  private let cdpWriteLock = NSLock()  // serializes send(json) writes to cdpWriteFd
+  private var cdpReaderStarted = false
+  // Signaled when the CDP reader thread exits, so shutdown() can join it before
+  // closing cdpReadFd (closing an fd a thread is blocked on is a use-after-free —
+  // mirrors readerDone for the IPC reader).
+  private let cdpReaderDone = DispatchSemaphore(value: 0)
+  // Invoked (off the CDP reader thread) for each complete CDP message (one
+  // NUL-delimited UTF-8 JSON line, NUL stripped). Set by the plugin/relay; the
+  // CEF-1 validation hook installs a temporary one to prove the round-trip.
+  var onCdpMessage: ((String) -> Void)?
+
   // Process + IPC machinery (hoisted from CefWebSession).
+  // `process` backs the default Foundation.Process launch; `spawnedPid` backs
+  // the posix_spawn (agent-control) launch. Exactly one is live per host:
+  // process != nil  => default path (terminate()/isRunning/terminationStatus).
+  // process == nil && spawnedPid > 0 => pipe path (kill()/waitpid()).
+  // This keeps the hardened default path's process handling byte-identical while
+  // the pipe path reuses the same teardown/crash-surfacing seams via the pid.
   private var process: Process?
+  private var spawnedPid: pid_t = 0
   private var listenFd: Int32 = -1
   private var connFd: Int32 = -1
   private var socketPath = ""
@@ -90,7 +121,18 @@ final class CefProfileHost {
   /// added only when `enableCdp` (port picked here). `--allowed-schemes` is a
   /// process arg shared by every browser in the profile — it's taken from the
   /// first browser that triggered this spawn. Returns false on failure.
-  func spawn(cefHostPath: String, enableCdp: Bool, allowedSchemes: String) -> Bool {
+  ///
+  /// `agentControl` (CEF-1) switches the LAUNCH MECHANISM only: when true we use
+  /// posix_spawn instead of Foundation.Process so cef_host inherits two CDP pipes
+  /// on fds 3/4 (Foundation.Process can't place arbitrary fds), and we add the
+  /// `--cdp-pipe` flag so the native side injects the `remote-debugging-pipe`
+  /// Chromium switch. Everything else (Unix-socket IPC, reader thread, dispose
+  /// ordering, crash surfacing) is identical to the default path; `enableCdp`
+  /// (TCP) and `agentControl` (pipe) are independent transports and the pipe
+  /// path never picks/passes a `--cdp-port`.
+  func spawn(cefHostPath: String, enableCdp: Bool, allowedSchemes: String,
+             agentControl: Bool = false) -> Bool {
+    self.agentControl = agentControl
     // Randomized name (not just the predictable profileId) in the per-user 0700
     // temp dir, so another same-UID process can't pre-bind it.
     let rnd = String(format: "%08x", UInt32.random(in: 0 ... UInt32.max))
@@ -102,6 +144,11 @@ final class CefProfileHost {
     unlink(socketPath)
     listenFd = socket(AF_UNIX, SOCK_STREAM, 0)
     guard listenFd >= 0 else { NSLog("[cef] socket() failed"); return false }
+    // Close-on-exec so the listening fd never leaks into the spawned cef_host (or
+    // its CEF helper subprocesses). Foundation.Process spawns CLOEXEC-default, but
+    // the posix_spawn path (attrp=nil) would otherwise inherit it; the child
+    // connects via --ipc by path and never needs the listener. Harmless on both.
+    fcntl(listenFd, F_SETFD, FD_CLOEXEC)
     var addr = sockaddr_un()
     addr.sun_family = sa_family_t(AF_UNIX)
     let pathC = socketPath.utf8CString
@@ -119,8 +166,6 @@ final class CefProfileHost {
     guard bound == 0 else { NSLog("[cef] bind() failed: \(errno)"); return false }
     listen(listenFd, 1)
 
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: cefHostPath)
     // Per-process args only: per-view geometry/url now ride opCreateBrowser. The
     // cache path is always the resolved --profile-dir (ephemeral = throwaway temp).
     var args = [
@@ -135,19 +180,57 @@ final class CefProfileHost {
     if !allowedSchemes.isEmpty {
       args.append("--allowed-schemes=\(allowedSchemes)")
     }
-    // Chrome DevTools Protocol (CDP): when enabled, pick a free 127.0.0.1 port
-    // and pass it via --cdp-port; cef_host sets CefSettings.remote_debugging_port
-    // and CEF binds it (localhost-only, M113+). UNAUTHENTICATED — any local client
-    // that reaches the port fully drives the page — so this is opt-in, never on by
-    // default, and rejected for named profiles (it could read the shared jar). The
-    // port is reported back to Dart in the create() result.
-    if enableCdp {
+    if agentControl {
+      // Agent-control / pipe mode: CDP rides inherited fds 3/4 (set up below in
+      // launchViaPosixSpawn), NOT a TCP port. --cdp-pipe is a no-value flag the
+      // native side detects to inject Chromium's "remote-debugging-pipe" switch
+      // (NUL-delimited JSON). cdpPort stays 0 — there is no listening socket, so
+      // it's never reported to Dart. Mutually exclusive with --cdp-port here:
+      // the pipe IS the transport for this path.
+      args.append("--cdp-pipe")
+    } else if enableCdp {
+      // Chrome DevTools Protocol (CDP) over TCP: pick a free 127.0.0.1 port and
+      // pass it via --cdp-port; cef_host sets CefSettings.remote_debugging_port
+      // and CEF binds it (localhost-only, M113+). UNAUTHENTICATED — any local
+      // client that reaches the port fully drives the page — so this is opt-in,
+      // never on by default, and rejected for named profiles (it could read the
+      // shared jar). The port is reported back to Dart in the create() result.
       let port = Self.pickFreeTcpPort()
       if port >= 1024 {
         cdpPort = port
         args.append("--cdp-port=\(port)")
       }
     }
+
+    let launched =
+      agentControl
+        ? launchViaPosixSpawn(cefHostPath: cefHostPath, args: args)
+        : launchViaProcess(cefHostPath: cefHostPath, args: args)
+    guard launched else { return false }
+
+    running = true
+    readerStarted = true
+    Thread.detachNewThread { [weak self] in self?.acceptAndRead() }
+    // Agent-control: drain CDP off fd 3/4's parent ends on a dedicated reader,
+    // splitting the NUL-delimited JSON stream into messages. Started only after
+    // a successful spawn (the fds exist). Joined in shutdown() before close.
+    // Install the (debug-only) validation handler BEFORE starting the reader so
+    // the reader never observes a half-installed onCdpMessage (the only path that
+    // mutates it in CEF-1); in normal flow it's a no-op and onCdpMessage stays
+    // nil. The probe-send loop it kicks off is fine to start first — the response
+    // just buffers in the pipe until the reader drains it.
+    if agentControl && cdpReadFd >= 0 {
+      maybeRunCdpValidation()
+      cdpReaderStarted = true
+      Thread.detachNewThread { [weak self] in self?.readCdpLoop() }
+    }
+    return true
+  }
+
+  /// Default launch: Foundation.Process (unchanged behavior). Sets `process`.
+  private func launchViaProcess(cefHostPath: String, args: [String]) -> Bool {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: cefHostPath)
     p.arguments = args
     do {
       try p.run()
@@ -156,9 +239,122 @@ final class CefProfileHost {
       NSLog("[cef] failed to spawn cef_host at \(cefHostPath): \(error)")
       return false
     }
-    running = true
-    readerStarted = true
-    Thread.detachNewThread { [weak self] in self?.acceptAndRead() }
+    return true
+  }
+
+  /// Agent-control launch: posix_spawn so cef_host inherits the two CDP pipes on
+  /// fds 3 (child reads CDP) and 4 (child writes CDP) — Foundation.Process can't
+  /// place arbitrary fds. Builds the pipes, dup2s the child ends onto 3/4 via
+  /// posix_spawn_file_actions (dup2 auto-clears CLOEXEC on the targets so they
+  /// survive exec), closes the originals in the child, marks the parent ends
+  /// CLOEXEC so cef_host's own renderer/GPU helper spawns don't inherit them, and
+  /// captures the pid for teardown/crash-surfacing. Sets `spawnedPid`,
+  /// `cdpReadFd`, `cdpWriteFd`. Returns false (cleaning up any half-built state)
+  /// on failure. Recipe verified against Chromium DevToolsPipeHandler + Puppeteer.
+  private func launchViaPosixSpawn(cefHostPath: String, args: [String]) -> Bool {
+    // cmd_pipe: parent writes CDP -> child reads on fd 3.
+    // out_pipe: child writes CDP on fd 4 -> parent reads.
+    var cmdPipe: [Int32] = [-1, -1]
+    var outPipe: [Int32] = [-1, -1]
+    guard pipe(&cmdPipe) == 0 else {
+      NSLog("[cef] cdp pipe() (cmd) failed: \(errno)")
+      return false
+    }
+    guard pipe(&outPipe) == 0 else {
+      NSLog("[cef] cdp pipe() (out) failed: \(errno)")
+      close(cmdPipe[0]); close(cmdPipe[1])
+      return false
+    }
+    var cmdRead = cmdPipe[0], cmdWrite = cmdPipe[1]
+    var outRead = outPipe[0], outWrite = outPipe[1]
+
+    // Helper to close all four pipe ends on a bail-out (before fds are adopted).
+    func closeAll() {
+      close(cmdRead); close(cmdWrite); close(outRead); close(outWrite)
+    }
+
+    // CRITICAL fd-collision guard: pipe() hands out the lowest free fds, and in a
+    // GUI app 0/1/2 are open so the FIRST pipe can land exactly on fds 3 and/or 4
+    // — our dup2 TARGETS. If a source fd already equals 3 or 4, the
+    // adddup2(src,target)+addclose(src) pair would either no-op the dup2 (POSIX:
+    // dup2 with oldfd==newfd does nothing AND does not clear FD_CLOEXEC) and then
+    // close the fd we meant to keep, or close a sibling end. So first relocate any
+    // end sitting on 3/4 to a high fd (>=10) via F_DUPFD; now all four sources are
+    // >=5 and the dup2/close plan onto 3/4 is unambiguous. (We don't need them
+    // CLOEXEC here — addclose removes the originals in the child, and the parent
+    // closes them right after spawn.)
+    func relocateAwayFromTargets(_ fd: inout Int32) -> Bool {
+      while fd == 3 || fd == 4 {
+        let hi = fcntl(fd, F_DUPFD, 10)
+        if hi < 0 { return false }
+        close(fd)
+        fd = hi
+      }
+      return true
+    }
+    guard relocateAwayFromTargets(&cmdRead), relocateAwayFromTargets(&cmdWrite),
+          relocateAwayFromTargets(&outRead), relocateAwayFromTargets(&outWrite)
+    else {
+      NSLog("[cef] cdp pipe fd relocation failed: \(errno)")
+      closeAll()
+      return false
+    }
+
+    // File actions: place the child read-end on fd 3 and write-end on fd 4, then
+    // close the originals in the child. adddup2 onto a target auto-clears
+    // FD_CLOEXEC on that target, so fds 3/4 survive exec (the originals do not).
+    // posix_spawn_file_actions_t is `void *` on Darwin -> an optional raw pointer
+    // in Swift; _init allocates it, _destroy frees it.
+    var fa: posix_spawn_file_actions_t?
+    guard posix_spawn_file_actions_init(&fa) == 0 else {
+      NSLog("[cef] posix_spawn_file_actions_init failed: \(errno)")
+      closeAll()
+      return false
+    }
+    posix_spawn_file_actions_adddup2(&fa, cmdRead, 3)
+    posix_spawn_file_actions_adddup2(&fa, outWrite, 4)
+    posix_spawn_file_actions_addclose(&fa, cmdRead)
+    posix_spawn_file_actions_addclose(&fa, cmdWrite)
+    posix_spawn_file_actions_addclose(&fa, outRead)
+    posix_spawn_file_actions_addclose(&fa, outWrite)
+
+    // Build a NULL-terminated C argv: [cefHostPath, args..., NULL]. strdup each
+    // so the C strings outlive the Swift String bridging during posix_spawn.
+    var cargv: [UnsafeMutablePointer<CChar>?] = []
+    cargv.append(strdup(cefHostPath))
+    for a in args { cargv.append(strdup(a)) }
+    cargv.append(nil)
+    defer { for p in cargv where p != nil { free(p) } }
+
+    var pid: pid_t = 0
+    let rc = posix_spawn(&pid, cefHostPath, &fa, nil, cargv, environ)
+    posix_spawn_file_actions_destroy(&fa)
+    guard rc == 0 else {
+      NSLog("[cef] posix_spawn cef_host at \(cefHostPath) failed: \(rc)")
+      closeAll()
+      return false
+    }
+    spawnedPid = pid
+    // Parent keeps the OPPOSITE ends from the child and closes the child's ends
+    // (now duped onto 3/4 in the child). Mark the kept ends CLOEXEC so they don't
+    // leak into any further exec the parent (the host app) might do — and, since
+    // cef_host launches its OWN renderer/GPU helper subprocesses, only the
+    // top-level browser process we just spawned inherits 3/4; those helpers are
+    // launched by CEF and get default-closed 3/4 (correct, per the design).
+    close(cmdRead)   // child's read end
+    close(outWrite)  // child's write end
+    cdpWriteFd = cmdWrite
+    cdpReadFd = outRead
+    _ = fcntl(cdpWriteFd, F_SETFD, FD_CLOEXEC)
+    _ = fcntl(cdpReadFd, F_SETFD, FD_CLOEXEC)
+    // SIGPIPE guard on the WRITE end (H2 discipline, pipe edition): the IPC conn
+    // fd uses the SO_NOSIGPIPE socket option, but pipe fds don't take it, so a
+    // write to a cef_host that closed its CDP read end (it died) would otherwise
+    // raise SIGPIPE and kill the whole host APP. F_SETNOSIGPIPE is the Darwin
+    // per-fd equivalent: the write returns -1/EPIPE and writeAll reports failure
+    // instead. (CLOEXEC was set above — note F_SETFD/F_SETNOSIGPIPE are distinct
+    // fcntl commands, so neither overwrites the other.)
+    _ = fcntl(cdpWriteFd, F_SETNOSIGPIPE, 1)
     return true
   }
 
@@ -316,16 +512,50 @@ final class CefProfileHost {
     if isEphemeral && !profileDir.isEmpty {
       try? FileManager.default.removeItem(atPath: profileDir)
     }
+    // Agent-control: close OUR CDP write end first — cef_host sees EOF on fd 3
+    // (DevToolsPipeHandler's disconnect signal), a clean CDP shutdown. The read
+    // end can't be Darwin.shutdown()'d (that's socket-only) and closing an fd the
+    // CDP reader is blocked in read() on would be a use-after-free, so the SAME
+    // discipline as the IPC reader applies: get the reader to EOF first (the
+    // child exiting closes its fd 4), JOIN it, THEN close the read fd.
+    cdpWriteLock.lock()
+    if cdpWriteFd >= 0 { close(cdpWriteFd); cdpWriteFd = -1 }
+    cdpWriteLock.unlock()
+    // terminateProcess() (SIGTERM, SIGKILL escalation) makes the child exit,
+    // which closes its CDP write end (fd 4) and yields EOF on cdpReadFd so the
+    // CDP reader loop returns. Done before the CDP reader join for that reason.
     terminateProcess()
+    if cdpReaderStarted && wasRunning { _ = cdpReaderDone.wait(timeout: .now() + 2) }
+    if cdpReadFd >= 0 { close(cdpReadFd); cdpReadFd = -1 }
   }
 
+  /// SIGTERM (then SIGKILL escalation) the cef_host process. Handles BOTH launch
+  /// paths: `process` (Foundation.Process, default) and `spawnedPid` (posix_spawn,
+  /// agent-control). Idempotent — clears whichever handle it used.
   private func terminateProcess() {
-    guard let p = process else { return }
-    process = nil
-    p.terminate()  // SIGTERM
-    // Escalate to SIGKILL if the host is wedged and ignores SIGTERM.
+    if let p = process {
+      process = nil
+      p.terminate()  // SIGTERM
+      // Escalate to SIGKILL if the host is wedged and ignores SIGTERM.
+      DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) {
+        if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+      }
+      return
+    }
+    // posix_spawn path: we own a raw pid, not a Process. SIGTERM then SIGKILL.
+    // Reap with a non-blocking waitpid so the child doesn't linger as a zombie
+    // (Foundation.Process reaps for us; for a bare pid we must do it ourselves).
+    let pid = spawnedPid
+    guard pid > 0 else { return }
+    spawnedPid = 0
+    kill(pid, SIGTERM)
     DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) {
-      if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+      var status: Int32 = 0
+      // If it already exited, waitpid reaps it now; if not, SIGKILL then reap.
+      if waitpid(pid, &status, WNOHANG) == 0 {
+        kill(pid, SIGKILL)
+        _ = waitpid(pid, &status, 0)
+      }
     }
   }
 
@@ -333,8 +563,15 @@ final class CefProfileHost {
     // Minimal net for a partial-spawn failure (host dropped without shutdown()).
     // shutdown() zeroes the fds, so this is a no-op after a clean teardown.
     if process?.isRunning == true { process?.terminate() }
+    if spawnedPid > 0 {
+      kill(spawnedPid, SIGTERM)
+      var st: Int32 = 0
+      _ = waitpid(spawnedPid, &st, WNOHANG)  // best-effort reap; avoid a zombie
+    }
     if connFd >= 0 { close(connFd) }
     if listenFd >= 0 { close(listenFd) }
+    if cdpWriteFd >= 0 { close(cdpWriteFd) }
+    if cdpReadFd >= 0 { close(cdpReadFd) }
     if !socketPath.isEmpty { unlink(socketPath) }
   }
 
@@ -452,6 +689,7 @@ final class CefProfileHost {
     diedFired = true
     crashed = true  // forces hasLiveBrowser false so the named profile reopens
     let p = process
+    let pid = spawnedPid
     let died = onHostDied
     writeLock.unlock()
     // Resolve the exit status + invoke onHostDied off the caller's thread: this
@@ -461,11 +699,29 @@ final class CefProfileHost {
     // process to actually exit (EOF usually means it already has), then deliver
     // on main (the plugin's maps are main-thread confined — H3). Generic-crash
     // status (-1) if it outlives the grace window.
+    //
+    // Two launch paths: `process` (Foundation.Process) exposes isRunning/
+    // terminationStatus; the posix_spawn path has only `pid`, so we poll waitpid
+    // (WNOHANG) and extract the exit code via WEXITSTATUS so the C2 cache-lock
+    // signal (exit 2 -> "locked") matches Process.terminationStatus's semantics.
     DispatchQueue.global().async {
       var status: Int32 = -1
       if let p = p {
         for _ in 0 ..< 20 {  // up to ~1s
           if !p.isRunning { status = p.terminationStatus; break }
+          usleep(50_000)
+        }
+      } else if pid > 0 {
+        for _ in 0 ..< 20 {  // up to ~1s
+          var raw: Int32 = 0
+          let r = waitpid(pid, &raw, WNOHANG)
+          if r == pid {
+            // Reaped. Mirror terminationStatus: exit code, or -1 if signaled.
+            status = (raw & 0o177) == 0 ? ((raw >> 8) & 0xff) : -1
+            break
+          } else if r < 0 {
+            break  // already reaped by terminateProcess() (or no child) — give up.
+          }
           usleep(50_000)
         }
       }
@@ -549,6 +805,99 @@ final class CefProfileHost {
   private func sanitizedSocketTag() -> String {
     let allowed = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
     return String(profileId.map { allowed.contains($0) ? $0 : "_" })
+  }
+
+  // MARK: CDP over pipe (agent-control)
+
+  /// Send one CDP message to cef_host: UTF-8 JSON followed by a single 0x00 NUL
+  /// (the ASCIIZ framing Chromium's DevToolsPipeHandler and Puppeteer's
+  /// PipeTransport use). Serialized under cdpWriteLock; writeAll handles short
+  /// writes. Safe to call before the round-trip is proven — a dead/absent pipe
+  /// (fd < 0, or EPIPE caught harmlessly via the write end's F_SETNOSIGPIPE) just
+  /// drops the message. No-op when not in agent-control mode.
+  func sendCdp(_ json: String) {
+    guard agentControl else { return }
+    cdpWriteLock.lock()
+    let fd = cdpWriteFd
+    var bytes = Array(json.utf8)
+    bytes.append(0)  // NUL terminator
+    if fd >= 0 {
+      _ = bytes.withUnsafeBytes { writeAll(fd, $0.baseAddress!, bytes.count) }
+    }
+    cdpWriteLock.unlock()
+  }
+
+  /// CDP reader thread: drain cdpReadFd (parent end of out_pipe; child writes CDP
+  /// on fd 4) and split the byte stream on 0x00 into complete UTF-8 JSON messages,
+  /// delivering each (NUL stripped) to `onCdpMessage`. Exits on EOF/error (the
+  /// host died or shutdown closed the fd). Signals cdpReaderDone on every exit so
+  /// shutdown() can join before closing the fd (mirrors acceptAndRead/readerDone).
+  /// A CDP message can exceed one read(), and one read() can carry several
+  /// messages or straddle a boundary, so we accumulate across reads.
+  private func readCdpLoop() {
+    defer { cdpReaderDone.signal() }
+    let fd = cdpReadFd
+    if fd < 0 { return }
+    var acc = [UInt8]()
+    var chunk = [UInt8](repeating: 0, count: 64 << 10)
+    while true {
+      let n = chunk.withUnsafeMutableBytes { read(fd, $0.baseAddress!, $0.count) }
+      if n <= 0 { break }  // EOF (0) or error (<0): host gone / fd closed.
+      var start = 0
+      for i in 0 ..< n {
+        if chunk[i] == 0 {
+          acc.append(contentsOf: chunk[start ..< i])
+          if let msg = String(bytes: acc, encoding: .utf8) {
+            onCdpMessage?(msg)
+          }
+          acc.removeAll(keepingCapacity: true)
+          start = i + 1
+        }
+      }
+      if start < n { acc.append(contentsOf: chunk[start ..< n]) }
+      // Bound the accumulator (mirrors the IPC reader's frame cap): a malformed
+      // never-NUL-terminated stream shouldn't grow memory unbounded. The peer is
+      // our own cef_host (M113+ always NUL-frames), so this is defensive.
+      if acc.count > (64 << 20) { break }
+    }
+  }
+
+  /// CEF-1 validation gate: prove the pipe round-trips end to end. Only when
+  /// agent-control AND FLUTTER_CEF_DEBUG is set, install a temporary CDP handler
+  /// and send {"id":1,"method":"Browser.getVersion"}; the first response line is
+  /// NSLogged. Behind the debug env so it never runs in normal flow, and it
+  /// chains (does not clobber) any handler a relay later installs. cef_host's CDP
+  /// endpoint comes up shortly after launch, so a couple of retries cover the
+  /// race between our write and DevToolsPipeHandler being ready.
+  private func maybeRunCdpValidation() {
+    guard agentControl,
+          ProcessInfo.processInfo.environment["FLUTTER_CEF_DEBUG"] != nil
+    else { return }
+    let prior = onCdpMessage
+    var logged = false
+    onCdpMessage = { [weak self] msg in
+      prior?(msg)
+      guard let self = self, !logged else { return }
+      // Only the response to our probe (id:1) proves the round-trip; ignore any
+      // unsolicited CDP events that may arrive first.
+      if msg.contains("\"id\":1") {
+        logged = true
+        NSLog("[cef][cdp-pipe:\(self.profileId)] Browser.getVersion round-trip OK: \(msg)")
+        // Restore the prior handler now that the gate has passed, so the probe
+        // wiring doesn't linger on the hot path.
+        self.onCdpMessage = prior
+      }
+    }
+    // Retry a few times in case DevToolsPipeHandler isn't reading fd 3 yet.
+    let probe = "{\"id\":1,\"method\":\"Browser.getVersion\"}"
+    DispatchQueue.global().async { [weak self] in
+      for _ in 0 ..< 10 {
+        guard let self = self else { return }
+        if logged { return }
+        self.sendCdp(probe)
+        usleep(200_000)  // 200ms between attempts (~2s total)
+      }
+    }
   }
 
   private func readAll(_ fd: Int32, _ buf: inout [UInt8], _ len: Int) -> Bool {
