@@ -89,10 +89,20 @@ browser — it signals `opReady` and waits for `opCreateBrowser`.
    mock key by accident.
 3. **Sandbox on** in signed builds (`no_sandbox=false`, already gated) — renderer
    can't read the cookie DB directly; the browser process brokers it.
-4. **Stable, app-scoped Keychain item.** The OSCrypt "Safe Storage" item must be
-   named per-product and stable across launches/builds (else: a Keychain prompt
-   every launch, or key shared with other CEF apps). **VERIFY** the exact knob
-   (likely `cef_host` bundle `CFBundleName` / CEF framework branding) experimentally.
+4. **Keychain item naming — RESOLVED (investigated).** The OSCrypt service name
+   is a hardcoded literal **`Chromium Safe Storage`** baked into the prebuilt CEF
+   framework binary (confirmed via `strings` on the 196 MB framework); it is NOT
+   derived from the bundle and NOT settable via `CefSettings`. Consequences for
+   signed builds: real AES-at-rest like Chrome, but the key sits under a generic
+   item **shared by every default-CEF app** (JCEF included) — isolation is by ACL
+   (signing identity), not by a per-product item name. First access shows a
+   one-time "Campus wants to use … 'Chromium Safe Storage'" prompt; stable
+   Developer-ID signing keeps it one-time (this is what `--use-mock-keychain`
+   suppressed in dev). Chrome-grade per-product isolation (a `Campus Safe Storage`
+   item) requires **building CEF from source with a branding patch** — a real
+   pipeline change, not a knob. **P1 decision: ship with the shared name** (ACL-
+   gated, crypto is Chrome-equivalent); rebranding is an optional hardening
+   follow-up only if cross-CEF-app coupling matters.
 5. **CDP is incompatible with a persistent profile.** `enableCdp` opens an
    *unauthenticated* localhost port that can read the whole cookie jar — and with
    multiplexing, every logged-in browser in the process. Reject `enableCdp == true`
@@ -145,10 +155,23 @@ browserId dimension lives entirely below it (plugin ↔ cef_host).
 - No real credentials ever persisted under mock-key crypto (the dev safety rail).
 - CDP never coexists with a persistent profile.
 
+## Investigation findings (main.mm refactor surface)
+
+- `HostClient` (`main.mm:520-772`) is **already one instance per browser** and
+  owns its `HostRenderHandler` — it's the natural home for per-browser state, so
+  the refactor moves globals into instance fields rather than building global
+  id-keyed dicts. Per-browser: `g_browser`, `g_surface`, `g_width/height/dpr`,
+  popup buffers, `g_trusted_pending`. Process-global (keep): `g_ipc_fd` + write
+  mutex, `g_allowed_schemes`, `g_channels`, `g_cdp_port`, `CefInitialize` settings.
+- `OnContextInitialized` (`835-862`) stops auto-creating the single browser;
+  `opCreateBrowser` drives creation; the render handler already receives
+  `CefBrowser*` per callback, so paint routes to its slot's IOSurface.
+- **`--profile-dir` is per-PROCESS (per-profile), not per-browser** — all browsers
+  in a profile's process share one `root_cache_path`. That shared dir *is* what
+  makes login shared; a per-browser cache would defeat the feature.
+
 ## Open questions to resolve in P1
 
-- Exact OSCrypt Keychain service-name knob under CEF (cef_host `CFBundleName` vs
-  framework branding) — confirm by inspecting the created Keychain item.
 - Model ephemeral as a throwaway `CefProfileHost` (one code path) vs. keep the
   legacy direct spawn? Prefer one code path if the refactor stays clean.
 - `persist_session_cookies` default — ON for "stay signed in" through session
