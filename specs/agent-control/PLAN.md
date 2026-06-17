@@ -187,25 +187,60 @@ crux, the CEF side itself lands in two increments:
   `--allowed-schemes` argv) + a Swift CDP-over-pipe IO path + relax the CDP
   rejection. Validation gate: the plugin round-trips a `Browser.getVersion` over
   the pipe. This proves the foundation before any relay is built.
-- **CEF-2 — token-gated, tile-scoped relay:** the localhost CDP-WebSocket the
-  agent connects to (token + `browserId` target scoping) + the
-  `enableAgentControl()/disableAgentControl()` API.
+- **CEF-2 — token-gated, tile-scoped relay** + the `enableAgentControl()/
+  disableAgentControl()` API. Itself staged, to de-risk the new server subsystem
+  before the isolation boundary:
+  - **CEF-2a — transport:** a minimal, dependency-free localhost HTTP+WebSocket
+    server (`NWListener` on `127.0.0.1:0`, hand-rolled RFC-6455 server framing — no
+    SwiftNIO/Starscream, to keep the supply-chain surface the security review
+    demanded). Serves `GET /json/version` advertising a **token-free**
+    `webSocketDebuggerUrl: ws://127.0.0.1:<port>/devtools/browser` (discovery is
+    unauthenticated — see token transport below), REQUIRES a `?token=<secret>` query
+    on the ws upgrade and rejects otherwise, and bridges that ws ⇄ the CEF-1 pipe
+    (full browser-level passthrough,
+    **no** target filter yet). `enableAgentControl()→{wsUrl, token}` /
+    `disableAgentControl()` threaded Swift→Dart→controller. Validation gate:
+    `agent-browser` connects via the advertised discovery URL+token and drives a tile
+    through relay→pipe→cef_host. (No-filter relay is dev-validation-only — never
+    shipped — since it would expose sibling tiles in the process.)
+  - **CEF-2b — isolation:** resolve `browserId`→CDP `targetId` (new IPC op:
+    cef_host `ExecuteDevToolsMethod(browser, "Target.getTargetInfo", {})` → the
+    browser's own `targetId`), then add the Target-domain filter so each token's ws
+    sees/attaches **only** its tile's target (`Target.getTargets`→the one;
+    auto-attach/`targetCreated` events→the one; reject `attachToTarget`/`sessionId`
+    for any other). This filter is THE per-tile security boundary — reviewed
+    adversarially like CEF-1. Multi-grant per process via CDP `id` remapping +
+    per-target `sessionId`.
 Then the Campus consumer (Layer C).
 
 ## Open questions / to resolve in P2
 
-- **`agent-browser` token transport:** confirm it accepts a full ws-url
-  (token-in-path) via `--cdp <url>` / `connect`, so the relay's token rides the
-  endpoint string (it should — Campus controls `controlDescriptor.connect`). If it
-  only takes a bare port, the token moves to a localhost-bound, per-grant ephemeral
-  port instead.
-- **Relay lifecycle:** when does a grant expire? Proposal: tied to the
-  `agentControllable` flag + an idle/explicit `disableAgentControl()`; revoking the
-  toggle kills live relay connections.
-- **CDP process-scope vs per-tile:** the relay's target-filtering is the only thing
-  enforcing per-tile isolation within a shared-profile process — verify CDP
-  target/session routing can be filtered to one `browserId` cleanly (Target domain
-  `attachToTarget`/`sessionId` scoping).
+- **`agent-browser` token transport — RESOLVED (spike, agent-browser `cli/src/
+  native/cdp/discovery.rs`):** agent-browser does standard CDP discovery — GETs
+  `http://host:port/json/version`, reads `webSocketDebuggerUrl`, then
+  `rewrite_ws_host` (rewrites host/port only, **preserves the path**) +
+  `append_query` (preserves user query). Crucially the `/json/version` GET is made
+  **without** the query — only the final ws-url gets `append_query`. So the SECURE
+  transport is: `/json/version` advertises a **token-free** ws-url (anything reading
+  discovery learns no secret), and the token rides in the **Campus-supplied
+  `?token=` query** on the `--cdp`/connect string — `append_query` puts it on the ws
+  connection, the relay validates it on upgrade. A local CDP port-scanner can read
+  discovery but cannot connect (no token). Residual: the token is visible via `ps`
+  to same-UID processes (Campus passes it on agent-browser's argv) — acceptable for
+  the "not random local CDP clients" goal; tighten later via env/stdin if needed.
+  Campus already mints the connect string, so this is minimal plumbing.
+- **Relay lifecycle:** when does a grant expire? Tied to the `agentControllable`
+  flag + an explicit `disableAgentControl()`; revoking the toggle kills live relay
+  connections (closes the ws + invalidates the token).
+- **CDP process-scope vs per-tile — RESOLVED (spike):** confirmed the relay can
+  scope to one `browserId` cleanly. agent-browser is a *browser-level* CDP client
+  (connects to `/devtools/browser`, manages targets itself), so the relay passes
+  real browser-level CDP through the pipe and filters the Target domain:
+  `Target.attachToTarget{flatten:true}`→`sessionId` is the modern routing, and "only
+  targets matching a filter will be attached" — the relay exposes exactly one target.
+  `browserId`→`targetId` resolved via cef_host `ExecuteDevToolsMethod(browser,
+  "Target.getTargetInfo", {})` (a page agent reports its own target). This filter is
+  the per-tile boundary (CEF-2b).
 - **Pipe + our IPC coexistence:** cef_host already uses a Unix socket (our IPC) on
   other fds; confirm fds 3/4 for CDP don't collide with that or the helper spawns.
 - **Posix-spawn migration risk:** moving `CefProfileHost.spawn` off `Foundation.
