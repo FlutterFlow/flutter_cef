@@ -2,10 +2,10 @@ import Foundation
 import CryptoKit
 import Security
 
-/// CEF-2a — the token-gated localhost CDP relay (transport only; no target filter
-/// yet, that is CEF-2b). It re-exposes the CEF-1 CDP-over-pipe to a standard CDP
-/// client (`agent-browser`) as a loopback HTTP+WebSocket endpoint, so the only
-/// thing that can drive the tile is a client Campus hands the per-grant token to.
+/// The token-gated, per-tile-scoped localhost CDP relay (CEF-2a transport + CEF-2b
+/// isolation). It re-exposes the CEF-1 CDP-over-pipe to a standard CDP client
+/// (`agent-browser`) as a loopback HTTP+WebSocket endpoint, confined (when scoped) to
+/// a single tile's CDP target — see the per-tile-isolation note below.
 ///
 /// Why a hand-rolled server (no SwiftNIO/Starscream): the security review demanded
 /// a minimal supply-chain surface, and the codebase already speaks raw BSD sockets
@@ -85,6 +85,15 @@ final class CdpRelay {
     self.token = CdpRelay.randomToken()
   }
 
+  // The relay runs on the normal grant path, so its diagnostics are gated behind
+  // FLUTTER_CEF_DEBUG — a release build stays quiet (and doesn't log the port or
+  // per-frame, peer-controlled protocol errors to unified logging).
+  private static let debugEnabled =
+    ProcessInfo.processInfo.environment["FLUTTER_CEF_DEBUG"] != nil
+  private func dlog(_ msg: @autoclosure () -> String) {
+    if CdpRelay.debugEnabled { NSLog("%@", msg()) }
+  }
+
   private static func randomToken() -> String {
     var bytes = [UInt8](repeating: 0, count: 24)
     if SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) != errSecSuccess {
@@ -102,7 +111,7 @@ final class CdpRelay {
   /// Returns false (cleaning up) on any failure.
   func start() -> Bool {
     let fd = socket(AF_INET, SOCK_STREAM, 0)
-    guard fd >= 0 else { NSLog("[cef][relay] socket() failed"); return false }
+    guard fd >= 0 else { dlog("[cef][relay] socket() failed"); return false }
     _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
     var on: Int32 = 1
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, socklen_t(MemoryLayout<Int32>.size))
@@ -117,7 +126,7 @@ final class CdpRelay {
       }
     }
     guard bindOK == 0, listen(fd, 4) == 0 else {
-      NSLog("[cef][relay] bind/listen failed: \(String(cString: strerror(errno)))")
+      dlog("[cef][relay] bind/listen failed: \(String(cString: strerror(errno)))")
       close(fd); return false
     }
 
@@ -127,12 +136,12 @@ final class CdpRelay {
     let nameOK = withUnsafeMutablePointer(to: &bound) {
       $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &len) }
     }
-    guard nameOK == 0 else { NSLog("[cef][relay] getsockname failed"); close(fd); return false }
+    guard nameOK == 0 else { dlog("[cef][relay] getsockname failed"); close(fd); return false }
     port = UInt16(bigEndian: bound.sin_port)
 
     stateLock.lock(); listenFd = fd; running = true; stateLock.unlock()
     Thread.detachNewThread { [weak self] in self?.acceptLoop(fd) }
-    NSLog("[cef][relay] listening on 127.0.0.1:\(port)")
+    dlog("[cef][relay] listening on 127.0.0.1:\(port)")
     return true
   }
 
@@ -221,7 +230,7 @@ final class CdpRelay {
       close(fd); return
     }
     guard tokenAcceptable(target) else {
-      NSLog("[cef][relay] ws upgrade rejected: token present but invalid")
+      dlog("[cef][relay] ws upgrade rejected: token present but invalid")
       writeRaw(fd, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
       close(fd); return
     }
@@ -241,7 +250,7 @@ final class CdpRelay {
     let digest = Insecure.SHA1.hash(data: accept)
     let acceptKey = Data(digest).base64EncodedString()
     writeRaw(fd, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: \(acceptKey)\r\n\r\n")
-    NSLog("[cef][relay] client attached")
+    dlog("[cef][relay] client attached")
 
     // Clear the handshake read timeout: the ws connection is persistent and idles
     // between agent commands.
@@ -257,7 +266,7 @@ final class CdpRelay {
     if owned { clientFd = -1 }
     clientLock.unlock()
     if owned { close(fd) }
-    NSLog("[cef][relay] client detached")
+    dlog("[cef][relay] client detached")
   }
 
   private func serveDiscovery(_ fd: Int32, path: String) {
@@ -348,11 +357,11 @@ final class CdpRelay {
         guard let e = readN(fd, 8) else { return }
         len = e.reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
       }
-      if len > UInt64(CdpRelay.maxFrame) { NSLog("[cef][relay] frame too large"); return }
+      if len > UInt64(CdpRelay.maxFrame) { dlog("[cef][relay] frame too large"); return }
       // RFC 6455 §5.5: control frames (close/ping/pong) carry <=125 bytes and are never
       // fragmented. Enforce so a hostile peer can't make us buffer + echo a huge ping.
       if opcode == 0x8 || opcode == 0x9 || opcode == 0xA {
-        if len > 125 || !fin { NSLog("[cef][relay] bad control frame"); return }
+        if len > 125 || !fin { dlog("[cef][relay] bad control frame"); return }
       }
       // Client→server frames MUST be masked (RFC 6455 §5.1).
       guard masked, let mask = readN(fd, 4) else { return }
@@ -367,13 +376,13 @@ final class CdpRelay {
       switch opcode {
       case 0x0, 0x1, 0x2:
         if opcode == 0x0 {
-          guard assembling else { NSLog("[cef][relay] continuation with no message"); return }
+          guard assembling else { dlog("[cef][relay] continuation with no message"); return }
         } else {
-          guard !assembling else { NSLog("[cef][relay] new data frame mid-message"); return }
+          guard !assembling else { dlog("[cef][relay] new data frame mid-message"); return }
           assemblingText = (opcode == 0x1)  // 0x2 binary: framing tracked, payload dropped
         }
         if assemblingText {
-          if msg.count + payload.count > CdpRelay.maxFrame { NSLog("[cef][relay] message too large"); return }
+          if msg.count + payload.count > CdpRelay.maxFrame { dlog("[cef][relay] message too large"); return }
           msg.append(contentsOf: payload)
         }
         assembling = !fin
@@ -392,7 +401,7 @@ final class CdpRelay {
       case 0xA:  // pong — ignore
         break
       default:
-        NSLog("[cef][relay] unknown opcode \(opcode)"); return
+        dlog("[cef][relay] unknown opcode \(opcode)"); return
       }
     }
   }
@@ -472,8 +481,9 @@ final class CdpRelay {
   // page work routed by that top-level sessionId (+ nested sub-target sessions).
 
   /// pipe → client. Returns the JSON to forward, or nil to drop. nil scope =
-  /// passthrough (CEF-2a, dev only).
-  private func filterPipeToClient(_ json: String) -> String? {
+  /// passthrough (CEF-2a, dev only). (Internal, not private, so the standalone
+  /// filter unit test — CdpRelayFilterTests.swift — can exercise it directly.)
+  func filterPipeToClient(_ json: String) -> String? {
     guard let tid = scopeTargetId else { return json }
     guard let m = parseJson(json) else { return nil }  // fail closed
     let method = m["method"] as? String
@@ -518,7 +528,8 @@ final class CdpRelay {
 
   /// client → pipe. Returns the JSON to forward, or nil to drop. Drops are reported
   /// to the client as a CDP error — sent OUTSIDE filterLock (never block IO under it).
-  private func filterClientToPipe(_ json: String) -> String? {
+  /// (Internal, not private, for CdpRelayFilterTests.swift.)
+  func filterClientToPipe(_ json: String) -> String? {
     guard scopeTargetId != nil else { return json }
     guard let m = parseJson(json) else { return nil }  // fail closed
     let method = m["method"] as? String

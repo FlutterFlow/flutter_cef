@@ -26,6 +26,21 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       name: "flutter_cef", binaryMessenger: registrar.messenger)
     instance.channel = channel
     registrar.addMethodCallDelegate(instance, channel: channel)
+    sweepStaleEphemeralProfiles()
+  }
+
+  /// Reclaim ephemeral (throwaway) profile temp dirs orphaned by a previous crash/
+  /// SIGKILL — they're normally removed on clean shutdown(), but a hard exit leaves
+  /// `flutter_cef_ephem_*` (a throwaway cookie jar) behind. At plugin init no host is
+  /// live yet, so sweeping every match is safe. Same-UID, 0700; this bounds disk
+  /// growth and stale at-rest session data.
+  private static func sweepStaleEphemeralProfiles() {
+    let tmp = NSTemporaryDirectory()
+    let fm = FileManager.default
+    guard let entries = try? fm.contentsOfDirectory(atPath: tmp) else { return }
+    for name in entries where name.hasPrefix("flutter_cef_ephem_") {
+      try? fm.removeItem(atPath: tmp + name)
+    }
   }
 
   public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {

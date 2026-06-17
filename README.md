@@ -251,6 +251,62 @@ named profile**: CDP is an unauthenticated localhost port that could read the
 shared cookie jar, so combining the two is rejected (the constructor asserts in
 debug, and the native side refuses the create).
 
+## Agent control
+
+Let an external CDP client (e.g. [agent-browser](https://github.com/vercel-labs/agent-browser),
+which is Playwright-based) drive a **live, logged-in** tile — without a duplicate
+browser, without losing state, and **without an open debug port**.
+
+```dart
+// 1. Create the view in agent-control mode (CDP over a private inherited pipe,
+//    not a TCP port — so it's permitted on a named profile, unlike enableCdp).
+CefWebView(controller: c, profile: 'work', agentControl: true)
+
+// 2. When you want an agent to drive THIS tile, broker a token-gated, per-tile
+//    loopback CDP endpoint and hand it to the agent:
+final grant = await c.enableAgentControl();        // -> {wsUrl, token, port}
+// e.g.  agent-browser --cdp <grant.port> open https://example.com
+await c.disableAgentControl();                     // revoke when done
+```
+
+`agentControl: true` launches `cef_host` so Chromium speaks CDP over an inherited
+pipe (`--remote-debugging-pipe`, NUL-framed JSON on fds 3/4) instead of a TCP port —
+there is **no listening debug port**. `enableAgentControl()` then starts a small
+**loopback** HTTP+WebSocket relay that bridges a standard CDP client to that pipe and
+returns the endpoint.
+
+**Trust model.** The relay is the only way in, and it is deliberately narrow:
+
+* **Per-tile opt-in.** Nothing is exposed until you call `enableAgentControl()`; the
+  relay exists *only while the grant is active* and is torn down on
+  `disableAgentControl()`, tile dispose, or host shutdown.
+* **Loopback + ephemeral + single-client.** It binds `127.0.0.1` on an OS-assigned
+  port and accepts one client at a time. The returned `token` is validated **if a
+  client presents it**; agent-browser/Playwright can't attach one, so for those the
+  controls above are the gate. (This is strictly better than raw Chrome's fixed,
+  always-open, multi-client `--remote-debugging-port`. A same-UID process that wins a
+  sub-second race on the ephemeral port before the agent connects is the documented
+  residual — and on macOS same-UID is already game-over via the Keychain.)
+* **Per-tile isolation.** Tiles in a shared profile run in one `cef_host` process
+  behind one browser-wide CDP pipe, so the relay enforces the boundary itself: a
+  deny-by-default, fail-closed, **flatten-only** CDP Target-domain filter exposes the
+  client **only its own tile's target** — sibling tiles are hidden (not in
+  `Target.getTargets`) and unreachable (`attachToTarget`, `sendMessageToTarget`,
+  `attachToBrowserTarget`, foreign sessions are all refused).
+
+**Limits, by design.** Per-tile CDP isolation *within a shared browser context* is
+inherently partial — browser-context-wide CDP can't be scoped to one tile. So
+browser-context/process-global domains are **refused** entirely: `Storage.*`,
+`Tracing.*`, `Memory.*`, `SystemInfo.*`, `Browser.*` (except `getVersion`), and the
+cookie/cache methods (`Network.getAllCookies`/`clearBrowserCookies`/…). The agent can
+drive its tile's page (navigate, click, type, read DOM, run JS) but **cannot read or
+clear the shared cookie jar** or touch sibling tiles. It *can* act with the tile's own
+authenticated session for the tile's own origin — that is inherent to driving a
+logged-in page. Strictly airtight CDP isolation would require a per-tile browser
+context, which would un-share the login the shared profile exists to provide. First
+cut: **one agent-controlled tile per `cef_host` process** (a second, different tile in
+the same process is refused).
+
 ## Roadmap
 
 Known limitation: the IOSurface is single-buffered, so very fast-updating pages
