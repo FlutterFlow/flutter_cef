@@ -54,13 +54,16 @@ void main() {
   });
 
   test('create omits allowedSchemes when unset or empty', () async {
-    final c = CefWebController(sessionId: 's-noallow');
-    await c.create(url: 'about:blank', width: 1, height: 1);
+    // Use a FRESH controller per case: a second create() on an already-created
+    // controller short-circuits (textureId is set) and never re-invokes the channel.
+    final c1 = CefWebController(sessionId: 's-noallow');
+    await c1.create(url: 'about:blank', width: 1, height: 1);
     final none = (log.firstWhere((m) => m.method == 'create').arguments as Map);
     expect(none.containsKey('allowedSchemes'), isFalse);
 
     log.clear();
-    await c.create(
+    final c2 = CefWebController(sessionId: 's-noallow2');
+    await c2.create(
         url: 'about:blank', width: 1, height: 1, allowedSchemes: const {});
     final empty =
         (log.firstWhere((m) => m.method == 'create').arguments as Map);
@@ -118,6 +121,69 @@ void main() {
         .cast<String, dynamic>();
     expect(args['enableCdp'], true);
     expect(args.containsKey('profile'), isFalse);
+  });
+
+  test('create forwards agentControl only when true', () async {
+    final c1 = CefWebController(sessionId: 'ac-on', profile: 'work');
+    await c1.create(
+        url: 'about:blank', width: 1, height: 1, agentControl: true);
+    final on = (log.firstWhere((m) => m.method == 'create').arguments as Map);
+    expect(on['agentControl'], true);
+
+    log.clear();
+    final c2 = CefWebController(sessionId: 'ac-off');
+    await c2.create(url: 'about:blank', width: 1, height: 1);
+    final off = (log.firstWhere((m) => m.method == 'create').arguments as Map);
+    expect(off.containsKey('agentControl'), isFalse,
+        reason: 'OFF path must be byte-identical to today (no key)');
+  });
+
+  test('agentControl suppresses the enableCdp×profile assert (private pipe)',
+      () async {
+    // agentControl is a private inherited-fd CDP pipe (no listening port), so it
+    // is permitted with a named profile even alongside enableCdp.
+    final c = CefWebController(sessionId: 'ac-prof', profile: 'work');
+    await expectLater(
+      c.create(
+          url: 'about:blank',
+          width: 1,
+          height: 1,
+          enableCdp: true,
+          agentControl: true),
+      completes,
+    );
+  });
+
+  test('enableAgentControl sends the verb and decodes the brokered endpoint',
+      () async {
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      log.add(call);
+      if (call.method == 'enableAgentControl') {
+        return <String, dynamic>{
+          'wsUrl': 'ws://127.0.0.1:5555/devtools/browser?token=abc',
+          'token': 'abc',
+          'port': 5555,
+        };
+      }
+      return null;
+    });
+    final c = CefWebController(sessionId: 'ac-en');
+    final ep = await c.enableAgentControl();
+    expect(
+        (log.firstWhere((m) => m.method == 'enableAgentControl').arguments
+            as Map)['sessionId'],
+        'ac-en');
+    expect(ep, isNotNull);
+    expect(ep!.port, 5555);
+    expect(ep.token, 'abc');
+    expect(ep.wsUrl, contains('token=abc'));
+  });
+
+  test('disableAgentControl sends the verb for the session', () async {
+    final c = CefWebController(sessionId: 'ac-dis');
+    await c.disableAgentControl();
+    final m = log.firstWhere((m) => m.method == 'disableAgentControl');
+    expect((m.arguments as Map)['sessionId'], 'ac-dis');
   });
 
   test('navigate forwards the url for this session', () async {

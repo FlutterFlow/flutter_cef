@@ -490,9 +490,13 @@ class CefWebController {
   /// passes `?token=` (defense-in-depth for a token-capable client); it's embedded
   /// in [wsUrl] for that case.
   ///
-  /// NOTE (CEF-2a): the relay passes CDP through browser-wide — per-tile isolation
-  /// (the Target-domain filter) lands in CEF-2b, so this must not be exposed in
-  /// production until then.
+  /// Per-tile isolation: the relay is scoped to THIS tile's CDP target (resolved
+  /// natively), and applies a deny-by-default / fail-closed / flatten-only Target-domain
+  /// filter — a connected client sees and drives only this tile, not sibling tiles in
+  /// the same shared-profile process. Browser-context-wide CDP (Storage/Tracing/Browser
+  /// mutators / cookie-jar methods) is refused, since tiles share one browser context
+  /// (so for a credentialed shared profile the agent can drive the page but cannot read
+  /// or clear the whole cookie jar). First cut: one agent-controlled tile per process.
   Future<({String wsUrl, String token, int port})?> enableAgentControl() async {
     final res = await _channel.invokeMapMethod<String, dynamic>(
         'enableAgentControl', {'sessionId': sessionId});

@@ -26,6 +26,24 @@
   profile). This is entirely below the method channel — the Dart API and the
   `create`/event arg maps are unchanged apart from the new optional `profile`
   key.
+* **Agent control (drive a tile over CDP, no open port)**:
+  `CefWebView(agentControl: true)` launches `cef_host` so it speaks CDP over an
+  inherited pipe (Chromium `--remote-debugging-pipe`) instead of a TCP port — so
+  there is **no listening debug port**, and (unlike `enableCdp`) it is permitted on
+  a named `profile`. `CefWebController.enableAgentControl()` then brokers a
+  token-gated **loopback** HTTP+WebSocket CDP endpoint (`{wsUrl, token, port}`) an
+  external CDP client (e.g. `agent-browser`/Playwright via `--cdp <port>`) connects
+  to; `disableAgentControl()` tears it down. Security model: per-tile opt-in; the
+  relay exists **only while a grant is active**, binds **loopback only** on an
+  **ephemeral port**, accepts a **single client**, and the token is validated **if
+  present** (clients that can't attach one — Playwright — rely on the ephemeral-port
+  + lifecycle + single-client controls). Crucially the relay **confines the agent to
+  that one tile**: a deny-by-default / fail-closed / flatten-only CDP Target-domain
+  filter exposes only the tile's own target (sibling tiles in the same shared-profile
+  process are hidden and unreachable), and browser-context-wide CDP (`Storage.*`,
+  `Tracing.*`, `Browser.*` mutators, cookie methods) is refused — so an agent can
+  drive the page but cannot read or clear the shared cookie jar. First cut: one
+  agent-controlled tile per `cef_host` process.
 
 ## 0.1.3
 

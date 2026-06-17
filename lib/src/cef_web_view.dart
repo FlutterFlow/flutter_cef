@@ -54,7 +54,7 @@ class CefWebView extends StatefulWidget {
     this.enableCdp = false,
     this.agentControl = false,
     this.profile,
-  }) : assert(!(enableCdp && !agentControl && profile != null),
+  }) : assert(!(enableCdp && !agentControl && profile != null && profile != ''),
             'enableCdp cannot be combined with a named profile: CDP-over-TCP '
             'exposes an unauthenticated localhost port that could read the '
             'profile\'s shared cookie jar. Use agentControl (CDP-over-pipe, no '
@@ -102,9 +102,10 @@ class CefWebView extends StatefulWidget {
   /// there is no listening socket and the only possible CDP client is this app.
   /// Because nothing is exposed to other local processes, this is permitted on a
   /// named [profile] (unlike [enableCdp]). Only honoured when this view creates
-  /// the session (not when it adopts a pre-created controller). In this build the
-  /// pipe is private to the app; brokering it to an external agent is a later
-  /// increment.
+  /// the session (not when it adopts a pre-created controller). Call
+  /// [CefWebController.enableAgentControl] to broker a token-gated, per-tile-scoped
+  /// loopback CDP endpoint to an external agent (e.g. agent-browser); the relay
+  /// confines the agent to this tile's CDP target.
   final bool agentControl;
 
   /// The persistent, shared browser profile this view's login lives in. Views with

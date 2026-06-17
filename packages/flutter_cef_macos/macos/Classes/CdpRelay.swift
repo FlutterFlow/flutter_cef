@@ -137,16 +137,25 @@ final class CdpRelay {
   }
 
   /// Stop the listener, drop any client, and refuse further connections. Idempotent.
+  ///
+  /// The CLIENT fd is only SHUT DOWN here, never close()'d: this process concurrently
+  /// holds the IPC socket and the CDP pipe fds, so close()ing a number a handler thread
+  /// is mid-syscall on (a pong/close write, or the next read) risks that number being
+  /// reclaimed and the syscall hitting an unrelated descriptor (fd-reuse). shutdown()
+  /// wakes the handler's blocked read() without freeing the number; the handler then
+  /// performs the single close() via the clientFd ownership protocol (it is kept alive
+  /// for the duration of its in-flight handleConnection call). Done under clientLock so
+  /// clientFd can't be a stale number when we shut it down. The listener has no such
+  /// race (its thread only ever blocks in accept()), so stop() owns its shutdown+close.
   func stop() {
     stateLock.lock()
     running = false
     let lfd = listenFd; listenFd = -1
     stateLock.unlock()
-    if lfd >= 0 { close(lfd) }  // unblocks accept() with EBADF
+    if lfd >= 0 { shutdown(lfd, SHUT_RDWR); close(lfd) }  // wake accept() reliably, then close
     clientLock.lock()
-    let cfd = clientFd; clientFd = -1
+    if clientFd >= 0 { shutdown(clientFd, SHUT_RDWR) }  // wake the handler; it owns the close
     clientLock.unlock()
-    if cfd >= 0 { close(cfd) }  // unblocks the frame loop's read()
   }
 
   private func isRunning() -> Bool { stateLock.lock(); defer { stateLock.unlock() }; return running }
@@ -340,6 +349,11 @@ final class CdpRelay {
         len = e.reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
       }
       if len > UInt64(CdpRelay.maxFrame) { NSLog("[cef][relay] frame too large"); return }
+      // RFC 6455 §5.5: control frames (close/ping/pong) carry <=125 bytes and are never
+      // fragmented. Enforce so a hostile peer can't make us buffer + echo a huge ping.
+      if opcode == 0x8 || opcode == 0x9 || opcode == 0xA {
+        if len > 125 || !fin { NSLog("[cef][relay] bad control frame"); return }
+      }
       // Client→server frames MUST be masked (RFC 6455 §5.1).
       guard masked, let mask = readN(fd, 4) else { return }
       var payload = len > 0 ? (readN(fd, Int(len)) ?? []) : []
@@ -439,9 +453,20 @@ final class CdpRelay {
   //  - FLATTEN ONLY: the legacy non-flatten messaging path (sendMessageToTarget /
   //    receivedMessageFromTarget, non-flatten attach) is refused/dropped — it would
   //    otherwise let a client wrap commands to a SIBLING session.
-  //  - DENY BY DEFAULT for browser-level Target.* control: only an explicit allow-list,
-  //    each scoped to OUR target, is forwarded; everything else (attachToBrowserTarget,
-  //    exposeDevToolsProtocol, createTarget, createBrowserContext, …) is refused.
+  //  - DENY BY DEFAULT (C→R), for ALL domains, not just Target.*: forwarded are only
+  //    (a) commands routed to an allowed session (page-scoped Page/Runtime/DOM/Input/
+  //    Network-events/etc.), (b) the scoped Target.* allow-list, and (c) Browser.getVersion.
+  //    Everything else is refused (attachToBrowserTarget, exposeDevToolsProtocol,
+  //    createTarget, createBrowserContext, …).
+  //  - BROWSER-CONTEXT-WIDE domains are denied REGARDLESS of session routing
+  //    (isCrossTileMethod): tiles in a shared profile share ONE browser context, so
+  //    Storage.*, Tracing.*, Memory.*, SystemInfo.*, Browser.* (except getVersion), and
+  //    the Network cookie/cache methods operate on the whole shared jar/process even
+  //    when sent with our page's sessionId. The page's own document.cookie (via
+  //    Runtime.evaluate) stays available and is correctly origin-scoped.
+  //    (Caveat: true per-tile isolation of these would require per-tile browser
+  //    contexts, which would un-share the login the shared profile exists to share —
+  //    so the denylist is the deliberate boundary here.)
   // Playwright drives in flatten mode: Target.setAutoAttach{flatten:true} (browser
   // level) → ONE Target.attachedToTarget for our page (sessionId learned here) → all
   // page work routed by that top-level sessionId (+ nested sub-target sessions).
@@ -501,6 +526,27 @@ final class CdpRelay {
     let params = m["params"] as? [String: Any]
     let id = m["id"] as? Int
 
+    // Browser.setDownloadBehavior is sent by Playwright/connectOverCDP during connect
+    // and is browser-context-wide (no per-tile scoping). NO-OP it: reply success
+    // without forwarding, so the client proceeds but the shared download behavior is
+    // not changed across tiles. (An agent drives the page, not browser-wide download
+    // policy; if real per-tile download control is ever needed it requires per-tile
+    // browser contexts.)
+    if method == "Browser.setDownloadBehavior" { synthesizeOk(id); return nil }
+
+    // Then: deny browser-context-wide / process-global methods REGARDLESS of session
+    // routing. All tiles in a shared profile run in ONE browser context (cef_host
+    // CreateBrowserSync with a null request context), so these domains operate on the
+    // whole shared cookie jar / storage / process — NOT scoped to our tile — even when
+    // sent with our page's sessionId. Routing them through a page session does not
+    // confine them. The agent drives its tile's PAGE (Page/Runtime/DOM/Input/Network
+    // events on its session); reading/clearing the shared jar or capturing the whole
+    // process crosses the per-tile boundary the design exists to enforce.
+    if let method = method, isCrossTileMethod(method) {
+      sendClientError(id, "\(method) is not permitted (browser-context-wide; crosses the per-tile boundary)")
+      return nil
+    }
+
     // Session-routed command (flatten): allow only for our (allowed) sessions. The
     // brief lock is released before any error IO (H4).
     if let s = sid {
@@ -540,8 +586,33 @@ final class CdpRelay {
       }
     }
 
-    // Non-Target, no sessionId: browser-level commands (Browser.getVersion, …) — allow.
-    return json
+    // Other browser-level (no sessionId, non-Target) command: DENY BY DEFAULT. Only a
+    // tiny tile-agnostic read-only allow-list is forwarded; the cross-tile domains were
+    // already denied above.
+    if method == "Browser.getVersion" { return json }
+    sendClientError(id, "\(method ?? "command") is not permitted at browser scope")
+    return nil
+  }
+
+  /// Browser-context-wide / process-global CDP methods that are NOT scoped to a single
+  /// tile even when sent with a page sessionId (tiles share one browser context). These
+  /// are denied in both directions of routing — see filterClientToPipe.
+  private func isCrossTileMethod(_ method: String) -> Bool {
+    if method == "Browser.getVersion" { return false }  // benign read-only
+    if method.hasPrefix("Storage.") || method.hasPrefix("Tracing.")
+        || method.hasPrefix("Memory.") || method.hasPrefix("SystemInfo.")
+        || method.hasPrefix("Browser.") { return true }
+    // Cookie/cache methods operate on the shared browser context's jar, not the page's
+    // origin. (The page's own document.cookie via Runtime.evaluate stays available and
+    // is correctly origin-scoped.)
+    switch method {
+    case "Network.getAllCookies", "Network.getCookies", "Network.setCookie",
+         "Network.setCookies", "Network.deleteCookies", "Network.clearBrowserCookies",
+         "Network.clearBrowserCache":
+      return true
+    default:
+      return false
+    }
   }
 
   /// Reply to the client's Target.getTargets with ONLY our tile (never the process).
@@ -557,6 +628,13 @@ final class CdpRelay {
   private func sendClientError(_ id: Int?, _ message: String) {
     guard let id = id else { return }
     sendClientJson(["id": id, "error": ["code": -32000, "message": message]])
+  }
+
+  /// Reply success ({}) to a command we intentionally NO-OP (don't forward) — lets the
+  /// client proceed without applying a cross-tile effect.
+  private func synthesizeOk(_ id: Int?) {
+    guard let id = id else { return }
+    sendClientJson(["id": id, "result": [String: Any]()])
   }
 
   private func sendClientJson(_ obj: [String: Any]) {

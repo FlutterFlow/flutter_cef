@@ -663,6 +663,12 @@ final class CefProfileHost {
     // and writeAll() reports failure, which we route to handleHostDeath().
     var one: Int32 = 1
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+    // Close-on-exec: accept() does NOT inherit the listener's CLOEXEC, and the
+    // agent-control launch (launchViaPosixSpawn, attrp=nil) does not set
+    // POSIX_SPAWN_CLOEXEC_DEFAULT — so without this, this host's accepted IPC fd would
+    // leak into a LATER agent-control cef_host spawn (cross-profile fd leak that keeps
+    // this socket's refcount > 0 and delays its EOF teardown).
+    _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
     // Bring the pipe up and drain anything queued before it connected — all under
     // writeLock so a concurrent send can't interleave with the flush. Unlike the
     // old per-view path, geometry is NOT re-synced here: each browser's
@@ -745,7 +751,7 @@ final class CefProfileHost {
     // terminationStatus; the posix_spawn path has only `pid`, so we poll waitpid
     // (WNOHANG) and extract the exit code via WEXITSTATUS so the C2 cache-lock
     // signal (exit 2 -> "locked") matches Process.terminationStatus's semantics.
-    DispatchQueue.global().async {
+    DispatchQueue.global().async { [weak self] in
       var status: Int32 = -1
       if let p = p {
         for _ in 0 ..< 20 {  // up to ~1s
@@ -759,6 +765,10 @@ final class CefProfileHost {
           if r == pid {
             // Reaped. Mirror terminationStatus: exit code, or -1 if signaled.
             status = (raw & 0o177) == 0 ? ((raw >> 8) & 0xff) : -1
+            // We reaped the pid, freeing it for OS reuse — clear the shared handle so a
+            // subsequent terminateProcess() (via onHostDied -> shutdown) doesn't
+            // kill()/waitpid() a now-reaped, possibly-recycled pid.
+            self?.clearReapedPid(pid)
             break
           } else if r < 0 {
             break  // already reaped by terminateProcess() (or no child) — give up.
@@ -768,6 +778,15 @@ final class CefProfileHost {
       }
       DispatchQueue.main.async { died?(status) }
     }
+  }
+
+  /// Clear `spawnedPid` once we've reaped it, so no later kill()/waitpid() targets a
+  /// reaped (possibly OS-recycled) pid. Guarded by writeLock and matched against `pid`
+  /// so a racing relaunch's new pid is never cleared.
+  private func clearReapedPid(_ pid: pid_t) {
+    writeLock.lock()
+    if spawnedPid == pid { spawnedPid = 0 }
+    writeLock.unlock()
   }
 
   /// Process/profile-level inbound frames (browserId 0): opReady (carries the
