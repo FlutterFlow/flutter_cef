@@ -14,5 +14,13 @@
   <key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
   <key>com.apple.security.cs.disable-library-validation</key><true/>
   <key>com.apple.security.get-task-allow</key><true/>
+  <!-- Hardened-runtime device access (same set Chrome's helpers carry). Without
+       these, a hardened-runtime process is KILLED the instant a page touches the
+       hardware — even with the usage string in the host app's Info.plist — which
+       is exactly what Google sign-in's WebAuthn/FIDO Bluetooth probe triggers.
+       With them, the access prompts (and is denied-safe) instead of crashing. -->
+  <key>com.apple.security.device.bluetooth</key><true/>
+  <key>com.apple.security.device.camera</key><true/>
+  <key>com.apple.security.device.audio-input</key><true/>
 </dict>
 </plist>
