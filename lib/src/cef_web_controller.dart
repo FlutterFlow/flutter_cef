@@ -14,7 +14,7 @@ import 'package:flutter_cef_platform_interface/flutter_cef_platform_interface.da
 /// Usually you don't create this directly — [CefWebView] manages one for you.
 /// Use it when you need to script a view.
 class CefWebController {
-  CefWebController({String? sessionId})
+  CefWebController({String? sessionId, this.profile})
       : sessionId = sessionId ?? 'cef-${_counter++}' {
     // Register + install the host->Dart handler at construction (not in create),
     // so callbacks wired before create() can't miss early events.
@@ -31,6 +31,13 @@ class CefWebController {
 
   /// Stable id for this session, echoed in every host message.
   final String sessionId;
+
+  /// The persistent, shared profile this view's login lives in, or null for an
+  /// ephemeral (in-memory, throwaway) session. Views constructed with the same
+  /// non-null [profile] share one host process → one cookie jar → one login,
+  /// and that login survives cef_host/host-app relaunch. Null (the default) is
+  /// today's behaviour.
+  final String? profile;
 
   /// The registered [Texture] id once [create] has resolved, else null.
   int? textureId;
@@ -365,6 +372,9 @@ class CefWebController {
     Set<String>? allowedSchemes,
     bool enableCdp = false,
   }) {
+    assert(!(enableCdp && profile != null && profile!.isNotEmpty),
+        'enableCdp cannot be combined with a named profile (CDP is an '
+        'unauthenticated localhost port that could read the shared cookie jar).');
     if (textureId != null) return Future<int?>.value(textureId);
     return _createInFlight ??= _createSession(
       url: url,
@@ -403,6 +413,7 @@ class CefWebController {
           'allowedSchemes':
               allowedSchemes.map((s) => s.toLowerCase()).join(','),
         if (enableCdp) 'enableCdp': true,
+        if (profile != null && profile!.isNotEmpty) 'profile': profile,
       });
     } finally {
       _scheduleSlotRelease();

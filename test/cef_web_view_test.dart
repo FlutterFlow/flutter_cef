@@ -259,6 +259,38 @@ void main() {
     expect(noCdp.cdpPort.value, 0);
   });
 
+  testWidgets('CefWebView(profile:) threads the name into the create args',
+      (tester) async {
+    // The view forwards `profile` to the controller it owns; create() reads it.
+    await tester
+        .pumpWidget(boxed(const CefWebView(url: 'about:blank', profile: 'work')));
+    await tester.pumpAndSettle();
+    final create = callsTo('create');
+    expect(create, hasLength(1));
+    expect((create.single.arguments as Map)['profile'], 'work');
+  });
+
+  testWidgets('CefWebView with no profile omits the key (ephemeral default)',
+      (tester) async {
+    await tester.pumpWidget(boxed(const CefWebView(url: 'about:blank')));
+    await tester.pumpAndSettle();
+    expect((callsTo('create').single.arguments as Map).containsKey('profile'),
+        isFalse);
+  });
+
+  testWidgets(
+      "CefWebView ignores its own profile when an external controller is "
+      'supplied (the controller carries its own)', (tester) async {
+    // Per the API: when you pass a controller, ITS profile wins — the widget's
+    // `profile` is ignored (documented mutual-exclusion of the two sources).
+    final controller = CefWebController(sessionId: 'ext-prof', profile: 'work');
+    addTearDown(controller.dispose);
+    await tester.pumpWidget(boxed(CefWebView(
+        url: 'about:blank', controller: controller, profile: 'ignored')));
+    await tester.pumpAndSettle();
+    expect((callsTo('create').single.arguments as Map)['profile'], 'work');
+  });
+
   // ── IME / text input ───────────────────────────────────────────────
   Future<FocusNode> focusedView(WidgetTester tester) async {
     final focus = FocusNode();

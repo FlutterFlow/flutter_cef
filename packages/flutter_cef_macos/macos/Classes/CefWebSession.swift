@@ -3,12 +3,18 @@
 //
 // Mirrors the flutter_embed transport (macos/Runner/FlutterEmbed): the host
 // allocates a global IOSurface + CVPixelBuffer, registers a FlutterTexture, and
-// spawns the renderer with the IOSurface id + a Unix-socket path. cef_host paints
-// the page into the IOSurface and sends a "present" frame; we then poke the
-// engine to re-sample the texture. Because the page renders off-screen, it keeps
-// updating even when the tile isn't engaged — the whole point of the CEF path.
+// the owning CefProfileHost tells cef_host (via opCreateBrowser) to bind a
+// browser to that IOSurface id. cef_host paints the page into the IOSurface and
+// sends a "present" frame; we then poke the engine to re-sample the texture.
+// Because the page renders off-screen, it keeps updating even when the tile isn't
+// engaged — the whole point of the CEF path.
 //
-// See native/cef_host/main.mm for the renderer and the IPC opcode definitions.
+// This is just the per-VIEW half: a session owns its texture/IOSurface/geometry
+// and the per-view verbs. The process/socket/reader layer (one subprocess per
+// `profile:`, multiplexing N of these by browserId) lives on CefProfileHost.
+// sendFrame delegates to host.send(browserId, ...); the host routes inbound
+// frames back via handleFrame(). See native/cef_host/main.mm for the renderer and
+// the IPC opcode definitions.
 
 import Cocoa
 import CoreVideo
@@ -16,11 +22,11 @@ import FlutterMacOS
 import IOSurface
 
 final class CefWebSession: NSObject, FlutterTexture {
-  // IPC opcodes (must match native/cef_host/main.mm).
+  // IPC opcodes (must match native/cef_host/main.mm). Process-level + control
+  // ops (ready/log/create/dispose/shutdown) live on CefProfileHost; this list is
+  // the per-view ops a session names directly.
   private static let opPresent: UInt8 = 0x01
-  private static let opReady: UInt8 = 0x02
   private static let opCursor: UInt8 = 0x03
-  private static let opLog: UInt8 = 0x04
   private static let opLoadState: UInt8 = 0x05
   private static let opTitle: UInt8 = 0x06
   private static let opUrl: UInt8 = 0x07
@@ -33,7 +39,6 @@ final class CefWebSession: NSObject, FlutterTexture {
   private static let opPointer: UInt8 = 0x10
   private static let opResize: UInt8 = 0x11
   private static let opKey: UInt8 = 0x12
-  private static let opShutdown: UInt8 = 0x14
   private static let opFindResult: UInt8 = 0x0e
   private static let opJsDialog: UInt8 = 0x0f
   private static let opEvalResult: UInt8 = 0x16
@@ -86,15 +91,14 @@ final class CefWebSession: NSObject, FlutterTexture {
 
   let sessionId: String
   private(set) var textureId: Int64 = 0
-  // The 127.0.0.1 port CEF's DevTools (CDP) server bound for this session, or 0
-  // when CDP wasn't requested. Chosen here (free-port pick) and reported back to
-  // Dart in the create() result.
-  private(set) var cdpPort: Int = 0
+
+  // Wire binding to the owning host: the host this session is multiplexed on and
+  // the Swift-assigned browserId it routes by. Set once via attach() right after
+  // CefProfileHost.createBrowser() allocates the id.
+  private weak var host: CefProfileHost?
+  private(set) var browserId: UInt32 = 0
 
   private weak var registry: FlutterTextureRegistry?
-  private let cefHostPath: String
-  private let allowedSchemes: String  // CSV; "" = allow all
-  private let enableCdp: Bool
   private var width: Int
   private var height: Int
   private let dpr: CGFloat
@@ -103,33 +107,35 @@ final class CefWebSession: NSObject, FlutterTexture {
   private var pixelBuffer: CVPixelBuffer?
   private let bufferLock = NSLock()
 
-  private var process: Process?
-  private var listenFd: Int32 = -1
-  private var connFd: Int32 = -1
-  private var socketPath = ""
-  private let writeLock = NSLock()
-  private var pendingFrames: [[UInt8]] = []  // queued until the pipe connects
-  private var running = false
-  private var readerStarted = false
-  private let readerDone = DispatchSemaphore(value: 0)  // signaled when the
-  // acceptAndRead thread exits, so dispose() can join it before freeing state.
+  /// The live IOSurface id this session's buffer is backed by, or 0 before
+  /// allocation. The host reads this to build the opCreateBrowser payload.
+  var surfaceId: UInt32 {
+    bufferLock.lock(); defer { bufferLock.unlock() }
+    return ioSurface.map { IOSurfaceGetID($0) } ?? 0
+  }
+  // Geometry, exposed for the host's opCreateBrowser payload.
+  var w: Int { width }
+  var h: Int { height }
+  var scale: CGFloat { dpr }
 
-  init(sessionId: String, url: String, width: Int, height: Int, dpr: CGFloat,
-       allowedSchemes: String = "", enableCdp: Bool = false,
-       registry: FlutterTextureRegistry, cefHostPath: String) {
+  init(sessionId: String, width: Int, height: Int, dpr: CGFloat,
+       registry: FlutterTextureRegistry) {
     self.sessionId = sessionId
     self.width = max(1, width)
     self.height = max(1, height)
     self.dpr = dpr
-    self.allowedSchemes = allowedSchemes
-    self.enableCdp = enableCdp
     self.registry = registry
-    self.cefHostPath = cefHostPath
     super.init()
     _ = allocateBuffers(self.width, self.height)
     self.textureId = registry.register(self)
-    running = true
-    setupSocketAndSpawn(url: url)
+  }
+
+  /// Bind this session to its host + wire browserId (called by
+  /// CefProfileHost.createBrowser). All sendFrame calls route through the host
+  /// after this.
+  func attach(host: CefProfileHost, browserId: UInt32) {
+    self.host = host
+    self.browserId = browserId
   }
 
   // MARK: FlutterTexture
@@ -275,48 +281,13 @@ final class CefWebSession: NSObject, FlutterTexture {
     sendFrame(Self.opKey, p)
   }
 
+  /// Release the texture + buffers. The process/socket teardown (and the
+  /// opDisposeBrowser/opShutdown signalling + reader join) is the owning
+  /// CefProfileHost's job — by the time this runs the host has already
+  /// unregistered this browser, so there's no reader racing the free.
   func dispose() {
-    // Tell the host to quit (best-effort), then stop the reader thread *first*:
-    // flag it, wake its blocking accept()/read() by shutting down the fds, and
-    // wait for it to exit before freeing anything it touches. Closing an fd a
-    // thread is blocked on, or freeing buffers/texture under the reader, is a
-    // use-after-free — this join makes teardown deterministic.
-    sendFrame(Self.opShutdown)
-    writeLock.lock()
-    let wasRunning = running
-    running = false
-    let c = connFd, l = listenFd
-    writeLock.unlock()
-    if c >= 0 { shutdown(c, SHUT_RDWR) }
-    if l >= 0 { shutdown(l, SHUT_RDWR) }
-    if readerStarted && wasRunning { _ = readerDone.wait(timeout: .now() + 2) }
-    writeLock.lock()
-    if connFd >= 0 { close(connFd); connFd = -1 }
-    if listenFd >= 0 { close(listenFd); listenFd = -1 }
-    writeLock.unlock()
-    if !socketPath.isEmpty { unlink(socketPath); socketPath = "" }
-    terminateProcess()
     if textureId != 0 { registry?.unregisterTexture(textureId); textureId = 0 }
     bufferLock.lock(); pixelBuffer = nil; ioSurface = nil; bufferLock.unlock()
-  }
-
-  private func terminateProcess() {
-    guard let p = process else { return }
-    process = nil
-    p.terminate()  // SIGTERM
-    // Escalate to SIGKILL if the host is wedged and ignores SIGTERM.
-    DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) {
-      if p.isRunning { kill(p.processIdentifier, SIGKILL) }
-    }
-  }
-
-  deinit {
-    // Safety net if the session is dropped without dispose() (e.g. setup failed
-    // partway). dispose() zeroes the fds, so this is a no-op after a clean dispose.
-    if process?.isRunning == true { process?.terminate() }
-    if connFd >= 0 { close(connFd) }
-    if listenFd >= 0 { close(listenFd) }
-    if !socketPath.isEmpty { unlink(socketPath) }
   }
 
   // MARK: Buffers
@@ -361,250 +332,98 @@ final class CefWebSession: NSObject, FlutterTexture {
     return true
   }
 
-  // MARK: Subprocess + IPC
+  // MARK: Inbound frames
 
-  /// Ask the OS for a free TCP port on 127.0.0.1 (bind :0, read it back, close).
-  /// Brief TOCTOU window until cef_host's CEF binds it — acceptable on loopback.
-  /// Returns 0 on failure.
-  private static func pickFreeTcpPort() -> Int {
-    let fd = socket(AF_INET, SOCK_STREAM, 0)
-    guard fd >= 0 else { return 0 }
-    defer { close(fd) }
-    var addr = sockaddr_in()
-    addr.sin_family = sa_family_t(AF_INET)
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1")
-    addr.sin_port = 0
-    let bound = withUnsafePointer(to: &addr) {
-      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-        Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-      }
-    }
-    guard bound == 0 else { return 0 }
-    var assigned = sockaddr_in()
-    var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-    let got = withUnsafeMutablePointer(to: &assigned) {
-      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-        getsockname(fd, $0, &len)
-      }
-    }
-    guard got == 0 else { return 0 }
-    return Int(UInt16(bigEndian: assigned.sin_port))
-  }
-
-  private func setupSocketAndSpawn(url: String) {
-    // Randomized name (not just the predictable sequential sessionId) in the
-    // per-user 0700 temp dir, so another same-UID process can't pre-bind it.
-    let rnd = String(format: "%08x", UInt32.random(in: 0 ... UInt32.max))
-    socketPath = NSTemporaryDirectory() + "wccef-\(sessionId)-\(rnd).sock"
-    guard socketPath.utf8CString.count <= 104 else {
-      NSLog("[cef] socket path exceeds sun_path (104); aborting")
-      return
-    }
-    unlink(socketPath)
-    listenFd = socket(AF_UNIX, SOCK_STREAM, 0)
-    guard listenFd >= 0 else { NSLog("[cef] socket() failed"); return }
-    var addr = sockaddr_un()
-    addr.sun_family = sa_family_t(AF_UNIX)
-    let pathC = socketPath.utf8CString
-    withUnsafeMutablePointer(to: &addr.sun_path) { raw in
-      raw.withMemoryRebound(to: CChar.self, capacity: 104) { dst in
-        pathC.withUnsafeBufferPointer { src in
-          dst.update(from: src.baseAddress!, count: min(pathC.count, 104))
+  /// Handle one inbound frame routed to this browser by the host. `payload` has
+  /// already had the [bodyLen][browserId][op] header stripped, so all offsets
+  /// start at 0 (the old per-view switch read from offset 1, after the op byte).
+  func handleFrame(_ op: UInt8, _ payload: [UInt8]) {
+    switch op {
+    case Self.opPresent:
+      let tid = textureId
+      if tid != 0 {
+        DispatchQueue.main.async { [weak self] in
+          self?.registry?.textureFrameAvailable(tid)
         }
       }
-    }
-    let len = socklen_t(MemoryLayout<sockaddr_un>.size)
-    let bound = withUnsafePointer(to: &addr) {
-      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(listenFd, $0, len) }
-    }
-    guard bound == 0 else { NSLog("[cef] bind() failed: \(errno)"); return }
-    listen(listenFd, 1)
-
-    let surfaceId = ioSurface.map { IOSurfaceGetID($0) } ?? 0
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: cefHostPath)
-    var args = [
-      "--url=\(url)",
-      "--width=\(width)",
-      "--height=\(height)",
-      "--dpr=\(dpr)",
-      "--iosurface-id=\(surfaceId)",
-      "--ipc=\(socketPath)",
-    ]
-    if !allowedSchemes.isEmpty {
-      args.append("--allowed-schemes=\(allowedSchemes)")
-    }
-    // Chrome DevTools Protocol (CDP): when enabled for this session, pick a free
-    // 127.0.0.1 port and pass it via --cdp-port; cef_host sets
-    // CefSettings.remote_debugging_port and CEF binds it (localhost-only, M113+).
-    // UNAUTHENTICATED — any local client that reaches the port fully drives the
-    // page — so this is opt-in, never on by default. The port is reported back
-    // to Dart in the create() result.
-    if enableCdp {
-      let port = Self.pickFreeTcpPort()
-      if port >= 1024 {
-        cdpPort = port
-        args.append("--cdp-port=\(port)")
+    case Self.opCursor:
+      if payload.count >= 4 {
+        let c = (Int(payload[0]) << 24) | (Int(payload[1]) << 16)
+          | (Int(payload[2]) << 8) | Int(payload[3])
+        onCursor?(c)
       }
-    }
-    p.arguments = args
-    do {
-      try p.run()
-      process = p
-    } catch {
-      NSLog("[cef] failed to spawn cef_host at \(cefHostPath): \(error)")
-      return
-    }
-    readerStarted = true
-    Thread.detachNewThread { [weak self] in self?.acceptAndRead() }
-  }
-
-  private func acceptAndRead() {
-    defer { readerDone.signal() }  // let dispose() join us on every exit path
-    let fd = accept(listenFd, nil, nil)
-    guard fd >= 0 else { NSLog("[cef] accept() failed"); return }
-    // Bring the pipe up and drain anything queued before it connected — all under
-    // writeLock so a concurrent sendFrame can't interleave with the flush.
-    bufferLock.lock()
-    let surf = ioSurface
-    bufferLock.unlock()
-    let w = width, h = height
-    writeLock.lock()
-    connFd = fd
-    // 1. Re-sync geometry from the live surface. A resize() that fired before the
-    //    pipe connected was intentionally dropped (replaying it could reference a
-    //    since-freed / recycled IOSurface id); the current surface is always
-    //    valid. Without this the view stays blank until a manual window resize.
-    if let surf = surf {
-      var p = [UInt8]()
-      appendU32(&p, UInt32(w))
-      appendU32(&p, UInt32(h))
-      appendU32(&p, IOSurfaceGetID(surf))
-      let frame = frameBytes(Self.opResize, p)
-      _ = frame.withUnsafeBytes { writeAll(fd, $0.baseAddress!, frame.count) }
-    }
-    // 2. Flush queued non-resize frames (early navigate / executeJavaScript / …).
-    for f in pendingFrames {
-      _ = f.withUnsafeBytes { writeAll(fd, $0.baseAddress!, f.count) }
-    }
-    pendingFrames.removeAll()
-    writeLock.unlock()
-    while running {
-      var hdr = [UInt8](repeating: 0, count: 4)
-      if !readAll(fd, &hdr, 4) { break }
-      let bodyLen = (Int(hdr[0]) << 24) | (Int(hdr[1]) << 16) | (Int(hdr[2]) << 8) | Int(hdr[3])
-      if bodyLen <= 0 || bodyLen > (64 << 20) { break }
-      var body = [UInt8](repeating: 0, count: bodyLen)
-      if !readAll(fd, &body, bodyLen) { break }
-      switch body[0] {
-      case Self.opPresent:
-        let tid = textureId
-        if tid != 0 {
-          DispatchQueue.main.async { [weak self] in
-            self?.registry?.textureFrameAvailable(tid)
-          }
-        }
-      case Self.opCursor:
-        if body.count >= 5 {
-          let c = (Int(body[1]) << 24) | (Int(body[2]) << 16)
-            | (Int(body[3]) << 8) | Int(body[4])
-          onCursor?(c)
-        }
-      case Self.opLog:
-        let msg = String(bytes: body[1...], encoding: .utf8) ?? ""
-        NSLog("[cef_host:\(sessionId)] \(msg)")
-      case Self.opLoadState:
-        if body.count >= 4 {
-          onLoadState?(body[1] != 0, body[2] != 0, body[3] != 0)
-        }
-      case Self.opTitle:
-        onTitle?(String(bytes: body[1...], encoding: .utf8) ?? "")
-      case Self.opUrl:
-        onUrl?(String(bytes: body[1...], encoding: .utf8) ?? "")
-      case Self.opLoadErr:
-        if body.count >= 5 {
-          let code = readU32(body, 1)
-          let s = String(bytes: body[5...], encoding: .utf8) ?? ""
-          let parts = s.split(separator: "\n", maxSplits: 1,
-                              omittingEmptySubsequences: false)
-          onLoadError?(code, parts.count > 0 ? String(parts[0]) : "",
-                       parts.count > 1 ? String(parts[1]) : "")
-        }
-      case Self.opConsole:
-        if body.count >= 5 {
-          onConsole?(readU32(body, 1),
-                     String(bytes: body[5...], encoding: .utf8) ?? "")
-        }
-      case Self.opPageStart:
-        onPageStarted?(String(bytes: body[1...], encoding: .utf8) ?? "")
-      case Self.opPageFinish:
-        onPageFinished?(String(bytes: body[1...], encoding: .utf8) ?? "")
-      case Self.opProgress:
-        if body.count >= 5 { onProgress?(readU32(body, 1)) }
-      case Self.opNewWindow:
-        onNewWindow?(String(bytes: body[1...], encoding: .utf8) ?? "")
-      case Self.opFindResult:
-        if body.count >= 10 {
-          onFindResult?(readU32(body, 1), readU32(body, 5), body[9] != 0)
-        }
-      case Self.opJsDialog:
-        if body.count >= 13 {
-          let type = readU32(body, 5)
-          let msgLen = readU32(body, 9)
-          let msgEnd = min(13 + msgLen, body.count)
-          let msg = String(bytes: body[13..<msgEnd], encoding: .utf8) ?? ""
-          let def = msgEnd < body.count
-              ? (String(bytes: body[msgEnd...], encoding: .utf8) ?? "")
-              : ""
-          onJsDialog?(readU32(body, 1), type, msg, def)
-        }
-      case Self.opEvalResult:
-        onEvalResult?(String(bytes: body[1...], encoding: .utf8) ?? "")
-      case Self.opChannelMsg:
-        onChannelMsg?(String(bytes: body[1...], encoding: .utf8) ?? "")
-      case Self.opDownload:
-        onDownload?(String(bytes: body[1...], encoding: .utf8) ?? "")
-      case Self.opImeBounds:
-        if body.count >= 17 {
-          onImeBounds?(readU32(body, 1), readU32(body, 5),
-                       readU32(body, 9), readU32(body, 13))
-        }
-      case Self.opCookies:
-        if body.count >= 5 {
-          onCookies?(readU32(body, 1),
-                     String(bytes: body[5...], encoding: .utf8) ?? "[]")
-        }
-      default:
-        break
+    case Self.opLoadState:
+      if payload.count >= 3 {
+        onLoadState?(payload[0] != 0, payload[1] != 0, payload[2] != 0)
       }
+    case Self.opTitle:
+      onTitle?(String(bytes: payload, encoding: .utf8) ?? "")
+    case Self.opUrl:
+      onUrl?(String(bytes: payload, encoding: .utf8) ?? "")
+    case Self.opLoadErr:
+      if payload.count >= 4 {
+        let code = readU32(payload, 0)
+        let s = String(bytes: payload[4...], encoding: .utf8) ?? ""
+        let parts = s.split(separator: "\n", maxSplits: 1,
+                            omittingEmptySubsequences: false)
+        onLoadError?(code, parts.count > 0 ? String(parts[0]) : "",
+                     parts.count > 1 ? String(parts[1]) : "")
+      }
+    case Self.opConsole:
+      if payload.count >= 4 {
+        onConsole?(readU32(payload, 0),
+                   String(bytes: payload[4...], encoding: .utf8) ?? "")
+      }
+    case Self.opPageStart:
+      onPageStarted?(String(bytes: payload, encoding: .utf8) ?? "")
+    case Self.opPageFinish:
+      onPageFinished?(String(bytes: payload, encoding: .utf8) ?? "")
+    case Self.opProgress:
+      if payload.count >= 4 { onProgress?(readU32(payload, 0)) }
+    case Self.opNewWindow:
+      onNewWindow?(String(bytes: payload, encoding: .utf8) ?? "")
+    case Self.opFindResult:
+      if payload.count >= 9 {
+        onFindResult?(readU32(payload, 0), readU32(payload, 4), payload[8] != 0)
+      }
+    case Self.opJsDialog:
+      if payload.count >= 12 {
+        let type = readU32(payload, 4)
+        let msgLen = readU32(payload, 8)
+        let msgEnd = min(12 + msgLen, payload.count)
+        let msg = String(bytes: payload[12..<msgEnd], encoding: .utf8) ?? ""
+        let def = msgEnd < payload.count
+            ? (String(bytes: payload[msgEnd...], encoding: .utf8) ?? "")
+            : ""
+        onJsDialog?(readU32(payload, 0), type, msg, def)
+      }
+    case Self.opEvalResult:
+      onEvalResult?(String(bytes: payload, encoding: .utf8) ?? "")
+    case Self.opChannelMsg:
+      onChannelMsg?(String(bytes: payload, encoding: .utf8) ?? "")
+    case Self.opDownload:
+      onDownload?(String(bytes: payload, encoding: .utf8) ?? "")
+    case Self.opImeBounds:
+      if payload.count >= 16 {
+        onImeBounds?(readU32(payload, 0), readU32(payload, 4),
+                     readU32(payload, 8), readU32(payload, 12))
+      }
+    case Self.opCookies:
+      if payload.count >= 4 {
+        onCookies?(readU32(payload, 0),
+                   String(bytes: payload[4...], encoding: .utf8) ?? "[]")
+      }
+    default:
+      break
     }
   }
 
   // MARK: Wire helpers
 
-  // Length-prefixed wire frame: [u32 bodyLen][op][payload]. Pure — no lock.
-  private func frameBytes(_ op: UInt8, _ payload: [UInt8]) -> [UInt8] {
-    var frame = [UInt8]()
-    frame.reserveCapacity(5 + payload.count)
-    appendU32(&frame, UInt32(1 + payload.count))
-    frame.append(op)
-    frame.append(contentsOf: payload)
-    return frame
-  }
-
+  /// Send a per-view frame: delegates to the owning host, which prepends the
+  /// browserId and length and routes it over the shared pipe.
   private func sendFrame(_ op: UInt8, _ payload: [UInt8] = []) {
-    let frame = frameBytes(op, payload)
-    writeLock.lock()
-    defer { writeLock.unlock() }
-    if connFd < 0 {
-      // Pipe not up yet. A pre-connect resize is re-synced from live geometry on
-      // connect (see acceptAndRead), so dropping it is correct — and avoids
-      // replaying a since-freed/recycled IOSurface id. Queue everything else
-      // (early navigate / executeJavaScript / …) so it isn't silently lost.
-      if op != Self.opResize { pendingFrames.append(frame) }
-      return
-    }
-    _ = frame.withUnsafeBytes { writeAll(connFd, $0.baseAddress!, frame.count) }
+    host?.send(browserId, op, payload)
   }
 
   private func appendU32(_ a: inout [UInt8], _ v: UInt32) {
@@ -624,27 +443,5 @@ final class CefWebSession: NSObject, FlutterTexture {
   private func readU32(_ b: [UInt8], _ o: Int) -> Int {
     return (Int(b[o]) << 24) | (Int(b[o + 1]) << 16) | (Int(b[o + 2]) << 8)
       | Int(b[o + 3])
-  }
-
-  private func readAll(_ fd: Int32, _ buf: inout [UInt8], _ len: Int) -> Bool {
-    var off = 0
-    while off < len {
-      let n = buf.withUnsafeMutableBytes { ptr -> Int in
-        read(fd, ptr.baseAddress!.advanced(by: off), len - off)
-      }
-      if n <= 0 { return false }
-      off += n
-    }
-    return true
-  }
-
-  private func writeAll(_ fd: Int32, _ buf: UnsafeRawPointer, _ len: Int) -> Bool {
-    var off = 0
-    while off < len {
-      let n = write(fd, buf.advanced(by: off), len - off)
-      if n <= 0 { return false }
-      off += n
-    }
-    return true
   }
 }

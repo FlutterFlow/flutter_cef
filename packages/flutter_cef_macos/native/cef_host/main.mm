@@ -1,12 +1,15 @@
 // cef_host — a standalone CEF off-screen-rendering subprocess.
 //
-// The Flutter host (the flutter_cef macOS plugin) allocates an IOSurface-backed
-// CVPixelBuffer, registers a FlutterTexture on it, and spawns one cef_host per
-// CefWebView. cef_host runs CEF windowless (OSR), paints the page into the
-// shared IOSurface, and notifies the host over a Unix-socket IPC so the host
-// calls textureFrameAvailable. Because the page renders to an offscreen buffer
-// (no NSWindow), it keeps rendering live even when the view is off-screen — the
-// whole point of the CEF path.
+// The Flutter host (the flutter_cef macOS plugin) spawns one cef_host per
+// PROFILE (persistent or ephemeral) and drives N browsers in it over a
+// Unix-socket IPC. For each browser the host allocates an IOSurface-backed
+// CVPixelBuffer, registers a FlutterTexture on it, and sends kOpCreateBrowser
+// (carrying url/width/height/dpr/iosurface-id). cef_host runs CEF windowless
+// (OSR), paints each page into its shared IOSurface, and notifies the host so
+// it calls textureFrameAvailable. Because the page renders to an offscreen
+// buffer (no NSWindow), it keeps rendering live even when the view is off-screen
+// — the whole point of the CEF path. No browser is created at startup; the host
+// waits for kOpReady, then issues kOpCreateBrowser per view.
 //
 // Multi-process is the default (CMake option CEF_MULTI_PROCESS, ON by default,
 // defines CEF_HOST_MULTIPROCESS): the CEF helper subprocesses
@@ -26,12 +29,20 @@
 // -DCEF_HOST_ADHOC=OFF, which enforces peer validation and uses the real
 // Keychain (OSCrypt) — and so requires correct inside-out Developer-ID signing.
 //
-// Args: --url=<url> --width=<px> --height=<px> --dpr=<scale> --iosurface-id=<id>
-//       --ipc=<path> --allowed-schemes=<csv>
+// Args (all per-PROCESS / per-profile): --ipc=<path> --cdp-port=<port>
+//       --allowed-schemes=<csv> --profile-dir=<abs path>
+// --profile-dir maps to settings.root_cache_path (empty/omitted -> a per-pid
+// ephemeral temp dir; Swift always supplies it, so the fallback is defensive).
+// The per-view args (url/width/height/dpr/iosurface-id) moved into the
+// kOpCreateBrowser payload. --cdp-port is rejected upstream when a named profile
+// is in use, so persistent profiles never expose the unauthenticated debug port.
 //
-// IPC wire format: 4-byte big-endian length prefix, then [opcode][payload].
-// The full opcode table lives in the `kOp*` constants below — each carries its
-// payload layout; cef_host -> host are 0x01-0x1a, host -> cef_host 0x10-0x34.
+// IPC wire format: 4-byte big-endian length prefix (bodyLen), then a 4-byte
+// big-endian browserId, then [opcode][payload]. bodyLen = 4 + 1 + payloadLen.
+// browserId is the Swift-assigned wire id (>=1); browserId 0 = process/profile
+// level (kOpReady, process-level kOpLog, inbound kOpShutdown). The full opcode
+// table lives in the `kOp*` constants below — each carries its payload layout;
+// cef_host -> host are 0x01-0x1a, host -> cef_host 0x10-0x35.
 
 #import <Cocoa/Cocoa.h>
 #import <IOSurface/IOSurface.h>
@@ -43,6 +54,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -102,7 +114,9 @@ constexpr uint8_t kOpCookies = 0x1a;    // {u32 id}{utf8 json-array} visitAllCoo
 constexpr uint8_t kOpPointer = 0x10;
 constexpr uint8_t kOpResize = 0x11;
 constexpr uint8_t kOpKey = 0x12;
-constexpr uint8_t kOpShutdown = 0x14;
+constexpr uint8_t kOpCreateBrowser = 0x13;  // {u32 w}{u32 h}{f64 dpr}{u32 iosurfaceId}{utf8 url}; frame browserId = NEW id
+constexpr uint8_t kOpShutdown = 0x14;       // {} tear down the whole PROCESS (all browsers); frame browserId 0
+constexpr uint8_t kOpDisposeBrowser = 0x15;  // {} close ONE browser (target = frame browserId); process survives
 constexpr uint8_t kOpNavigate = 0x20;
 constexpr uint8_t kOpReload = 0x21;
 constexpr uint8_t kOpStop = 0x22;
@@ -130,40 +144,96 @@ constexpr uint8_t kOpSetVisible = 0x35;     // {u8 visible} -> CefBrowserHost::W
 int g_ipc_fd = -1;
 std::mutex g_ipc_write_mutex;
 
-std::mutex g_surface_mutex;      // guards g_surface / g_width / g_height / g_dpr
-IOSurfaceRef g_surface = nullptr;
-int g_width = 800;   // logical (DIP) — GetViewRect; CEF scales by g_dpr.
-int g_height = 600;
-double g_dpr = 1.0;  // device pixel ratio; the IOSurface is logical*g_dpr px.
+// Per-browser state. One cef_host process now multiplexes N browsers (one per
+// CefWebView sharing this profile), so the state that used to be process-global
+// (surface/geometry/dpr, the browser, pending JS dialogs, the trusted-load
+// allowlist exemptions, popup compositing buffers) moves into a per-browser
+// Slot. HostClient / HostRenderHandler each hold a shared_ptr to their slot, and
+// per-op UI tasks bind a shared_ptr copy so the slot outlives the
+// dispose/in-flight race. Slots are created in DoCreateBrowser and torn down in
+// OnBeforeClose (both on the CEF UI thread).
+struct Slot {
+  uint32_t browser_id = 0;  // Swift-assigned wire id (>=1); NOT GetIdentifier().
+  CefRefPtr<CefBrowser> browser;
 
-CefRefPtr<CefBrowser> g_browser;
+  // Guards surface / width / height / dpr / popup_* for THIS browser. Per-slot
+  // (not a single global) so paints on independent browsers don't contend.
+  std::mutex surface_mutex;
+  IOSurfaceRef surface = nullptr;  // host-shared IOSurface we paint into
+  int width = 800;   // logical (DIP) — GetViewRect; CEF scales by dpr.
+  int height = 600;
+  double dpr = 1.0;  // device pixel ratio; the IOSurface is logical*dpr px.
+
+  // Popup widgets (<select> dropdowns, autofill) paint into a separate PET_POPUP
+  // buffer that we composite over the view at the popup rect. Guarded by
+  // surface_mutex. Per-slot so two browsers' open dropdowns don't clobber.
+  bool popup_visible = false;
+  CefRect popup_rect;
+  std::vector<uint8_t> popup_buf;
+  int popup_w = 0;
+  int popup_h = 0;
+
+  // Exact URLs armed for a host-trusted content load (kOpLoadTrusted). The
+  // exemption is bound to the specific URL, NOT to a moment in time: LoadURL does
+  // not deliver OnBeforeBrowse synchronously (it enqueues the nav; the callback
+  // arrives as a later UI task), so a global one-shot flag could be consumed by a
+  // page-initiated navigation queued in the gap — an allowlist bypass. Matching
+  // on the exact URL (and main frame) in OnBeforeBrowse means a page nav to a
+  // different URL can never steal another load's exemption. A multiset tolerates
+  // identical concurrent trusted loads. UI-thread only, so no lock. Per-slot so a
+  // trusted load on one browser can't exempt a navigation on another.
+  // (A page racing the host to the EXACT same data:/file: URL could consume one
+  // armed entry, but that is benign — it loads the same content the host chose —
+  // so it is not defended beyond exact-URL matching.)
+  std::multiset<std::string> trusted_pending;
+
+  // Pending JS dialog callbacks, keyed by id. UI-thread-only (OnJSDialog and the
+  // host's response both run on the CEF UI thread), so no lock is needed.
+  // Per-slot so dialog ids on one browser can't Continue() another's callback.
+  std::map<uint32_t, CefRefPtr<CefJSDialogCallback>> dialogs;
+  uint32_t dialog_next = 1;
+};
+
+// Routing maps from a browser identity to its Slot. MUTATED ONLY ON THE CEF UI
+// THREAD (insert in DoCreateBrowser, erase in OnBeforeClose). Readers (the IPC
+// reader thread for inbound routing, paint threads for display lookup) take
+// g_slots_mutex, copy the shared_ptr, release the lock, then operate — so a slot
+// stays alive for the duration of an in-flight op even if it's disposed.
+std::mutex g_slots_mutex;
+std::map<int /*cef GetIdentifier()*/, std::shared_ptr<Slot>>
+    g_slots_by_cef_id;  // paint / display callbacks -> slot
+std::map<uint32_t /*wire id*/, std::shared_ptr<Slot>>
+    g_slots_by_wire_id;  // inbound IPC routing -> slot
+
+// Look up a slot by CEF's per-process browser identifier (the g_slots_by_cef_id
+// map's reader). Provided for display/paint callbacks that only have a
+// CefBrowser*; the current handlers instead hold their slot_ shared_ptr directly
+// (no map lookup on the hot paint path — see HostRenderHandler), so this is
+// presently unused but kept as the canonical by-cef-id resolver.
+[[maybe_unused]] std::shared_ptr<Slot> SlotForBrowser(CefBrowser* b) {
+  if (!b) return nullptr;
+  std::lock_guard<std::mutex> lock(g_slots_mutex);
+  auto it = g_slots_by_cef_id.find(b->GetIdentifier());
+  return it == g_slots_by_cef_id.end() ? nullptr : it->second;
+}
+
+// Look up a slot by its Swift-assigned wire id (used by the IPC reader to route
+// an inbound per-browser op). Null for wire id 0 or an unknown/disposed id.
+std::shared_ptr<Slot> LookupWireId(uint32_t wire_id) {
+  if (wire_id == 0) return nullptr;
+  std::lock_guard<std::mutex> lock(g_slots_mutex);
+  auto it = g_slots_by_wire_id.find(wire_id);
+  return it == g_slots_by_wire_id.end() ? nullptr : it->second;
+}
 
 // Host-set navigation scheme allowlist (lowercased; `--allowed-schemes=a,b`).
 // Empty = allow all. `about` is always allowed (the blank placeholder).
 // Enforced in HostClient::OnBeforeBrowse so it covers the initial load,
 // programmatic navigation (navigate), in-page clicks, and redirects. The host's
 // explicit content-injection APIs (loadHtmlString -> data:, loadFile -> file:)
-// are NOT subject to it — they arrive as kOpLoadTrusted and set the one-shot
-// g_skip_allowlist_once below so their load isn't refused.
+// are NOT subject to it — they arrive as kOpLoadTrusted and arm an exact-URL
+// exemption in the browser's Slot::trusted_pending so their load isn't refused.
 std::set<std::string> g_allowed_schemes;
-
-// Exact URLs armed for a host-trusted content load (kOpLoadTrusted). The
-// exemption is bound to the specific URL, NOT to a moment in time: LoadURL does
-// not deliver OnBeforeBrowse synchronously (it enqueues the nav; the callback
-// arrives as a later UI task), so a global one-shot flag could be consumed by a
-// page-initiated navigation queued in the gap — an allowlist bypass. Matching on
-// the exact URL (and main frame) in OnBeforeBrowse means a page nav to a
-// different URL can never steal another load's exemption. A multiset tolerates
-// identical concurrent trusted loads. UI-thread only, so no lock.
-// (A page racing the host to the EXACT same data:/file: URL could consume one
-// armed entry, but that is benign — it loads the same content the host chose —
-// so it is not defended beyond exact-URL matching.)
-std::multiset<std::string> g_trusted_pending;
-
-// Pending JS dialog callbacks, keyed by id. UI-thread-only (OnJSDialog and the
-// host's response both run on the CEF UI thread), so no lock is needed.
-std::map<uint32_t, CefRefPtr<CefJSDialogCallback>> g_dialogs;
-uint32_t g_dialog_next = 1;
 
 // Registered JS channel names (UI-thread-only). On each frame load we inject a
 // window.<name>.postMessage shim that routes to the host over window.cefQuery
@@ -198,15 +268,6 @@ void InjectChannelShim(CefRefPtr<CefFrame> frame, const std::string& name) {
   frame->ExecuteJavaScript(js, "", 0);
 }
 
-// Popup widgets (<select> dropdowns, autofill) paint into a separate PET_POPUP
-// buffer that we composite over the view at the popup rect. Guarded by
-// g_surface_mutex.
-bool g_popup_visible = false;
-CefRect g_popup_rect;
-std::vector<uint8_t> g_popup_buf;
-int g_popup_w = 0;
-int g_popup_h = 0;
-
 // ---- IPC helpers ----
 bool WriteAll(int fd, const void* buf, size_t len) {
   const uint8_t* p = static_cast<const uint8_t*>(buf);
@@ -237,10 +298,15 @@ bool ReadAll(int fd, void* buf, size_t len) {
   return true;
 }
 
-void SendFrame(uint8_t opcode, const void* payload, uint32_t payload_len) {
+// Frame layout: [u32 bodyLen BE][u32 browserId BE][u8 opcode][payload]. browserId
+// is the Swift-assigned wire id of the originating browser; 0 for process-level
+// frames (kOpReady, process-level kOpLog). bodyLen = 4 (browserId) + 1 (op) +
+// payloadLen, counting every byte after the length prefix.
+void SendFrame(uint32_t browser_id, uint8_t opcode, const void* payload,
+               uint32_t payload_len) {
   if (g_ipc_fd < 0) return;
   std::lock_guard<std::mutex> lock(g_ipc_write_mutex);
-  uint32_t body_len = 1 + payload_len;
+  uint32_t body_len = 4 + 1 + payload_len;
   // Assemble the whole frame and write it in one WriteAll so a partial write
   // never leaves the peer with a length prefix it can't satisfy (stream desync).
   std::vector<uint8_t> frame(4 + body_len);
@@ -248,36 +314,41 @@ void SendFrame(uint8_t opcode, const void* payload, uint32_t payload_len) {
   frame[1] = static_cast<uint8_t>((body_len >> 16) & 0xff);
   frame[2] = static_cast<uint8_t>((body_len >> 8) & 0xff);
   frame[3] = static_cast<uint8_t>(body_len & 0xff);
-  frame[4] = opcode;
-  if (payload_len) memcpy(frame.data() + 5, payload, payload_len);
+  frame[4] = static_cast<uint8_t>((browser_id >> 24) & 0xff);
+  frame[5] = static_cast<uint8_t>((browser_id >> 16) & 0xff);
+  frame[6] = static_cast<uint8_t>((browser_id >> 8) & 0xff);
+  frame[7] = static_cast<uint8_t>(browser_id & 0xff);
+  frame[8] = opcode;
+  if (payload_len) memcpy(frame.data() + 9, payload, payload_len);
   WriteAll(g_ipc_fd, frame.data(), frame.size());
 }
 
-void SendLog(const std::string& msg) {
-  SendFrame(kOpLog, msg.data(), static_cast<uint32_t>(msg.size()));
+void SendLog(uint32_t browser_id, const std::string& msg) {
+  SendFrame(browser_id, kOpLog, msg.data(), static_cast<uint32_t>(msg.size()));
 }
 
-void SendUtf8(uint8_t op, const std::string& s) {
-  SendFrame(op, s.data(), static_cast<uint32_t>(s.size()));
+void SendUtf8(uint32_t browser_id, uint8_t op, const std::string& s) {
+  SendFrame(browser_id, op, s.data(), static_cast<uint32_t>(s.size()));
 }
 
-void SendLoadState(bool loading, bool back, bool forward) {
+void SendLoadState(uint32_t browser_id, bool loading, bool back, bool forward) {
   uint8_t p[3];
   p[0] = loading ? 1 : 0;
   p[1] = back ? 1 : 0;
   p[2] = forward ? 1 : 0;
-  SendFrame(kOpLoadState, p, 3);
+  SendFrame(browser_id, kOpLoadState, p, 3);
 }
 
 // op payload: [u32 BE code][utf8 body]. Used for load-error and console.
-void SendCodePlusUtf8(uint8_t op, uint32_t code, const std::string& body) {
+void SendCodePlusUtf8(uint32_t browser_id, uint8_t op, uint32_t code,
+                      const std::string& body) {
   std::vector<uint8_t> p(4 + body.size());
   p[0] = (code >> 24) & 0xff;
   p[1] = (code >> 16) & 0xff;
   p[2] = (code >> 8) & 0xff;
   p[3] = code & 0xff;
   memcpy(p.data() + 4, body.data(), body.size());
-  SendFrame(op, p.data(), static_cast<uint32_t>(p.size()));
+  SendFrame(browser_id, op, p.data(), static_cast<uint32_t>(p.size()));
 }
 
 uint32_t ReadU32BE(const uint8_t* p) {
@@ -348,65 +419,75 @@ void BlitBGRA(uint8_t* dst, size_t dst_stride, int surf_w, int surf_h,
 }
 
 // ---- Render handler: OSR -> shared IOSurface ----
+// One handler per browser; it holds a shared_ptr to that browser's Slot and
+// derefs it instead of the old process-global surface/geometry. The CefBrowser*
+// the callbacks are handed is ignored (this handler already owns exactly one
+// slot — no map lookup on the hot paint path). All surface/popup access is under
+// slot_->surface_mutex; OnPaint/OnAcceleratedPaint re-check slot_->surface after
+// taking the lock, since OnBeforeClose nulls + CFReleases it under the same lock
+// (a GPU-thread paint racing UI-thread teardown then sees null and no-ops).
 class HostRenderHandler : public CefRenderHandler {
  public:
+  explicit HostRenderHandler(std::shared_ptr<Slot> slot)
+      : slot_(std::move(slot)) {}
+
   void GetViewRect(CefRefPtr<CefBrowser>, CefRect& rect) override {
-    std::lock_guard<std::mutex> lock(g_surface_mutex);
-    rect = CefRect(0, 0, g_width, g_height);
+    std::lock_guard<std::mutex> lock(slot_->surface_mutex);
+    rect = CefRect(0, 0, slot_->width, slot_->height);
   }
 
   // Report the device scale so CEF renders the OSR buffer at logical*dpr
   // (Retina-native) instead of 1x upscaled — fixes the blur on HiDPI displays.
   bool GetScreenInfo(CefRefPtr<CefBrowser>, CefScreenInfo& info) override {
-    std::lock_guard<std::mutex> lock(g_surface_mutex);
-    info.device_scale_factor = static_cast<float>(g_dpr);
-    info.rect = CefRect(0, 0, g_width, g_height);
+    std::lock_guard<std::mutex> lock(slot_->surface_mutex);
+    info.device_scale_factor = static_cast<float>(slot_->dpr);
+    info.rect = CefRect(0, 0, slot_->width, slot_->height);
     info.available_rect = info.rect;
     return true;
   }
 
   void OnPaint(CefRefPtr<CefBrowser>, PaintElementType type, const RectList&,
                const void* buffer, int width, int height) override {
-    std::lock_guard<std::mutex> lock(g_surface_mutex);
-    if (!g_surface) return;
-    if (IOSurfaceLock(g_surface, 0, nullptr) != kIOReturnSuccess) return;
-    uint8_t* dst = static_cast<uint8_t*>(IOSurfaceGetBaseAddress(g_surface));
-    const size_t dst_stride = IOSurfaceGetBytesPerRow(g_surface);
-    const int surf_w = static_cast<int>(IOSurfaceGetWidth(g_surface));
-    const int surf_h = static_cast<int>(IOSurfaceGetHeight(g_surface));
+    std::lock_guard<std::mutex> lock(slot_->surface_mutex);
+    if (!slot_->surface) return;
+    if (IOSurfaceLock(slot_->surface, 0, nullptr) != kIOReturnSuccess) return;
+    uint8_t* dst = static_cast<uint8_t*>(IOSurfaceGetBaseAddress(slot_->surface));
+    const size_t dst_stride = IOSurfaceGetBytesPerRow(slot_->surface);
+    const int surf_w = static_cast<int>(IOSurfaceGetWidth(slot_->surface));
+    const int surf_h = static_cast<int>(IOSurfaceGetHeight(slot_->surface));
     const uint8_t* src = static_cast<const uint8_t*>(buffer);
     // OnPopupSize reports the popup rect in LOGICAL (DIP) coords, but we blit
     // into the physical (device-scaled) IOSurface — so the paint offset must be
     // scaled by the device pixel ratio. Without this the dropdown paints at the
     // wrong position on HiDPI and mouse clicks miss it (CEF hit-tests the popup
     // against the logical rect, which no longer matches where it was drawn).
-    const int popup_px = static_cast<int>(g_popup_rect.x * g_dpr);
-    const int popup_py = static_cast<int>(g_popup_rect.y * g_dpr);
+    const int popup_px = static_cast<int>(slot_->popup_rect.x * slot_->dpr);
+    const int popup_py = static_cast<int>(slot_->popup_rect.y * slot_->dpr);
     if (type == PET_VIEW) {
       BlitBGRA(dst, dst_stride, surf_w, surf_h, src, width, height, 0, 0);
       // Keep an open popup (<select> dropdown) painted on top of the view.
-      if (g_popup_visible && !g_popup_buf.empty()) {
-        BlitBGRA(dst, dst_stride, surf_w, surf_h, g_popup_buf.data(), g_popup_w,
-                 g_popup_h, popup_px, popup_py);
+      if (slot_->popup_visible && !slot_->popup_buf.empty()) {
+        BlitBGRA(dst, dst_stride, surf_w, surf_h, slot_->popup_buf.data(),
+                 slot_->popup_w, slot_->popup_h, popup_px, popup_py);
       }
     } else if (type == PET_POPUP) {
-      g_popup_w = width;
-      g_popup_h = height;
-      g_popup_buf.assign(src, src + static_cast<size_t>(width) * height * 4);
+      slot_->popup_w = width;
+      slot_->popup_h = height;
+      slot_->popup_buf.assign(src, src + static_cast<size_t>(width) * height * 4);
       BlitBGRA(dst, dst_stride, surf_w, surf_h, src, width, height, popup_px,
                popup_py);
     }
-    IOSurfaceUnlock(g_surface, 0, nullptr);
-    SendFrame(kOpPresent, nullptr, 0);
+    IOSurfaceUnlock(slot_->surface, 0, nullptr);
+    SendFrame(slot_->browser_id, kOpPresent, nullptr, 0);
   }
 
   void OnPopupShow(CefRefPtr<CefBrowser> browser, bool show) override {
     {
-      std::lock_guard<std::mutex> lock(g_surface_mutex);
-      g_popup_visible = show;
+      std::lock_guard<std::mutex> lock(slot_->surface_mutex);
+      slot_->popup_visible = show;
       if (!show) {
-        g_popup_buf.clear();
-        g_popup_rect = CefRect();
+        slot_->popup_buf.clear();
+        slot_->popup_rect = CefRect();
       }
     }
     // Repaint the view so the render path switches: on show, the next view paint
@@ -416,12 +497,12 @@ class HostRenderHandler : public CefRenderHandler {
   }
 
   void OnPopupSize(CefRefPtr<CefBrowser>, const CefRect& rect) override {
-    std::lock_guard<std::mutex> lock(g_surface_mutex);
-    g_popup_rect = rect;
+    std::lock_guard<std::mutex> lock(slot_->surface_mutex);
+    slot_->popup_rect = rect;
   }
 
   // Copy a popup's GPU surface into the CPU popup buffer so the software
-  // composite can draw it over the view. Caller holds g_surface_mutex.
+  // composite can draw it over the view. Caller holds slot_->surface_mutex.
   void CopyAccelToPopupBuf(IOSurfaceRef src) {
     if (IOSurfaceLock(src, kIOSurfaceLockReadOnly, nullptr) != kIOReturnSuccess) {
       return;
@@ -430,27 +511,27 @@ class HostRenderHandler : public CefRenderHandler {
     const int ph = static_cast<int>(IOSurfaceGetHeight(src));
     const size_t ss = IOSurfaceGetBytesPerRow(src);
     const auto* s = static_cast<const uint8_t*>(IOSurfaceGetBaseAddress(src));
-    g_popup_w = pw;
-    g_popup_h = ph;
-    g_popup_buf.resize(static_cast<size_t>(pw) * ph * 4);
+    slot_->popup_w = pw;
+    slot_->popup_h = ph;
+    slot_->popup_buf.resize(static_cast<size_t>(pw) * ph * 4);
     for (int y = 0; y < ph; ++y) {
-      memcpy(g_popup_buf.data() + static_cast<size_t>(y) * pw * 4,
+      memcpy(slot_->popup_buf.data() + static_cast<size_t>(y) * pw * 4,
              s + static_cast<size_t>(y) * ss, static_cast<size_t>(pw) * 4);
     }
     IOSurfaceUnlock(src, kIOSurfaceLockReadOnly, nullptr);
   }
 
   // Software-composite the view (optional GPU surface, stride-aware) and the open
-  // popup into the host-allocated g_surface and present it. Used only while a
-  // <select> dropdown is open, since a popup can't ride the zero-copy texture.
-  // Caller holds g_surface_mutex.
+  // popup into the host-allocated slot_->surface and present it. Used only while
+  // a <select> dropdown is open, since a popup can't ride the zero-copy texture.
+  // Caller holds slot_->surface_mutex.
   void CompositeSoftwareLocked(IOSurfaceRef view_src) {
-    if (!g_surface) return;
-    if (IOSurfaceLock(g_surface, 0, nullptr) != kIOReturnSuccess) return;
-    auto* dst = static_cast<uint8_t*>(IOSurfaceGetBaseAddress(g_surface));
-    const size_t ds = IOSurfaceGetBytesPerRow(g_surface);
-    const int dw = static_cast<int>(IOSurfaceGetWidth(g_surface));
-    const int dh = static_cast<int>(IOSurfaceGetHeight(g_surface));
+    if (!slot_->surface) return;
+    if (IOSurfaceLock(slot_->surface, 0, nullptr) != kIOReturnSuccess) return;
+    auto* dst = static_cast<uint8_t*>(IOSurfaceGetBaseAddress(slot_->surface));
+    const size_t ds = IOSurfaceGetBytesPerRow(slot_->surface);
+    const int dw = static_cast<int>(IOSurfaceGetWidth(slot_->surface));
+    const int dh = static_cast<int>(IOSurfaceGetHeight(slot_->surface));
     if (view_src &&
         IOSurfaceLock(view_src, kIOSurfaceLockReadOnly, nullptr) ==
             kIOReturnSuccess) {
@@ -465,13 +546,14 @@ class HostRenderHandler : public CefRenderHandler {
       }
       IOSurfaceUnlock(view_src, kIOSurfaceLockReadOnly, nullptr);
     }
-    if (g_popup_visible && !g_popup_buf.empty()) {
-      const int px = static_cast<int>(g_popup_rect.x * g_dpr);
-      const int py = static_cast<int>(g_popup_rect.y * g_dpr);
-      BlitBGRA(dst, ds, dw, dh, g_popup_buf.data(), g_popup_w, g_popup_h, px, py);
+    if (slot_->popup_visible && !slot_->popup_buf.empty()) {
+      const int px = static_cast<int>(slot_->popup_rect.x * slot_->dpr);
+      const int py = static_cast<int>(slot_->popup_rect.y * slot_->dpr);
+      BlitBGRA(dst, ds, dw, dh, slot_->popup_buf.data(), slot_->popup_w,
+               slot_->popup_h, px, py);
     }
-    IOSurfaceUnlock(g_surface, 0, nullptr);
-    SendFrame(kOpPresent, nullptr, 0);
+    IOSurfaceUnlock(slot_->surface, 0, nullptr);
+    SendFrame(slot_->browser_id, kOpPresent, nullptr, 0);
   }
 
   // GPU-accelerated OSR. With shared_texture_enabled, CEF's GPU/Viz process
@@ -489,13 +571,14 @@ class HostRenderHandler : public CefRenderHandler {
     IOSurfaceRef src =
         reinterpret_cast<IOSurfaceRef>(info.shared_texture_io_surface);
     if (!src) {
-      SendLog("OnAcceleratedPaint: null io_surface");
+      SendLog(slot_->browser_id, "OnAcceleratedPaint: null io_surface");
       return;
     }
-    std::lock_guard<std::mutex> lock(g_surface_mutex);
+    std::lock_guard<std::mutex> lock(slot_->surface_mutex);
+    if (!slot_->surface) return;  // disposed under us (see OnBeforeClose)
     if (type == PET_POPUP) {
       CopyAccelToPopupBuf(src);
-      CompositeSoftwareLocked(nullptr);  // popup over the latest view in g_surface
+      CompositeSoftwareLocked(nullptr);  // popup over latest view in slot->surface
       return;
     }
     CompositeSoftwareLocked(src);  // GPU-composited view (+ any open popup)
@@ -511,8 +594,11 @@ class HostRenderHandler : public CefRenderHandler {
     WriteU32BE(p + 4, static_cast<uint32_t>(std::max(0, r.y)));
     WriteU32BE(p + 8, static_cast<uint32_t>(std::max(0, r.width)));
     WriteU32BE(p + 12, static_cast<uint32_t>(std::max(0, r.height)));
-    SendFrame(kOpImeBounds, p, 16);
+    SendFrame(slot_->browser_id, kOpImeBounds, p, 16);
   }
+
+ private:
+  std::shared_ptr<Slot> slot_;
 
   IMPLEMENT_REFCOUNTING(HostRenderHandler);
 };
@@ -527,13 +613,14 @@ class HostClient : public CefClient,
                    public CefRequestHandler,
                    public CefMessageRouterBrowserSide::Handler {
  public:
-  HostClient() {
+  explicit HostClient(std::shared_ptr<Slot> slot) : slot_(std::move(slot)) {
     CefMessageRouterConfig config;  // default: window.cefQuery / cefQueryCancel
     router_ = CefMessageRouterBrowserSide::Create(config);
     router_->AddHandler(this, false);
+    rh_ = new HostRenderHandler(slot_);
   }
   CefRefPtr<CefMessageRouterBrowserSide> router_;
-  CefRefPtr<CefRenderHandler> rh_ = new HostRenderHandler();
+  CefRefPtr<CefRenderHandler> rh_;
   CefRefPtr<CefRenderHandler> GetRenderHandler() override { return rh_; }
   CefRefPtr<CefLoadHandler> GetLoadHandler() override { return this; }
   CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
@@ -549,7 +636,7 @@ class HostClient : public CefClient,
   bool OnBeforeDownload(CefRefPtr<CefBrowser>, CefRefPtr<CefDownloadItem>,
                         const CefString& suggested_name,
                         CefRefPtr<CefBeforeDownloadCallback> callback) override {
-    SendUtf8(kOpDownload, suggested_name.ToString());
+    SendUtf8(slot_->browser_id, kOpDownload, suggested_name.ToString());
     callback->Continue(CefString(), true);
     return true;
   }
@@ -569,7 +656,7 @@ class HostClient : public CefClient,
                     static_cast<uint8_t>((a >> 8) & 0xff),
                     static_cast<uint8_t>(a & 0xff),
                     static_cast<uint8_t>(finalUpdate ? 1 : 0)};
-    SendFrame(kOpFindResult, p, 9);
+    SendFrame(slot_->browser_id, kOpFindResult, p, 9);
   }
 
   // CefJSDialogHandler: forward alert/confirm/prompt to the host, which shows a
@@ -579,8 +666,8 @@ class HostClient : public CefClient,
                   const CefString& default_prompt_text,
                   CefRefPtr<CefJSDialogCallback> callback,
                   bool& /*suppress_message*/) override {
-    uint32_t id = g_dialog_next++;
-    g_dialogs[id] = callback;
+    uint32_t id = slot_->dialog_next++;
+    slot_->dialogs[id] = callback;
     uint32_t type = dialog_type == JSDIALOGTYPE_ALERT
                         ? 0
                         : (dialog_type == JSDIALOGTYPE_CONFIRM ? 1 : 2);
@@ -595,7 +682,8 @@ class HostClient : public CefClient,
     }
     memcpy(p.data() + 12, msg.data(), msg.size());
     memcpy(p.data() + 12 + msg.size(), def.data(), def.size());
-    SendFrame(kOpJsDialog, p.data(), static_cast<uint32_t>(p.size()));
+    SendFrame(slot_->browser_id, kOpJsDialog, p.data(),
+              static_cast<uint32_t>(p.size()));
     return true;  // we answer asynchronously via Continue()
   }
   bool OnBeforeUnloadDialog(CefRefPtr<CefBrowser>, const CefString&, bool,
@@ -607,7 +695,9 @@ class HostClient : public CefClient,
   // CEF calls this when a pending dialog is dismissed by navigation / reload /
   // renderer death. Drop any held callbacks so they don't leak (the host may
   // never send a response for a dialog the page already abandoned).
-  void OnResetDialogState(CefRefPtr<CefBrowser>) override { g_dialogs.clear(); }
+  void OnResetDialogState(CefRefPtr<CefBrowser>) override {
+    slot_->dialogs.clear();
+  }
 
   // Recover from a renderer crash (multi-process only): reload rather than show
   // a dead page. In single-process a renderer CHECK kills the whole process, so
@@ -615,8 +705,8 @@ class HostClient : public CefClient,
   void OnRenderProcessTerminated(CefRefPtr<CefBrowser> browser,
                                  TerminationStatus status, int /*error_code*/,
                                  const CefString& /*error_string*/) override {
-    SendLog("renderer terminated (status " + std::to_string(status) +
-            ") — reloading");
+    SendLog(slot_->browser_id, "renderer terminated (status " +
+                                   std::to_string(status) + ") — reloading");
     if (router_) router_->OnRenderProcessTerminated(browser);
     if (browser) browser->ReloadIgnoreCache();
   }
@@ -624,40 +714,42 @@ class HostClient : public CefClient,
   // CefLoadHandler: spinner + back/forward enablement.
   void OnLoadingStateChange(CefRefPtr<CefBrowser>, bool isLoading,
                             bool canGoBack, bool canGoForward) override {
-    SendLoadState(isLoading, canGoBack, canGoForward);
+    SendLoadState(slot_->browser_id, isLoading, canGoBack, canGoForward);
   }
   void OnLoadStart(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
                    TransitionType) override {
     if (!frame) return;
     if (frame->IsMain())
-      SendUtf8(kOpPageStart, frame->GetURL().ToString());
+      SendUtf8(slot_->browser_id, kOpPageStart, frame->GetURL().ToString());
     // (Re)install JS-channel shims for this freshly-loaded frame.
     for (const auto& name : g_channels) InjectChannelShim(frame, name);
   }
   void OnLoadEnd(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
                  int /*httpStatusCode*/) override {
     if (frame && frame->IsMain())
-      SendUtf8(kOpPageFinish, frame->GetURL().ToString());
+      SendUtf8(slot_->browser_id, kOpPageFinish, frame->GetURL().ToString());
   }
   void OnLoadError(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, ErrorCode code,
                    const CefString& text, const CefString& url) override {
     if (code == ERR_ABORTED) return;
-    SendCodePlusUtf8(kOpLoadErr, static_cast<uint32_t>(code),
+    SendCodePlusUtf8(slot_->browser_id, kOpLoadErr, static_cast<uint32_t>(code),
                      url.ToString() + "\n" + text.ToString());
   }
 
   // CefDisplayHandler: title / address / console -> host.
   void OnTitleChange(CefRefPtr<CefBrowser>, const CefString& title) override {
-    SendUtf8(kOpTitle, title.ToString());
+    SendUtf8(slot_->browser_id, kOpTitle, title.ToString());
   }
   void OnAddressChange(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
                        const CefString& url) override {
-    if (frame && frame->IsMain()) SendUtf8(kOpUrl, url.ToString());
+    if (frame && frame->IsMain())
+      SendUtf8(slot_->browser_id, kOpUrl, url.ToString());
   }
   bool OnConsoleMessage(CefRefPtr<CefBrowser>, cef_log_severity_t level,
                         const CefString& message, const CefString& source,
                         int line) override {
-    SendCodePlusUtf8(kOpConsole, static_cast<uint32_t>(level),
+    SendCodePlusUtf8(slot_->browser_id, kOpConsole,
+                     static_cast<uint32_t>(level),
                      source.ToString() + ":" + std::to_string(line) + "\t" +
                          message.ToString());
     return false;  // also keep CEF's default console logging
@@ -668,7 +760,7 @@ class HostClient : public CefClient,
                     static_cast<uint8_t>((pct >> 16) & 0xff),
                     static_cast<uint8_t>((pct >> 8) & 0xff),
                     static_cast<uint8_t>(pct & 0xff)};
-    SendFrame(kOpProgress, p, 4);
+    SendFrame(slot_->browser_id, kOpProgress, p, 4);
   }
 
   // CefLifeSpanHandler: route popups (window.open / target=_blank) to the host
@@ -681,7 +773,8 @@ class HostClient : public CefClient,
                      WindowOpenDisposition, bool, const CefPopupFeatures&,
                      CefWindowInfo&, CefRefPtr<CefClient>&, CefBrowserSettings&,
                      CefRefPtr<CefDictionaryValue>&, bool*) override {
-    if (!target_url.empty()) SendUtf8(kOpNewWindow, target_url.ToString());
+    if (!target_url.empty())
+      SendUtf8(slot_->browser_id, kOpNewWindow, target_url.ToString());
     return true;
   }
 
@@ -695,7 +788,7 @@ class HostClient : public CefClient,
     p[1] = (t >> 16) & 0xff;
     p[2] = (t >> 8) & 0xff;
     p[3] = t & 0xff;
-    SendFrame(kOpCursor, p, 4);
+    SendFrame(slot_->browser_id, kOpCursor, p, 4);
     return true;
   }
 
@@ -708,12 +801,12 @@ class HostClient : public CefClient,
                CefRefPtr<Callback> callback) override {
     std::string r = request.ToString();
     if (r.rfind("eval:", 0) == 0) {
-      SendUtf8(kOpEvalResult, r.substr(5));
+      SendUtf8(slot_->browser_id, kOpEvalResult, r.substr(5));
       callback->Success(CefString());
       return true;
     }
     if (r.rfind("ch:", 0) == 0) {
-      SendUtf8(kOpChannelMsg, r.substr(3));
+      SendUtf8(slot_->browser_id, kOpChannelMsg, r.substr(3));
       callback->Success(CefString());
       return true;
     }
@@ -726,8 +819,28 @@ class HostClient : public CefClient,
     return router_->OnProcessMessageReceived(browser, frame, source_process,
                                              message);
   }
+  // Centralized per-browser teardown (CEF UI thread). CloseBrowser(true) — sent
+  // by DoDisposeBrowser or DoShutdown — lands here. Drop the routing-map entries
+  // (so no inbound op or paint can find this slot again), release the host
+  // IOSurface under the slot's lock (nulling it FIRST so a GPU-thread paint
+  // racing this teardown sees null and no-ops, then CFRelease the old surface),
+  // and break the HostClient -> Slot -> CefBrowser -> HostClient retain cycle by
+  // nulling slot_->browser. The last shared_ptr<Slot> drops once any in-flight
+  // paint refs (which copied the shared_ptr) drain.
   void OnBeforeClose(CefRefPtr<CefBrowser> browser) override {
     if (router_) router_->OnBeforeClose(browser);
+    {
+      std::lock_guard<std::mutex> lock(g_slots_mutex);
+      if (browser) g_slots_by_cef_id.erase(browser->GetIdentifier());
+      g_slots_by_wire_id.erase(slot_->browser_id);
+    }
+    {
+      std::lock_guard<std::mutex> lock(slot_->surface_mutex);
+      IOSurfaceRef old = slot_->surface;
+      slot_->surface = nullptr;
+      if (old) CFRelease(old);
+    }
+    slot_->browser = nullptr;
   }
   bool OnBeforeBrowse(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame,
                       CefRefPtr<CefRequest> request, bool, bool) override {
@@ -745,9 +858,9 @@ class HostClient : public CefClient,
       // trusted load carries a different URL and so remains gated.
       bool host_trusted = false;
       if (main_frame) {
-        auto it = g_trusted_pending.find(url);
-        if (it != g_trusted_pending.end()) {
-          g_trusted_pending.erase(it);
+        auto it = slot_->trusted_pending.find(url);
+        if (it != slot_->trusted_pending.end()) {
+          slot_->trusted_pending.erase(it);
           host_trusted = true;
         }
       }
@@ -768,10 +881,12 @@ class HostClient : public CefClient,
     return false;  // allow
   }
 
+ private:
+  std::shared_ptr<Slot> slot_;
+
   IMPLEMENT_REFCOUNTING(HostClient);
 };
 
-std::string g_initial_url;
 // The CDP port for this session (0 = CDP disabled). Set from --cdp-port before
 // CefInitialize; read in OnBeforeCommandLineProcessing to allow CDP WebSocket
 // origins (Chromium M113+ rejects them by default).
@@ -832,60 +947,115 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
       command_line->AppendSwitchWithValue("remote-allow-origins", "*");
     }
   }
+  // No browser is created here. We only announce readiness; the host then drives
+  // browser creation on demand via kOpCreateBrowser (one per CefWebView sharing
+  // this profile). Nothing loads — and nothing is written to the profile cache —
+  // until the first kOpCreateBrowser, which is the safety window the host uses to
+  // refuse a persistent profile under a mock-keychain (ad-hoc) build (F.5). The
+  // readyFlags byte tells the host whether this is an ad-hoc build (bit0).
   void OnContextInitialized() override {
     CEF_REQUIRE_UI_THREAD();
     if (std::getenv("FLUTTER_CEF_DEBUG"))
       fprintf(stderr, "[cef_host] OnContextInitialized\n");
-    CefWindowInfo window_info;
-    window_info.SetAsWindowless(0);
-#ifdef CEF_HOST_MULTIPROCESS
-    // Multi-process GPU OSR: the GPU/Viz process composites on the GPU and hands
-    // the frame to OnAcceleratedPaint as a shared IOSurface, which we copy into
-    // the host surface. This used to be gated by -67030 (process_requirement.cc
-    // peer validation of this process's ad-hoc signature), but disabling the
-    // MachPortRendezvous*PeerRequirements features above clears it — so the
-    // GPU-accelerated path runs multi-process (crash-isolated) without
-    // Developer-ID signing. (The software OnPaint path remains the fallback if a
-    // build leaves shared_texture_enabled off.)
-    window_info.shared_texture_enabled = true;
+    uint8_t ready_flags = 0;
+#ifdef CEF_HOST_ADHOC
+    ready_flags |= 0x01;  // bit0 = ad-hoc / mock-keychain build
 #endif
-    CefBrowserSettings settings;
-    settings.windowless_frame_rate = 60;
-    g_browser = CefBrowserHost::CreateBrowserSync(
-        window_info, new HostClient(), g_initial_url, settings, nullptr,
-        nullptr);
-    if (std::getenv("FLUTTER_CEF_DEBUG"))
-      fprintf(stderr, "[cef_host] browser=%p\n", (void*)g_browser.get());
-    SendFrame(kOpReady, nullptr, 0);
+    SendFrame(/*browser_id=*/0, kOpReady, &ready_flags, 1);
   }
   IMPLEMENT_REFCOUNTING(HostApp);
 };
 
 // ---- CEF-thread task helpers (IPC reader runs off the UI thread) ----
-void DoResize(int w, int h, uint32_t surface_id) {
+
+// Create a windowless browser for a CefWebView (kOpCreateBrowser). Runs on the
+// CEF UI thread. wire_id is the Swift-assigned browser id this slot is keyed by;
+// sid is the host's IOSurface for this view (0 / lookup-failure -> no surface
+// until the first resize). Builds the Slot, registers it in both routing maps,
+// and creates the CEF browser bound to a HostClient that holds the slot.
+void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr, uint32_t sid,
+                     std::string url) {
+  CEF_REQUIRE_UI_THREAD();
+  auto slot = std::make_shared<Slot>();
+  slot->browser_id = wire_id;
+  slot->width = w < 1 ? 1 : w;
+  slot->height = h < 1 ? 1 : h;
+  slot->dpr = dpr;
+  if (sid) {
+    slot->surface = IOSurfaceLookup(sid);  // owns the +1 from Lookup
+    if (!slot->surface)
+      SendLog(wire_id, "createBrowser: IOSurfaceLookup failed for id " +
+                           std::to_string(sid));
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_slots_mutex);
+    g_slots_by_wire_id[wire_id] = slot;
+  }
+  CefWindowInfo window_info;
+  window_info.SetAsWindowless(0);
+#ifdef CEF_HOST_MULTIPROCESS
+  // Multi-process GPU OSR: the GPU/Viz process composites on the GPU and hands
+  // the frame to OnAcceleratedPaint as a shared IOSurface, which we copy into
+  // the host surface. This used to be gated by -67030 (process_requirement.cc
+  // peer validation of this process's ad-hoc signature), but disabling the
+  // MachPortRendezvous*PeerRequirements features above clears it — so the
+  // GPU-accelerated path runs multi-process (crash-isolated) without
+  // Developer-ID signing. (The software OnPaint path remains the fallback if a
+  // build leaves shared_texture_enabled off.) All browsers in this process share
+  // one GPU/Viz process; set per-create, it resolves to that same process (the
+  // second+ browser attaching cleanly is the one multiplex behavior to confirm
+  // at runtime under a signed build — see CONTRACT H.6).
+  window_info.shared_texture_enabled = true;
+#endif
+  CefBrowserSettings settings;
+  settings.windowless_frame_rate = 60;
+  CefRefPtr<HostClient> client = new HostClient(slot);
+  CefRefPtr<CefBrowser> browser = CefBrowserHost::CreateBrowserSync(
+      window_info, client, url, settings, nullptr, nullptr);
+  slot->browser = browser;
+  if (browser) {
+    std::lock_guard<std::mutex> lock(g_slots_mutex);
+    g_slots_by_cef_id[browser->GetIdentifier()] = slot;
+  }
+  if (std::getenv("FLUTTER_CEF_DEBUG"))
+    fprintf(stderr, "[cef_host] createBrowser wire=%u browser=%p\n", wire_id,
+            (void*)browser.get());
+}
+
+// Close one browser (kOpDisposeBrowser). Runs on the CEF UI thread. The actual
+// map-erase + surface release happen in OnBeforeClose once CEF finishes closing.
+void DoDisposeBrowser(uint32_t wire_id) {
+  CEF_REQUIRE_UI_THREAD();
+  std::shared_ptr<Slot> slot = LookupWireId(wire_id);
+  if (slot && slot->browser) slot->browser->GetHost()->CloseBrowser(true);
+}
+
+void DoResize(const std::shared_ptr<Slot>& slot, int w, int h,
+              uint32_t surface_id) {
   if (w < 1 || w > 16384 || h < 1 || h > 16384) {
-    SendLog("resize: out-of-range dims " + std::to_string(w) + "x" +
-            std::to_string(h));
+    SendLog(slot->browser_id, "resize: out-of-range dims " + std::to_string(w) +
+                                  "x" + std::to_string(h));
     return;
   }
   IOSurfaceRef next = IOSurfaceLookup(surface_id);
   if (!next) {
-    SendLog("resize: IOSurfaceLookup failed for id " + std::to_string(surface_id));
+    SendLog(slot->browser_id,
+            "resize: IOSurfaceLookup failed for id " + std::to_string(surface_id));
     return;
   }
   {
-    std::lock_guard<std::mutex> lock(g_surface_mutex);
-    if (g_surface) CFRelease(g_surface);
-    g_surface = next;  // owns the +1 from Lookup
-    g_width = w;
-    g_height = h;
+    std::lock_guard<std::mutex> lock(slot->surface_mutex);
+    if (slot->surface) CFRelease(slot->surface);
+    slot->surface = next;  // owns the +1 from Lookup
+    slot->width = w;
+    slot->height = h;
   }
-  if (g_browser) g_browser->GetHost()->WasResized();
+  if (slot->browser) slot->browser->GetHost()->WasResized();
 }
 
-void DoNavigate(const std::string& url) {
-  if (!g_browser) return;
-  CefRefPtr<CefFrame> f = g_browser->GetMainFrame();
+void DoNavigate(const std::shared_ptr<Slot>& slot, const std::string& url) {
+  if (!slot->browser) return;
+  CefRefPtr<CefFrame> f = slot->browser->GetMainFrame();
   if (f) f->LoadURL(url);
 }
 
@@ -896,55 +1066,58 @@ void DoNavigate(const std::string& url) {
 // g_allowed_schemes is immutable after startup, so when the feature is off this
 // is a plain navigate and we don't accumulate unconsumed entries. Trusted
 // because the host explicitly chose this content, not the page.
-void DoNavigateTrusted(const std::string& url) {
-  if (!g_allowed_schemes.empty()) g_trusted_pending.insert(url);
-  DoNavigate(url);
+void DoNavigateTrusted(const std::shared_ptr<Slot>& slot,
+                       const std::string& url) {
+  if (!g_allowed_schemes.empty()) slot->trusted_pending.insert(url);
+  DoNavigate(slot, url);
 }
 
-void DoReload() {
-  if (g_browser) g_browser->Reload();
+void DoReload(const std::shared_ptr<Slot>& slot) {
+  if (slot->browser) slot->browser->Reload();
 }
-void DoStopLoad() {
-  if (g_browser) g_browser->StopLoad();
+void DoStopLoad(const std::shared_ptr<Slot>& slot) {
+  if (slot->browser) slot->browser->StopLoad();
 }
-void DoGoBack() {
-  if (g_browser) g_browser->GoBack();
+void DoGoBack(const std::shared_ptr<Slot>& slot) {
+  if (slot->browser) slot->browser->GoBack();
 }
-void DoGoForward() {
-  if (g_browser) g_browser->GoForward();
+void DoGoForward(const std::shared_ptr<Slot>& slot) {
+  if (slot->browser) slot->browser->GoForward();
 }
-void DoExecuteJs(const std::string& code) {
-  if (!g_browser) return;
-  CefRefPtr<CefFrame> f = g_browser->GetMainFrame();
+void DoExecuteJs(const std::shared_ptr<Slot>& slot, const std::string& code) {
+  if (!slot->browser) return;
+  CefRefPtr<CefFrame> f = slot->browser->GetMainFrame();
   if (f) f->ExecuteJavaScript(code, "", 0);
 }
-void DoSetZoom(double level) {
-  if (g_browser) g_browser->GetHost()->SetZoomLevel(level);
+void DoSetZoom(const std::shared_ptr<Slot>& slot, double level) {
+  if (slot->browser) slot->browser->GetHost()->SetZoomLevel(level);
 }
 // Off-screen render gating. WasHidden(true) makes CEF stop producing frames
 // (no OnPaint, the compositor idles) until WasHidden(false); the browser stays
 // alive, so this is a cheap pause/resume — not a teardown. The host pauses a
 // tile that scrolls fully out of the canvas viewport and resumes it on return.
-void DoSetVisible(bool visible) {
-  if (g_browser) g_browser->GetHost()->WasHidden(!visible);
+void DoSetVisible(const std::shared_ptr<Slot>& slot, bool visible) {
+  if (slot->browser) slot->browser->GetHost()->WasHidden(!visible);
 }
-void DoFind(const std::string& text, bool forward, bool match_case,
-            bool find_next) {
-  if (g_browser)
-    g_browser->GetHost()->Find(text, forward, match_case, find_next);
+void DoFind(const std::shared_ptr<Slot>& slot, const std::string& text,
+            bool forward, bool match_case, bool find_next) {
+  if (slot->browser)
+    slot->browser->GetHost()->Find(text, forward, match_case, find_next);
 }
-void DoStopFind(bool clear_selection) {
-  if (g_browser) g_browser->GetHost()->StopFinding(clear_selection);
+void DoStopFind(const std::shared_ptr<Slot>& slot, bool clear_selection) {
+  if (slot->browser) slot->browser->GetHost()->StopFinding(clear_selection);
 }
-void DoJsDialogResp(uint32_t id, bool ok, const std::string& text) {
-  auto it = g_dialogs.find(id);
-  if (it == g_dialogs.end()) return;
+void DoJsDialogResp(const std::shared_ptr<Slot>& slot, uint32_t id, bool ok,
+                    const std::string& text) {
+  auto it = slot->dialogs.find(id);
+  if (it == slot->dialogs.end()) return;
   it->second->Continue(ok, text);
-  g_dialogs.erase(it);
+  slot->dialogs.erase(it);
 }
-void DoEvalReturning(uint32_t id, const std::string& code) {
-  if (!g_browser) return;
-  CefRefPtr<CefFrame> frame = g_browser->GetMainFrame();
+void DoEvalReturning(const std::shared_ptr<Slot>& slot, uint32_t id,
+                     const std::string& code) {
+  if (!slot->browser) return;
+  CefRefPtr<CefFrame> frame = slot->browser->GetMainFrame();
   if (!frame) return;
   // Evaluate the user expression and post its JSON result back via window.cefQuery
   // (OnQuery -> kOpEvalResult). `code` is the trusted host's JS (same trust level
@@ -959,18 +1132,22 @@ void DoEvalReturning(uint32_t id, const std::string& code) {
       "persistent:false,onSuccess:function(){},onFailure:function(){}});";
   frame->ExecuteJavaScript(js, "", 0);
 }
-void DoAddChannel(const std::string& name) {
+void DoAddChannel(const std::shared_ptr<Slot>& slot, const std::string& name) {
   if (!IsValidChannelName(name)) {
-    SendLog("addJavaScriptChannel: rejected invalid name '" + name +
-            "' (must be a JS identifier)");
+    SendLog(slot->browser_id, "addJavaScriptChannel: rejected invalid name '" +
+                                  name + "' (must be a JS identifier)");
     return;
   }
   g_channels.insert(name);
-  if (g_browser) InjectChannelShim(g_browser->GetMainFrame(), name);
+  if (slot->browser) InjectChannelShim(slot->browser->GetMainFrame(), name);
 }
-void DoSetCookie(const std::string& url, const std::string& name,
-                 const std::string& value, const std::string& domain,
-                 const std::string& path) {
+// Cookie ops act on the GLOBAL cookie manager (= the shared profile jar), so a
+// login in one browser is visible to every browser sharing this profile. They
+// take `slot` only to stamp the reply browserId / route a log. Note clear/delete
+// affect the WHOLE shared jar by design (the contract's kOpClearCookies semantics).
+void DoSetCookie(const std::shared_ptr<Slot>& slot, const std::string& url,
+                 const std::string& name, const std::string& value,
+                 const std::string& domain, const std::string& path) {
   CefRefPtr<CefCookieManager> mgr = CefCookieManager::GetGlobalManager(nullptr);
   if (!mgr) return;
   CefCookie cookie;
@@ -980,10 +1157,12 @@ void DoSetCookie(const std::string& url, const std::string& name,
   CefString(&cookie.path).FromString(path.empty() ? "/" : path);
   cookie.has_expires = false;
   if (!mgr->SetCookie(url, cookie, nullptr)) {
-    SendLog("setCookie rejected for " + url + " (name '" + name + "')");
+    SendLog(slot->browser_id,
+            "setCookie rejected for " + url + " (name '" + name + "')");
   }
 }
-void DoClearCookies() {
+void DoClearCookies(const std::shared_ptr<Slot>& slot) {
+  (void)slot;  // shared jar; slot unused beyond routing the op here
   CefRefPtr<CefCookieManager> mgr = CefCookieManager::GetGlobalManager(nullptr);
   if (mgr) mgr->DeleteCookies(CefString(), CefString(), nullptr);
 }
@@ -1027,26 +1206,32 @@ std::string CookieToJson(const CefCookie& c) {
 // 0-cookie case (Visit never called) still replies (godot-cef does the same).
 class HostCookieVisitor : public CefCookieVisitor {
  public:
-  explicit HostCookieVisitor(uint32_t id) : id_(id) {}
+  HostCookieVisitor(uint32_t browser_id, uint32_t id)
+      : browser_id_(browser_id), id_(id) {}
   bool Visit(const CefCookie& cookie, int, int, bool&) override {
     if (!json_.empty()) json_ += ",";
     json_ += CookieToJson(cookie);
     return true;
   }
   ~HostCookieVisitor() override {
-    SendCodePlusUtf8(kOpCookies, id_, "[" + json_ + "]");
+    // Stamp the reply with the browser that asked, so the host routes the
+    // kOpCookies result back to the right CefWebSession.
+    SendCodePlusUtf8(browser_id_, kOpCookies, id_, "[" + json_ + "]");
   }
 
  private:
+  uint32_t browser_id_;
   uint32_t id_;
   std::string json_;
   IMPLEMENT_REFCOUNTING(HostCookieVisitor);
 };
 
-void DoVisitCookies(uint32_t id, const std::string& url) {
+void DoVisitCookies(const std::shared_ptr<Slot>& slot, uint32_t id,
+                    const std::string& url) {
   CefRefPtr<CefCookieManager> mgr = CefCookieManager::GetGlobalManager(nullptr);
   // The visitor replies on destruction; a null manager just yields [].
-  CefRefPtr<HostCookieVisitor> visitor = new HostCookieVisitor(id);
+  CefRefPtr<HostCookieVisitor> visitor =
+      new HostCookieVisitor(slot->browser_id, id);
   if (!mgr) return;
   if (url.empty()) {
     mgr->VisitAllCookies(visitor);
@@ -1055,21 +1240,25 @@ void DoVisitCookies(uint32_t id, const std::string& url) {
   }
 }
 
-void DoDeleteCookie(const std::string& url, const std::string& name) {
+void DoDeleteCookie(const std::shared_ptr<Slot>& slot, const std::string& url,
+                    const std::string& name) {
+  (void)slot;  // shared jar; slot unused beyond routing the op here
   CefRefPtr<CefCookieManager> mgr = CefCookieManager::GetGlobalManager(nullptr);
   if (mgr) mgr->DeleteCookies(url, name, nullptr);
 }
 
-void DoShowDevTools() {
-  if (!g_browser) return;
+void DoShowDevTools(const std::shared_ptr<Slot>& slot) {
+  if (!slot->browser) return;
   // Windowed DevTools (default CefWindowInfo is windowed) — the OSR host can
   // still host a real window. null client lets CEF manage it.
   CefWindowInfo window_info;
   CefBrowserSettings settings;
-  g_browser->GetHost()->ShowDevTools(window_info, nullptr, settings, CefPoint());
+  slot->browser->GetHost()->ShowDevTools(window_info, nullptr, settings,
+                                         CefPoint());
 }
-void DoImeSetComposition(const std::string& text) {
-  if (!g_browser) return;
+void DoImeSetComposition(const std::shared_ptr<Slot>& slot,
+                         const std::string& text) {
+  if (!slot->browser) return;
   CefString t(text);
   uint32_t len = static_cast<uint32_t>(t.length());
   // Mark the whole composition with a single underline so the in-progress text
@@ -1085,27 +1274,29 @@ void DoImeSetComposition(const std::string& text) {
     u.style = CEF_CUS_SOLID;
     underlines.push_back(u);
   }
-  g_browser->GetHost()->ImeSetComposition(t, underlines,
-                                          CefRange::InvalidRange(),
-                                          CefRange(len, len));
+  slot->browser->GetHost()->ImeSetComposition(t, underlines,
+                                              CefRange::InvalidRange(),
+                                              CefRange(len, len));
 }
-void DoImeCommitText(const std::string& text) {
-  if (g_browser)
-    g_browser->GetHost()->ImeCommitText(text, CefRange::InvalidRange(), 0);
+void DoImeCommitText(const std::shared_ptr<Slot>& slot,
+                     const std::string& text) {
+  if (slot->browser)
+    slot->browser->GetHost()->ImeCommitText(text, CefRange::InvalidRange(), 0);
 }
-void DoImeCancel() {
-  if (g_browser) g_browser->GetHost()->ImeCancelComposition();
+void DoImeCancel(const std::shared_ptr<Slot>& slot) {
+  if (slot->browser) slot->browser->GetHost()->ImeCancelComposition();
 }
 
 // type: 0=move 1=down 2=up 3=wheel; button: 0=left 1=middle 2=right.
-void DoPointer(int type, int button, int click_count, uint32_t modifiers,
-               double x, double y, double dx, double dy) {
-  if (!g_browser) return;
+void DoPointer(const std::shared_ptr<Slot>& slot, int type, int button,
+               int click_count, uint32_t modifiers, double x, double y,
+               double dx, double dy) {
+  if (!slot->browser) return;
   CefMouseEvent ev;
   ev.x = static_cast<int>(x);
   ev.y = static_cast<int>(y);
   ev.modifiers = modifiers;
-  CefRefPtr<CefBrowserHost> host = g_browser->GetHost();
+  CefRefPtr<CefBrowserHost> host = slot->browser->GetHost();
   switch (type) {
     case 0:
       host->SendMouseMoveEvent(ev, false);
@@ -1134,9 +1325,10 @@ void DoPointer(int type, int button, int click_count, uint32_t modifiers,
 }
 
 // type: 0=rawkeydown 2=keyup 3=char (cef_key_event_type_t).
-void DoKey(int type, uint32_t modifiers, int32_t windows_key_code,
-           int32_t native_key_code, uint32_t character) {
-  if (!g_browser) return;
+void DoKey(const std::shared_ptr<Slot>& slot, int type, uint32_t modifiers,
+           int32_t windows_key_code, int32_t native_key_code,
+           uint32_t character) {
+  if (!slot->browser) return;
   CefKeyEvent ev;
   ev.type = static_cast<cef_key_event_type_t>(type);
   ev.modifiers = modifiers;
@@ -1149,13 +1341,22 @@ void DoKey(int type, uint32_t modifiers, int32_t windows_key_code,
   // text rides the IME ImeCommitText path, and a raw keydown inserts nothing.
   ev.character = static_cast<char16_t>(character);
   ev.unmodified_character = static_cast<char16_t>(character);
-  g_browser->GetHost()->SendKeyEvent(ev);
+  slot->browser->GetHost()->SendKeyEvent(ev);
 }
 
+// Tear down the WHOLE process: close every browser, then quit the message loop.
+// Each browser's per-slot cleanup (maps, surface, retain-cycle break) runs in
+// OnBeforeClose as CEF processes the CloseBrowser(true). Sent when the host
+// disposes the last browser, on socket loss, or on parent death.
 void DoShutdown() {
-  if (g_browser) {
-    g_browser->GetHost()->CloseBrowser(true);
-    g_browser = nullptr;
+  std::vector<std::shared_ptr<Slot>> slots;
+  {
+    std::lock_guard<std::mutex> lock(g_slots_mutex);
+    slots.reserve(g_slots_by_wire_id.size());
+    for (auto& kv : g_slots_by_wire_id) slots.push_back(kv.second);
+  }
+  for (auto& slot : slots) {
+    if (slot->browser) slot->browser->GetHost()->CloseBrowser(true);
   }
   CefQuitMessageLoop();
 }
@@ -1166,91 +1367,134 @@ void IpcReadLoop() {
     uint8_t hdr[4];
     if (!ReadAll(g_ipc_fd, hdr, 4)) break;
     uint32_t body_len = ReadU32BE(hdr);
-    if (body_len == 0 || body_len > (64u << 20)) break;
+    // Minimum valid body is 5 bytes (4 browserId + 1 op + 0 payload).
+    if (body_len < 5 || body_len > (64u << 20)) break;
     std::vector<uint8_t> body(body_len);
     if (!ReadAll(g_ipc_fd, body.data(), body_len)) break;
-    uint8_t opcode = body[0];
-    const uint8_t* p = body.data() + 1;
-    uint32_t plen = body_len - 1;
+    uint32_t wire_id = ReadU32BE(body.data());
+    uint8_t opcode = body[4];
+    const uint8_t* p = body.data() + 5;
+    uint32_t plen = body_len - 5;
+    // Resolve the target browser once. null for wire id 0 (process-level) or an
+    // unknown/disposed id. Per-browser ops bind this shared_ptr into their UI
+    // task, so the slot stays alive even if a dispose lands while the task is
+    // queued (closes the dispose/in-flight race). Control ops handle slot==null.
+    std::shared_ptr<Slot> slot = LookupWireId(wire_id);
     switch (opcode) {
+      case kOpCreateBrowser: {
+        if (plen < 20) break;  // {u32 w}{u32 h}{f64 dpr}{u32 sid}{utf8 url}
+        int w = static_cast<int>(ReadU32BE(p));
+        int h = static_cast<int>(ReadU32BE(p + 4));
+        double dpr = ReadF64BE(p + 8);
+        if (dpr <= 0.0 || dpr > 8.0) dpr = 1.0;  // guard a bad/forged dpr
+        uint32_t sid = ReadU32BE(p + 16);
+        std::string url(reinterpret_cast<const char*>(p + 20), plen - 20);
+        if (url.empty()) url = "about:blank";
+        CefPostTask(TID_UI, base::BindOnce(&DoCreateBrowser, wire_id, w, h, dpr,
+                                           sid, url));
+        break;
+      }
+      case kOpDisposeBrowser:
+        if (slot)
+          CefPostTask(TID_UI, base::BindOnce(&DoDisposeBrowser, wire_id));
+        break;
+      case kOpShutdown:
+        CefPostTask(TID_UI, base::BindOnce(&DoShutdown));
+        return;
       case kOpResize: {
+        if (!slot) break;
         if (plen < 12) break;
         int w = static_cast<int>(ReadU32BE(p));
         int h = static_cast<int>(ReadU32BE(p + 4));
         uint32_t sid = ReadU32BE(p + 8);
-        CefPostTask(TID_UI, base::BindOnce(&DoResize, w, h, sid));
+        CefPostTask(TID_UI, base::BindOnce(&DoResize, slot, w, h, sid));
         break;
       }
       case kOpNavigate: {
+        if (!slot) break;
         std::string url(reinterpret_cast<const char*>(p), plen);
-        CefPostTask(TID_UI, base::BindOnce(&DoNavigate, url));
+        CefPostTask(TID_UI, base::BindOnce(&DoNavigate, slot, url));
         break;
       }
       case kOpLoadTrusted: {
+        if (!slot) break;
         std::string url(reinterpret_cast<const char*>(p), plen);
-        CefPostTask(TID_UI, base::BindOnce(&DoNavigateTrusted, url));
+        CefPostTask(TID_UI, base::BindOnce(&DoNavigateTrusted, slot, url));
         break;
       }
       case kOpReload:
-        CefPostTask(TID_UI, base::BindOnce(&DoReload));
+        if (!slot) break;
+        CefPostTask(TID_UI, base::BindOnce(&DoReload, slot));
         break;
       case kOpStop:
-        CefPostTask(TID_UI, base::BindOnce(&DoStopLoad));
+        if (!slot) break;
+        CefPostTask(TID_UI, base::BindOnce(&DoStopLoad, slot));
         break;
       case kOpBack:
-        CefPostTask(TID_UI, base::BindOnce(&DoGoBack));
+        if (!slot) break;
+        CefPostTask(TID_UI, base::BindOnce(&DoGoBack, slot));
         break;
       case kOpForward:
-        CefPostTask(TID_UI, base::BindOnce(&DoGoForward));
+        if (!slot) break;
+        CefPostTask(TID_UI, base::BindOnce(&DoGoForward, slot));
         break;
       case kOpExecuteJs: {
+        if (!slot) break;
         std::string code(reinterpret_cast<const char*>(p), plen);
-        CefPostTask(TID_UI, base::BindOnce(&DoExecuteJs, code));
+        CefPostTask(TID_UI, base::BindOnce(&DoExecuteJs, slot, code));
         break;
       }
       case kOpSetZoom: {
+        if (!slot) break;
         if (plen < 8) break;
-        CefPostTask(TID_UI, base::BindOnce(&DoSetZoom, ReadF64BE(p)));
+        CefPostTask(TID_UI, base::BindOnce(&DoSetZoom, slot, ReadF64BE(p)));
         break;
       }
       case kOpSetVisible: {
+        if (!slot) break;
         bool vis = plen >= 1 ? p[0] != 0 : true;
-        CefPostTask(TID_UI, base::BindOnce(&DoSetVisible, vis));
+        CefPostTask(TID_UI, base::BindOnce(&DoSetVisible, slot, vis));
         break;
       }
       case kOpFind: {
+        if (!slot) break;
         if (plen < 3) break;
         bool fwd = p[0] != 0, mc = p[1] != 0, fn = p[2] != 0;
         std::string text(reinterpret_cast<const char*>(p + 3), plen - 3);
-        CefPostTask(TID_UI, base::BindOnce(&DoFind, text, fwd, mc, fn));
+        CefPostTask(TID_UI, base::BindOnce(&DoFind, slot, text, fwd, mc, fn));
         break;
       }
       case kOpStopFind: {
+        if (!slot) break;
         bool clear = plen >= 1 ? p[0] != 0 : true;
-        CefPostTask(TID_UI, base::BindOnce(&DoStopFind, clear));
+        CefPostTask(TID_UI, base::BindOnce(&DoStopFind, slot, clear));
         break;
       }
       case kOpJsDialogResp: {
+        if (!slot) break;
         if (plen < 5) break;
         uint32_t id = ReadU32BE(p);
         bool ok = p[4] != 0;
         std::string text(reinterpret_cast<const char*>(p + 5), plen - 5);
-        CefPostTask(TID_UI, base::BindOnce(&DoJsDialogResp, id, ok, text));
+        CefPostTask(TID_UI, base::BindOnce(&DoJsDialogResp, slot, id, ok, text));
         break;
       }
       case kOpEvalReturning: {
+        if (!slot) break;
         if (plen < 4) break;
         uint32_t id = ReadU32BE(p);
         std::string code(reinterpret_cast<const char*>(p + 4), plen - 4);
-        CefPostTask(TID_UI, base::BindOnce(&DoEvalReturning, id, code));
+        CefPostTask(TID_UI, base::BindOnce(&DoEvalReturning, slot, id, code));
         break;
       }
       case kOpAddChannel: {
+        if (!slot) break;
         std::string name(reinterpret_cast<const char*>(p), plen);
-        CefPostTask(TID_UI, base::BindOnce(&DoAddChannel, name));
+        CefPostTask(TID_UI, base::BindOnce(&DoAddChannel, slot, name));
         break;
       }
       case kOpSetCookie: {
+        if (!slot) break;
         std::string s(reinterpret_cast<const char*>(p), plen);
         std::vector<std::string> f;
         size_t start = 0;
@@ -1261,67 +1505,74 @@ void IpcReadLoop() {
           }
         }
         while (f.size() < 5) f.push_back("");
-        CefPostTask(TID_UI, base::BindOnce(&DoSetCookie, f[0], f[1], f[2], f[3],
-                                           f[4]));
+        CefPostTask(TID_UI, base::BindOnce(&DoSetCookie, slot, f[0], f[1], f[2],
+                                           f[3], f[4]));
         break;
       }
       case kOpClearCookies:
-        CefPostTask(TID_UI, base::BindOnce(&DoClearCookies));
+        if (!slot) break;
+        CefPostTask(TID_UI, base::BindOnce(&DoClearCookies, slot));
         break;
       case kOpVisitCookies: {
+        if (!slot) break;
         if (plen < 4) break;
         uint32_t id = ReadU32BE(p);
         std::string url(reinterpret_cast<const char*>(p + 4), plen - 4);
-        CefPostTask(TID_UI, base::BindOnce(&DoVisitCookies, id, url));
+        CefPostTask(TID_UI, base::BindOnce(&DoVisitCookies, slot, id, url));
         break;
       }
       case kOpDeleteCookie: {
+        if (!slot) break;
         std::string s(reinterpret_cast<const char*>(p), plen);
         const size_t nul = s.find('\0');
         std::string url = nul == std::string::npos ? s : s.substr(0, nul);
         std::string name = nul == std::string::npos ? "" : s.substr(nul + 1);
-        CefPostTask(TID_UI, base::BindOnce(&DoDeleteCookie, url, name));
+        CefPostTask(TID_UI, base::BindOnce(&DoDeleteCookie, slot, url, name));
         break;
       }
       case kOpImeSetComp: {
+        if (!slot) break;
         std::string text(reinterpret_cast<const char*>(p), plen);
-        CefPostTask(TID_UI, base::BindOnce(&DoImeSetComposition, text));
+        CefPostTask(TID_UI, base::BindOnce(&DoImeSetComposition, slot, text));
         break;
       }
       case kOpImeCommit: {
+        if (!slot) break;
         std::string text(reinterpret_cast<const char*>(p), plen);
-        CefPostTask(TID_UI, base::BindOnce(&DoImeCommitText, text));
+        CefPostTask(TID_UI, base::BindOnce(&DoImeCommitText, slot, text));
         break;
       }
       case kOpShowDevTools:
-        CefPostTask(TID_UI, base::BindOnce(&DoShowDevTools));
+        if (!slot) break;
+        CefPostTask(TID_UI, base::BindOnce(&DoShowDevTools, slot));
         break;
       case kOpImeCancel:
-        CefPostTask(TID_UI, base::BindOnce(&DoImeCancel));
+        if (!slot) break;
+        CefPostTask(TID_UI, base::BindOnce(&DoImeCancel, slot));
         break;
       case kOpPointer: {
+        if (!slot) break;
         if (plen < 40) break;
         int type = p[0], button = p[1], clicks = p[2];
         uint32_t mods = ReadU32BE(p + 4);
         double x = ReadF64BE(p + 8), y = ReadF64BE(p + 16);
         double dx = ReadF64BE(p + 24), dy = ReadF64BE(p + 32);
-        CefPostTask(TID_UI, base::BindOnce(&DoPointer, type, button, clicks,
-                                           mods, x, y, dx, dy));
+        CefPostTask(TID_UI, base::BindOnce(&DoPointer, slot, type, button,
+                                           clicks, mods, x, y, dx, dy));
         break;
       }
       case kOpKey: {
+        if (!slot) break;
         if (plen < 20) break;
         int type = p[0];
         uint32_t mods = ReadU32BE(p + 4);
         int32_t wkc = static_cast<int32_t>(ReadU32BE(p + 8));
         int32_t nkc = static_cast<int32_t>(ReadU32BE(p + 12));
         uint32_t ch = ReadU32BE(p + 16);
-        CefPostTask(TID_UI, base::BindOnce(&DoKey, type, mods, wkc, nkc, ch));
+        CefPostTask(TID_UI, base::BindOnce(&DoKey, slot, type, mods, wkc, nkc,
+                                           ch));
         break;
       }
-      case kOpShutdown:
-        CefPostTask(TID_UI, base::BindOnce(&DoShutdown));
-        return;
       default:
         break;
     }
@@ -1402,14 +1653,12 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  std::string url = ArgValue(argc, argv, "url");
+  // All args are now per-PROCESS / per-profile; the per-view geometry/url moved
+  // into the kOpCreateBrowser payload.
   std::string ipc_path = ArgValue(argc, argv, "ipc");
-  std::string ws = ArgValue(argc, argv, "width");
-  std::string hs = ArgValue(argc, argv, "height");
-  std::string dprs = ArgValue(argc, argv, "dpr");
-  std::string sid = ArgValue(argc, argv, "iosurface-id");
   std::string allowed = ArgValue(argc, argv, "allowed-schemes");
   std::string cdp = ArgValue(argc, argv, "cdp-port");
+  std::string profile_dir = ArgValue(argc, argv, "profile-dir");
   for (size_t start = 0; start < allowed.size();) {
     const size_t comma = allowed.find(',', start);
     const size_t len =
@@ -1421,20 +1670,7 @@ int main(int argc, char* argv[]) {
     if (comma == std::string::npos) break;
     start = comma + 1;
   }
-  if (url.empty()) url = "about:blank";
-  if (!ws.empty()) g_width = atoi(ws.c_str());
-  if (!hs.empty()) g_height = atoi(hs.c_str());
-  if (!dprs.empty()) g_dpr = atof(dprs.c_str());
-  if (g_dpr <= 0.0 || g_dpr > 8.0) g_dpr = 1.0; // guard a bad/forged --dpr
-  g_initial_url = url;
 
-  if (!sid.empty()) {
-    g_surface = IOSurfaceLookup(static_cast<uint32_t>(atoll(sid.c_str())));
-    if (!g_surface) {
-      fprintf(stderr, "[cef_host] IOSurfaceLookup failed for id %s\n",
-              sid.c_str());
-    }
-  }
   if (!ipc_path.empty()) {
     g_ipc_fd = ConnectUnixSocket(ipc_path);
     if (g_ipc_fd < 0) {
@@ -1443,9 +1679,28 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  // Hand Chromium ONLY the program name. Our custom switches (--url,
-  // --iosurface-id, --ipc, --width, --height) are parsed by us above; if they
-  // reach Chromium's CommandLine, cef_initialize CHECK-crashes on them.
+  // Defense-in-depth (Swift is the real gate): CDP is an unauthenticated
+  // localhost port that could read the shared cookie jar, so a persistent
+  // profile must never expose it. Swift already rejects this combination; if it
+  // somehow co-arrives, drop --cdp-port and warn (belt-and-suspenders).
+  if (!cdp.empty() && !profile_dir.empty()) {
+    SendLog(0,
+            "ignoring --cdp-port: refusing CDP on a persistent --profile-dir");
+    cdp.clear();
+  }
+#ifdef CEF_HOST_ADHOC
+  // Ad-hoc / mock-keychain build: secrets at rest aren't really encrypted, so a
+  // persistent profile here is insecure. Swift downgrades named profiles to
+  // ephemeral on an ad-hoc host (F.5); this is an advisory log only.
+  if (!profile_dir.empty() &&
+      !std::getenv("FLUTTER_CEF_ALLOW_INSECURE_PROFILE")) {
+    SendLog(0, "warning: persistent profile under mock keychain (ad-hoc build)");
+  }
+#endif
+
+  // Hand Chromium ONLY the program name. Our custom switches (--ipc,
+  // --cdp-port, --allowed-schemes, --profile-dir) are parsed by us above; if
+  // they reach Chromium's CommandLine, cef_initialize CHECK-crashes on them.
   char* clean_argv[] = {argv[0]};
   CefMainArgs main_args(1, clean_argv);
   @autoreleasepool {
@@ -1478,13 +1733,22 @@ int main(int argc, char* argv[]) {
         g_cdp_port = port;  // OnBeforeCommandLineProcessing allows WS origins
       }
     }
-    // Per-process cache under the per-user (0700) temp dir — NOT a fixed,
-    // world-readable /tmp path (cookies/localStorage are private), and a per-pid
-    // dir avoids the CEF cache lock colliding when several webviews run at once.
+    // Per-profile cache. The host supplies --profile-dir: a stable 0700 dir
+    // under Application Support for a named (persistent, shared-login) profile,
+    // or a unique throwaway temp dir for an ephemeral session. One root_cache_path
+    // is shared by every browser in this process, which is what makes login
+    // shared. The per-pid temp fallback is defensive — Swift always passes
+    // --profile-dir, so it normally never fires. persist_session_cookies keeps
+    // session cookies across relaunch (harmless for ephemeral; required for
+    // "stay signed in").
     std::string cef_cache =
-        std::string([NSTemporaryDirectory() UTF8String]) + "flutter_cef_cache_" +
-        std::to_string([[NSProcessInfo processInfo] processIdentifier]);
+        !profile_dir.empty()
+            ? profile_dir
+            : std::string([NSTemporaryDirectory() UTF8String]) +
+                  "flutter_cef_cache_" +
+                  std::to_string([[NSProcessInfo processInfo] processIdentifier]);
     CefString(&settings.root_cache_path) = cef_cache;
+    settings.persist_session_cookies = true;
     // A plain (non-.app) executable can't auto-locate the framework Resources
     // (icudtl.dat, *.pak, locale .lproj), so point CEF at them explicitly via a
     // normalized (no "..") framework dir.
@@ -1515,8 +1779,7 @@ int main(int argc, char* argv[]) {
       return 1;
     }
     if (std::getenv("FLUTTER_CEF_DEBUG"))
-      fprintf(stderr, "[cef_host] CefInitialize OK (fd=%d surface=%p)\n",
-              g_ipc_fd, (void*)g_surface);
+      fprintf(stderr, "[cef_host] CefInitialize OK (fd=%d)\n", g_ipc_fd);
     std::thread reader;
     if (g_ipc_fd >= 0) reader = std::thread(&IpcReadLoop);
     std::thread(&WatchParentDeath, getppid()).detach();

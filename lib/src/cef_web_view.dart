@@ -45,7 +45,11 @@ class CefWebView extends StatefulWidget {
     this.placeholder,
     this.allowedSchemes,
     this.enableCdp = false,
-  });
+    this.profile,
+  }) : assert(!(enableCdp && profile != null),
+            'enableCdp cannot be combined with a named profile: CDP exposes an '
+            'unauthenticated localhost port that could read the profile\'s shared '
+            'cookie jar. Use one or the other.');
 
   /// Page to load. Changing it on an existing view navigates.
   final String url;
@@ -84,6 +88,12 @@ class CefWebView extends StatefulWidget {
   /// pre-created controller).
   final bool enableCdp;
 
+  /// The persistent, shared browser profile this view's login lives in. Views with
+  /// the same non-null [profile] share one signed-in profile that survives relaunch.
+  /// Null (default) is ephemeral. Ignored when an external [controller] is supplied
+  /// (that controller carries its own profile). Mutually exclusive with [enableCdp].
+  final String? profile;
+
   @override
   State<CefWebView> createState() => _CefWebViewState();
 }
@@ -91,7 +101,7 @@ class CefWebView extends StatefulWidget {
 class _CefWebViewState extends State<CefWebView>
     implements DeltaTextInputClient {
   late final CefWebController _controller =
-      widget.controller ?? CefWebController();
+      widget.controller ?? CefWebController(profile: widget.profile);
   bool _ownsController = false;
   FocusNode? _ownFocusNode;
   int? _textureId;

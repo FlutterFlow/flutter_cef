@@ -67,6 +67,59 @@ void main() {
     expect(empty.containsKey('allowedSchemes'), isFalse);
   });
 
+  test('create forwards the controller profile when set', () async {
+    // `profile` is a controller field (not a create() arg) — create() reads it.
+    final c = CefWebController(sessionId: 's-prof', profile: 'work');
+    await c.create(url: 'about:blank', width: 10, height: 10);
+    final args = (log.firstWhere((m) => m.method == 'create').arguments as Map)
+        .cast<String, dynamic>();
+    expect(args['profile'], 'work');
+  });
+
+  test('create omits profile when null or empty (ephemeral default)', () async {
+    // Default (no profile) — the map must be byte-identical to today (no key).
+    final none0 = CefWebController(sessionId: 's-noprof');
+    await none0.create(url: 'about:blank', width: 1, height: 1);
+    final none = (log.firstWhere((m) => m.method == 'create').arguments as Map);
+    expect(none.containsKey('profile'), isFalse);
+
+    // An empty-string profile is treated as "no profile" too (omitted).
+    log.clear();
+    final empty0 = CefWebController(sessionId: 's-emptyprof', profile: '');
+    await empty0.create(url: 'about:blank', width: 1, height: 1);
+    final empty =
+        (log.firstWhere((m) => m.method == 'create').arguments as Map);
+    expect(empty.containsKey('profile'), isFalse);
+  });
+
+  test('CefWebController(profile:) exposes the profile name', () {
+    expect(CefWebController(profile: 'work').profile, 'work');
+    expect(CefWebController().profile, isNull);
+  });
+
+  test('create() asserts when enableCdp is combined with a named profile', () {
+    // CDP is an unauthenticated localhost port that could read the shared
+    // cookie jar, so it is mutually exclusive with a named profile. The guard
+    // is a debug assert; it only fires in debug builds.
+    final c = CefWebController(sessionId: 's-cdp-prof', profile: 'work');
+    expect(
+      () => c.create(
+          url: 'about:blank', width: 1, height: 1, enableCdp: true),
+      throwsA(isA<AssertionError>()),
+    );
+  });
+
+  test('create() allows enableCdp with no profile (ephemeral)', () async {
+    // The assert must NOT fire for the common ephemeral + CDP case.
+    final c = CefWebController(sessionId: 's-cdp-noprof');
+    await c.create(
+        url: 'about:blank', width: 1, height: 1, enableCdp: true);
+    final args = (log.firstWhere((m) => m.method == 'create').arguments as Map)
+        .cast<String, dynamic>();
+    expect(args['enableCdp'], true);
+    expect(args.containsKey('profile'), isFalse);
+  });
+
   test('navigate forwards the url for this session', () async {
     final c = CefWebController(sessionId: 's2');
     await c.navigate('https://flutter.dev');

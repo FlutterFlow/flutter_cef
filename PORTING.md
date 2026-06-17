@@ -54,8 +54,13 @@ lives in the Flutter app's process and:
 
 - Registers a **platform texture** (a `FlutterTexture` on macOS) backed by a
   shared GPU surface, and hands its id to the page.
-- Spawns **one `cef_host` subprocess per view**, passing
-  `--url --width --height --dpr --iosurface-id --ipc --allowed-schemes` as argv.
+- Spawns **one `cef_host` subprocess per profile** (`--ipc --cdp-port
+  --profile-dir --allowed-schemes` as argv), then creates **N browsers in that
+  process** via `opCreateBrowser` frames carrying `url, width, height, dpr,
+  iosurface-id` + a `browserId`. A null/empty `--profile-dir` is an ephemeral,
+  throwaway profile (a unique temp dir); a non-empty one is a persistent,
+  shared cache. `--profile-dir` is per-process — the shared cache is what makes
+  one login (cookies, storage) shared across the browsers in the profile.
 - Relays method-channel calls → IPC opcodes to `cef_host`, and IPC events from
   `cef_host` → `invokeMethod` back to Dart.
 
@@ -78,8 +83,8 @@ reused verbatim. Only these seams are macOS-specific (file:line are into
 | Seam | macOS reference | What your platform provides |
 | --- | --- | --- |
 | **Shared surface** — receive painted frames and present them to the host texture. CEF delivers either software `OnPaint` (CPU buffer) or `OnAcceleratedPaint` (a shared GPU texture handle). | `OnPaint` / `OnAcceleratedPaint` + the `IOSurface*` ops (~lines 346–450); `g_surface` (~133). macOS uses an IOSurface-backed `CVPixelBuffer`. | **Windows**: a shared D3D11 texture / DXGI keyed-mutex handle. **Linux**: shared memory or a DMA-buf, presented via the platform texture. Look the surface up by the `--iosurface-id`-equivalent handle the host passes. |
-| **IPC transport** — a framed bidirectional byte stream to the host. Wire format: 4-byte big-endian length prefix, then `[opcode][payload]`. | `WriteAll`/`ReadAll` (207–235), `SendFrame` (~237–249), `ConnectUnixSocket` (1341+), the read loop (~1140). Unix domain socket. | **Windows**: a named pipe. **Linux**: a Unix domain socket (reuse as-is). Keep the same length-prefixed framing. |
-| **App / run loop** — give CEF a host application + message loop, and a per-process cache dir. | `CefHostApplication : NSApplication<CefAppProtocol>` (304–330); `@autoreleasepool` + `sharedApplication` (1420+); `NSTemporaryDirectory()` cache; `_NSGetExecutablePath` (1335). | **Windows/Linux**: the platform's CEF message-loop integration (`CefRunMessageLoop` or OS loop) and a per-user, per-process cache path. |
+| **IPC transport** — a framed bidirectional byte stream to the host. Wire format: 4-byte big-endian length prefix, then `[u32 browserId][opcode][payload]` (`browserId 0` = process-level: `opReady`, process logs, `opShutdown`). | `WriteAll`/`ReadAll` (207–235), `SendFrame` (~237–249), `ConnectUnixSocket` (1341+), the read loop (~1140). Unix domain socket. | **Windows**: a named pipe. **Linux**: a Unix domain socket (reuse as-is). Keep the same length-prefixed framing and the `browserId` dimension. |
+| **App / run loop** — give CEF a host application + message loop, and a per-profile cache dir. | `CefHostApplication : NSApplication<CefAppProtocol>` (304–330); `@autoreleasepool` + `sharedApplication` (1420+); `--profile-dir` → `settings.root_cache_path` cache; `_NSGetExecutablePath` (1335). | **Windows/Linux**: the platform's CEF message-loop integration (`CefRunMessageLoop` or OS loop) and the caller-supplied `--profile-dir` (per-profile, persistent) as the cache path. |
 | **Sandbox** — bring the child processes into the Chromium sandbox in a signed/release build. | `process_helper.mm`: `CefScopedSandboxContext` (release only); `settings.no_sandbox` toggled by `CEF_HOST_ADHOC` (1426/1433). | **Windows**: link the `cef_sandbox` static lib + `CefScopedSandboxContext`. **Linux**: the SUID / user-namespace sandbox helper. |
 | **Framework / resource path** — point CEF at the CEF binary distribution. | `CefScopedLibraryLoader::LoadInMain`/`LoadInHelper`; `framework_dir_path` / `main_bundle_path` (1453/1466). | The equivalent paths for your bundle layout. |
 | **Build + bundle + sign** | `native/build_cef_host.sh` (CMake, `CEF_MULTI_PROCESS` / `CEF_HOST_ADHOC` flags), `tool/bundle_cef_host.sh`. | A platform build that produces `cef_host` + the CEF runtime, and a bundling step into the host app. |

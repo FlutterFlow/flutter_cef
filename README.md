@@ -8,6 +8,11 @@ Embed a **live Chromium browser** (via the [Chromium Embedded Framework](https:/
 import 'package:flutter_cef/flutter_cef.dart';
 
 CefWebView(url: 'https://flutter.dev')
+
+// Opt into a persistent, shared profile: the login (cookies + storage) survives
+// relaunch and is shared by every view with the same profile name. Omit
+// `profile:` (the default) for an ephemeral, throwaway session. See "Profiles".
+CefWebView(url: 'https://app.example.com', profile: 'work')
 ```
 
 Drive and observe it via a controller:
@@ -139,7 +144,62 @@ Other always-on protections:
   **`runJavaScriptReturningResult` expects a single expression** from trusted
   app code.
 - **Per-user, per-process CEF cache** (under the 0700 temp dir, not a fixed
-  world-readable `/tmp` path) and a **randomized control-socket name**.
+  world-readable `/tmp` path) and a **randomized control-socket name** — a named
+  `profile:` instead uses a stable 0700 dir under Application Support (see
+  [Profiles](#profiles)).
+
+## Profiles
+
+By default a `CefWebView` is **ephemeral**: cookies, `localStorage`, and the rest
+of the page's storage live in a throwaway in-memory profile that is discarded
+when the view is disposed (and the host process exits). Nothing persists across
+relaunch. This is the historical behaviour and stays the default.
+
+Pass `profile:` to opt into a **persistent, shared profile**:
+
+```dart
+CefWebView(url: 'https://app.example.com', profile: 'work')
+// or, when scripting a view yourself:
+final c = CefWebController(profile: 'work');
+CefWebView(url: startUrl, controller: c);
+```
+
+- **Persistent.** A named profile is stored on disk at
+  `<Application Support>/<bundleId>/flutter_cef/profiles/<name>` (the directory
+  is created `0700`, owner-only, and the profile name is sanitized to
+  `[A-Za-z0-9._-]`). CEF is started with `persist_session_cookies` on, so a
+  login survives `cef_host` and host-app relaunch.
+- **Shared.** Every view constructed with the same non-null `profile` is served
+  by **one `cef_host` process with one cookie jar** — they share one login.
+  Cookie writes are therefore process-wide: `clearCookies()` /
+  `deleteCookie()` clear the cookie for *all* views in the profile, by design.
+
+### Secrets at rest
+
+Cookies (and Chromium's password / OSCrypt-encrypted data) are only encrypted
+at rest under a **signed release build** (`CEF_HOST_ADHOC=OFF` — see
+[Security](#security)), where `cef_host` uses the real macOS Keychain /
+OSCrypt. The encryption key is stored in a login-Keychain item named
+**"Chromium Safe Storage"**, ACL-scoped so only the signing identity's binary
+can read it (you'll see a **one-time Keychain prompt** the first time a profile
+is created). **FileVault** is the backstop for the at-rest bytes the key
+protects.
+
+The default ad-hoc / dev build (`CEF_HOST_ADHOC=ON`) has only a **mock keychain**
+— it cannot encrypt cookies at rest. To avoid silently writing a "persistent"
+login to a plaintext on-disk store, an ad-hoc host **downgrades a named profile
+to ephemeral** (and logs a warning) rather than persisting it. Set
+`FLUTTER_CEF_ALLOW_INSECURE_PROFILE=1` in the environment to override this and
+persist under the mock keychain anyway (dev convenience only — do not ship it).
+The downgrade leaks nothing: the refusal happens before any browser is created,
+so nothing is ever written to the persistent directory.
+
+Two further caveats even under a signed build: `localStorage` and IndexedDB are
+**not** encrypted by OSCrypt (they sit in the profile directory as plaintext —
+FileVault is again the backstop), and **CDP (`enableCdp`) is incompatible with a
+named profile**: CDP is an unauthenticated localhost port that could read the
+shared cookie jar, so combining the two is rejected (the constructor asserts in
+debug, and the native side refuses the create).
 
 ## Roadmap
 

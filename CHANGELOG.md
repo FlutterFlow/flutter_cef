@@ -1,3 +1,32 @@
+## 0.2.0
+
+* **Persistent, shared profiles**: `CefWebView(profile: 'name')` /
+  `CefWebController(profile: 'name')` opt a view into a persistent, shared
+  browser profile — cookies and storage live in a stable `0700` directory under
+  Application Support (`<bundleId>/flutter_cef/profiles/<name>`,
+  `persist_session_cookies` on), so a login survives `cef_host` / host-app
+  relaunch. Every view with the same non-null `profile` is served by **one
+  `cef_host` process and one cookie jar**, so they share one login (and
+  `clearCookies` / `deleteCookie` clear it for all of them). Omitting `profile:`
+  (the default) is **byte-for-byte today's behaviour** — an ephemeral, throwaway
+  in-memory session. See the new "Profiles" section in the README.
+* **Secrets-at-rest safety rail**: cookies only encrypt at rest under a signed
+  release build (`CEF_HOST_ADHOC=OFF`, real Keychain / OSCrypt). An ad-hoc / dev
+  build cannot, so a named profile is **automatically downgraded to ephemeral**
+  (with a logged warning) rather than persisting a login to a plaintext store;
+  set `FLUTTER_CEF_ALLOW_INSECURE_PROFILE=1` to override. The refusal happens
+  before any browser is created, so it leaks no credentials.
+* **CDP × profile rejection**: `enableCdp` cannot be combined with a named
+  `profile` — CDP is an unauthenticated localhost port that could read the shared
+  cookie jar — so the combination is rejected (a debug assert in
+  `CefWebView` / `CefWebController`, and a native refusal of the create).
+* **Internal: per-browser IPC dimension**. The host↔`cef_host` wire protocol
+  gained a `browserId` frame field plus `opCreateBrowser` / `opDisposeBrowser`
+  control ops, so one `cef_host` process can host several browsers (the shared
+  profile). This is entirely below the method channel — the Dart API and the
+  `create`/event arg maps are unchanged apart from the new optional `profile`
+  key.
+
 ## 0.1.3
 
 * **Federated package structure** (no API change): `flutter_cef` is now a
