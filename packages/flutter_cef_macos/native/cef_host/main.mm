@@ -1016,6 +1016,21 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr, uint32_t sid,
   if (browser) {
     std::lock_guard<std::mutex> lock(g_slots_mutex);
     g_slots_by_cef_id[browser->GetIdentifier()] = slot;
+  } else {
+    // CreateBrowserSync failed: OnBeforeClose (the only path that erases the
+    // wire-id entry and releases slot->surface) can never fire without a
+    // browser, so reclaim here or the slot + the looked-up IOSurface (+1 ref)
+    // leak forever and the wire id is stranded.
+    SendLog(wire_id, "createBrowser: CreateBrowserSync returned null");
+    {
+      std::lock_guard<std::mutex> lock(g_slots_mutex);
+      g_slots_by_wire_id.erase(wire_id);
+    }
+    std::lock_guard<std::mutex> slock(slot->surface_mutex);
+    if (slot->surface) {
+      CFRelease(slot->surface);
+      slot->surface = nullptr;
+    }
   }
   if (std::getenv("FLUTTER_CEF_DEBUG"))
     fprintf(stderr, "[cef_host] createBrowser wire=%u browser=%p\n", wire_id,
@@ -1659,6 +1674,11 @@ int main(int argc, char* argv[]) {
   std::string allowed = ArgValue(argc, argv, "allowed-schemes");
   std::string cdp = ArgValue(argc, argv, "cdp-port");
   std::string profile_dir = ArgValue(argc, argv, "profile-dir");
+  // Swift always passes --profile-dir (even for an ephemeral host, whose dir is a
+  // throwaway temp dir), so profile_dir alone can't tell "persistent" from
+  // "ephemeral". --ephemeral marks the throwaway case so the CDP / mock-keychain
+  // guards below fire only for a real (named, persistent) profile.
+  const bool is_ephemeral = !ArgValue(argc, argv, "ephemeral").empty();
   for (size_t start = 0; start < allowed.size();) {
     const size_t comma = allowed.find(',', start);
     const size_t len =
@@ -1680,19 +1700,21 @@ int main(int argc, char* argv[]) {
   }
 
   // Defense-in-depth (Swift is the real gate): CDP is an unauthenticated
-  // localhost port that could read the shared cookie jar, so a persistent
-  // profile must never expose it. Swift already rejects this combination; if it
-  // somehow co-arrives, drop --cdp-port and warn (belt-and-suspenders).
-  if (!cdp.empty() && !profile_dir.empty()) {
+  // localhost port that could read the shared cookie jar, so a *persistent*
+  // profile must never expose it. CDP IS allowed on an ephemeral host, so gate
+  // on !is_ephemeral — not on profile_dir alone, which is always set. Swift
+  // already rejects CDP+named before spawn; this is belt-and-suspenders.
+  if (!cdp.empty() && !profile_dir.empty() && !is_ephemeral) {
     SendLog(0,
             "ignoring --cdp-port: refusing CDP on a persistent --profile-dir");
     cdp.clear();
   }
 #ifdef CEF_HOST_ADHOC
   // Ad-hoc / mock-keychain build: secrets at rest aren't really encrypted, so a
-  // persistent profile here is insecure. Swift downgrades named profiles to
-  // ephemeral on an ad-hoc host (F.5); this is an advisory log only.
-  if (!profile_dir.empty() &&
+  // persistent (named) profile here is insecure. Swift downgrades named profiles
+  // to ephemeral on an ad-hoc host (F.5); this is an advisory log only, and only
+  // for a real persistent profile (an ephemeral throwaway dir is never at risk).
+  if (!profile_dir.empty() && !is_ephemeral &&
       !std::getenv("FLUTTER_CEF_ALLOW_INSECURE_PROFILE")) {
     SendLog(0, "warning: persistent profile under mock keychain (ad-hoc build)");
   }

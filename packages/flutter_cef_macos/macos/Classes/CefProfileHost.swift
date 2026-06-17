@@ -113,6 +113,11 @@ final class CefProfileHost {
       "--ipc=\(socketPath)",
       "--profile-dir=\(profileDir)",
     ]
+    // Mark the throwaway-temp case so the host's CDP / mock-keychain guards fire
+    // only for a real persistent profile (--profile-dir is set for both).
+    if isEphemeral {
+      args.append("--ephemeral=1")
+    }
     if !allowedSchemes.isEmpty {
       args.append("--allowed-schemes=\(allowedSchemes)")
     }
@@ -158,31 +163,36 @@ final class CefProfileHost {
     browsersLock.unlock()
     session.attach(host: self, browserId: id)
 
-    // opCreateBrowser payload: {u32 w}{u32 h}{f64 dpr}{u32 iosurfaceId}{utf8 url}.
-    // allowedSchemes is NOT here — it's a process arg (see spawn).
+    writeLock.lock()
+    let isReady = ready
+    if !isReady {
+      // Queue until opReady; the safety-rail (F.5) may refuse to flush these. The
+      // payload is built at FLUSH time inside sendCreate from the session's LIVE
+      // surfaceId/geometry — a resize during the pre-ready spawn window
+      // reallocates the IOSurface (freeing the old global id) and updates the
+      // size, so capturing them now would ship a since-freed id and a stale size.
+      pendingCreates.append { [weak self, weak session] in
+        guard let self = self, let session = session else { return }
+        self.sendCreate(id, session, url)
+      }
+    }
+    writeLock.unlock()
+    if isReady { sendCreate(id, session, url) }
+    return id
+  }
+
+  /// Send an opCreateBrowser frame and mark the browserId as enqueued so its
+  /// pre-connect resizes are no longer dropped. The payload is assembled HERE
+  /// (not at createBrowser time) so it carries the session's current surfaceId +
+  /// geometry: {u32 w}{u32 h}{f64 dpr}{u32 iosurfaceId}{utf8 url}. allowedSchemes
+  /// is NOT here — it's a process arg fixed at spawn (A.4).
+  private func sendCreate(_ id: UInt32, _ session: CefWebSession, _ url: String) {
     var payload = [UInt8]()
     appendU32(&payload, UInt32(session.w))
     appendU32(&payload, UInt32(session.h))
     appendF64(&payload, Double(session.scale))
     appendU32(&payload, session.surfaceId)
     payload.append(contentsOf: Array(url.utf8))
-
-    writeLock.lock()
-    let isReady = ready
-    if !isReady {
-      // Queue until opReady; the safety-rail (F.5) may refuse to flush these.
-      pendingCreates.append { [weak self] in
-        self?.sendCreate(id, payload)
-      }
-    }
-    writeLock.unlock()
-    if isReady { sendCreate(id, payload) }
-    return id
-  }
-
-  /// Send an opCreateBrowser frame and mark the browserId as enqueued so its
-  /// pre-connect resizes are no longer dropped.
-  private func sendCreate(_ id: UInt32, _ payload: [UInt8]) {
     writeLock.lock()
     createEnqueued.insert(id)
     writeLock.unlock()

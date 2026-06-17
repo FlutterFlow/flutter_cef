@@ -26,6 +26,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   // ops (ready/log/create/dispose/shutdown) live on CefProfileHost; this list is
   // the per-view ops a session names directly.
   private static let opPresent: UInt8 = 0x01
+  private static let opLog: UInt8 = 0x04
   private static let opCursor: UInt8 = 0x03
   private static let opLoadState: UInt8 = 0x05
   private static let opTitle: UInt8 = 0x06
@@ -286,8 +287,16 @@ final class CefWebSession: NSObject, FlutterTexture {
   /// CefProfileHost's job — by the time this runs the host has already
   /// unregistered this browser, so there's no reader racing the free.
   func dispose() {
-    if textureId != 0 { registry?.unregisterTexture(textureId); textureId = 0 }
-    bufferLock.lock(); pixelBuffer = nil; ioSurface = nil; bufferLock.unlock()
+    // Zero textureId under bufferLock so a reader-thread opPresent can't read it
+    // torn or schedule a frame for an id we're about to unregister (it re-reads
+    // under the lock on main). unregisterTexture itself runs on the main thread.
+    bufferLock.lock()
+    let tid = textureId
+    textureId = 0
+    pixelBuffer = nil
+    ioSurface = nil
+    bufferLock.unlock()
+    if tid != 0 { registry?.unregisterTexture(tid) }
   }
 
   // MARK: Buffers
@@ -340,12 +349,27 @@ final class CefWebSession: NSObject, FlutterTexture {
   func handleFrame(_ op: UInt8, _ payload: [UInt8]) {
     switch op {
     case Self.opPresent:
+      // Read textureId under bufferLock — dispose() writes it under the same
+      // lock on the main thread, so this avoids a data race on the Int64.
+      bufferLock.lock()
       let tid = textureId
+      bufferLock.unlock()
       if tid != 0 {
         DispatchQueue.main.async { [weak self] in
-          self?.registry?.textureFrameAvailable(tid)
+          // Re-read on main (serialized with dispose()): the texture may have
+          // been unregistered between the reader capturing tid and here, so
+          // don't poke a stale id into the registry.
+          guard let self = self else { return }
+          self.bufferLock.lock()
+          let live = self.textureId
+          self.bufferLock.unlock()
+          if live != 0 { self.registry?.textureFrameAvailable(live) }
         }
       }
+    case Self.opLog:
+      // Per-browser diagnostic from cef_host (paint/renderer/resize/etc.). Surface
+      // it with this session's context (process-level logs go via the host).
+      NSLog("[cef_host:\(sessionId)] \(String(bytes: payload, encoding: .utf8) ?? "")")
     case Self.opCursor:
       if payload.count >= 4 {
         let c = (Int(payload[0]) << 24) | (Int(payload[1]) << 16)

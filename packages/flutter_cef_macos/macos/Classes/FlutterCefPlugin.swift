@@ -424,7 +424,12 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     }
     // Sanitize to a filesystem-safe leaf; anything outside [A-Za-z0-9._-] -> '_'.
     let allowed = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
-    let safe = String(profile.map { allowed.contains($0) ? $0 : "_" })
+    let sanitized = String(profile.map { allowed.contains($0) ? $0 : "_" })
+    // '/' is already mapped to '_', but a leaf of all dots ("." / ".." / "...")
+    // survives and resolves to the profiles/ container or its PARENT — a
+    // one-level containment escape whose 0700 chmod would clobber a shared
+    // ancestor. Neutralize it to a literal name.
+    let safe = sanitized.allSatisfy { $0 == "." } ? "_" : sanitized
     let bundleId = Bundle.main.bundleIdentifier ?? "flutter_cef"
     let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
     let base = (appSupport?.path ?? NSTemporaryDirectory())
