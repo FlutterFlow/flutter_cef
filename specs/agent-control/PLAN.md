@@ -41,6 +41,13 @@ per-tile opt-in, and (b) make the CDP channel Campus-only + tile-scoped.
    endpoint (lists every page in the process — and our model is one process per
    profile), so per-tile scoping **must** be enforced here; CDP can't do it.
 
+**Owner-local by construction.** The agent only ever drives the *owner's own*
+tiles — the relay runs on the owner's machine and peers can't run the owner's
+cef_host (they only ever get the read-only `{url,title}` mirror), so there is no
+"drive a peer's tile" path to build or secure. The `agentControllable` flag is
+*synced* so peers can *see* which tiles are agent-controllable, but control itself
+is owner-local. (This removes any cross-peer relay concern from the design.)
+
 Net: the raw CDP never leaves the app; agents reach a tile only with a token, only
 for tiles the user opted in. The credentialed jar is no longer exposed to local
 processes.
@@ -168,6 +175,22 @@ the pipe.
 
 P1 unblocks the workflow fast; P2 is the real security posture. They share the
 Campus toggle (Layer C) verbatim — only the transport under it changes.
+
+**Build order (decided):** the **flutter_cef (CEF) side ships first, then the
+Campus consumer**, and we go straight for the **P2 pipe-broker** (the user's
+"only Campus can connect" goal) rather than the P1 TCP shortcut. To de-risk the
+crux, the CEF side itself lands in two increments:
+- **CEF-1 — pipe foundation:** `--remote-debugging-pipe` in cef_host +
+  `posix_spawn` fd 3/4 wiring in `CefProfileHost` (replacing `Process()` while
+  PRESERVING the hardened spawn discipline — reader-thread join, `SO_NOSIGPIPE`,
+  C1 crash-surfacing, dispose ordering, the `--profile-dir`/`--ephemeral`/
+  `--allowed-schemes` argv) + a Swift CDP-over-pipe IO path + relax the CDP
+  rejection. Validation gate: the plugin round-trips a `Browser.getVersion` over
+  the pipe. This proves the foundation before any relay is built.
+- **CEF-2 — token-gated, tile-scoped relay:** the localhost CDP-WebSocket the
+  agent connects to (token + `browserId` target scoping) + the
+  `enableAgentControl()/disableAgentControl()` API.
+Then the Campus consumer (Layer C).
 
 ## Open questions / to resolve in P2
 
