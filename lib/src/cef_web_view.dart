@@ -33,6 +33,13 @@ const double _kTrackpadScrollGain = 3.0;
 /// ancestor opts into Flutter's trackpad gesture API (which reroutes them from
 /// [PointerScrollEvent] to pan-zoom events — e.g. canvas hosts).
 ///
+/// If the backing `cef_host` process dies (crash, or the profile's cache lock
+/// was taken by another process), the texture freezes on its last frame. Wire
+/// [CefWebController.onProcessGone] to detect it and recreate the view — this
+/// widget surfaces the event through the controller rather than handling it
+/// itself, so the host decides what UI to show (a reload affordance, an
+/// "already open elsewhere" message for the `"locked"` reason, etc.).
+///
 /// ```dart
 /// CefWebView(url: 'https://flutter.dev')
 /// ```
@@ -45,7 +52,13 @@ class CefWebView extends StatefulWidget {
     this.placeholder,
     this.allowedSchemes,
     this.enableCdp = false,
-  });
+    this.agentControl = false,
+    this.profile,
+  }) : assert(!(enableCdp && !agentControl && profile != null && profile != ''),
+            'enableCdp cannot be combined with a named profile: CDP-over-TCP '
+            'exposes an unauthenticated localhost port that could read the '
+            'profile\'s shared cookie jar. Use agentControl (CDP-over-pipe, no '
+            'open port) for a named profile instead.');
 
   /// Page to load. Changing it on an existing view navigates.
   final String url;
@@ -84,6 +97,24 @@ class CefWebView extends StatefulWidget {
   /// pre-created controller).
   final bool enableCdp;
 
+  /// Enable agent-control / pipe mode: cef_host exposes CDP over inherited file
+  /// descriptors (a private, NUL-framed JSON pipe) instead of a TCP port, so
+  /// there is no listening socket and the only possible CDP client is this app.
+  /// Because nothing is exposed to other local processes, this is permitted on a
+  /// named [profile] (unlike [enableCdp]). Only honoured when this view creates
+  /// the session (not when it adopts a pre-created controller). Call
+  /// [CefWebController.enableAgentControl] to broker a token-gated, per-tile-scoped
+  /// loopback CDP endpoint to an external agent (e.g. agent-browser); the relay
+  /// confines the agent to this tile's CDP target.
+  final bool agentControl;
+
+  /// The persistent, shared browser profile this view's login lives in. Views with
+  /// the same non-null [profile] share one signed-in profile that survives relaunch.
+  /// Null (default) is ephemeral. Ignored when an external [controller] is supplied
+  /// (that controller carries its own profile). Mutually exclusive with the TCP
+  /// [enableCdp] (open port), but compatible with [agentControl] (private pipe).
+  final String? profile;
+
   @override
   State<CefWebView> createState() => _CefWebViewState();
 }
@@ -91,7 +122,7 @@ class CefWebView extends StatefulWidget {
 class _CefWebViewState extends State<CefWebView>
     implements DeltaTextInputClient {
   late final CefWebController _controller =
-      widget.controller ?? CefWebController();
+      widget.controller ?? CefWebController(profile: widget.profile);
   bool _ownsController = false;
   FocusNode? _ownFocusNode;
   int? _textureId;
@@ -183,7 +214,8 @@ class _CefWebViewState extends State<CefWebView>
             height: h,
             dpr: dpr,
             allowedSchemes: widget.allowedSchemes,
-            enableCdp: widget.enableCdp);
+            enableCdp: widget.enableCdp,
+            agentControl: widget.agentControl);
         // Don't record `_lastSize` here: create() may have ADOPTED an in-flight
         // session a host eager-spawned at a different (tile snapshot) size, so
         // we can't assume the live surface is `size`. Leaving `_lastSize` null

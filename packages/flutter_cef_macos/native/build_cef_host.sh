@@ -60,6 +60,8 @@ fi
 # default so a dev/CI build runs without Developer-ID signing. A signed release
 # sets CEF_HOST_ADHOC=OFF: real Keychain + enforced validation, which then
 # require correct inside-out Developer-ID signing of the cef_host tree.
+# CEF_HOST_ADHOC=OFF is also required for at-rest OSCrypt encryption of a
+# persistent profile's cookies (ad-hoc has only a mock keychain — see Profiles).
 ADHOC_FLAG="-DCEF_HOST_ADHOC=ON"
 if [ "${CEF_HOST_ADHOC:-}" = "0" ] || [ "${CEF_HOST_ADHOC:-}" = "OFF" ]; then
   ADHOC_FLAG="-DCEF_HOST_ADHOC=OFF"

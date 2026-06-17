@@ -32,14 +32,28 @@ class _BrowserDemoState extends State<BrowserDemo> {
   // toolbar button — a file:// navigation is refused in the renderer's
   // OnBeforeBrowse and the page stays put. Pass `null` to allow every scheme.
   static const _allowedSchemes = {'http', 'https'};
-  final CefWebController _controller = CefWebController();
+  // The name of the persistent, shared profile this demo runs in, or null for
+  // the default ephemeral (throwaway) session. Toggle it from the toolbar; the
+  // view is rebuilt with a fresh controller so the new profile takes effect (a
+  // profile is fixed at create() time). A non-null profile is mutually exclusive
+  // with enableCdp, so CDP is only requested in the ephemeral (null) case.
+  String? _profile;
+  late CefWebController _controller = _newController();
   final FocusNode _webFocus = FocusNode(debugLabel: 'web');
   final TextEditingController _urlBar = TextEditingController(text: _startUrl);
   double _zoom = 0;
 
+  CefWebController _newController() => CefWebController(profile: _profile);
+
   @override
   void initState() {
     super.initState();
+    _wireController();
+  }
+
+  /// Attach the demo's listeners/callbacks to the current [_controller]. Called
+  /// once at init and again whenever a profile toggle swaps the controller.
+  void _wireController() {
     // Keep the URL bar showing the page's actual address as it navigates.
     _controller.url.addListener(() {
       final u = _controller.url.value;
@@ -53,6 +67,25 @@ class _BrowserDemoState extends State<BrowserDemo> {
       _urlBar.text = url;
       _controller.navigate(url);
     };
+  }
+
+  /// Toggle between the default ephemeral session and a persistent, shared
+  /// `'work'` profile. A profile is bound at create() time, so we dispose the
+  /// current controller and build a fresh one for the new profile; the keyed
+  /// [CefWebView] recreates its session against it.
+  void _toggleProfile() {
+    final old = _controller;
+    setState(() {
+      _profile = _profile == null ? 'work' : null;
+      _controller = _newController();
+    });
+    old.dispose();
+    _wireController();
+    _urlBar.text = _startUrl;
+    _snack(_profile == null
+        ? 'Ephemeral session (no profile) — login does not persist.'
+        : "Persistent profile '$_profile' — login is shared + survives relaunch "
+            '(CDP is disabled while a profile is active).');
   }
 
   void _setZoom(double z) {
@@ -230,6 +263,15 @@ and committed text — including emoji — should appear intact.</p>
                     tooltip: 'Try a blocked file:// navigation (allowedSchemes)',
                     onPressed: _tryBlockedScheme,
                   ),
+                  IconButton(
+                    icon: Icon(_profile == null
+                        ? Icons.person_off_outlined
+                        : Icons.person_outline),
+                    tooltip: _profile == null
+                        ? "Switch to a persistent 'work' profile"
+                        : "Profile '$_profile' — switch back to ephemeral",
+                    onPressed: _toggleProfile,
+                  ),
                   Expanded(
                     child: TextField(
                       controller: _urlBar,
@@ -272,13 +314,22 @@ and committed text — including emoji — should appear intact.</p>
             ),
             Expanded(
               child: CefWebView(
+                // Key on the profile so toggling it rebuilds the view against
+                // the fresh controller (a profile is fixed at create() time).
+                key: ValueKey(_profile),
                 url: _startUrl,
                 controller: _controller,
                 focusNode: _webFocus,
                 allowedSchemes: _allowedSchemes,
-                // Demo: expose CDP so the page can be driven by a CDP client.
-                // The bound port is on _controller.cdpPort.
-                enableCdp: true,
+                // Persistent, shared profile: login survives relaunch and is
+                // shared by every view with the same name. Null (default) is an
+                // ephemeral throwaway session. Toggle it from the toolbar.
+                profile: _profile,
+                // Demo: expose CDP so the page can be driven by a CDP client
+                // (the bound port is on _controller.cdpPort). CDP is mutually
+                // exclusive with a named profile, so only request it when none
+                // is active.
+                enableCdp: _profile == null,
               ),
             ),
           ],

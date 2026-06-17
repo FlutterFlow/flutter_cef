@@ -8,6 +8,11 @@ Embed a **live Chromium browser** (via the [Chromium Embedded Framework](https:/
 import 'package:flutter_cef/flutter_cef.dart';
 
 CefWebView(url: 'https://flutter.dev')
+
+// Opt into a persistent, shared profile: the login (cookies + storage) survives
+// relaunch and is shared by every view with the same profile name. Omit
+// `profile:` (the default) for an ephemeral, throwaway session. See "Profiles".
+CefWebView(url: 'https://app.example.com', profile: 'work')
 ```
 
 Drive and observe it via a controller:
@@ -104,6 +109,25 @@ IOSurface, writes a cache); entitlements need
 one identity (framework → cef_host → app, inside-out) and library validation can
 stay on.
 
+**Privacy usage descriptions (required in YOUR app's `Info.plist`).** `cef_host`
+is spawned as a child of your app, so macOS TCC attributes the page's
+privacy-sensitive hardware access to your app (the responsible process) and reads
+the usage string from **your app's** `Info.plist` — not `cef_host`'s. Without it,
+the process is **SIGABRT'd** the instant a page touches the hardware (e.g. Google
+sign-in probing WebAuthn/FIDO security keys reaches Bluetooth). Declare at least:
+
+```xml
+<key>NSBluetoothAlwaysUsageDescription</key><string>A web page is requesting Bluetooth to use a security key or passkey.</string>
+<key>NSCameraUsageDescription</key><string>A web page is requesting camera access.</string>
+<key>NSMicrophoneUsageDescription</key><string>A web page is requesting microphone access.</string>
+```
+
+(`example/macos/Runner/Info.plist` carries these.) Hardened-runtime apps that want
+the access to actually *function* (not just avoid the crash) also need the
+matching `com.apple.security.device.{bluetooth,camera,microphone}` entitlements;
+with them absent the access is denied gracefully, which is enough to keep
+password sign-in working when WebAuthn isn't supported.
+
 ## Security
 
 `flutter_cef` embeds a full Chromium that runs arbitrary web content with JIT.
@@ -128,18 +152,160 @@ sandbox can't validate without proper signing), which is why `ON` is the default
 
 Other always-on protections:
 
-- **Hardened-runtime relaxations** (`disable-library-validation`, `allow-jit`,
-  `allow-unsigned-executable-memory`) are kept in both entitlements files — CEF's
-  JIT renderer + dlopen'd framework require them.
+- **Hardened-runtime relaxations.** The signed-release set
+  (`entitlements.release.plist`) is intentionally minimal: only `allow-jit`
+  (CEF's V8 JIT, via MAP_JIT) plus `device.bluetooth` (caBLE passkeys). The
+  dev/ad-hoc set (`entitlements.plist`) additionally relaxes
+  `disable-library-validation` and `allow-unsigned-executable-memory` for
+  convenience, but neither is load-bearing under correct inside-out single-identity
+  signing, so release drops both (see the hardening backlog and
+  `entitlements.release.plist` for the rationale).
 - **Navigation scheme allowlist** (`CefWebView(allowedSchemes:)`) — gate which
   schemes a page may navigate to (main-frame nav, programmatic `navigate()`,
   clicks, redirects); host content-injection (`loadHtmlString`/`loadFile`) is
-  exempt. Off by default (allow-all).
+  exempt. Off by default (allow-all). This is a **navigation policy knob, not a
+  content-isolation boundary**: it gates *main-frame navigations only* — it does
+  **not** restrict subframes, subresources, or `fetch`/XHR/`<img>`/`ws:` loads,
+  so a page can still issue requests over any scheme. Use it to constrain where
+  the top-level frame can go, not to sandbox what content can load.
 - **JS channel names are validated** as JS identifiers before injection, and
   **`runJavaScriptReturningResult` expects a single expression** from trusted
   app code.
 - **Per-user, per-process CEF cache** (under the 0700 temp dir, not a fixed
-  world-readable `/tmp` path) and a **randomized control-socket name**.
+  world-readable `/tmp` path) and a **randomized control-socket name** — a named
+  `profile:` instead uses a stable 0700 dir under Application Support (see
+  [Profiles](#profiles)).
+
+### Known limitations / hardening backlog
+
+This is a competent CEF embedding with honestly-labeled deferrals, not a fully
+hardened browser. Notable items still open — see
+[`specs/persistent-profiles/SECURITY-REVIEW.md`](specs/persistent-profiles/SECURITY-REVIEW.md)
+for the full punch list (file:line) and prioritization:
+
+- **Per-product keychain item name** for OSCrypt (true at-rest isolation from
+  other CEF apps) — needs a from-source CEF build to override the hardcoded
+  `"Chromium Safe Storage"` name (see [Secrets at rest](#secrets-at-rest)).
+- **Browser-process auto-respawn** — a `cef_host` crash surfaces and unbricks
+  the profile, but does not yet automatically restart it.
+- **Socket peer authentication** — the control socket is first-connector-wins
+  with no `getpeereid()` check on the spawned process.
+
+## Profiles
+
+By default a `CefWebView` is **ephemeral**: cookies, `localStorage`, and the rest
+of the page's storage live in a throwaway in-memory profile that is discarded
+when the view is disposed (and the host process exits). Nothing persists across
+relaunch. This is the historical behaviour and stays the default.
+
+Pass `profile:` to opt into a **persistent, shared profile**:
+
+```dart
+CefWebView(url: 'https://app.example.com', profile: 'work')
+// or, when scripting a view yourself:
+final c = CefWebController(profile: 'work');
+CefWebView(url: startUrl, controller: c);
+```
+
+- **Persistent.** A named profile is stored on disk at
+  `<Application Support>/<bundleId>/flutter_cef/profiles/<name>` (the directory
+  is created `0700`, owner-only, and the profile name is sanitized to
+  `[A-Za-z0-9._-]`). CEF is started with `persist_session_cookies` on, so a
+  login survives `cef_host` and host-app relaunch.
+- **Shared.** Every view constructed with the same non-null `profile` is served
+  by **one `cef_host` process with one cookie jar** — they share one login.
+  Cookie writes are therefore process-wide: `clearCookies()` /
+  `deleteCookie()` clear the cookie for *all* views in the profile, by design.
+
+### Secrets at rest
+
+Cookies (and Chromium's password / OSCrypt-encrypted data) are only encrypted
+at rest under a **signed release build** (`CEF_HOST_ADHOC=OFF` — see
+[Security](#security)), where `cef_host` uses the real macOS Keychain /
+OSCrypt. The encryption key is stored in the default OSCrypt login-Keychain
+item named **"Chromium Safe Storage"** (you'll see a **one-time Keychain
+prompt** the first time a profile is created). This item is **shared** with
+every CEF/Chromium-based app that resolves the same default name — it is *not*
+ACL-scoped to one signing identity, so it does not isolate our key from other
+CEF apps the user has approved. At-rest protection therefore comes from
+**FileVault** (full-disk encryption) plus the **login keychain** being locked
+when the user is logged out — not from a per-binary keychain ACL. True per-app
+isolation needs a **per-product keychain item name**, but that name is a
+hardcoded literal baked into the prebuilt CEF framework; overriding it requires
+a from-source CEF build and is tracked as a follow-up (see the hardening
+backlog).
+
+The default ad-hoc / dev build (`CEF_HOST_ADHOC=ON`) has only a **mock keychain**
+— it cannot encrypt cookies at rest. To avoid silently writing a "persistent"
+login to a plaintext on-disk store, an ad-hoc host **downgrades a named profile
+to ephemeral** (and logs a warning) rather than persisting it. Set
+`FLUTTER_CEF_ALLOW_INSECURE_PROFILE=1` in the environment to override this and
+persist under the mock keychain anyway (dev convenience only — do not ship it).
+The downgrade leaks nothing: the refusal happens before any browser is created,
+so nothing is ever written to the persistent directory.
+
+Two further caveats even under a signed build: `localStorage` and IndexedDB are
+**not** encrypted by OSCrypt (they sit in the profile directory as plaintext —
+FileVault is again the backstop), and **CDP (`enableCdp`) is incompatible with a
+named profile**: CDP is an unauthenticated localhost port that could read the
+shared cookie jar, so combining the two is rejected (the constructor asserts in
+debug, and the native side refuses the create).
+
+## Agent control
+
+Let an external CDP client (e.g. [agent-browser](https://github.com/vercel-labs/agent-browser),
+which is Playwright-based) drive a **live, logged-in** tile — without a duplicate
+browser, without losing state, and **without an open debug port**.
+
+```dart
+// 1. Create the view in agent-control mode (CDP over a private inherited pipe,
+//    not a TCP port — so it's permitted on a named profile, unlike enableCdp).
+CefWebView(controller: c, profile: 'work', agentControl: true)
+
+// 2. When you want an agent to drive THIS tile, broker a token-gated, per-tile
+//    loopback CDP endpoint and hand it to the agent:
+final grant = await c.enableAgentControl();        // -> {wsUrl, token, port}
+// e.g.  agent-browser --cdp <grant.port> open https://example.com
+await c.disableAgentControl();                     // revoke when done
+```
+
+`agentControl: true` launches `cef_host` so Chromium speaks CDP over an inherited
+pipe (`--remote-debugging-pipe`, NUL-framed JSON on fds 3/4) instead of a TCP port —
+there is **no listening debug port**. `enableAgentControl()` then starts a small
+**loopback** HTTP+WebSocket relay that bridges a standard CDP client to that pipe and
+returns the endpoint.
+
+**Trust model.** The relay is the only way in, and it is deliberately narrow:
+
+* **Per-tile opt-in.** Nothing is exposed until you call `enableAgentControl()`; the
+  relay exists *only while the grant is active* and is torn down on
+  `disableAgentControl()`, tile dispose, or host shutdown.
+* **Loopback + ephemeral + single-client.** It binds `127.0.0.1` on an OS-assigned
+  port and accepts one client at a time. The returned `token` is validated **if a
+  client presents it**; agent-browser/Playwright can't attach one, so for those the
+  controls above are the gate. (This is strictly better than raw Chrome's fixed,
+  always-open, multi-client `--remote-debugging-port`. A same-UID process that wins a
+  sub-second race on the ephemeral port before the agent connects is the documented
+  residual — and on macOS same-UID is already game-over via the Keychain.)
+* **Per-tile isolation.** Tiles in a shared profile run in one `cef_host` process
+  behind one browser-wide CDP pipe, so the relay enforces the boundary itself: a
+  deny-by-default, fail-closed, **flatten-only** CDP Target-domain filter exposes the
+  client **only its own tile's target** — sibling tiles are hidden (not in
+  `Target.getTargets`) and unreachable (`attachToTarget`, `sendMessageToTarget`,
+  `attachToBrowserTarget`, foreign sessions are all refused).
+
+**Limits, by design.** Per-tile CDP isolation *within a shared browser context* is
+inherently partial — browser-context-wide CDP can't be scoped to one tile. So
+browser-context/process-global domains are **refused** entirely: `Storage.*`,
+`Tracing.*`, `Memory.*`, `SystemInfo.*`, `Browser.*` (except `getVersion`), and the
+cookie/cache methods (`Network.getAllCookies`/`clearBrowserCookies`/…). The agent can
+drive its tile's page (navigate, click, type, read DOM, run JS) but **cannot read or
+clear the shared cookie jar** or touch sibling tiles. It *can* act with the tile's own
+authenticated session for the tile's own origin — that is inherent to driving a
+logged-in page. Strictly airtight CDP isolation would require a per-tile browser
+context, which would un-share the login the shared profile exists to provide. First
+cut: **one agent-controlled tile per `cef_host` process** (a second, different tile in
+the same process is refused).
 
 ## Roadmap
 

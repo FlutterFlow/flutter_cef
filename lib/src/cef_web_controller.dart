@@ -14,7 +14,7 @@ import 'package:flutter_cef_platform_interface/flutter_cef_platform_interface.da
 /// Usually you don't create this directly — [CefWebView] manages one for you.
 /// Use it when you need to script a view.
 class CefWebController {
-  CefWebController({String? sessionId})
+  CefWebController({String? sessionId, this.profile})
       : sessionId = sessionId ?? 'cef-${_counter++}' {
     // Register + install the host->Dart handler at construction (not in create),
     // so callbacks wired before create() can't miss early events.
@@ -31,6 +31,13 @@ class CefWebController {
 
   /// Stable id for this session, echoed in every host message.
   final String sessionId;
+
+  /// The persistent, shared profile this view's login lives in, or null for an
+  /// ephemeral (in-memory, throwaway) session. Views constructed with the same
+  /// non-null [profile] share one host process → one cookie jar → one login,
+  /// and that login survives cef_host/host-app relaunch. Null (the default) is
+  /// today's behaviour.
+  final String? profile;
 
   /// The registered [Texture] id once [create] has resolved, else null.
   int? textureId;
@@ -92,6 +99,14 @@ class CefWebController {
   /// Called when a download begins. The user is shown a native Save panel; this
   /// is informational (e.g. to surface a toast).
   void Function(String suggestedName)? onDownload;
+
+  /// Called when the backing `cef_host` process is gone — it died unexpectedly
+  /// (crash) or lost the profile's cross-process cache lock. The texture is
+  /// frozen on its last frame and the session is no longer usable; recreate the
+  /// view (or controller) to recover. [reason] is `"locked"` when the profile is
+  /// already open in another process (show "already open elsewhere") or
+  /// `"crashed"` for a generic process death.
+  void Function(String reason)? onProcessGone;
 
   /// The caret rect (view-local logical px) of the active IME composition.
   /// Wired by [CefWebView] to position the OS candidate window under the text;
@@ -217,6 +232,11 @@ class CefWebController {
           (a['w'] as num? ?? 0).toDouble(),
           (a['h'] as num? ?? 0).toDouble(),
         ));
+        break;
+      case 'processGone':
+        // The native host dropped this session (crash or cache-lock loss). The
+        // texture is dead; let the consumer react (show a reload affordance).
+        onProcessGone?.call(a['reason'] as String? ?? 'crashed');
         break;
     }
   }
@@ -364,7 +384,17 @@ class CefWebController {
     double dpr = 1.0,
     Set<String>? allowedSchemes,
     bool enableCdp = false,
+    bool agentControl = false,
   }) {
+    // The TCP enableCdp+named-profile combination is rejected because CDP-over-TCP
+    // is an unauthenticated localhost port that could read the shared cookie jar.
+    // Agent-control (pipe) mode is exempt: CDP rides cef_host's inherited fds 3/4
+    // (no listening socket), so it's allowed on a named profile — the gate only
+    // covers the plain-TCP case.
+    assert(!(enableCdp && !agentControl && profile != null && profile!.isNotEmpty),
+        'enableCdp cannot be combined with a named profile (CDP-over-TCP is an '
+        'unauthenticated localhost port that could read the shared cookie jar). '
+        'Use agentControl for a private CDP-over-pipe channel instead.');
     if (textureId != null) return Future<int?>.value(textureId);
     return _createInFlight ??= _createSession(
       url: url,
@@ -373,6 +403,7 @@ class CefWebController {
       dpr: dpr,
       allowedSchemes: allowedSchemes,
       enableCdp: enableCdp,
+      agentControl: agentControl,
     ).whenComplete(() => _createInFlight = null);
   }
 
@@ -383,6 +414,7 @@ class CefWebController {
     required double dpr,
     required Set<String>? allowedSchemes,
     required bool enableCdp,
+    required bool agentControl,
   }) async {
     await _acquireCreateSlot();
     // Disposed while parked in the spawn-throttle queue — never fork for a dead
@@ -403,6 +435,12 @@ class CefWebController {
           'allowedSchemes':
               allowedSchemes.map((s) => s.toLowerCase()).join(','),
         if (enableCdp) 'enableCdp': true,
+        // Agent-control / pipe mode (CEF-1): when set, the native side launches
+        // cef_host via posix_spawn with CDP over inherited fds 3/4 (--cdp-pipe)
+        // instead of a TCP --cdp-port. Omit-when-false so the OFF path is
+        // byte-identical to today's create args.
+        if (agentControl) 'agentControl': true,
+        if (profile != null && profile!.isNotEmpty) 'profile': profile,
       });
     } finally {
       _scheduleSlotRelease();
@@ -435,6 +473,45 @@ class CefWebController {
   /// trusted local content you want to render regardless of the allowlist.
   Future<void> navigate(String url) =>
       _channel.invokeMethod('navigate', {'sessionId': sessionId, 'url': url});
+
+  /// CEF-2a — enable agent control for this tile and return a brokered, token-gated
+  /// CDP endpoint a standard CDP client (e.g. `agent-browser`) can connect to.
+  ///
+  /// Requires the controller to have been created with `agentControl: true` (the
+  /// CDP-over-pipe mode); otherwise the platform throws a [PlatformException]. The
+  /// relay binds loopback only and exists only while enabled. Point a CDP client at
+  /// `--cdp <port>` (Playwright/agent-browser discover the ws-url via
+  /// `/json/version`). Idempotent: repeated calls return the same live endpoint.
+  /// Tear down with [disableAgentControl].
+  ///
+  /// Security: vanilla agent-browser can't attach a secret to a CDP connection, so
+  /// the gate is the ephemeral loopback port + grant lifecycle + single active
+  /// client, not the token. The returned [token] is validated only **if** a client
+  /// passes `?token=` (defense-in-depth for a token-capable client); it's embedded
+  /// in [wsUrl] for that case.
+  ///
+  /// Per-tile isolation: the relay is scoped to THIS tile's CDP target (resolved
+  /// natively), and applies a deny-by-default / fail-closed / flatten-only Target-domain
+  /// filter — a connected client sees and drives only this tile, not sibling tiles in
+  /// the same shared-profile process. Browser-context-wide CDP (Storage/Tracing/Browser
+  /// mutators / cookie-jar methods) is refused, since tiles share one browser context
+  /// (so for a credentialed shared profile the agent can drive the page but cannot read
+  /// or clear the whole cookie jar). First cut: one agent-controlled tile per process.
+  Future<({String wsUrl, String token, int port})?> enableAgentControl() async {
+    final res = await _channel.invokeMapMethod<String, dynamic>(
+        'enableAgentControl', {'sessionId': sessionId});
+    if (res == null) return null;
+    return (
+      wsUrl: res['wsUrl'] as String,
+      token: res['token'] as String,
+      port: res['port'] as int,
+    );
+  }
+
+  /// CEF-2a — tear down the agent-control relay (closes the listener and any client,
+  /// invalidates the token). The tile itself keeps running. Idempotent.
+  Future<void> disableAgentControl() =>
+      _channel.invokeMethod('disableAgentControl', {'sessionId': sessionId});
 
   /// Load host-trusted content, bypassing the navigation scheme allowlist.
   /// Backs [loadHtmlString] (data:) and [loadFile] (file:): the host explicitly

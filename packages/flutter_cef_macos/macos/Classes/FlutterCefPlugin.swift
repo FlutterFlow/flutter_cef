@@ -5,13 +5,19 @@ import FlutterMacOS
 /// `case` labels in `handle(_:result:)`) and the native->Dart events (the
 /// `emit(...)` calls in `create`) together form the cross-platform method-channel
 /// protocol — see PORTING.md for the authoritative list. Each verb carries a
-/// `sessionId`; `create` returns `{textureId, width, height}`. The Swift side
-/// only relays: it spawns and talks to a per-view `cef_host` subprocess (see
-/// `CefWebSession`) over the IPC opcode protocol.
+/// `sessionId`; `create` returns `{textureId, width, height, cdpPort}`. The Swift
+/// side only relays: it spawns and talks to a per-PROFILE `cef_host` subprocess
+/// (see `CefProfileHost`), which multiplexes N per-view `CefWebSession` browsers
+/// over one IPC pipe. Views sharing a non-empty `profile` share one host -> one
+/// cookie jar -> one login.
 public class FlutterCefPlugin: NSObject, FlutterPlugin {
   private weak var textureRegistry: FlutterTextureRegistry?
   private var channel: FlutterMethodChannel?
-  private var sessions: [String: CefWebSession] = [:]
+  // Two-level registry: one host per profile, many sessions per host.
+  private var profiles: [String: CefProfileHost] = [:]   // key: profile name OR "~ephemeral~"+sessionId
+  private var sessions: [String: CefWebSession] = [:]     // sessionId -> session (verb routing)
+  private var sessionHost: [String: CefProfileHost] = [:] // sessionId -> its host
+  private var sessionKey: [String: String] = [:]          // sessionId -> profiles[] key, for teardown
 
   public static func register(with registrar: FlutterPluginRegistrar) {
     let instance = FlutterCefPlugin()
@@ -20,6 +26,21 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       name: "flutter_cef", binaryMessenger: registrar.messenger)
     instance.channel = channel
     registrar.addMethodCallDelegate(instance, channel: channel)
+    sweepStaleEphemeralProfiles()
+  }
+
+  /// Reclaim ephemeral (throwaway) profile temp dirs orphaned by a previous crash/
+  /// SIGKILL — they're normally removed on clean shutdown(), but a hard exit leaves
+  /// `flutter_cef_ephem_*` (a throwaway cookie jar) behind. At plugin init no host is
+  /// live yet, so sweeping every match is safe. Same-UID, 0700; this bounds disk
+  /// growth and stale at-rest session data.
+  private static func sweepStaleEphemeralProfiles() {
+    let tmp = NSTemporaryDirectory()
+    let fm = FileManager.default
+    guard let entries = try? fm.contentsOfDirectory(atPath: tmp) else { return }
+    for name in entries where name.hasPrefix("flutter_cef_ephem_") {
+      try? fm.removeItem(atPath: tmp + name)
+    }
   }
 
   public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -105,6 +126,29 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     case "showDevTools":
       withSession(args) { $0.showDevTools() }
       result(nil)
+    case "enableAgentControl":
+      // CEF-2b: broker a token-gated CDP endpoint scoped to THIS tile's CDP target.
+      // Async (resolves the targetId via cef_host first). Requires the session to
+      // have been created with agentControl (pipe) mode.
+      guard let sid = args["sessionId"] as? String, let host = sessionHost[sid],
+            let session = sessions[sid] else {
+        result(FlutterError(code: "agent_control", message: "no such session", details: nil))
+        return
+      }
+      host.enableAgentControl(browserId: session.browserId) { info in
+        DispatchQueue.main.async {
+          if let info = info {
+            result(["wsUrl": info.wsUrl, "token": info.token, "port": info.port])
+          } else {
+            result(FlutterError(code: "agent_control",
+                                message: "enableAgentControl failed: not in agent-control mode, host down, targetId unresolved, or another tile is already agent-controlled in this process",
+                                details: nil))
+          }
+        }
+      }
+    case "disableAgentControl":
+      if let sid = args["sessionId"] as? String { sessionHost[sid]?.disableAgentControl() }
+      result(nil)
     case "showEmojiPicker":
       // The Character Viewer targets the current first responder's input
       // context — Flutter's text-input plugin while the CefWebView is focused.
@@ -135,6 +179,11 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   }
 
   private func create(_ a: [String: Any], _ result: @escaping FlutterResult) {
+    // The session/profile dictionaries below are unlocked and rely on being
+    // touched only from the main thread (H3) — the method-channel handler always
+    // runs here. Assert it so a future off-main caller fails loudly, not silently
+    // corrupting the maps.
+    dispatchPrecondition(condition: .onQueue(.main))
     guard let sessionId = a["sessionId"] as? String,
           let registry = textureRegistry else {
       result(FlutterError(code: "bad_args", message: "missing sessionId/registry",
@@ -153,11 +202,84 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     let dpr = (a["dpr"] as? Double).map { CGFloat($0) } ?? 1.0
     let allowedSchemes = a["allowedSchemes"] as? String ?? ""
     let enableCdp = a["enableCdp"] as? Bool ?? false
-    sessions[sessionId]?.dispose()
+    // Agent-control / pipe mode (CEF-1): CDP rides cef_host's inherited fds 3/4
+    // (a private, NUL-framed pipe) instead of a TCP port. Because there's no
+    // listening socket, the open-port cookie-exfil rationale doesn't apply, so
+    // (unlike TCP enableCdp) it's permitted on a named profile — see below. Omit-
+    // when-false from Dart, like enableCdp.
+    let agentControl = a["agentControl"] as? Bool ?? false
+    // A non-empty `profile` => a persistent, shared host; absent/empty => an
+    // ephemeral throwaway host. Backward-compat is structural: no `profile`
+    // behaves exactly as before.
+    let profile = a["profile"] as? String
+    let namedProfile = profile != nil && !profile!.isEmpty
+
+    // Dispose any prior session with this id first (route teardown through its
+    // host), so re-creating the same id is idempotent and doesn't trip the
+    // single-view guard below on itself.
+    disposeSession(sessionId)
+
+    // Safety rail (a): TCP CDP is an unauthenticated localhost port that could
+    // read the shared cookie jar, so it's incompatible with a named profile.
+    // Reject before spawn, so --cdp-port and --profile-dir never co-arrive at
+    // cef_host. The agent-control PIPE path is exempt: it exposes no listening
+    // socket (CDP rides inherited fds 3/4, private to this app), so the exfil
+    // rationale doesn't apply — and when agentControl is set, spawn() passes
+    // --cdp-pipe and never --cdp-port even if enableCdp was also requested, so no
+    // TCP port opens. Hence the rejection gates only the plain-TCP case
+    // (enableCdp && !agentControl). The TCP enableCdp+named lockdown is unchanged.
+    if enableCdp && namedProfile && !agentControl {
+      result(FlutterError(
+        code: "cdp_with_profile",
+        message: "enableCdp cannot be combined with a named profile: CDP exposes "
+          + "an unauthenticated localhost port that could read the profile's "
+          + "shared cookie jar. (Agent-control pipe mode is exempt — it opens no "
+          + "port.)",
+        details: nil))
+      return
+    }
+    // Safety rail (c) — P1 single-view guard: only one live browser per named
+    // profile for now (multi-view sharing lands in P2). An ephemeral host is
+    // per-session, so this only applies to named profiles.
+    if namedProfile, let existing = profiles[profile!], existing.hasLiveBrowser {
+      result(FlutterError(
+        code: "profile_in_use",
+        message: "profile '\(profile!)' is already in use by another view "
+          + "(single-view per profile in this build).",
+        details: nil))
+      return
+    }
+
+    let (profileDir, isEphemeral) = resolveProfileDir(namedProfile ? profile : nil)
+    let key = namedProfile ? profile! : "~ephemeral~" + sessionId
+
+    guard let host = resolveOrSpawnHost(
+      key: key, profileDir: profileDir, isEphemeral: isEphemeral,
+      cefHostPath: cefHost, enableCdp: enableCdp, allowedSchemes: allowedSchemes,
+      agentControl: agentControl)
+    else {
+      result(FlutterError(code: "spawn_failed",
+                          message: "failed to spawn cef_host", details: nil))
+      return
+    }
+
+    // F.5 dev safety-rail: an ad-hoc (mock-keychain) host refuses a named
+    // persistent profile at opReady (nothing's been written, so no creds leak).
+    // When that fires, tear the host down and respawn an EPHEMERAL host for this
+    // same session, then re-issue createBrowser. Wired only for named profiles;
+    // an already-ephemeral host never refuses.
+    if namedProfile {
+      host.onInsecureProfileRefused = { [weak self] in
+        DispatchQueue.main.async {
+          self?.respawnEphemeral(sessionId: sessionId, url: url,
+                                 allowedSchemes: allowedSchemes)
+        }
+      }
+    }
+
     let session = CefWebSession(
-      sessionId: sessionId, url: url, width: width, height: height, dpr: dpr,
-      allowedSchemes: allowedSchemes, enableCdp: enableCdp, registry: registry,
-      cefHostPath: cefHost)
+      sessionId: sessionId, width: width, height: height, dpr: dpr,
+      registry: registry)
     session.onCursor = { [weak self] cursor in
       self?.emit("cursor", ["sessionId": sessionId, "cursor": cursor])
     }
@@ -224,11 +346,111 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     session.onCookies = { [weak self] id, json in
       self?.emit("cookies", ["sessionId": sessionId, "id": id, "json": json])
     }
+    // Allocate the wire browserId + (when ready) issue opCreateBrowser. The
+    // process arg --allowed-schemes is shared by every browser in the profile;
+    // it's taken from the first browser that triggered the spawn.
+    _ = host.createBrowser(session, url: url, allowedSchemes: allowedSchemes)
     sessions[sessionId] = session
+    sessionHost[sessionId] = host
+    sessionKey[sessionId] = key
     result([
       "textureId": session.textureId, "width": width, "height": height,
-      "cdpPort": session.cdpPort,
+      "cdpPort": host.cdpPort,
     ])
+  }
+
+  /// Resolve an existing host for `key`, or spawn a fresh one. Returns nil if the
+  /// spawn fails. `agentControl` switches the launch to posix_spawn (CDP over
+  /// inherited fds 3/4) — see CefProfileHost.spawn. Only meaningful when this call
+  /// actually spawns; an EXISTING host keeps its original transport (a named
+  /// profile is single-view in this build, so an agent-control create() resolving
+  /// to a pre-existing host is not a normal path).
+  private func resolveOrSpawnHost(
+    key: String, profileDir: String, isEphemeral: Bool, cefHostPath: String,
+    enableCdp: Bool, allowedSchemes: String, agentControl: Bool
+  ) -> CefProfileHost? {
+    if let existing = profiles[key] { return existing }
+    let host = CefProfileHost(
+      profileId: key, profileDir: profileDir, isEphemeral: isEphemeral)
+    guard host.spawn(cefHostPath: cefHostPath, enableCdp: enableCdp,
+                     allowedSchemes: allowedSchemes, agentControl: agentControl)
+    else {
+      return nil
+    }
+    wireHostDied(host)
+    profiles[key] = host
+    return host
+  }
+
+  /// C1: install the host-died handler. When `cef_host` dies unexpectedly (its
+  /// reader hit EOF while running, or a write hit a dead pipe — see
+  /// CefProfileHost.handleHostDeath), tell every session on this host that its
+  /// process is gone, drop those sessions and the host so the profile_in_use
+  /// guard unblocks (hasLiveBrowser also goes false via the host's crashed flag),
+  /// and reap the process. `onHostDied` is dispatched on the main thread by the
+  /// host, so the unlocked dictionaries are touched only here on main (H3).
+  private func wireHostDied(_ host: CefProfileHost) {
+    host.onHostDied = { [weak self, weak host] status in
+      dispatchPrecondition(condition: .onQueue(.main))
+      guard let self = self, let host = host else { return }
+      // C2 cross-group contract: cef_host exits 2 (after SendLog "profile-locked")
+      // when it loses the cache singleton lock to another process. Surface that as
+      // a distinct reason so the widget can say "already open elsewhere" instead of
+      // a generic crash.
+      let reason = (status == 2) ? "locked" : "crashed"
+      // Every session still routed to this host loses its browser. Snapshot first
+      // (we mutate the maps in the loop).
+      let goneSessions = self.sessionHost.compactMap { $0.value === host ? $0.key : nil }
+      for sid in goneSessions {
+        self.emit("processGone", ["sessionId": sid, "reason": reason])
+        self.sessions[sid] = nil
+        self.sessionHost[sid] = nil
+        self.sessionKey[sid] = nil
+      }
+      // Drop the host from the profile registry so a re-create spawns a fresh
+      // one. Snapshot the matching keys first — never mutate a Dictionary while
+      // iterating it.
+      let goneKeys = self.profiles.compactMap { $0.value === host ? $0.key : nil }
+      for k in goneKeys { self.profiles[k] = nil }
+      // Reap: idempotent SIGTERM(+SIGKILL escalation), a no-op if already exited.
+      host.shutdown()
+    }
+  }
+
+  /// F.5: the running cef_host turned out to be an ad-hoc (mock-keychain) build
+  /// and refused the named profile. Tear that host down and recreate this session
+  /// on a fresh EPHEMERAL host (recomputing dir/key), then re-issue createBrowser
+  /// with the original url/allowedSchemes. Because nothing was written to the
+  /// persistent dir, no creds leak.
+  private func respawnEphemeral(sessionId: String, url: String,
+                                allowedSchemes: String) {
+    // The unlocked session/profile dictionaries are confined to the main thread
+    // (H3); this is reached from onInsecureProfileRefused via DispatchQueue.main.
+    dispatchPrecondition(condition: .onQueue(.main))
+    guard let session = sessions[sessionId],
+          let cefHost = resolveCefHostPath() else { return }
+    // Tear down the refused (named) host and forget it.
+    if let oldKey = sessionKey[sessionId], let oldHost = profiles[oldKey] {
+      oldHost.shutdown()
+      profiles[oldKey] = nil
+    }
+    // The slimmed session keeps its texture/buffers; just re-bind it to a fresh
+    // ephemeral host. CDP is never enabled here (a named profile rejects CDP, so
+    // a refused-then-downgraded session had none).
+    let (profileDir, isEphemeral) = resolveProfileDir(nil)
+    let key = "~ephemeral~" + sessionId
+    let host = CefProfileHost(
+      profileId: key, profileDir: profileDir, isEphemeral: isEphemeral)
+    guard host.spawn(cefHostPath: cefHost, enableCdp: false,
+                     allowedSchemes: allowedSchemes) else {
+      NSLog("[cef] respawn ephemeral host failed for \(sessionId)")
+      return
+    }
+    wireHostDied(host)
+    profiles[key] = host
+    _ = host.createBrowser(session, url: url, allowedSchemes: allowedSchemes)
+    sessionHost[sessionId] = host
+    sessionKey[sessionId] = key
   }
 
   private func navigate(_ a: [String: Any], _ result: @escaping FlutterResult) {
@@ -257,11 +479,72 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   }
 
   private func destroy(_ a: [String: Any], _ result: @escaping FlutterResult) {
-    if let id = a["sessionId"] as? String {
-      sessions[id]?.dispose()
-      sessions[id] = nil
-    }
+    if let id = a["sessionId"] as? String { disposeSession(id) }
     result(nil)
+  }
+
+  /// Tear down one session: close its browser on the shared host, then dispose
+  /// the session. ORDERING (binding, F.3): if this was the host's last browser,
+  /// `host.shutdown()` (which joins the reader, so no more inbound) runs BEFORE
+  /// `session.dispose()` and the profile is dropped. Otherwise `removeBrowser`
+  /// has already unregistered this browser under lock, so `session.dispose()`
+  /// runs safely while the shared reader keeps serving the siblings.
+  private func disposeSession(_ id: String) {
+    // Unlocked session/profile dictionaries — main-thread confined (H3). Reached
+    // from create()/destroy() (channel handler, on main) and never off-main.
+    dispatchPrecondition(condition: .onQueue(.main))
+    guard let session = sessions[id] else { return }
+    let host = sessionHost[id]
+    let key = sessionKey[id]
+    sessions[id] = nil
+    sessionHost[id] = nil
+    sessionKey[id] = nil
+    guard let host = host else {
+      // No host on record (shouldn't happen) — just release the session.
+      session.dispose()
+      return
+    }
+    let remaining = host.removeBrowser(session.browserId)
+    if remaining == 0 {
+      host.shutdown()
+      session.dispose()
+      if let key = key { profiles[key] = nil }
+    } else {
+      session.dispose()
+    }
+  }
+
+  /// Resolve the on-disk cache dir for a profile. F.4: a null/empty profile gets
+  /// a unique throwaway temp dir (ephemeral, removed on host shutdown); a named
+  /// profile gets a stable 0700 dir under Application Support that survives
+  /// relaunch. Both go through one downstream code path: the host always receives
+  /// --profile-dir=<dir>.
+  private func resolveProfileDir(_ profile: String?) -> (dir: String, ephemeral: Bool) {
+    let fm = FileManager.default
+    guard let profile = profile, !profile.isEmpty else {
+      let dir = NSTemporaryDirectory() + "flutter_cef_ephem_" + UUID().uuidString
+      try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true,
+                              attributes: [.posixPermissions: 0o700])
+      return (dir, true)
+    }
+    // Sanitize to a filesystem-safe leaf; anything outside [A-Za-z0-9._-] -> '_'.
+    let allowed = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
+    let sanitized = String(profile.map { allowed.contains($0) ? $0 : "_" })
+    // '/' is already mapped to '_', but a leaf of all dots ("." / ".." / "...")
+    // survives and resolves to the profiles/ container or its PARENT — a
+    // one-level containment escape whose 0700 chmod would clobber a shared
+    // ancestor. Neutralize it to a literal name.
+    let safe = sanitized.allSatisfy { $0 == "." } ? "_" : sanitized
+    let bundleId = Bundle.main.bundleIdentifier ?? "flutter_cef"
+    let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+    let base = (appSupport?.path ?? NSTemporaryDirectory())
+    let dir = base + "/" + bundleId + "/flutter_cef/profiles/" + safe
+    try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true,
+                            attributes: [.posixPermissions: 0o700])
+    // Re-chmod the leaf: createDirectory's attributes apply only to dirs it
+    // creates, and an existing leaf from a prior run keeps its old mode.
+    try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir)
+    return (dir, false)
   }
 
   private func pointer(_ a: [String: Any], _ result: @escaping FlutterResult) {

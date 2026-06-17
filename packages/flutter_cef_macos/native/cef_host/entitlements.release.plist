@@ -3,16 +3,25 @@
 <plist version="1.0">
 <dict>
   <!-- Signed-release entitlements for cef_host (browser) + all CEF helper
-       processes. Identical to entitlements.plist EXCEPT it omits
-       get-task-allow: that entitlement makes notarization hard-fail and is a
-       local task-port privilege-escalation vector, so a distributable build
-       must not carry it. Selected automatically by the build when
-       CEF_HOST_ADHOC=OFF (see CMakeLists.txt / build_cef_host.sh).
-       The renderer and GPU helpers JIT JavaScript / WebAssembly, so they still
-       need JIT + unsigned executable memory under hardened runtime; library
-       validation stays relaxed because the framework is loaded via dlopen. -->
+       processes. Deliberately the MINIMAL set — omits get-task-allow (notarization
+       hard-fail + task-port escalation vector for distributables) and, unlike the
+       dev/ad-hoc entitlements.plist, drops every relaxation that isn't load-bearing
+       in a signed build. Selected automatically by the build when CEF_HOST_ADHOC=OFF
+       (see CMakeLists.txt / build_cef_host.sh).
+       The renderer and GPU helpers JIT JavaScript / WebAssembly, so they keep
+       allow-jit (MAP_JIT). We intentionally do NOT carry:
+         - disable-library-validation: a dylib-injection -> entitlement-theft vector;
+           single-identity inside-out signing (framework -> cef_host -> app) keeps
+           library validation satisfied without it, so it's dev-only.
+         - allow-unsigned-executable-memory: strictly broader than allow-jit and
+           deprecated on macOS 14+; V8/MAP_JIT works with just allow-jit (Mozilla
+           ships V8 the same way), so it's dev-only.
+         - device.camera / device.audio-input: camera/mic are now gated by the
+           deny-default CefPermissionHandler, so untrusted page content can't reach
+           them and the OS-level entitlement buys nothing here. -->
   <key>com.apple.security.cs.allow-jit</key><true/>
-  <key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
-  <key>com.apple.security.cs.disable-library-validation</key><true/>
+  <!-- Bluetooth is load-bearing: caBLE / hybrid passkeys (WebAuthn cross-device)
+       reach Web Bluetooth, so this stays even in the minimal release set. -->
+  <key>com.apple.security.device.bluetooth</key><true/>
 </dict>
 </plist>
