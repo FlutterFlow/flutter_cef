@@ -78,6 +78,7 @@
 #include "include/cef_client.h"
 #include "include/cef_command_line.h"
 #include "include/cef_cookie.h"
+#include "include/cef_devtools_message_observer.h"
 #include "include/cef_download_handler.h"
 #include "include/cef_find_handler.h"
 #include "include/cef_jsdialog_handler.h"
@@ -114,6 +115,7 @@ constexpr uint8_t kOpChannelMsg = 0x17; // {utf8 "name:message"} JS channel -> h
 constexpr uint8_t kOpDownload = 0x18;   // {utf8 suggestedName} a download started
 constexpr uint8_t kOpImeBounds = 0x19;  // {u32 x}{u32 y}{u32 w}{u32 h} caret rect (DIP)
 constexpr uint8_t kOpCookies = 0x1a;    // {u32 id}{utf8 json-array} visitAllCookies result
+constexpr uint8_t kOpTargetId = 0x1b;   // {utf8 targetId} -> plugin: this browser's CDP targetId (CEF-2b)
 constexpr uint8_t kOpPointer = 0x10;
 constexpr uint8_t kOpResize = 0x11;
 constexpr uint8_t kOpKey = 0x12;
@@ -142,6 +144,7 @@ constexpr uint8_t kOpImeCancel = 0x32;      // {} cancel composition
 constexpr uint8_t kOpShowDevTools = 0x33;   // {} open DevTools in a window
 constexpr uint8_t kOpLoadTrusted = 0x34;    // {utf8 url} host content-load, exempt from allowlist
 constexpr uint8_t kOpSetVisible = 0x35;     // {u8 visible} -> CefBrowserHost::WasHidden(!visible)
+constexpr uint8_t kOpResolveTargetId = 0x36;  // {} resolve this browser's CDP targetId (CEF-2b) -> kOpTargetId
 
 // ---- Shared runtime state ----
 // Atomic: the reader thread reads it (ReadAll), SendFrame on any thread reads it,
@@ -199,6 +202,11 @@ struct Slot {
   // Per-slot so dialog ids on one browser can't Continue() another's callback.
   std::map<uint32_t, CefRefPtr<CefJSDialogCallback>> dialogs;
   uint32_t dialog_next = 1;
+
+  // CEF-2b: registration for the DevTools message observer used to resolve this
+  // browser's CDP targetId (Target.getTargetInfo). Kept alive for the slot's life;
+  // UI-thread only. Lazily set on the first kOpResolveTargetId.
+  CefRefPtr<CefRegistration> devtools_reg;
 };
 
 // Routing map from a wire browser id to its Slot. MUTATED ONLY ON THE CEF UI
@@ -1314,6 +1322,64 @@ void DoShowDevTools(const std::shared_ptr<Slot>& slot) {
   slot->browser->GetHost()->ShowDevTools(window_info, nullptr, settings,
                                          CefPoint());
 }
+
+// CEF-2b: resolve a browser's CDP targetId so the Swift relay can scope an agent's
+// CDP session to exactly this tile. Extract the first quoted string value for `key`
+// from a flat CDP result JSON (targetIds are GUIDs with no embedded quotes/escapes).
+std::string ExtractJsonStringField(const std::string& json,
+                                   const std::string& key) {
+  std::string needle = "\"" + key + "\"";
+  size_t k = json.find(needle);
+  if (k == std::string::npos) return "";
+  size_t colon = json.find(':', k + needle.size());
+  if (colon == std::string::npos) return "";
+  size_t q1 = json.find('"', colon + 1);
+  if (q1 == std::string::npos) return "";
+  size_t q2 = json.find('"', q1 + 1);
+  if (q2 == std::string::npos) return "";
+  return json.substr(q1 + 1, q2 - q1 - 1);
+}
+
+constexpr int kTargetInfoMsgId = 0x7e57;  // fixed id for our Target.getTargetInfo probe
+
+// Receives the Target.getTargetInfo result for one browser and reports its targetId
+// back to the plugin (kOpTargetId). UI-thread callbacks. One per browser.
+class TargetIdObserver : public CefDevToolsMessageObserver {
+ public:
+  explicit TargetIdObserver(uint32_t wire_id) : wire_id_(wire_id) {}
+  void OnDevToolsMethodResult(CefRefPtr<CefBrowser> browser, int message_id,
+                              bool success, const void* result,
+                              size_t result_size) override {
+    if (message_id != kTargetInfoMsgId || !success || !result || result_size == 0)
+      return;
+    std::string json(static_cast<const char*>(result), result_size);
+    // Anchor to the targetInfo object first, so a differently-named *targetId* field
+    // (e.g. openerId/browserContextId) earlier in the JSON can't be mistaken for it.
+    size_t ti = json.find("\"targetInfo\"");
+    std::string scope = (ti != std::string::npos) ? json.substr(ti) : json;
+    std::string tid = ExtractJsonStringField(scope, "targetId");
+    if (!tid.empty()) SendUtf8(wire_id_, kOpTargetId, tid);
+  }
+
+ private:
+  uint32_t wire_id_;
+  IMPLEMENT_REFCOUNTING(TargetIdObserver);
+};
+
+void DoResolveTargetId(const std::shared_ptr<Slot>& slot) {
+  if (!slot->browser) return;
+  CefRefPtr<CefBrowserHost> host = slot->browser->GetHost();
+  if (!host) return;
+  if (!slot->devtools_reg) {
+    slot->devtools_reg =
+        host->AddDevToolsMessageObserver(new TargetIdObserver(slot->browser_id));
+  }
+  // Target.getTargetInfo with no params: executed on a specific browser's DevTools
+  // agent (a page target), it returns THAT page's own targetInfo — so this resolves
+  // exactly this browser's targetId, with no cross-tile ambiguity.
+  host->ExecuteDevToolsMethod(kTargetInfoMsgId, "Target.getTargetInfo", nullptr);
+}
+
 void DoImeSetComposition(const std::shared_ptr<Slot>& slot,
                          const std::string& text) {
   if (!slot->browser) return;
@@ -1603,6 +1669,10 @@ void IpcReadLoop() {
       case kOpShowDevTools:
         if (!slot) break;
         CefPostTask(TID_UI, base::BindOnce(&DoShowDevTools, slot));
+        break;
+      case kOpResolveTargetId:
+        if (!slot) break;
+        CefPostTask(TID_UI, base::BindOnce(&DoResolveTargetId, slot));
         break;
       case kOpImeCancel:
         if (!slot) break;

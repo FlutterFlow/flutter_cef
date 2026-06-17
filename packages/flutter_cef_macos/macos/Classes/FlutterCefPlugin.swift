@@ -112,16 +112,25 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       withSession(args) { $0.showDevTools() }
       result(nil)
     case "enableAgentControl":
-      // CEF-2a: broker a token-gated CDP endpoint for this session's host. Requires
-      // the session to have been created with agentControl (pipe) mode.
+      // CEF-2b: broker a token-gated CDP endpoint scoped to THIS tile's CDP target.
+      // Async (resolves the targetId via cef_host first). Requires the session to
+      // have been created with agentControl (pipe) mode.
       guard let sid = args["sessionId"] as? String, let host = sessionHost[sid],
-            let info = host.enableAgentControl() else {
-        result(FlutterError(code: "agent_control",
-                            message: "enableAgentControl failed: session not in agent-control mode, or host down",
-                            details: nil))
+            let session = sessions[sid] else {
+        result(FlutterError(code: "agent_control", message: "no such session", details: nil))
         return
       }
-      result(["wsUrl": info.wsUrl, "token": info.token, "port": info.port])
+      host.enableAgentControl(browserId: session.browserId) { info in
+        DispatchQueue.main.async {
+          if let info = info {
+            result(["wsUrl": info.wsUrl, "token": info.token, "port": info.port])
+          } else {
+            result(FlutterError(code: "agent_control",
+                                message: "enableAgentControl failed: not in agent-control mode, host down, targetId unresolved, or another tile is already agent-controlled in this process",
+                                details: nil))
+          }
+        }
+      }
     case "disableAgentControl":
       if let sid = args["sessionId"] as? String { sessionHost[sid]?.disableAgentControl() }
       result(nil)

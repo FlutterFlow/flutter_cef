@@ -32,9 +32,11 @@ import Security
 /// that passes `?token=` gets it constant-time-checked, upgrading to real auth; an
 /// absent token is allowed (so vanilla agent-browser works).
 ///
-/// CEF-2a passes CDP through whole (browser-level). Per-tile isolation (the Target
-/// filter) is CEF-2b; until then the relay is dev-validation-only and must not ship
-/// enabled, since a connected client could reach sibling tiles in the process.
+/// Per-tile isolation (CEF-2b): the CDP pipe is browser-wide, so when constructed
+/// with a `scopeTargetId` the relay applies a Target-domain filter that exposes the
+/// client ONLY that tile's target (and its sub-targets) — sibling tiles in the same
+/// shared-profile process are hidden and unreachable. Constructed without a scope it
+/// is a raw browser-level passthrough (CEF-2a; dev/test only).
 final class CdpRelay {
   /// Forwards a CDP message (one JSON line) to cef_host over the pipe. Captures the
   /// host weakly so the host↔relay ownership (host strongly holds the relay) is not
@@ -67,8 +69,19 @@ final class CdpRelay {
   /// or buggy client must not be able to make us allocate unbounded.
   private static let maxFrame = 64 << 20
 
-  init(sendToPipe: @escaping (String) -> Void) {
+  // CEF-2b: per-tile isolation filter. When `scopeTargetId` is set, the relay
+  // exposes the client ONLY this CDP target (the opted-in tile) and its descendant
+  // sub-targets — sibling tiles in the same shared-profile process are hidden. When
+  // nil, the relay is a raw browser-level passthrough (CEF-2a; dev-only). The CDP
+  // pipe is browser-wide, so this filter is the per-tile security boundary.
+  private let scopeTargetId: String?
+  private var ourSessionId: String?            // learned from our target's attachedToTarget
+  private var allowedSessions = Set<String>()  // our session + descendant sub-target sessions
+  private let filterLock = NSLock()
+
+  init(sendToPipe: @escaping (String) -> Void, scopeTargetId: String? = nil) {
     self.sendToPipe = sendToPipe
+    self.scopeTargetId = scopeTargetId
     self.token = CdpRelay.randomToken()
   }
 
@@ -351,7 +364,9 @@ final class CdpRelay {
         }
         assembling = !fin
         if fin {
-          if assemblingText, let s = String(bytes: msg, encoding: .utf8) { sendToPipe(s) }
+          if assemblingText, let s = String(bytes: msg, encoding: .utf8) {
+            if let out = filterClientToPipe(s) { sendToPipe(out) }  // CEF-2b scope filter
+          }
           msg.removeAll(keepingCapacity: true)
           assemblingText = false
         }
@@ -368,9 +383,16 @@ final class CdpRelay {
     }
   }
 
-  /// Deliver a CDP message from the pipe to the connected client as a text frame.
-  /// No-op when no client is attached. Called off the CDP reader thread.
+  /// Deliver a CDP message from the pipe to the connected client. Applies the CEF-2b
+  /// scope filter (drops sibling-tile traffic) before writing. Called off the CDP
+  /// reader thread.
   func deliverToClient(_ json: String) {
+    guard let out = filterPipeToClient(json) else { return }  // dropped: not our tile
+    sendRawToClient(out)
+  }
+
+  /// Write a raw (already-filtered / self-originated) JSON text frame to the client.
+  private func sendRawToClient(_ json: String) {
     clientLock.lock(); defer { clientLock.unlock() }
     guard clientFd >= 0 else { return }
     writeFrameLocked(clientFd, opcode: 0x1, payload: Array(json.utf8))
@@ -405,6 +427,147 @@ final class CdpRelay {
       // shutdown (not close/clear) here, leaving the single close-owner intact.
       shutdown(fd, SHUT_RDWR)
     }
+  }
+
+  // MARK: CEF-2b — per-tile Target-domain filter (deny-by-default, fail-closed)
+  //
+  // The CDP pipe is browser-wide, so this filter is THE per-tile security boundary —
+  // built to be safe against a hostile client, not just to support Playwright:
+  //  - FAIL CLOSED: a message we can't parse is dropped, never forwarded unfiltered
+  //    (JSONSerialization is stricter than Chromium's parser, so "forward on parse
+  //    fail" would be a filter bypass).
+  //  - FLATTEN ONLY: the legacy non-flatten messaging path (sendMessageToTarget /
+  //    receivedMessageFromTarget, non-flatten attach) is refused/dropped — it would
+  //    otherwise let a client wrap commands to a SIBLING session.
+  //  - DENY BY DEFAULT for browser-level Target.* control: only an explicit allow-list,
+  //    each scoped to OUR target, is forwarded; everything else (attachToBrowserTarget,
+  //    exposeDevToolsProtocol, createTarget, createBrowserContext, …) is refused.
+  // Playwright drives in flatten mode: Target.setAutoAttach{flatten:true} (browser
+  // level) → ONE Target.attachedToTarget for our page (sessionId learned here) → all
+  // page work routed by that top-level sessionId (+ nested sub-target sessions).
+
+  /// pipe → client. Returns the JSON to forward, or nil to drop. nil scope =
+  /// passthrough (CEF-2a, dev only).
+  private func filterPipeToClient(_ json: String) -> String? {
+    guard let tid = scopeTargetId else { return json }
+    guard let m = parseJson(json) else { return nil }  // fail closed
+    let method = m["method"] as? String
+    let sid = m["sessionId"] as? String
+    let params = m["params"] as? [String: Any]
+
+    filterLock.lock(); defer { filterLock.unlock() }
+
+    switch method {
+    case "Target.attachedToTarget":
+      let attachedTid = (params?["targetInfo"] as? [String: Any])?["targetId"] as? String
+      let childSession = params?["sessionId"] as? String
+      if sid == nil {  // browser-level auto-attach of a top-level target (a tile)
+        guard attachedTid == tid else { return nil }  // sibling tile — hide
+        if let cs = childSession { allowedSessions.insert(cs); ourSessionId = cs }
+        return json
+      }
+      guard let s = sid, allowedSessions.contains(s) else { return nil }  // sub-target of ours
+      if let cs = childSession { allowedSessions.insert(cs) }
+      return json
+    case "Target.detachedFromTarget", "Target.targetDestroyed",
+         "Target.targetCreated", "Target.targetInfoChanged":
+      let evtTid = (params?["targetInfo"] as? [String: Any])?["targetId"] as? String
+        ?? params?["targetId"] as? String
+      if sid == nil { return evtTid == tid ? json : nil }
+      return allowedSessions.contains(sid!) ? json : nil
+    case "Target.receivedMessageFromTarget":
+      // legacy non-flatten wrapper carrying a target's reply — forward only for our
+      // sessions (we refuse non-flatten C→R, but drop defensively regardless).
+      let s = params?["sessionId"] as? String
+      return (s != nil && allowedSessions.contains(s!)) ? json : nil
+    default:
+      break
+    }
+    // Any message carrying a sessionId: forward only for our (allowed) sessions.
+    if let s = sid { return allowedSessions.contains(s) ? json : nil }
+    // Defensive: drop any stray target enumeration (we synthesize the only getTargets
+    // reply ourselves, C→R — cef_host should never send one here).
+    if let result = m["result"] as? [String: Any], result["targetInfos"] != nil { return nil }
+    return json  // browser-level response / event, no session or foreign target ref
+  }
+
+  /// client → pipe. Returns the JSON to forward, or nil to drop. Drops are reported
+  /// to the client as a CDP error — sent OUTSIDE filterLock (never block IO under it).
+  private func filterClientToPipe(_ json: String) -> String? {
+    guard scopeTargetId != nil else { return json }
+    guard let m = parseJson(json) else { return nil }  // fail closed
+    let method = m["method"] as? String
+    let sid = m["sessionId"] as? String
+    let params = m["params"] as? [String: Any]
+    let id = m["id"] as? Int
+
+    // Session-routed command (flatten): allow only for our (allowed) sessions. The
+    // brief lock is released before any error IO (H4).
+    if let s = sid {
+      filterLock.lock(); let allowed = allowedSessions.contains(s); filterLock.unlock()
+      if allowed { return json }
+      sendClientError(id, "Session with given id not found"); return nil
+    }
+
+    // Browser-level Target.* control: explicit allow-list, scoped to our target.
+    if let method = method, method.hasPrefix("Target.") {
+      let qTid = params?["targetId"] as? String
+      switch method {
+      case "Target.setDiscoverTargets":
+        return json  // browser-wide; resulting events are filtered inbound
+      case "Target.setAutoAttach":
+        guard (params?["flatten"] as? Bool) == true else {
+          sendClientError(id, "non-flatten setAutoAttach is not permitted"); return nil
+        }
+        return json
+      case "Target.attachToTarget":
+        guard qTid == scopeTargetId else { sendClientError(id, "No target with given id found"); return nil }
+        guard (params?["flatten"] as? Bool) == true else {
+          sendClientError(id, "non-flatten attachToTarget is not permitted"); return nil
+        }
+        return json
+      case "Target.getTargetInfo", "Target.closeTarget", "Target.activateTarget":
+        guard qTid == nil || qTid == scopeTargetId else {  // no id (browser/own) or ours
+          sendClientError(id, "No target with given id found"); return nil
+        }
+        return json
+      case "Target.getTargets":
+        synthesizeGetTargets(id); return nil  // never enumerate the process to the client
+      default:
+        // createTarget, attachToBrowserTarget, exposeDevToolsProtocol, sendMessageToTarget,
+        // setRemoteLocations, createBrowserContext, autoAttachRelated, … — DENY.
+        sendClientError(id, "\(method) is not permitted"); return nil
+      }
+    }
+
+    // Non-Target, no sessionId: browser-level commands (Browser.getVersion, …) — allow.
+    return json
+  }
+
+  /// Reply to the client's Target.getTargets with ONLY our tile (never the process).
+  private func synthesizeGetTargets(_ id: Int?) {
+    guard let id = id, let tid = scopeTargetId else { return }
+    let info: [String: Any] = ["targetId": tid, "type": "page", "title": "", "url": "",
+                               "attached": true, "canAccessOpener": false, "browserContextId": ""]
+    sendClientJson(["id": id, "result": ["targetInfos": [info]]])
+  }
+
+  /// Send a CDP error reply to the client. Built via JSONSerialization so the message
+  /// can't break the frame. No-op without an id (a notification has nothing to error).
+  private func sendClientError(_ id: Int?, _ message: String) {
+    guard let id = id else { return }
+    sendClientJson(["id": id, "error": ["code": -32000, "message": message]])
+  }
+
+  private func sendClientJson(_ obj: [String: Any]) {
+    if let d = try? JSONSerialization.data(withJSONObject: obj),
+       let s = String(data: d, encoding: .utf8) { sendRawToClient(s) }
+  }
+
+  private func parseJson(_ s: String) -> [String: Any]? {
+    guard let d = s.data(using: .utf8),
+          let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return nil }
+    return o
   }
 
   // MARK: Blocking IO helpers

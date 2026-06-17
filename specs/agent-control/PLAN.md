@@ -207,14 +207,22 @@ crux, the CEF side itself lands in two increments:
     navigated to a new page, read the DOM snapshot — through relay→pipe→cef_host.
     (The no-filter relay is dev-validation-only — never shipped — since a connected
     client could reach sibling tiles in the process.)
-  - **CEF-2b — isolation:** resolve `browserId`→CDP `targetId` (new IPC op:
-    cef_host `ExecuteDevToolsMethod(browser, "Target.getTargetInfo", {})` → the
-    browser's own `targetId`), then add the Target-domain filter so each token's ws
-    sees/attaches **only** its tile's target (`Target.getTargets`→the one;
-    auto-attach/`targetCreated` events→the one; reject `attachToTarget`/`sessionId`
-    for any other). This filter is THE per-tile security boundary — reviewed
-    adversarially like CEF-1. Multi-grant per process via CDP `id` remapping +
-    per-target `sessionId`.
+  - **CEF-2b — isolation (DONE, validated):** `browserId`→CDP `targetId` is resolved
+    via a new IPC op (`kOpResolveTargetId`/`kOpTargetId`): cef_host runs
+    `CefBrowserHost::ExecuteDevToolsMethod(browser, "Target.getTargetInfo")` on the
+    specific browser (a page agent returns its OWN targetId — no cross-tile ambiguity)
+    via a `CefDevToolsMessageObserver`. `enableAgentControl` is now async: resolve the
+    targetId, then create the relay scoped to it, then start it (so no client ever
+    sees an unscoped relay). The CdpRelay Target-domain filter then exposes the client
+    ONLY that target + its descendant sub-targets: R→C drops sibling `attachedToTarget`
+    / Target lifecycle events / foreign-session traffic and filters `getTargets`
+    responses; C→R blocks `attachToTarget`/`getTargetInfo`/etc. for a foreign targetId,
+    blocks `createTarget` (no spawning pages in the shared process), and blocks
+    foreign-session commands. Validated end-to-end: real agent-browser drives the
+    scoped tile normally; a sibling target created via `createTarget` is HIDDEN from
+    `getTargets` and UNATTACHABLE; the hardened filter then blocks `createTarget`
+    itself. First cut: ONE agent-controlled tile per process (a second different tile
+    is refused); multi-grant (per-tile relays + CDP `id` remapping) deferred.
 Then the Campus consumer (Layer C).
 
 ## Open questions / to resolve in P2
