@@ -114,9 +114,11 @@ final class CefWebSession: NSObject, FlutterTexture {
     bufferLock.lock(); defer { bufferLock.unlock() }
     return ioSurface.map { IOSurfaceGetID($0) } ?? 0
   }
-  // Geometry, exposed for the host's opCreateBrowser payload.
-  var w: Int { width }
-  var h: Int { height }
+  // Geometry, exposed for the host's opCreateBrowser payload. width/height are
+  // mutated by resize() on the main thread and read by the host on its reader
+  // thread, so guard them with bufferLock (dpr is immutable, so scale needn't).
+  var w: Int { bufferLock.lock(); defer { bufferLock.unlock() }; return width }
+  var h: Int { bufferLock.lock(); defer { bufferLock.unlock() }; return height }
   var scale: CGFloat { dpr }
 
   init(sessionId: String, width: Int, height: Int, dpr: CGFloat,
@@ -152,12 +154,20 @@ final class CefWebSession: NSObject, FlutterTexture {
 
   func resize(width newW: Int, height newH: Int) {
     let w = max(1, newW), h = max(1, newH)
-    if w == width && h == height { return }
-    guard allocateBuffers(w, h) else { return }
+    bufferLock.lock()
+    let unchanged = (w == width && h == height)
+    bufferLock.unlock()
+    if unchanged { return }
+    guard allocateBuffers(w, h) else { return }  // takes bufferLock internally
+    // Publish the new geometry and read the fresh surface id under bufferLock so a
+    // concurrent host read (sendCreate on the reader thread) sees a consistent
+    // (w, h, surfaceId). Released before sendFrame — no bufferLock→writeLock nest.
+    bufferLock.lock()
     width = w
     height = h
-    guard let surf = ioSurface else { return }
-    let sid = IOSurfaceGetID(surf)
+    let sid = ioSurface.map { IOSurfaceGetID($0) } ?? 0
+    bufferLock.unlock()
+    guard sid != 0 else { return }
     var payload = [UInt8]()
     appendU32(&payload, UInt32(w))
     appendU32(&payload, UInt32(h))

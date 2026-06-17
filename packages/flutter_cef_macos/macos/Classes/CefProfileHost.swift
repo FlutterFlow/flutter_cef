@@ -187,16 +187,28 @@ final class CefProfileHost {
   /// geometry: {u32 w}{u32 h}{f64 dpr}{u32 iosurfaceId}{utf8 url}. allowedSchemes
   /// is NOT here — it's a process arg fixed at spawn (A.4).
   private func sendCreate(_ id: UInt32, _ session: CefWebSession, _ url: String) {
+    writeLock.lock()
+    defer { writeLock.unlock() }
+    // Read the session's LIVE geometry + surfaceId AND write the create frame in a
+    // single writeLock section, so a racing resize can neither slip between the
+    // surfaceId read and the create write, nor order its opResize ahead of the
+    // create on the wire (cef_host drops a resize for a not-yet-created browser).
+    // Any resize after this lands after the create, so cef_host has a slot and
+    // self-heals the surface via DoResize. (writeLock→bufferLock here is safe: no
+    // path holds bufferLock then takes writeLock.)
     var payload = [UInt8]()
     appendU32(&payload, UInt32(session.w))
     appendU32(&payload, UInt32(session.h))
     appendF64(&payload, Double(session.scale))
     appendU32(&payload, session.surfaceId)
     payload.append(contentsOf: Array(url.utf8))
-    writeLock.lock()
     createEnqueued.insert(id)
-    writeLock.unlock()
-    send(id, Self.opCreateBrowser, payload)
+    let frame = frameBytes(id, Self.opCreateBrowser, payload)
+    if connFd < 0 {
+      pendingFrames.append(frame)
+    } else {
+      _ = frame.withUnsafeBytes { writeAll(connFd, $0.baseAddress!, frame.count) }
+    }
   }
 
   /// Frame `[u32 bodyLen=4+1+payload.count][u32 browserId][op][payload]` and
