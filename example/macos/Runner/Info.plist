@@ -28,5 +28,17 @@
 	<string>MainMenu</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<!-- flutter_cef: the embedded Chromium (cef_host) is spawned as a child of
+	     THIS app, so macOS TCC attributes its privacy-sensitive access to this
+	     (the responsible) app's Info.plist — NOT cef_host's. Without these, the
+	     process is SIGABRT'd the instant a page touches the hardware (e.g. Google
+	     sign-in probing WebAuthn/FIDO security keys reaches Bluetooth). Any app
+	     embedding flutter_cef must declare these. -->
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>A web page is requesting Bluetooth to use a security key or passkey.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>A web page is requesting camera access.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>A web page is requesting microphone access.</string>
 </dict>
 </plist>

@@ -109,6 +109,25 @@ IOSurface, writes a cache); entitlements need
 one identity (framework → cef_host → app, inside-out) and library validation can
 stay on.
 
+**Privacy usage descriptions (required in YOUR app's `Info.plist`).** `cef_host`
+is spawned as a child of your app, so macOS TCC attributes the page's
+privacy-sensitive hardware access to your app (the responsible process) and reads
+the usage string from **your app's** `Info.plist` — not `cef_host`'s. Without it,
+the process is **SIGABRT'd** the instant a page touches the hardware (e.g. Google
+sign-in probing WebAuthn/FIDO security keys reaches Bluetooth). Declare at least:
+
+```xml
+<key>NSBluetoothAlwaysUsageDescription</key><string>A web page is requesting Bluetooth to use a security key or passkey.</string>
+<key>NSCameraUsageDescription</key><string>A web page is requesting camera access.</string>
+<key>NSMicrophoneUsageDescription</key><string>A web page is requesting microphone access.</string>
+```
+
+(`example/macos/Runner/Info.plist` carries these.) Hardened-runtime apps that want
+the access to actually *function* (not just avoid the crash) also need the
+matching `com.apple.security.device.{bluetooth,camera,microphone}` entitlements;
+with them absent the access is denied gracefully, which is enough to keep
+password sign-in working when WebAuthn isn't supported.
+
 ## Security
 
 `flutter_cef` embeds a full Chromium that runs arbitrary web content with JIT.
