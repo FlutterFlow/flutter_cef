@@ -81,6 +81,30 @@ enum CdpRelayFilterTests {
     drop("unknown browser-level method", #"{"id":1,"method":"Fetch.enable"}"#)
     drop("C→R malformed JSON (fail closed)", "{not json")
 
+    // ── ws-upgrade token enforcement (MANDATORY — defeats the localhost port-scan) ──
+    let tok = r.token
+    func tokOK(_ n: String, _ target: String, _ h: [String: String]) { check("token ok:   \(n)", r.tokenAcceptable(target, h)) }
+    func tokNo(_ n: String, _ target: String, _ h: [String: String]) { check("token deny: \(n)", !r.tokenAcceptable(target, h)) }
+    tokNo("absent — no header, no query (port-scanner)", "/devtools/browser", [:])
+    tokOK("Authorization: Bearer <token>", "/devtools/browser", ["authorization": "Bearer \(tok)"])
+    tokNo("Authorization: Bearer <wrong>", "/devtools/browser", ["authorization": "Bearer deadbeef"])
+    tokNo("Authorization: Basic (not bearer)", "/devtools/browser", ["authorization": "Basic \(tok)"])
+    tokNo("Authorization: Bearer (empty)", "/devtools/browser", ["authorization": "Bearer "])
+    tokOK("?token=<token> query fallback", "/devtools/browser?token=\(tok)", [:])
+    tokNo("?token=<wrong> query", "/devtools/browser?token=deadbeef", [:])
+    // header/query precedence + parsing edges (audit-driven)
+    tokOK("non-bearer header falls through to a valid query", "/devtools/browser?token=\(tok)", ["authorization": "Basic \(tok)"])
+    tokNo("wrong Bearer header does NOT consult the query", "/devtools/browser?token=\(tok)", ["authorization": "Bearer deadbeef"])
+    tokOK("empty 'Bearer ' header falls through to a valid query", "/devtools/browser?token=\(tok)", ["authorization": "Bearer "])
+    tokOK("valid Bearer header ignores a wrong query", "/devtools/browser?token=deadbeef", ["authorization": "Bearer \(tok)"])
+    tokNo("last token= wins (good then wrong)", "/devtools/browser?token=\(tok)&token=deadbeef", [:])
+    tokOK("last token= wins (wrong then good)", "/devtools/browser?token=deadbeef&token=\(tok)", [:])
+    tokOK("valid token + trailing param", "/devtools/browser?token=\(tok)&x=1", [:])
+    tokNo("empty ?token=", "/devtools/browser?token=", [:])
+    tokNo("?token with no '='", "/devtools/browser?token", [:])
+    tokNo("lookalike key ?tokenx=", "/devtools/browser?tokenx=\(tok)", [:])
+    tokNo("tab (not SP) between scheme and token", "/devtools/browser", ["authorization": "Bearer\t\(tok)"])
+
     print(failures == 0
       ? "\n==== CdpRelay filter: ALL PASS ===="
       : "\n==== CdpRelay filter: \(failures) FAILURE(S) ====")

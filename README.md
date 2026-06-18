@@ -280,13 +280,16 @@ returns the endpoint.
 * **Per-tile opt-in.** Nothing is exposed until you call `enableAgentControl()`; the
   relay exists *only while the grant is active* and is torn down on
   `disableAgentControl()`, tile dispose, or host shutdown.
-* **Loopback + ephemeral + single-client.** It binds `127.0.0.1` on an OS-assigned
-  port and accepts one client at a time. The returned `token` is validated **if a
-  client presents it**; agent-browser/Playwright can't attach one, so for those the
-  controls above are the gate. (This is strictly better than raw Chrome's fixed,
-  always-open, multi-client `--remote-debugging-port`. A same-UID process that wins a
-  sub-second race on the ephemeral port before the agent connects is the documented
-  residual — and on macOS same-UID is already game-over via the Keychain.)
+* **Loopback + ephemeral + single-client + mandatory token.** It binds `127.0.0.1`
+  on an OS-assigned port and accepts one client at a time. The returned `token` is
+  **required** — the ws upgrade is rejected (401) without a valid `Authorization:
+  Bearer <token>` (a `?token=` query is an accepted fallback). A CDP client attaches
+  it via `connectOverCDP({ headers })` (Playwright forwards request headers on the
+  upgrade). Discovery (`/json/*`) stays token-free, so a local port-scanner learns
+  the ws-url but cannot upgrade. (Strictly better than raw Chrome's fixed, always-
+  open, multi-client `--remote-debugging-port`: even a same-UID process can't connect,
+  because it never sees the token — the integrator must deliver it to its CDP client
+  out-of-band, kept in memory, never on disk/argv/env.)
 * **Per-tile isolation.** Tiles in a shared profile run in one `cef_host` process
   behind one browser-wide CDP pipe, so the relay enforces the boundary itself: a
   deny-by-default, fail-closed, **flatten-only** CDP Target-domain filter exposes the

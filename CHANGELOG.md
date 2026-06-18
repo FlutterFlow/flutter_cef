@@ -35,9 +35,11 @@
   external CDP client (e.g. `agent-browser`/Playwright via `--cdp <port>`) connects
   to; `disableAgentControl()` tears it down. Security model: per-tile opt-in; the
   relay exists **only while a grant is active**, binds **loopback only** on an
-  **ephemeral port**, accepts a **single client**, and the token is validated **if
-  present** (clients that can't attach one — Playwright — rely on the ephemeral-port
-  + lifecycle + single-client controls). Crucially the relay **confines the agent to
+  **ephemeral port**, accepts a **single client**, and **requires** the token: the ws
+  upgrade is rejected without a valid `Authorization: Bearer <token>` (Playwright
+  forwards it via `connectOverCDP({ headers })`; a `?token=` query is a fallback),
+  while discovery (`/json/*`) stays token-free so a port-scanner can't upgrade.
+  Crucially the relay **confines the agent to
   that one tile**: a deny-by-default / fail-closed / flatten-only CDP Target-domain
   filter exposes only the tile's own target (sibling tiles in the same shared-profile
   process are hidden and unreachable), and browser-context-wide CDP (`Storage.*`,
