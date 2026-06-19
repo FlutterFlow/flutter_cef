@@ -201,8 +201,8 @@ crux, the CEF side itself lands in two increments:
     browser-level passthrough, **no** target filter yet).
     `enableAgentControl()→{wsUrl, token, port}` / `disableAgentControl()` threaded
     Swift→Dart→controller. Security (see the token-transport note): per-tile opt-in +
-    ephemeral loopback port + relay-exists-only-during-grant + single active client;
-    the token is validated-if-present defense-in-depth. Validated end-to-end: the
+    ephemeral loopback port + relay-exists-only-during-grant + single active client +
+    a MANDATORY token (`Authorization: Bearer`, `?token=` fallback). Validated end-to-end: the
     real `agent-browser` CLI (`--cdp <port>`) drove the live tile — read url/title,
     navigated to a new page, read the DOM snapshot — through relay→pipe→cef_host.
     (The no-filter relay is dev-validation-only — never shipped — since a connected
@@ -221,29 +221,29 @@ crux, the CEF side itself lands in two increments:
     foreign-session commands. Validated end-to-end: real agent-browser drives the
     scoped tile normally; a sibling target created via `createTarget` is HIDDEN from
     `getTargets` and UNATTACHABLE; the hardened filter then blocks `createTarget`
-    itself. First cut: ONE agent-controlled tile per process (a second different tile
-    is refused); multi-grant (per-tile relays + CDP `id` remapping) deferred.
+    itself. First cut was ONE agent-controlled tile per process; multi-grant
+    (per-tile relays + CDP `id` remapping) was deferred — **now implemented in
+    P2-step2**: N tiles per shared `cef_host`, one relay per `browserId` over the
+    shared pipe, with a per-relay CDP-id rewrite for browser-level commands (see
+    `CefProfileHost.cdpRelays` / `CdpRelay.rewriteOutgoingId` + `CdpRelayFilterTests`).
 Then the Campus consumer (Layer C).
 
 ## Open questions / to resolve in P2
 
-- **`agent-browser` token transport — RESOLVED (empirically, against the installed
-  CLI):** the installed `agent-browser` (v0.6.0, via npm) is **Playwright-based**
-  (the CDP client UA is `Playwright/1.57.0`), NOT the Rust `cli/src/native/cdp`
-  path. Its `--cdp <port>` parses a **bare integer** (it rejected `host:port?token`)
-  and the CDP connection attaches **no** secret — Playwright's `connectOverCDP`
-  fetches `GET /json/version/` (trailing slash) for the ws-url and upgrades with no
-  token/auth header. So a client-supplied token **cannot** gate agent-browser. The
-  achievable security is therefore NOT a token but: **per-tile opt-in + ephemeral
-  loopback port + relay-exists-only-during-grant + single active client** (a second
-  concurrent upgrade is rejected, so the agent's connection holds the slot). This is
-  strictly better than raw Chrome's fixed, always-open, multi-client
-  `--remote-debugging-port`. The relay still mints a token and validates it
-  **if present** (defense-in-depth for a token-capable client or a future Campus-side
-  forwarder that injects it), but does not require it. Residual: a same-UID process
-  could race the ephemeral port in the sub-second gap before the agent connects —
-  documented; tighten later with a Campus-side forwarder (relay stays strict, the
-  unauth surface confined to Campus) or a token-capable client.
+- **`agent-browser` token transport — RESOLVED (the token is now MANDATORY):** the
+  installed `agent-browser` (v0.6.0) is **Playwright-based** (CDP UA
+  `Playwright/1.57.0`). Its bare `--cdp <port>` form attaches no secret — BUT
+  Playwright's `connectOverCDP(endpoint, { headers })` DOES forward request headers
+  on the ws upgrade, so the integrator (Campus) presents the token as
+  `Authorization: Bearer <token>`. The relay therefore **requires** the token (401 on
+  an absent/wrong one; a `?token=` query is accepted as a fallback), while discovery
+  (`/json/*`) stays token-free — a port-scanner learns the ws-url but can't upgrade.
+  This closes the classic "malware scans localhost, finds the debug port, drives the
+  browser" attack. **Same-UID is closed too**, by the Campus integration: Campus
+  brokers the drive (it spawns/owns its CDP client and feeds it the token in memory),
+  so the token never lands on disk/argv/env and a same-UID process can't obtain it.
+  (The earlier conclusion — "agent-browser can't pass a token, so the gate is the
+  port-race only" — is SUPERSEDED: the `connectOverCDP({ headers })` path works.)
 - **Relay lifecycle:** when does a grant expire? Tied to the `agentControllable`
   flag + an explicit `disableAgentControl()`; revoking the toggle kills live relay
   connections (closes the ws + invalidates the token).

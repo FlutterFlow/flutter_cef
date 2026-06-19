@@ -27,6 +27,48 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     instance.channel = channel
     registrar.addMethodCallDelegate(instance, channel: channel)
     sweepStaleEphemeralProfiles()
+    // On app quit, SIGTERM+reap every live cef_host so none is orphaned. Each
+    // posix-spawned cef_host holds its named profile's Chromium SingletonLock; an
+    // orphan keeps it held and the next launch collides ("already open elsewhere").
+    // The macOS FlutterPlugin protocol has no detachFromEngine hook (that's iOS-
+    // only), so we observe NSApplication.willTerminateNotification directly — fires
+    // regardless of how the host app wires its delegate. The closure captures
+    // `instance` strongly (intended: keep it alive to term so shutdownAllHosts can
+    // run), and removes itself so it can't fire twice. Idempotent: shutdownAllHosts
+    // tolerates an already-clean state, and CefProfileHost.shutdown() is itself
+    // idempotent, so this is safe even after normal per-tile teardown.
+    instance.terminateObserver = NotificationCenter.default.addObserver(
+      forName: NSApplication.willTerminateNotification, object: nil, queue: .main
+    ) { [weak instance] _ in
+      instance?.shutdownAllHosts()
+    }
+  }
+
+  /// Token for the willTerminateNotification observer (Task D). Held so we keep the
+  /// closure registered for the plugin's lifetime; removed once it has fired.
+  private var terminateObserver: NSObjectProtocol?
+
+  /// Shut down EVERY live cef_host (SIGTERM+SIGKILL escalation + reap, via the host's
+  /// own shutdown()) so app termination leaves no orphaned subprocess holding a
+  /// profile's Chromium SingletonLock. Main-thread confined like the other map
+  /// accessors (H3); the willTerminate observer is queued on .main. Idempotent: clears
+  /// the maps so a stray second call (or a later normal teardown) is a no-op, and
+  /// drops the self-observer.
+  private func shutdownAllHosts() {
+    dispatchPrecondition(condition: .onQueue(.main))
+    if let tok = terminateObserver {
+      NotificationCenter.default.removeObserver(tok)
+      terminateObserver = nil
+    }
+    // De-dup: several sessions can share one host (one named profile -> one host).
+    var seen = Set<ObjectIdentifier>()
+    for host in profiles.values where seen.insert(ObjectIdentifier(host)).inserted {
+      host.shutdown()
+    }
+    profiles.removeAll()
+    sessions.removeAll()
+    sessionHost.removeAll()
+    sessionKey.removeAll()
   }
 
   /// Reclaim ephemeral (throwaway) profile temp dirs orphaned by a previous crash/
@@ -141,13 +183,18 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
             result(["wsUrl": info.wsUrl, "token": info.token, "port": info.port])
           } else {
             result(FlutterError(code: "agent_control",
-                                message: "enableAgentControl failed: not in agent-control mode, host down, targetId unresolved, or another tile is already agent-controlled in this process",
+                                message: "enableAgentControl failed: not in agent-control mode, host down, or targetId unresolved",
                                 details: nil))
           }
         }
       }
     case "disableAgentControl":
-      if let sid = args["sessionId"] as? String { sessionHost[sid]?.disableAgentControl() }
+      // CEF-2b: route by this session's browserId (mirrors enableAgentControl) so
+      // only THIS tile's relay is torn down — siblings on the same shared host stay
+      // agent-controlled.
+      if let sid = args["sessionId"] as? String, let session = sessions[sid] {
+        sessionHost[sid]?.disableAgentControl(browserId: session.browserId)
+      }
       result(nil)
     case "showEmojiPicker":
       // The Character Viewer targets the current first responder's input
@@ -238,17 +285,13 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
         details: nil))
       return
     }
-    // Safety rail (c) — P1 single-view guard: only one live browser per named
-    // profile for now (multi-view sharing lands in P2). An ephemeral host is
-    // per-session, so this only applies to named profiles.
-    if namedProfile, let existing = profiles[profile!], existing.hasLiveBrowser {
-      result(FlutterError(
-        code: "profile_in_use",
-        message: "profile '\(profile!)' is already in use by another view "
-          + "(single-view per profile in this build).",
-        details: nil))
-      return
-    }
+    // P2-step1: the single-view guard is lifted — multiple views on a named
+    // profile now share ONE cef_host (resolveOrSpawnHost de-dups by key), so
+    // every web tile renders and shares one cookie jar (sign-in persists across
+    // tiles + relaunch). P2-step2: agent-control is now multi-tile — N tiles on
+    // one shared host can be agent-controlled concurrently, each via its own
+    // per-target CDP relay (one relay per browserId, demuxed over the shared pipe
+    // by the per-relay CDP-id rewrite — see CdpRelay's multiplex note).
 
     let (profileDir, isEphemeral) = resolveProfileDir(namedProfile ? profile : nil)
     let key = namedProfile ? profile! : "~ephemeral~" + sessionId
@@ -362,9 +405,11 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   /// Resolve an existing host for `key`, or spawn a fresh one. Returns nil if the
   /// spawn fails. `agentControl` switches the launch to posix_spawn (CDP over
   /// inherited fds 3/4) — see CefProfileHost.spawn. Only meaningful when this call
-  /// actually spawns; an EXISTING host keeps its original transport (a named
-  /// profile is single-view in this build, so an agent-control create() resolving
-  /// to a pre-existing host is not a normal path).
+  /// actually spawns; an EXISTING host keeps its original transport. Since P2,
+  /// a named profile is MULTI-view (N tiles share one host), so an agent-control
+  /// create() resolving to a pre-existing host is the normal path for the 2nd+
+  /// tile — the host was already spawned in agent-control mode by the first, and
+  /// each tile gets its own per-target CDP relay (see CefProfileHost.enableAgentControl).
   private func resolveOrSpawnHost(
     key: String, profileDir: String, isEphemeral: Bool, cefHostPath: String,
     enableCdp: Bool, allowedSchemes: String, agentControl: Bool

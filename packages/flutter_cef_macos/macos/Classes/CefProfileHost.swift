@@ -60,24 +60,31 @@ final class CefProfileHost {
   // NUL-delimited UTF-8 JSON line, NUL stripped). Set by the plugin/relay; the
   // CEF-1 validation hook installs a temporary one to prove the round-trip.
   var onCdpMessage: ((String) -> Void)?
-  // CEF-2a: the token-gated localhost CDP relay (created lazily on the first
-  // enableAgentControl()). Bridges a CDP client's WebSocket ⇄ this host's pipe.
-  // Held strongly here; its pipe-send closure captures self weakly (no cycle).
-  private var cdpRelay: CdpRelay?
-  // Guards onCdpMessage and cdpRelay. CEF-2a mutates onCdpMessage LIVE (enable/
+  // CEF-2a/b: the token-gated localhost CDP relays (created lazily by
+  // enableAgentControl()). Each bridges a CDP client's WebSocket ⇄ this host's pipe
+  // and is scoped to ONE browser's CDP target. Keyed by the wire browserId so N
+  // tiles in the same shared cef_host can be agent-controlled concurrently — they
+  // share the one browser-wide pipe, and each relay demuxes its own traffic (by
+  // sessionId, plus a per-relay CDP-id rewrite for browser-level commands — see
+  // CdpRelay's multiplex note). Held strongly here; each relay's pipe-send closure
+  // captures self weakly (no cycle).
+  private var cdpRelays: [UInt32: CdpRelay] = [:]
+  // Guards onCdpMessage and cdpRelays. CEF-2a/b mutates onCdpMessage LIVE (enable/
   // disable on the main thread) while the CDP reader thread reads it per message,
   // so — unlike CEF-1, which only set it before the reader started — both must be
   // synchronized. A plain closure property is a fat (ptr+context) value; a concurrent
   // read during a write can tear it and call into freed context.
   private let cdpHandlerLock = NSLock()
-  // CEF-2b: the single relay is scoped to ONE browser's CDP target (first cut: one
-  // agent-controlled tile per process). `relayBrowserId` is the browser it's scoped
-  // to (0 = none); guarded by cdpHandlerLock.
-  private var relayBrowserId: UInt32 = 0
   // Pending browserId→targetId resolutions (kOpResolveTargetId round-trip), keyed by
   // browserId. Set on the plugin thread, fulfilled on the reader thread (kOpTargetId)
   // or a timeout; guarded by targetIdLock. The completion fires exactly once.
   private var pendingTargetId: [UInt32: [(String?) -> Void]] = [:]
+  // Per-browser resolve epoch, bumped on each fresh in-flight resolve. A resolve's 5s
+  // timeout captures its epoch and only fulfills if still current — so an EARLY
+  // response (which doesn't cancel the timer) can't let the stale timer clobber a
+  // LATER resolve for the same browser (e.g. re-enabling agent-control within 5s of a
+  // prior enable/disable). Guarded by targetIdLock.
+  private var targetIdEpoch: [UInt32: Int] = [:]
   private let targetIdLock = NSLock()
 
   // Process + IPC machinery (hoisted from CefWebSession).
@@ -389,6 +396,12 @@ final class CefProfileHost {
   func createBrowser(_ session: CefWebSession, url: String, allowedSchemes: String) -> UInt32 {
     browsersLock.lock()
     let id = nextBrowserId
+    // browserIds are STRICTLY MONOTONIC and never reused: nextBrowserId only ever
+    // increments (never reset/decremented) and a disposed id is never recycled. The
+    // CEF-2b relayId<->target binding (CdpRelay's pipeId = relayId<<21 | localSeq)
+    // relies on this for global uniqueness across N concurrent relays, so guard it —
+    // the slot we're about to hand out must be FREE (never previously registered).
+    assert(browsers[id] == nil, "browserId must be monotonic / never reused")
     nextBrowserId += 1
     browsers[id] = session
     browsersLock.unlock()
@@ -488,6 +501,11 @@ final class CefProfileHost {
   /// Close ONE browser (opDisposeBrowser) and unregister it under lock. Returns
   /// the number of browsers still registered on this host afterward.
   func removeBrowser(_ browserId: UInt32) -> Int {
+    // CEF-2b: if this tile was agent-controlled, tear down ITS relay (its scoped
+    // targetId is now dead) BEFORE disposing the browser — disableAgentControl is
+    // a no-op when there's no relay for this id. Does its own locking + stops the
+    // relay outside cdpHandlerLock.
+    disableAgentControl(browserId: browserId)
     send(browserId, Self.opDisposeBrowser, [])
     browsersLock.lock()
     browsers[browserId] = nil
@@ -496,13 +514,6 @@ final class CefProfileHost {
     writeLock.lock()
     createEnqueued.remove(browserId)
     writeLock.unlock()
-    // CEF-2b: if the disposed tile was the agent-controlled one, tear down its relay
-    // (its scoped targetId is now dead) and free the one-per-process slot.
-    cdpHandlerLock.lock()
-    let relay = relayBrowserId == browserId ? cdpRelay : nil
-    if relay != nil { cdpRelay = nil; relayBrowserId = 0; onCdpMessage = nil }
-    cdpHandlerLock.unlock()
-    relay?.stop()
     return remaining
   }
 
@@ -523,15 +534,16 @@ final class CefProfileHost {
     let wasRunning = running
     running = false
     writeLock.unlock()
-    // CEF-2a: drop the relay (listener + any client) before tearing down the pipe,
-    // so it stops bridging into a closing fd.
+    // CEF-2a/b: drop ALL relays (each a listener + any client) before tearing down
+    // the pipe, so none keeps bridging into a closing fd. Snapshot under the lock,
+    // clear the dict + onCdpMessage, then stop each OUTSIDE the lock (stop() may
+    // block briefly on a stuck client and takes the relay's own locks).
     cdpHandlerLock.lock()
-    let relay = cdpRelay
-    cdpRelay = nil
-    relayBrowserId = 0
+    let relays = Array(cdpRelays.values)
+    cdpRelays.removeAll()
     onCdpMessage = nil
     cdpHandlerLock.unlock()
-    relay?.stop()
+    for r in relays { r.stop() }
     send(0, Self.opShutdown, [])
     writeLock.lock()
     let c = connFd, l = listenFd
@@ -887,24 +899,37 @@ final class CefProfileHost {
     cdpWriteLock.unlock()
   }
 
-  /// CEF-2b: start (lazily) the token-gated CDP relay SCOPED to `browserId`'s tile
-  /// and return the brokered endpoint Campus hands an agent. Async: first resolves
-  /// the browser's CDP targetId (round-trip to cef_host), then creates a relay whose
+  /// CEF-2b: deliver one CDP pipe message to EVERY live relay. Snapshot the relays
+  /// under cdpHandlerLock, then call deliverToClient OUTSIDE the lock on each —
+  /// deliverToClient does blocking IO and takes the relay's own locks, so holding
+  /// cdpHandlerLock across it would invert the lock order (and could deadlock /
+  /// stall the reader). Each relay demuxes its own traffic (sessionId + CDP-id
+  /// rewrite); a sibling relay drops what isn't its.
+  private func deliverCdpToRelays(_ msg: String) {
+    cdpHandlerLock.lock()
+    let relays = Array(cdpRelays.values)
+    cdpHandlerLock.unlock()
+    for r in relays { r.deliverToClient(msg) }
+  }
+
+  /// CEF-2b: start (lazily) a token-gated CDP relay SCOPED to `browserId`'s tile and
+  /// return the brokered endpoint Campus hands an agent. Async: first resolves the
+  /// browser's CDP targetId (round-trip to cef_host), then creates a relay whose
   /// Target-domain filter exposes only that tile, then starts it (so no client ever
   /// sees an unscoped relay). Requires agent-control (pipe) mode and a live host.
-  /// First cut: one agent-controlled tile per process — a second, different tile is
-  /// refused. Idempotent for the same tile. The completion fires exactly once.
+  /// N tiles in the same shared cef_host can be agent-controlled concurrently — one
+  /// relay per browserId, all sharing the one browser-wide pipe. Idempotent for the
+  /// same tile. The completion fires exactly once.
   func enableAgentControl(browserId: UInt32,
                           completion: @escaping ((wsUrl: String, token: String, port: Int)?) -> Void) {
     writeLock.lock(); let alive = running && !crashed; writeLock.unlock()
     guard agentControl, alive, browserId > 0 else { completion(nil); return }
 
+    // Idempotent fast-path: this tile already has a relay — hand back its endpoint.
     cdpHandlerLock.lock()
-    if let r = cdpRelay {
-      let sameTile = relayBrowserId == browserId
+    if let r = cdpRelays[browserId] {
       cdpHandlerLock.unlock()
-      if sameTile { completion(endpoint(r)) }
-      else { NSLog("[cef] agent-control already active for another tile in this process"); completion(nil) }
+      completion(endpoint(r))
       return
     }
     cdpHandlerLock.unlock()
@@ -912,19 +937,29 @@ final class CefProfileHost {
     resolveTargetId(browserId) { [weak self] tid in
       guard let self = self, let tid = tid, !tid.isEmpty else { completion(nil); return }
       self.cdpHandlerLock.lock()
-      if self.cdpRelay == nil {  // re-check: a concurrent enable could have raced
-        let relay = CdpRelay(sendToPipe: { [weak self] in self?.sendCdp($0) }, scopeTargetId: tid)
-        guard relay.start() else { self.cdpHandlerLock.unlock(); completion(nil); return }
-        self.cdpRelay = relay
-        self.relayBrowserId = browserId
-        // Route pipe → relay. Capture the relay directly (weakly) so the reader
-        // thread never dereferences self.cdpRelay (which mutates across threads).
-        self.onCdpMessage = { [weak relay] msg in relay?.deliverToClient(msg) }
+      // Re-check under the lock: a concurrent enable for the SAME browserId could
+      // have raced us between the fast-path check and here.
+      if let r = self.cdpRelays[browserId] {
+        self.cdpHandlerLock.unlock()
+        completion(self.endpoint(r))
+        return
       }
-      let r = self.cdpRelay!
-      let same = self.relayBrowserId == browserId
+      // relayId: browserId binds this relay into the shared pipe's CDP id space, so
+      // its rewritten command ids never collide with a sibling tile's.
+      let relay = CdpRelay(sendToPipe: { [weak self] in self?.sendCdp($0) },
+                           scopeTargetId: tid, relayId: Int(browserId))
+      guard relay.start() else { self.cdpHandlerLock.unlock(); completion(nil); return }
+      // Install the fan-out pipe → relays handler ONCE, when the first relay appears,
+      // CHAINING any prior handler (preserves the debug CEF-1 validation probe) rather
+      // than clobbering it. Subsequent relays just join cdpRelays; deliverCdpToRelays
+      // snapshots the dict per message, so it picks them up automatically.
+      if self.cdpRelays.isEmpty {
+        let prior = self.onCdpMessage
+        self.onCdpMessage = { [weak self] msg in prior?(msg); self?.deliverCdpToRelays(msg) }
+      }
+      self.cdpRelays[browserId] = relay
       self.cdpHandlerLock.unlock()
-      completion(same ? self.endpoint(r) : nil)
+      completion(self.endpoint(relay))
     }
   }
 
@@ -943,15 +978,18 @@ final class CefProfileHost {
     targetIdLock.lock()
     let first = pendingTargetId[browserId] == nil
     pendingTargetId[browserId, default: []].append(completion)
+    let epoch = (targetIdEpoch[browserId] ?? 0) + (first ? 1 : 0)
+    if first { targetIdEpoch[browserId] = epoch }
     targetIdLock.unlock()
     guard first else { return }  // a resolve is already in flight for this browser
     send(browserId, Self.opResolveTargetId, [])
     DispatchQueue.global().asyncAfter(deadline: .now() + 5) { [weak self] in
-      self?.handleTargetId(browserId, nil)  // timeout: fulfill any still-pending waiters with nil
+      self?.timeoutTargetId(browserId, epoch)  // fulfill with nil only if still this resolve
     }
   }
 
-  /// Fulfill all pending targetId waiters for a browser (reader thread, or timeout).
+  /// Fulfill all pending targetId waiters for a browser with a real result (reader
+  /// thread). The matching resolve's timer is left to no-op via the epoch guard.
   private func handleTargetId(_ browserId: UInt32, _ tid: String?) {
     targetIdLock.lock()
     let waiters = pendingTargetId.removeValue(forKey: browserId)
@@ -959,16 +997,30 @@ final class CefProfileHost {
     waiters?.forEach { $0(tid) }
   }
 
-  /// CEF-2a/b: tear down the relay (closes the listener + any client, invalidates the
-  /// token). Idempotent. The pipe itself stays up (the tile keeps running).
-  func disableAgentControl() {
+  /// A resolve's own 5s timeout: fulfill its still-pending waiters with nil — but
+  /// ONLY if a fresh resolve hasn't superseded it (epoch bumped). Without this guard
+  /// an early response leaves the timer armed and it would clobber the NEXT resolve.
+  private func timeoutTargetId(_ browserId: UInt32, _ epoch: Int) {
+    targetIdLock.lock()
+    guard targetIdEpoch[browserId] == epoch,
+          let waiters = pendingTargetId.removeValue(forKey: browserId) else {
+      targetIdLock.unlock(); return
+    }
+    targetIdLock.unlock()
+    waiters.forEach { $0(nil) }
+  }
+
+  /// CEF-2a/b: tear down `browserId`'s relay (closes the listener + any client,
+  /// invalidates the token). Idempotent — a no-op if that tile has no relay. When
+  /// the LAST relay goes, drop the fan-out onCdpMessage too. The pipe itself stays
+  /// up (the tile keeps running). The relay is stopped OUTSIDE the lock: stop() may
+  /// block briefly on a stuck client and takes the relay's own locks.
+  func disableAgentControl(browserId: UInt32) {
     cdpHandlerLock.lock()
-    let relay = cdpRelay
-    cdpRelay = nil
-    relayBrowserId = 0
-    onCdpMessage = nil
+    let relay = cdpRelays.removeValue(forKey: browserId)
+    if cdpRelays.isEmpty { onCdpMessage = nil }
     cdpHandlerLock.unlock()
-    relay?.stop()  // outside the lock: stop() may block briefly on a stuck client
+    relay?.stop()
   }
 
   /// CDP reader thread: drain cdpReadFd (parent end of out_pipe; child writes CDP

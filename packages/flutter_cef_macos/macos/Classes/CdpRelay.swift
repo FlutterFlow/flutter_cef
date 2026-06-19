@@ -14,23 +14,25 @@ import Security
 /// `listen()` on `127.0.0.1:0`, an accept thread, and per-connection handler
 /// threads doing RFC-6455 framing by hand.
 ///
-/// Security model (CEF-2a). agent-browser v0.6.0 connects via a bare `--cdp <port>`
-/// and cannot attach any secret (query or header) to the CDP connection, so a
-/// client-supplied token cannot be the gate for it. The achievable controls are:
+/// Security model. The agent does NOT connect directly: Campus brokers it — the app
+/// spawns agent-browser, holds the per-grant token in memory, and presents it as an
+/// `Authorization: Bearer <token>` header on the CDP upgrade (Playwright forwards
+/// request headers). So the relay REQUIRES the token, defeating the classic "malware
+/// scans localhost, finds the debug port, drives the browser" attack:
+/// - **Mandatory token** — the ws upgrade is rejected (401) without a valid
+///   `Authorization: Bearer <token>` (a `?token=` query is an accepted fallback).
+///   Discovery (`/json/*`) stays token-free, so a port-scanner learns the ws-url but
+///   can't upgrade — it never sees the token (held only in the Campus + spawned-agent
+///   process memory; never on disk, argv, env, or the discovery response).
 /// - **Loopback only** (`127.0.0.1`) — never reachable off-box.
-/// - **Exists only during a grant** — the relay is created by enableAgentControl()
-///   and torn down by disableAgentControl()/toggle-off/dispose. No standing port.
-/// - **Ephemeral, unadvertised port** — random per grant; `/json/version` discovery
-///   reveals only a token-free ws-url, never the port out-of-band.
-/// - **Single active client** — a second concurrent ws upgrade is rejected (503), so
-///   once the agent's connection is established it holds the slot for the session.
-/// Net: an attacker must win a sub-second race on a random loopback port in the gap
-/// between enable and the agent connecting — narrow, same-UID only. Strictly better
-/// than raw Chrome's fixed, always-open, multi-client `--remote-debugging-port`.
-/// The TOKEN is kept as validated-if-present defense-in-depth: a token-capable
-/// client (Campus's own CDP client, or a Campus-side forwarder that injects it)
-/// that passes `?token=` gets it constant-time-checked, upgrading to real auth; an
-/// absent token is allowed (so vanilla agent-browser works).
+/// - **Exists only during a grant** — created by enableAgentControl(), torn down by
+///   disableAgentControl()/toggle-off/dispose. No standing port.
+/// - **Ephemeral, unadvertised port** — random per grant.
+/// - **Single active client** — a second concurrent ws upgrade is rejected (503).
+/// Net: even a same-UID local process can't connect — it can't obtain the token
+/// without reading the Campus/agent process memory (SIP/hardened-runtime protected).
+/// Strictly better than raw Chrome's fixed, always-open, multi-client
+/// `--remote-debugging-port`.
 ///
 /// Per-tile isolation (CEF-2b): the CDP pipe is browser-wide, so when constructed
 /// with a `scopeTargetId` the relay applies a Target-domain filter that exposes the
@@ -42,7 +44,8 @@ final class CdpRelay {
   /// host weakly so the host↔relay ownership (host strongly holds the relay) is not
   /// a cycle.
   private let sendToPipe: (String) -> Void
-  /// Per-grant capability secret, required as `?token=` on the ws upgrade.
+  /// Per-grant capability secret, REQUIRED on the ws upgrade (presented as an
+  /// `Authorization: Bearer <token>` header, or a `?token=` query fallback).
   let token: String
   /// The loopback port the OS assigned (valid after `start()` succeeds).
   private(set) var port: UInt16 = 0
@@ -79,9 +82,24 @@ final class CdpRelay {
   private var allowedSessions = Set<String>()  // our session + descendant sub-target sessions
   private let filterLock = NSLock()
 
-  init(sendToPipe: @escaping (String) -> Void, scopeTargetId: String? = nil) {
+  // CEF-2b multiplex: this relay's identity in the shared pipe's CDP id space (the
+  // owning browser's wire browserId). 0 for the CEF-2a passthrough / unit tests.
+  private let relayId: Int
+
+  // CEF-2b multiplex: N relays share ONE browser-wide pipe with ONE CDP id space.
+  // Session-routed traffic is demuxed by sessionId, but BROWSER-LEVEL commands
+  // (no sessionId — Playwright's connect handshake) would collide. We rewrite
+  // EVERY outgoing command id to a globally-unique pipe id and demux responses
+  // back. pipeId = (relayId << 21) | localSeq is unique per relay because
+  // browserIds are strictly monotonic / never reused.
+  private var pipeIdToClientId: [Int: Int] = [:]
+  private var nextLocalId = 0
+  private let multiplexLock = NSLock()
+
+  init(sendToPipe: @escaping (String) -> Void, scopeTargetId: String? = nil, relayId: Int = 0) {
     self.sendToPipe = sendToPipe
     self.scopeTargetId = scopeTargetId
+    self.relayId = relayId
     self.token = CdpRelay.randomToken()
   }
 
@@ -229,9 +247,9 @@ final class CdpRelay {
       writeRaw(fd, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
       close(fd); return
     }
-    guard tokenAcceptable(target) else {
-      dlog("[cef][relay] ws upgrade rejected: token present but invalid")
-      writeRaw(fd, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    guard tokenAcceptable(target, headers) else {
+      dlog("[cef][relay] ws upgrade rejected: token absent or invalid")
+      writeRaw(fd, "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
       close(fd); return
     }
 
@@ -270,8 +288,9 @@ final class CdpRelay {
   }
 
   private func serveDiscovery(_ fd: Int32, path: String) {
-    // Token-free ws-url (see security model). agent-browser rewrites host/port and
-    // appends its ?token= query before connecting.
+    // Token-free ws-url (see security model). The token is NOT advertised here — the
+    // Campus-brokered agent presents it as an `Authorization: Bearer` header on the
+    // upgrade, so a local port-scanner that reads this url still can't connect.
     let wsUrl = "ws://127.0.0.1:\(port)/devtools/browser"
     let body: String
     if path == "/json/list" {
@@ -284,18 +303,29 @@ final class CdpRelay {
     _ = writeAll(fd, bytes)
   }
 
-  /// True unless a `?token=` is present AND wrong. An absent token is accepted —
-  /// agent-browser can't attach one to a bare `--cdp <port>` connection, so for it
-  /// the gate is the ephemeral port + lifecycle + single-client slot (see the type
-  /// doc). A client that DOES pass `?token=` gets it constant-time-validated.
-  private func tokenAcceptable(_ target: String) -> Bool {
-    guard let q = target.split(separator: "?", maxSplits: 1).dropFirst().first else { return true }
+  /// True iff the connection presents the correct token — now REQUIRED (an absent
+  /// OR wrong token is rejected). The token is minted per-grant and handed to
+  /// Campus in-process; the Campus-brokered agent-browser presents it as an
+  /// `Authorization: Bearer <token>` header (Playwright forwards request headers on
+  /// the ws upgrade), with a `?token=` query as a fallback. Discovery (`/json/*`)
+  /// stays token-free, so a local port-scanner learns the ws-url but can't upgrade
+  /// without the token it never sees. Constant-time compared.
+  func tokenAcceptable(_ target: String, _ headers: [String: String]) -> Bool {
     var supplied: String?
-    for pair in q.split(separator: "&") {
-      let kv = pair.split(separator: "=", maxSplits: 1)
-      if kv.first == "token" { supplied = kv.count > 1 ? String(kv[1]) : "" }
+    // Preferred: Authorization: Bearer <token> — how the Campus-brokered agent
+    // presents it (the token never lands in the url/argv/discovery response).
+    if let auth = headers["authorization"] {
+      let parts = auth.split(separator: " ", maxSplits: 1)
+      if parts.count == 2, parts[0].lowercased() == "bearer" { supplied = String(parts[1]) }
     }
-    guard let got = supplied else { return true }  // no token param → allowed
+    // Fallback: ?token=<token> in the upgrade target (e.g. a token-bearing ws-url).
+    if supplied == nil, let q = target.split(separator: "?", maxSplits: 1).dropFirst().first {
+      for pair in q.split(separator: "&") {
+        let kv = pair.split(separator: "=", maxSplits: 1)
+        if kv.first == "token" { supplied = kv.count > 1 ? String(kv[1]) : "" }
+      }
+    }
+    guard let got = supplied, !got.isEmpty else { return false }  // absent → REJECT
     return constantTimeEquals(got, token)
   }
 
@@ -319,6 +349,10 @@ final class CdpRelay {
       if acc.count >= 4, acc[acc.count - 4] == 0x0d, acc[acc.count - 3] == 0x0a,
          acc[acc.count - 2] == 0x0d, acc[acc.count - 1] == 0x0a { break }
     }
+    // Reject a head that hit the 16 KiB cap without a complete CRLFCRLF terminator —
+    // a truncated head must not be parsed (and accepted) as if it were complete.
+    guard acc.count >= 4, acc[acc.count - 4] == 0x0d, acc[acc.count - 3] == 0x0a,
+          acc[acc.count - 2] == 0x0d, acc[acc.count - 1] == 0x0a else { return nil }
     guard let text = String(bytes: acc, encoding: .utf8) else { return nil }
     let lines = text.components(separatedBy: "\r\n")
     guard let reqLine = lines.first else { return nil }
@@ -388,7 +422,7 @@ final class CdpRelay {
         assembling = !fin
         if fin {
           if assemblingText, let s = String(bytes: msg, encoding: .utf8) {
-            if let out = filterClientToPipe(s) { sendToPipe(out) }  // CEF-2b scope filter
+            if let out = filterClientToPipe(s) { sendToPipe(rewriteOutgoingId(out)) }  // CEF-2b scope filter + id remap
           }
           msg.removeAll(keepingCapacity: true)
           assemblingText = false
@@ -407,11 +441,30 @@ final class CdpRelay {
   }
 
   /// Deliver a CDP message from the pipe to the connected client. Applies the CEF-2b
-  /// scope filter (drops sibling-tile traffic) before writing. Called off the CDP
-  /// reader thread.
+  /// multiplex demux + scope filter (drops sibling-tile traffic) before writing.
+  /// Called off the CDP reader thread.
   func deliverToClient(_ json: String) {
-    guard let out = filterPipeToClient(json) else { return }  // dropped: not our tile
+    guard let out = demuxPipeToClient(json) else { return }  // dropped: not our tile
     sendRawToClient(out)
+  }
+
+  /// CEF-2b pure decision seam (no socket IO — unit-testable): map one inbound pipe
+  /// message to the bytes this relay should hand its client, or nil to DROP it.
+  ///
+  /// Multiplex demux (scoped relays only): a pipe message with a top-level id and NO
+  /// method is a command RESPONSE, owned by exactly the relay that issued that unique
+  /// pipe id. Restore the client's original id, or drop if it's a sibling relay's
+  /// response. Events (method present) + the CEF-2a passthrough fall through to the
+  /// scope filter unchanged.
+  func demuxPipeToClient(_ json: String) -> String? {
+    if scopeTargetId != nil, let m = parseJson(json), m["method"] == nil,
+       let pipeId = m["id"] as? Int {
+      multiplexLock.lock(); let clientId = pipeIdToClientId.removeValue(forKey: pipeId); multiplexLock.unlock()
+      guard let clientId = clientId else { return nil }  // sibling relay's response — drop
+      var restored = m; restored["id"] = clientId
+      return jsonString(restored)
+    }
+    return filterPipeToClient(json)  // events / browser-level / CEF-2a passthrough
   }
 
   /// Write a raw (already-filtered / self-originated) JSON text frame to the client.
@@ -657,6 +710,28 @@ final class CdpRelay {
     guard let d = s.data(using: .utf8),
           let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return nil }
     return o
+  }
+
+  private func jsonString(_ obj: [String: Any]) -> String? {
+    guard let d = try? JSONSerialization.data(withJSONObject: obj) else { return nil }
+    return String(data: d, encoding: .utf8)
+  }
+
+  // Rewrite an outgoing command's top-level id to a globally-unique pipe id and
+  // record the mapping. No-op for the CEF-2a passthrough (nil scope) and for
+  // messages without a top-level Int id (none, in practice clients only send
+  // commands). Called for client->pipe traffic only. Internal (not private) so the
+  // standalone filter tests can drive the rewrite↔demux round-trip directly.
+  func rewriteOutgoingId(_ json: String) -> String {
+    guard scopeTargetId != nil else { return json }
+    guard var m = parseJson(json), let clientId = m["id"] as? Int else { return json }
+    multiplexLock.lock()
+    let pipeId = (relayId << 21) | (nextLocalId & 0x1FFFFF)
+    nextLocalId &+= 1
+    pipeIdToClientId[pipeId] = clientId
+    multiplexLock.unlock()
+    m["id"] = pipeId
+    return jsonString(m) ?? json
   }
 
   // MARK: Blocking IO helpers

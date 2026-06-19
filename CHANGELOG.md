@@ -35,15 +35,24 @@
   external CDP client (e.g. `agent-browser`/Playwright via `--cdp <port>`) connects
   to; `disableAgentControl()` tears it down. Security model: per-tile opt-in; the
   relay exists **only while a grant is active**, binds **loopback only** on an
-  **ephemeral port**, accepts a **single client**, and the token is validated **if
-  present** (clients that can't attach one — Playwright — rely on the ephemeral-port
-  + lifecycle + single-client controls). Crucially the relay **confines the agent to
+  **ephemeral port**, accepts a **single client**, and **requires** the token: the ws
+  upgrade is rejected without a valid `Authorization: Bearer <token>` (Playwright
+  forwards it via `connectOverCDP({ headers })`; a `?token=` query is a fallback),
+  while discovery (`/json/*`) stays token-free so a port-scanner can't upgrade.
+  Crucially the relay **confines the agent to
   that one tile**: a deny-by-default / fail-closed / flatten-only CDP Target-domain
   filter exposes only the tile's own target (sibling tiles in the same shared-profile
   process are hidden and unreachable), and browser-context-wide CDP (`Storage.*`,
   `Tracing.*`, `Browser.*` mutators, cookie methods) is refused — so an agent can
-  drive the page but cannot read or clear the shared cookie jar. First cut: one
-  agent-controlled tile per `cef_host` process.
+  drive the page but cannot read or clear the shared cookie jar. **Multi-view:**
+  N tiles sharing one `cef_host` (one named profile) can each be agent-controlled
+  concurrently — one token-gated relay per tile, each pinned to its own CDP target,
+  all multiplexed over the single browser-wide `--remote-debugging-pipe`: inbound
+  traffic is scoped by `sessionId`, and browser-level commands (which carry no
+  `sessionId`) are disambiguated by a per-relay CDP-id rewrite, so a sibling tile's
+  page can be neither observed nor driven through another tile's grant (distinct
+  ephemeral port + token each). On host quit every `cef_host` is SIGTERM-reaped so
+  none is left orphaned holding a profile's Chromium `SingletonLock`.
 
 ## 0.1.3
 
