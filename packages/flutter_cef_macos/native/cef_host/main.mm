@@ -207,6 +207,12 @@ struct Slot {
   // browser's CDP targetId (Target.getTargetInfo). Kept alive for the slot's life;
   // UI-thread only. Lazily set on the first kOpResolveTargetId.
   CefRefPtr<CefRegistration> devtools_reg;
+  // CEF-2b: the DevTools message id of the LAST Target.getTargetInfo probe on this
+  // browser. A FRESH, monotonically-increasing id per probe (seeded to
+  // kTargetInfoMsgId) — Chromium's DevTools session requires increasing command ids,
+  // so reusing a fixed id silently drops the 2nd+ probe, which hung a re-enable of
+  // agent-control (disable then enable again). UI-thread only, like dialog_next.
+  int target_info_msg = 0;
 };
 
 // Routing map from a wire browser id to its Slot. MUTATED ONLY ON THE CEF UI
@@ -1359,7 +1365,12 @@ class TargetIdObserver : public CefDevToolsMessageObserver {
   void OnDevToolsMethodResult(CefRefPtr<CefBrowser> browser, int message_id,
                               bool success, const void* result,
                               size_t result_size) override {
-    if (message_id != kTargetInfoMsgId || !success || !result || result_size == 0)
+    // Match this browser's CURRENT probe id (ids now increment per resolve, so a
+    // fixed constant would miss every probe after the first). UI-thread, like the
+    // resolve that set it.
+    auto slot = LookupWireId(wire_id_);
+    if (!slot || message_id != slot->target_info_msg || !success || !result ||
+        result_size == 0)
       return;
     std::string json(static_cast<const char*>(result), result_size);
     // Anchor to the targetInfo object first, so a differently-named *targetId* field
@@ -1383,10 +1394,15 @@ void DoResolveTargetId(const std::shared_ptr<Slot>& slot) {
     slot->devtools_reg =
         host->AddDevToolsMessageObserver(new TargetIdObserver(slot->browser_id));
   }
+  // Fresh, increasing id per probe (see Slot::target_info_msg) so a re-resolve on the
+  // SAME browser isn't dropped by the DevTools session's monotonic-id requirement.
+  slot->target_info_msg = slot->target_info_msg < kTargetInfoMsgId
+                              ? kTargetInfoMsgId
+                              : slot->target_info_msg + 1;
   // Target.getTargetInfo with no params: executed on a specific browser's DevTools
   // agent (a page target), it returns THAT page's own targetInfo — so this resolves
   // exactly this browser's targetId, with no cross-tile ambiguity.
-  host->ExecuteDevToolsMethod(kTargetInfoMsgId, "Target.getTargetInfo", nullptr);
+  host->ExecuteDevToolsMethod(slot->target_info_msg, "Target.getTargetInfo", nullptr);
 }
 
 void DoImeSetComposition(const std::shared_ptr<Slot>& slot,

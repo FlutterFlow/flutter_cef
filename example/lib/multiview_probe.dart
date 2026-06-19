@@ -19,8 +19,8 @@
 //      and presenting tile A's token to tile B's port is rejected.
 //   F. concurrency + lifecycle: enabling both CONCURRENTLY brings up two isolated
 //      relays (the per-browserId dict, not the P1 scalar); disabling A kills only
-//      A's grant (its endpoint goes dead) while B keeps driving; re-enabling A mints
-//      a FRESH port+token and the torn-down grant stays dead (no reuse).
+//      A's grant (its endpoint goes dead) while B keeps driving; and A can be
+//      RE-ENABLED after disable — a fresh port+token, the torn-down grant stays dead.
 //
 // Not covered here — reader-stall isolation (PLAN Test G, the SO_SNDTIMEO reaping of
 // a wedged client + no sibling starvation): a faithful repro needs a real CDP driver
@@ -181,24 +181,29 @@ class _ProbeAppState extends State<ProbeApp> {
         _check('F: sibling B unaffected by A teardown (still drives its own target)',
             bUnaffected);
 
-        // DIAGNOSTIC (non-fatal) — re-enable after disable. This currently FAILS due
-        // to a PRE-EXISTING limitation (NOT a P2-step2 regression — the targetId
-        // resolution path is untouched by P2-step2): the 2nd Target.getTargetInfo
-        // resolve for the SAME browser never returns kOpTargetId, so enableAgentControl
-        // times out. Root cause is in cef_host's per-browser targetId re-resolution and
-        // is not yet isolated (one candidate: DoResolveTargetId reuses a fixed DevTools
-        // message id, kTargetInfoMsgId 0x7e57, on that browser's session; concurrent
-        // A+B resolve fine because they are distinct sessions). Recorded as a diagnostic
-        // so it doesn't mask the P2-step2 result; tracked for a separate cef_host fix.
-        // Short timeout so the suite isn't held up by the known failure.
-        setState(() => _status = 're-enable after teardown (diagnostic)…');
-        final gA2 = await _enable(_a, timeout: const Duration(seconds: 6));
-        out['reenableDiag'] = {
-          'reenabledOk': gA2 != null,
-          'note': gA2 != null
-              ? 'pre-existing re-enable limitation appears FIXED'
-              : 'pre-existing cef_host re-resolve limitation (see comment) — not a P2-step2 regression',
-        };
+        // F — re-enable after disable (a tile gets driven again later): yields a
+        // FRESH, independent grant (new port+token) and the torn-down one stays dead.
+        // Needs cef_host's per-probe monotonic DevTools id (a fixed id dropped the 2nd
+        // resolve on the same browser) + resolveTargetId's epoch-guarded timer.
+        setState(() => _status = 're-enable after teardown…');
+        final gA2 = await _enable(_a);
+        out['grantA2'] =
+            gA2 == null ? null : {'port': gA2.port, 'token8': gA2.token.substring(0, 8)};
+        _check('F: A re-enables after disable (fresh grant)', gA2 != null);
+        if (gA2 != null) {
+          _check('F: re-enabled grant differs from the torn-down one',
+              gA2.port != gA.port || gA2.token != gA.token);
+          final ta2 = await _targets(gA2.wsUrl);
+          _check('F: re-enabled relay drives A again (one own target)',
+              ta2.length == 1 && ta2.first == ta.first);
+          bool oldStillDead = false;
+          try {
+            await _targets(gA.wsUrl);
+          } catch (_) {
+            oldStillDead = true;
+          }
+          _check('F: the torn-down grant stays dead after re-enable', oldStillDead);
+        }
       }
     } catch (e, st) {
       out['fatal'] = '$e';
