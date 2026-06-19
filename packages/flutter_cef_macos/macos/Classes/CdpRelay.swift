@@ -441,24 +441,30 @@ final class CdpRelay {
   }
 
   /// Deliver a CDP message from the pipe to the connected client. Applies the CEF-2b
-  /// scope filter (drops sibling-tile traffic) before writing. Called off the CDP
-  /// reader thread.
+  /// multiplex demux + scope filter (drops sibling-tile traffic) before writing.
+  /// Called off the CDP reader thread.
   func deliverToClient(_ json: String) {
-    // Multiplex demux (scoped relays only): a pipe message with a top-level id
-    // and NO method is a command RESPONSE, owned by exactly the relay that
-    // issued that unique pipe id. Restore the client's original id, or drop if
-    // it's a sibling relay's response. Events (method present) + the CEF-2a
-    // passthrough fall through to the scope filter unchanged.
+    guard let out = demuxPipeToClient(json) else { return }  // dropped: not our tile
+    sendRawToClient(out)
+  }
+
+  /// CEF-2b pure decision seam (no socket IO — unit-testable): map one inbound pipe
+  /// message to the bytes this relay should hand its client, or nil to DROP it.
+  ///
+  /// Multiplex demux (scoped relays only): a pipe message with a top-level id and NO
+  /// method is a command RESPONSE, owned by exactly the relay that issued that unique
+  /// pipe id. Restore the client's original id, or drop if it's a sibling relay's
+  /// response. Events (method present) + the CEF-2a passthrough fall through to the
+  /// scope filter unchanged.
+  func demuxPipeToClient(_ json: String) -> String? {
     if scopeTargetId != nil, let m = parseJson(json), m["method"] == nil,
        let pipeId = m["id"] as? Int {
       multiplexLock.lock(); let clientId = pipeIdToClientId.removeValue(forKey: pipeId); multiplexLock.unlock()
-      guard let clientId = clientId else { return }  // sibling relay's response — drop
+      guard let clientId = clientId else { return nil }  // sibling relay's response — drop
       var restored = m; restored["id"] = clientId
-      if let out = jsonString(restored) { sendRawToClient(out) }
-      return
+      return jsonString(restored)
     }
-    guard let out = filterPipeToClient(json) else { return }  // dropped: not our tile
-    sendRawToClient(out)
+    return filterPipeToClient(json)  // events / browser-level / CEF-2a passthrough
   }
 
   /// Write a raw (already-filtered / self-originated) JSON text frame to the client.
@@ -714,8 +720,9 @@ final class CdpRelay {
   // Rewrite an outgoing command's top-level id to a globally-unique pipe id and
   // record the mapping. No-op for the CEF-2a passthrough (nil scope) and for
   // messages without a top-level Int id (none, in practice clients only send
-  // commands). Called for client->pipe traffic only.
-  private func rewriteOutgoingId(_ json: String) -> String {
+  // commands). Called for client->pipe traffic only. Internal (not private) so the
+  // standalone filter tests can drive the rewrite↔demux round-trip directly.
+  func rewriteOutgoingId(_ json: String) -> String {
     guard scopeTargetId != nil else { return json }
     guard var m = parseJson(json), let clientId = m["id"] as? Int else { return json }
     multiplexLock.lock()
