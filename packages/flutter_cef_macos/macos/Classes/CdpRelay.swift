@@ -82,9 +82,24 @@ final class CdpRelay {
   private var allowedSessions = Set<String>()  // our session + descendant sub-target sessions
   private let filterLock = NSLock()
 
-  init(sendToPipe: @escaping (String) -> Void, scopeTargetId: String? = nil) {
+  // CEF-2b multiplex: this relay's identity in the shared pipe's CDP id space (the
+  // owning browser's wire browserId). 0 for the CEF-2a passthrough / unit tests.
+  private let relayId: Int
+
+  // CEF-2b multiplex: N relays share ONE browser-wide pipe with ONE CDP id space.
+  // Session-routed traffic is demuxed by sessionId, but BROWSER-LEVEL commands
+  // (no sessionId — Playwright's connect handshake) would collide. We rewrite
+  // EVERY outgoing command id to a globally-unique pipe id and demux responses
+  // back. pipeId = (relayId << 21) | localSeq is unique per relay because
+  // browserIds are strictly monotonic / never reused.
+  private var pipeIdToClientId: [Int: Int] = [:]
+  private var nextLocalId = 0
+  private let multiplexLock = NSLock()
+
+  init(sendToPipe: @escaping (String) -> Void, scopeTargetId: String? = nil, relayId: Int = 0) {
     self.sendToPipe = sendToPipe
     self.scopeTargetId = scopeTargetId
+    self.relayId = relayId
     self.token = CdpRelay.randomToken()
   }
 
@@ -407,7 +422,7 @@ final class CdpRelay {
         assembling = !fin
         if fin {
           if assemblingText, let s = String(bytes: msg, encoding: .utf8) {
-            if let out = filterClientToPipe(s) { sendToPipe(out) }  // CEF-2b scope filter
+            if let out = filterClientToPipe(s) { sendToPipe(rewriteOutgoingId(out)) }  // CEF-2b scope filter + id remap
           }
           msg.removeAll(keepingCapacity: true)
           assemblingText = false
@@ -429,6 +444,19 @@ final class CdpRelay {
   /// scope filter (drops sibling-tile traffic) before writing. Called off the CDP
   /// reader thread.
   func deliverToClient(_ json: String) {
+    // Multiplex demux (scoped relays only): a pipe message with a top-level id
+    // and NO method is a command RESPONSE, owned by exactly the relay that
+    // issued that unique pipe id. Restore the client's original id, or drop if
+    // it's a sibling relay's response. Events (method present) + the CEF-2a
+    // passthrough fall through to the scope filter unchanged.
+    if scopeTargetId != nil, let m = parseJson(json), m["method"] == nil,
+       let pipeId = m["id"] as? Int {
+      multiplexLock.lock(); let clientId = pipeIdToClientId.removeValue(forKey: pipeId); multiplexLock.unlock()
+      guard let clientId = clientId else { return }  // sibling relay's response — drop
+      var restored = m; restored["id"] = clientId
+      if let out = jsonString(restored) { sendRawToClient(out) }
+      return
+    }
     guard let out = filterPipeToClient(json) else { return }  // dropped: not our tile
     sendRawToClient(out)
   }
@@ -676,6 +704,27 @@ final class CdpRelay {
     guard let d = s.data(using: .utf8),
           let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return nil }
     return o
+  }
+
+  private func jsonString(_ obj: [String: Any]) -> String? {
+    guard let d = try? JSONSerialization.data(withJSONObject: obj) else { return nil }
+    return String(data: d, encoding: .utf8)
+  }
+
+  // Rewrite an outgoing command's top-level id to a globally-unique pipe id and
+  // record the mapping. No-op for the CEF-2a passthrough (nil scope) and for
+  // messages without a top-level Int id (none, in practice clients only send
+  // commands). Called for client->pipe traffic only.
+  private func rewriteOutgoingId(_ json: String) -> String {
+    guard scopeTargetId != nil else { return json }
+    guard var m = parseJson(json), let clientId = m["id"] as? Int else { return json }
+    multiplexLock.lock()
+    let pipeId = (relayId << 21) | (nextLocalId & 0x1FFFFF)
+    nextLocalId &+= 1
+    pipeIdToClientId[pipeId] = clientId
+    multiplexLock.unlock()
+    m["id"] = pipeId
+    return jsonString(m) ?? json
   }
 
   // MARK: Blocking IO helpers
