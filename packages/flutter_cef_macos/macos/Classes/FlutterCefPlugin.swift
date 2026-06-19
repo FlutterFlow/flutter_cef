@@ -405,9 +405,11 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   /// Resolve an existing host for `key`, or spawn a fresh one. Returns nil if the
   /// spawn fails. `agentControl` switches the launch to posix_spawn (CDP over
   /// inherited fds 3/4) — see CefProfileHost.spawn. Only meaningful when this call
-  /// actually spawns; an EXISTING host keeps its original transport (a named
-  /// profile is single-view in this build, so an agent-control create() resolving
-  /// to a pre-existing host is not a normal path).
+  /// actually spawns; an EXISTING host keeps its original transport. Since P2,
+  /// a named profile is MULTI-view (N tiles share one host), so an agent-control
+  /// create() resolving to a pre-existing host is the normal path for the 2nd+
+  /// tile — the host was already spawned in agent-control mode by the first, and
+  /// each tile gets its own per-target CDP relay (see CefProfileHost.enableAgentControl).
   private func resolveOrSpawnHost(
     key: String, profileDir: String, isEphemeral: Bool, cefHostPath: String,
     enableCdp: Bool, allowedSchemes: String, agentControl: Bool

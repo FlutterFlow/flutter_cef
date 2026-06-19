@@ -91,7 +91,7 @@ class _ProbeAppState extends State<ProbeApp> {
     }, onDone: () {
       if (!done.isCompleted) done.completeError(StateError('socket closed'));
     });
-    ws.add(jsonEncode({'id': id, 'method': method, if (params != null) 'params': params}));
+    ws.add(jsonEncode({'id': id, 'method': method, 'params': ?params}));
     try {
       return await done.future.timeout(timeout);
     } finally {

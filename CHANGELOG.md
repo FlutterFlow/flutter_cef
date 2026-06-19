@@ -44,8 +44,15 @@
   filter exposes only the tile's own target (sibling tiles in the same shared-profile
   process are hidden and unreachable), and browser-context-wide CDP (`Storage.*`,
   `Tracing.*`, `Browser.*` mutators, cookie methods) is refused — so an agent can
-  drive the page but cannot read or clear the shared cookie jar. First cut: one
-  agent-controlled tile per `cef_host` process.
+  drive the page but cannot read or clear the shared cookie jar. **Multi-view:**
+  N tiles sharing one `cef_host` (one named profile) can each be agent-controlled
+  concurrently — one token-gated relay per tile, each pinned to its own CDP target,
+  all multiplexed over the single browser-wide `--remote-debugging-pipe`: inbound
+  traffic is scoped by `sessionId`, and browser-level commands (which carry no
+  `sessionId`) are disambiguated by a per-relay CDP-id rewrite, so a sibling tile's
+  page can be neither observed nor driven through another tile's grant (distinct
+  ephemeral port + token each). On host quit every `cef_host` is SIGTERM-reaped so
+  none is left orphaned holding a profile's Chromium `SingletonLock`.
 
 ## 0.1.3
 

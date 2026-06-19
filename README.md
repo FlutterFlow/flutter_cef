@@ -306,9 +306,13 @@ drive its tile's page (navigate, click, type, read DOM, run JS) but **cannot rea
 clear the shared cookie jar** or touch sibling tiles. It *can* act with the tile's own
 authenticated session for the tile's own origin — that is inherent to driving a
 logged-in page. Strictly airtight CDP isolation would require a per-tile browser
-context, which would un-share the login the shared profile exists to provide. First
-cut: **one agent-controlled tile per `cef_host` process** (a second, different tile in
-the same process is refused).
+context, which would un-share the login the shared profile exists to provide.
+**Multi-view:** N tiles sharing one `cef_host` (one named profile) can each be
+agent-controlled concurrently — one token-gated relay per tile, each pinned to its
+own CDP target, all multiplexed over the single browser-wide `--remote-debugging-pipe`
+(per-tile sessionId scoping + a per-relay CDP-id rewrite so a sibling's traffic can
+neither be seen nor driven). See the `CdpRelay` multiplex notes and
+`CdpRelayFilterTests` for the isolation boundary.
 
 ## Roadmap
 

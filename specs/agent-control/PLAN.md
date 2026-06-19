@@ -221,8 +221,11 @@ crux, the CEF side itself lands in two increments:
     foreign-session commands. Validated end-to-end: real agent-browser drives the
     scoped tile normally; a sibling target created via `createTarget` is HIDDEN from
     `getTargets` and UNATTACHABLE; the hardened filter then blocks `createTarget`
-    itself. First cut: ONE agent-controlled tile per process (a second different tile
-    is refused); multi-grant (per-tile relays + CDP `id` remapping) deferred.
+    itself. First cut was ONE agent-controlled tile per process; multi-grant
+    (per-tile relays + CDP `id` remapping) was deferred — **now implemented in
+    P2-step2**: N tiles per shared `cef_host`, one relay per `browserId` over the
+    shared pipe, with a per-relay CDP-id rewrite for browser-level commands (see
+    `CefProfileHost.cdpRelays` / `CdpRelay.rewriteOutgoingId` + `CdpRelayFilterTests`).
 Then the Campus consumer (Layer C).
 
 ## Open questions / to resolve in P2
