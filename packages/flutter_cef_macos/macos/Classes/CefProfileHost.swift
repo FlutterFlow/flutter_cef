@@ -79,6 +79,12 @@ final class CefProfileHost {
   // browserId. Set on the plugin thread, fulfilled on the reader thread (kOpTargetId)
   // or a timeout; guarded by targetIdLock. The completion fires exactly once.
   private var pendingTargetId: [UInt32: [(String?) -> Void]] = [:]
+  // Per-browser resolve epoch, bumped on each fresh in-flight resolve. A resolve's 5s
+  // timeout captures its epoch and only fulfills if still current — so an EARLY
+  // response (which doesn't cancel the timer) can't let the stale timer clobber a
+  // LATER resolve for the same browser (e.g. re-enabling agent-control within 5s of a
+  // prior enable/disable). Guarded by targetIdLock.
+  private var targetIdEpoch: [UInt32: Int] = [:]
   private let targetIdLock = NSLock()
 
   // Process + IPC machinery (hoisted from CefWebSession).
@@ -972,20 +978,36 @@ final class CefProfileHost {
     targetIdLock.lock()
     let first = pendingTargetId[browserId] == nil
     pendingTargetId[browserId, default: []].append(completion)
+    let epoch = (targetIdEpoch[browserId] ?? 0) + (first ? 1 : 0)
+    if first { targetIdEpoch[browserId] = epoch }
     targetIdLock.unlock()
     guard first else { return }  // a resolve is already in flight for this browser
     send(browserId, Self.opResolveTargetId, [])
     DispatchQueue.global().asyncAfter(deadline: .now() + 5) { [weak self] in
-      self?.handleTargetId(browserId, nil)  // timeout: fulfill any still-pending waiters with nil
+      self?.timeoutTargetId(browserId, epoch)  // fulfill with nil only if still this resolve
     }
   }
 
-  /// Fulfill all pending targetId waiters for a browser (reader thread, or timeout).
+  /// Fulfill all pending targetId waiters for a browser with a real result (reader
+  /// thread). The matching resolve's timer is left to no-op via the epoch guard.
   private func handleTargetId(_ browserId: UInt32, _ tid: String?) {
     targetIdLock.lock()
     let waiters = pendingTargetId.removeValue(forKey: browserId)
     targetIdLock.unlock()
     waiters?.forEach { $0(tid) }
+  }
+
+  /// A resolve's own 5s timeout: fulfill its still-pending waiters with nil — but
+  /// ONLY if a fresh resolve hasn't superseded it (epoch bumped). Without this guard
+  /// an early response leaves the timer armed and it would clobber the NEXT resolve.
+  private func timeoutTargetId(_ browserId: UInt32, _ epoch: Int) {
+    targetIdLock.lock()
+    guard targetIdEpoch[browserId] == epoch,
+          let waiters = pendingTargetId.removeValue(forKey: browserId) else {
+      targetIdLock.unlock(); return
+    }
+    targetIdLock.unlock()
+    waiters.forEach { $0(nil) }
   }
 
   /// CEF-2a/b: tear down `browserId`'s relay (closes the listener + any client,
