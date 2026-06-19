@@ -999,6 +999,15 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
     // the switch can't ride in via clean_argv.
     if (g_cdp_pipe) {
       command_line->AppendSwitch("remote-debugging-pipe");
+      // Chromium turns on the "AutomationControlled" blink feature whenever
+      // remote debugging is active, which exposes `navigator.webdriver === true`.
+      // Sites that gate on it (Google's OAuth — "this browser or app may not be
+      // secure") then refuse human sign-in. We drive the page over CDP, never
+      // WebDriver, so suppressing that one signal costs us nothing and lets a
+      // user log in to a tile that's simultaneously agent-controllable. Does NOT
+      // affect the DevTools pipe / CDP itself — only the JS-visible flag.
+      command_line->AppendSwitchWithValue("disable-blink-features",
+                                          "AutomationControlled");
     }
   }
   // No browser is created here. We only announce readiness; the host then drives

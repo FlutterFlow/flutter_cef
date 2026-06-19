@@ -238,17 +238,13 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
         details: nil))
       return
     }
-    // Safety rail (c) — P1 single-view guard: only one live browser per named
-    // profile for now (multi-view sharing lands in P2). An ephemeral host is
-    // per-session, so this only applies to named profiles.
-    if namedProfile, let existing = profiles[profile!], existing.hasLiveBrowser {
-      result(FlutterError(
-        code: "profile_in_use",
-        message: "profile '\(profile!)' is already in use by another view "
-          + "(single-view per profile in this build).",
-        details: nil))
-      return
-    }
+    // P2-step1: the single-view guard is lifted — multiple views on a named
+    // profile now share ONE cef_host (resolveOrSpawnHost de-dups by key), so
+    // every web tile renders and shares one cookie jar (sign-in persists across
+    // tiles + relaunch). Agent-control is still single-relay per host for now:
+    // a second concurrent agent-controlled tile gets a clear "already active"
+    // error from enableAgentControl. Concurrent multi-tile agent-control lands
+    // with the per-target CDP relay demux (P2-step2).
 
     let (profileDir, isEphemeral) = resolveProfileDir(namedProfile ? profile : nil)
     let key = namedProfile ? profile! : "~ephemeral~" + sessionId
