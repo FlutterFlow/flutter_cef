@@ -98,6 +98,10 @@ final class CefWebSession: NSObject, FlutterTexture {
   // CefProfileHost.createBrowser() allocates the id.
   private weak var host: CefProfileHost?
   private(set) var browserId: UInt32 = 0
+  // C1: set once when this browser delivers its first present frame. Owned/guarded by
+  // CefProfileHost under its browsersLock (the reader flips it there) — a cheap per-frame
+  // first-paint check that avoids a second lock on the hot paint path.
+  var firstPresentSeen = false
 
   private weak var registry: FlutterTextureRegistry?
   private var width: Int

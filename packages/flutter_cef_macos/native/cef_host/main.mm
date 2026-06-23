@@ -168,6 +168,13 @@ std::mutex g_ipc_write_mutex;
 struct Slot {
   uint32_t browser_id = 0;  // Swift-assigned wire id (>=1); NOT GetIdentifier().
   CefRefPtr<CefBrowser> browser;
+  // H3 async-create dispose-loss guard: a dispose arriving while the async
+  // CreateBrowser is still in flight (browser == null) can't CloseBrowser yet, so it
+  // records intent here and OnAfterCreated honors it the instant the browser binds —
+  // otherwise that browser is a live orphan (renderer + IOSurface) nothing reclaims
+  // until whole-host shutdown. UI-thread-confined (DoDisposeBrowser + OnAfterCreated
+  // both run on the CEF UI thread), so no lock.
+  bool close_requested = false;
 
   // Guards surface / width / height / dpr / popup_* for THIS browser. Per-slot
   // (not a single global) so paints on independent browsers don't contend.
@@ -838,6 +845,10 @@ class HostClient : public CefClient,
   void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
     slot_->browser = browser;
     SendFrame(slot_->browser_id, kOpCreated, nullptr, 0);
+    // H3: a dispose arrived during the async-create window and recorded intent — honor
+    // it now (OnBeforeClose then does the normal map-erase + surface release + retain-
+    // cycle break) so we don't leak a live orphan browser the Swift side already forgot.
+    if (slot_->close_requested) browser->GetHost()->CloseBrowser(true);
   }
 
   // CefLifeSpanHandler: route popups (window.open / target=_blank) to the host
@@ -1140,7 +1151,16 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr, uint32_t sid,
 void DoDisposeBrowser(uint32_t wire_id) {
   CEF_REQUIRE_UI_THREAD();
   std::shared_ptr<Slot> slot = LookupWireId(wire_id);
-  if (slot && slot->browser) slot->browser->GetHost()->CloseBrowser(true);
+  if (!slot) return;
+  if (slot->browser) {
+    slot->browser->GetHost()->CloseBrowser(true);
+  } else {
+    // H3: the async CreateBrowser hasn't bound the browser yet — record the close so
+    // OnAfterCreated closes it the instant it lands. Without this the create completes
+    // into a live orphan browser the Swift side has already forgotten (browsers[id]
+    // cleared), leaking a renderer + IOSurface until whole-host shutdown.
+    slot->close_requested = true;
+  }
 }
 
 void DoResize(const std::shared_ptr<Slot>& slot, int w, int h,

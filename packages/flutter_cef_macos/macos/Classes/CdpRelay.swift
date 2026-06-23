@@ -98,9 +98,19 @@ final class CdpRelay {
   // H2: this relay's OWN Target.attachToTarget pipe id (used to learn our page's CDP
   // session order-independently, instead of passively witnessing a fire-once
   // browser-wide attachedToTarget event we may register too late to see), plus the
-  // client's browser-level setAutoAttach id to ack once we've attached. multiplexLock.
+  // client setAutoAttach ids to ack once we've attached. multiplexLock.
+  //
+  // The relay OUTLIVES a client connection (it is browser-keyed, freed only on
+  // agent-control toggle / browser disposal). So this state is reset on client detach
+  // and the in-flight attach is stamped with the client GENERATION that issued it — a
+  // late self-attach response from a departed client must NOT be written to whatever
+  // client connected next (stale ack / spurious event). pendingAutoAttachClientIds is a
+  // LIST so a second browser-level setAutoAttach issued before the first resolves is
+  // queued (one attachToTarget in flight) and acked too, instead of orphaning the first.
   private var selfAttachPipeId: Int?
-  private var pendingAutoAttachClientId: Int?
+  private var pendingAutoAttachClientIds: [Int] = []
+  private var attachClientGeneration = 0  // the clientGeneration that issued the in-flight attach
+  private var clientGeneration = 0        // bumped on each client detach
 
   init(sendToPipe: @escaping (String) -> Void, scopeTargetId: String? = nil, relayId: Int = 0) {
     self.sendToPipe = sendToPipe
@@ -269,6 +279,10 @@ final class CdpRelay {
     }
     clientFd = fd
     clientLock.unlock()
+    // H2: stamp a fresh client identity. A self-attach response still in flight from a
+    // PRIOR client connection captured the old generation, so handleSelfAttachResponse
+    // will refuse to deliver its synthesized event / ack to THIS connection.
+    multiplexLock.lock(); clientGeneration &+= 1; multiplexLock.unlock()
 
     let accept = Data((key + CdpRelay.wsGUID).utf8)
     let digest = Insecure.SHA1.hash(data: accept)
@@ -290,6 +304,16 @@ final class CdpRelay {
     if owned { clientFd = -1 }
     clientLock.unlock()
     if owned { close(fd) }
+    // H2: the relay persists past this client — drop the in-flight attach so a late
+    // self-attach response isn't delivered to the next client (a stale ack / spurious
+    // attachedToTarget). The generation is bumped at the NEXT connect, so even a
+    // response that races this reset is gated by attachClientGeneration. ourSessionId/
+    // allowedSessions stay (the page is unchanged; the next client re-issues
+    // setAutoAttach and we synthesize from the known session).
+    multiplexLock.lock()
+    selfAttachPipeId = nil
+    pendingAutoAttachClientIds.removeAll()
+    multiplexLock.unlock()
     dlog("[cef][relay] client detached")
   }
 
@@ -727,30 +751,42 @@ final class CdpRelay {
     }
     guard let tid = scopeTargetId else { synthesizeOk(clientAutoAttachId); return }
     multiplexLock.lock()
+    if let ack = clientAutoAttachId { pendingAutoAttachClientIds.append(ack) }
+    // Only ONE self-attach in flight: a second setAutoAttach arriving before the first
+    // resolves just queues its ack above (the single attachToTarget resolves the session
+    // for both); issuing a second would leak its pipeId mapping and lose an ack.
+    guard selfAttachPipeId == nil else { multiplexLock.unlock(); return }
     let pipeId = (relayId << 21) | (nextLocalId & 0x1FFFFF)
     nextLocalId &+= 1
     selfAttachPipeId = pipeId
-    pendingAutoAttachClientId = clientAutoAttachId
+    attachClientGeneration = clientGeneration
     multiplexLock.unlock()
     let cmd: [String: Any] = ["id": pipeId, "method": "Target.attachToTarget",
                               "params": ["targetId": tid, "flatten": true]]
     if let s = jsonString(cmd) { sendToPipe(s) }
   }
 
-  /// H2: our scoped attachToTarget came back — record the page session, hand the client
-  /// the synthesized attachedToTarget, and ack its pending setAutoAttach.
+  /// H2: our scoped attachToTarget came back — record the page session, and (if the
+  /// client that issued it is still attached) hand it the synthesized attachedToTarget +
+  /// ack every queued setAutoAttach. If that client has since detached
+  /// (clientGeneration moved on), learn the session but write NOTHING — otherwise we'd
+  /// deliver a stale ack / spurious event to whatever client connected next.
   private func handleSelfAttachResponse(_ m: [String: Any]) {
     let sessionId = (m["result"] as? [String: Any])?["sessionId"] as? String
     multiplexLock.lock()
     selfAttachPipeId = nil
-    let clientAckId = pendingAutoAttachClientId
-    pendingAutoAttachClientId = nil
+    let acks = pendingAutoAttachClientIds
+    pendingAutoAttachClientIds.removeAll()
+    let sameClient = (attachClientGeneration == clientGeneration)
     multiplexLock.unlock()
     if let s = sessionId {
       filterLock.lock(); allowedSessions.insert(s); ourSessionId = s; filterLock.unlock()
+      guard sameClient else { return }  // issuing client gone — don't write to its successor
       synthesizeAttachedToTarget(sessionId: s)
+    } else if !sameClient {
+      return
     }
-    synthesizeOk(clientAckId)
+    for ack in acks { synthesizeOk(ack) }
   }
 
   /// H2: fabricate the page's Target.attachedToTarget for the client (flatten mode) so

@@ -539,7 +539,16 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       guard host.spawn(cefHostPath: cefHost, enableCdp: false,
                        allowedSchemes: args.allowedSchemes,
                        agentControl: args.agentControl) else {
+        // The old host is already shut down, so a bare `continue` would strand this
+        // session bound to a dead host: blank tile, no signal, leaked session+texture.
+        // Fail it explicitly instead — processGone lets the consumer recreate.
         NSLog("[cef] C2 respawn ephemeral host failed for \(sid)")
+        emit("processGone", ["sessionId": sid, "reason": "respawnFailed"])
+        sessions[sid] = nil
+        sessionHost[sid] = nil
+        sessionKey[sid] = nil
+        sessionCreateArgs[sid] = nil
+        session.dispose()
         continue
       }
       wireHostDied(host)

@@ -30,6 +30,7 @@ final class CefProfileHost {
   static let opCreated: UInt8 = 0x1c          // cef_host -> us: OnAfterCreated — advance the create pacer (H3)
   static let opCreateFailed: UInt8 = 0x1d     // cef_host -> us: create dispatch failed — drop the session (H7)
   static let opInvalidate: UInt8 = 0x37       // us -> cef_host: force a repaint to re-kick a stalled first frame (C1)
+  static let opSetVisible: UInt8 = 0x35       // us -> cef_host: WasHidden(!visible); peeked to make the C1 watchdog visibility-aware
 
   // Profile identity / config.
   let profileId: String
@@ -145,6 +146,11 @@ final class CefProfileHost {
   // into self-healing-or-signalled.
   private let presentLock = NSLock()
   private var firstPresentPending: Set<UInt32> = []
+  // C1: browsers the host has hidden (WasHidden(true) via opSetVisible). A hidden CEF
+  // browser stops producing frames entirely, so it legitimately never sends opPresent —
+  // the watchdog must NOT treat that as a stall (work_canvas creates tiles already
+  // off-screen as a normal lazy-spawn pattern). Guarded by presentLock.
+  private var hiddenBrowsers: Set<UInt32> = []
 
   // Invoked (off the reader thread) when an ad-hoc host refuses to load a named
   // profile (no creds were written — see F.5). The plugin tears this host down
@@ -597,12 +603,36 @@ final class CefProfileHost {
     presentLock.lock(); firstPresentPending.remove(browserId); presentLock.unlock()
   }
 
+  /// C1: track WasHidden state (peeked from opSetVisible). A hidden browser produces no
+  /// frames, so the watchdog suspends rather than flagging it stalled. On UNHIDE, re-arm
+  /// the watchdog for a browser that's still blank, so a genuinely-stuck now-visible tile
+  /// is still caught.
+  private func noteVisibility(_ browserId: UInt32, visible: Bool) {
+    presentLock.lock()
+    if !visible {
+      hiddenBrowsers.insert(browserId)
+      presentLock.unlock()
+      return
+    }
+    hiddenBrowsers.remove(browserId)
+    let reArm = firstPresentPending.contains(browserId)
+    presentLock.unlock()
+    guard reArm else { return }
+    DispatchQueue.global().asyncAfter(deadline: .now() + 3) { [weak self] in
+      self?.checkFirstPresent(browserId, phase: 1)
+    }
+  }
+
   private func checkFirstPresent(_ browserId: UInt32, phase: Int) {
     presentLock.lock()
     let stillBlank = firstPresentPending.contains(browserId)
-    if stillBlank && phase >= 2 { firstPresentPending.remove(browserId) }
+    let hidden = hiddenBrowsers.contains(browserId)
+    // Don't retire the watch while hidden — a hidden browser is suspended, not stalled;
+    // noteVisibility re-arms it on unhide if still blank.
+    if stillBlank && !hidden && phase >= 2 { firstPresentPending.remove(browserId) }
     presentLock.unlock()
     guard stillBlank else { return }  // it painted — nothing to do
+    guard !hidden else { return }     // hidden by design — suspended; re-armed on unhide
     // Only act while the browser is still live + the host healthy.
     browsersLock.lock(); let live = browsers[browserId] != nil; browsersLock.unlock()
     writeLock.lock(); let healthy = running && !crashed; writeLock.unlock()
@@ -625,6 +655,11 @@ final class CefProfileHost {
   /// the current geometry, so replaying the resize could reference a since-freed
   /// IOSurface id.
   func send(_ browserId: UInt32, _ op: UInt8, _ payload: [UInt8]) {
+    // C1: peek visibility so the first-present watchdog doesn't flag an intentionally
+    // hidden (WasHidden) browser as stalled — it produces no frames by design.
+    if op == Self.opSetVisible, let v = payload.first {
+      noteVisibility(browserId, visible: v != 0)
+    }
     let frame = frameBytes(browserId, op, payload)
     writeLock.lock()
     if connFd < 0 {
@@ -675,6 +710,12 @@ final class CefProfileHost {
     writeLock.lock()
     createEnqueued.remove(browserId)
     writeLock.unlock()
+    // C1: drop any watchdog/visibility bookkeeping for the gone browser so the sets
+    // don't grow across a long session of tile churn.
+    presentLock.lock()
+    firstPresentPending.remove(browserId)
+    hiddenBrowsers.remove(browserId)
+    presentLock.unlock()
     return remaining
   }
 
@@ -911,10 +952,15 @@ final class CefProfileHost {
       } else if op == Self.opCreateFailed {
         handleCreateFailed(bid)  // H7
       } else {
-        if op == Self.opPresent { firstPresentArrived(bid) }  // C1: cancel the watchdog
         browsersLock.lock()
         let session = browsers[bid]
+        // C1: detect the FIRST present under the browsersLock we already hold, via a
+        // per-session flag, so the watchdog-cancel (presentLock) fires once per browser
+        // instead of acquiring a second lock on every (up to 60fps) present frame.
+        let firstPaint = op == Self.opPresent && session != nil && !session!.firstPresentSeen
+        if firstPaint { session!.firstPresentSeen = true }
         browsersLock.unlock()
+        if firstPaint { firstPresentArrived(bid) }  // cancel the watchdog (once)
         session?.handleFrame(op, payload)
       }
     }
@@ -1317,9 +1363,12 @@ final class CefProfileHost {
       if msg.contains("\"id\":1") {
         logged = true
         NSLog("[cef][cdp-pipe:\(self.profileId)] Browser.getVersion round-trip OK: \(msg)")
-        // Restore the prior handler now that the gate has passed, so the probe
-        // wiring doesn't linger on the hot path.
-        self.cdpHandlerLock.lock(); self.onCdpMessage = prior; self.cdpHandlerLock.unlock()
+        // Do NOT restore onCdpMessage here. enableAgentControl may have chained the relay
+        // fan-out ON TOP of this probe handler (it captures the then-current handler as
+        // its own `prior`); overwriting back to OUR captured `prior` (the pre-probe
+        // handler, usually nil) would silently DROP that fan-out so relays receive no
+        // pipe messages. The handler is harmless once `logged`: it forwards to `prior`
+        // and short-circuits the id:1 check.
       }
     }
     cdpHandlerLock.unlock()
