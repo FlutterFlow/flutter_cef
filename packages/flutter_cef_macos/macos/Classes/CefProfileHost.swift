@@ -122,6 +122,18 @@ final class CefProfileHost {
   private var adhocHost = false  // host reported a mock-keychain (ad-hoc) build
   private var createEnqueued: Set<UInt32> = []  // browserIds whose create has been sent
 
+  // Per-host create pacing (guarded by writeLock). A BURST of opCreateBrowser
+  // frames makes cef_host run a queue of blocking CreateBrowserSync calls on its
+  // single CEF UI thread: they serialize and contend the one shared GPU/Viz
+  // accelerated-surface handshake, so later browsers can get NO surface and never
+  // paint (blank tile), and their resize/paint/targetId tasks wedge behind the
+  // create backlog. So we send creates ONE AT A TIME, spaced by `createSpacing`,
+  // instead of all at once — each browser's create + surface handshake completes
+  // before the next starts. (2-per-host always worked; 7-at-once is what fails.)
+  private var createSendQueue: [(id: UInt32, session: CefWebSession, url: String)] = []
+  private var createPacerRunning = false
+  private let createSpacing: TimeInterval = 0.18
+
   // Invoked (off the reader thread) when an ad-hoc host refuses to load a named
   // profile (no creds were written — see F.5). The plugin tears this host down
   // and respawns an ephemeral one for the same session.
@@ -417,11 +429,11 @@ final class CefProfileHost {
       // size, so capturing them now would ship a since-freed id and a stale size.
       pendingCreates.append { [weak self, weak session] in
         guard let self = self, let session = session else { return }
-        self.sendCreate(id, session, url)
+        self.enqueueCreate(id, session, url)
       }
     }
     writeLock.unlock()
-    if isReady { sendCreate(id, session, url) }
+    if isReady { enqueueCreate(id, session, url) }
     return id
   }
 
@@ -456,6 +468,50 @@ final class CefProfileHost {
     writeLock.unlock()
     // H2: surface a dead pipe (unlocked first — handleHostDeath re-takes writeLock).
     if !ok { handleHostDeath() }
+  }
+
+  /// Enqueue a create for PACED sending instead of writing its opCreateBrowser
+  /// frame immediately. See `createSendQueue`: many tiles on one shared host
+  /// created in a burst would otherwise hand cef_host's single UI thread a pile of
+  /// blocking CreateBrowserSync calls at once. Idempotent pump kicks the pacer.
+  private func enqueueCreate(_ id: UInt32, _ session: CefWebSession, _ url: String) {
+    writeLock.lock()
+    createSendQueue.append((id, session, url))
+    writeLock.unlock()
+    pumpCreateQueue()
+  }
+
+  /// Send the NEXT queued create, then schedule the following one after
+  /// `createSpacing`, so cef_host creates browsers one-at-a-time and each
+  /// accelerated-surface handshake completes before the next contends the shared
+  /// GPU/Viz process. A create whose browser was disposed while queued (rapid
+  /// create/close churn) is skipped without consuming a spacing interval.
+  private func pumpCreateQueue() {
+    writeLock.lock()
+    if createPacerRunning || createSendQueue.isEmpty {
+      writeLock.unlock()
+      return
+    }
+    createPacerRunning = true
+    let next = createSendQueue.removeFirst()
+    writeLock.unlock()
+
+    browsersLock.lock()
+    let stillLive = browsers[next.id] != nil
+    browsersLock.unlock()
+    guard stillLive else {
+      // Disposed while queued — drop it and advance immediately (no spacing).
+      writeLock.lock(); createPacerRunning = false; writeLock.unlock()
+      pumpCreateQueue()
+      return
+    }
+
+    sendCreate(next.id, next.session, next.url)
+    DispatchQueue.global().asyncAfter(deadline: .now() + createSpacing) { [weak self] in
+      guard let self = self else { return }
+      self.writeLock.lock(); self.createPacerRunning = false; self.writeLock.unlock()
+      self.pumpCreateQueue()
+    }
   }
 
   /// Frame `[u32 bodyLen=4+1+payload.count][u32 browserId][op][payload]` and
@@ -983,8 +1039,35 @@ final class CefProfileHost {
     targetIdLock.unlock()
     guard first else { return }  // a resolve is already in flight for this browser
     send(browserId, Self.opResolveTargetId, [])
+    // The page target may not have COMMITTED when the first probe fires — common
+    // for a tile force-spawned in a burst, where GPU/page init is async after
+    // create(). cef_host then finds no targetInfo and never sends opTargetId, so the
+    // old fire-once probe silently timed out to nil (empty `webview snapshot`).
+    // Re-probe within the deadline so a late-committing page still resolves. Each
+    // opResolveTargetId uses a fresh per-browser DevTools message id (see the
+    // 33858fb fix), so extra probes are harmless; handleTargetId removes the entry
+    // on the first reply, stopping the retries.
+    scheduleTargetIdRetry(browserId, epoch, attemptsLeft: 9)  // ~9 × 0.5s ≈ 4.5s
     DispatchQueue.global().asyncAfter(deadline: .now() + 5) { [weak self] in
       self?.timeoutTargetId(browserId, epoch)  // fulfill with nil only if still this resolve
+    }
+  }
+
+  /// Re-send opResolveTargetId every 0.5s while this exact resolve is still pending
+  /// (not yet answered by handleTargetId, not superseded by a newer epoch), up to
+  /// `attemptsLeft` times — so a page that commits a second or two after create()
+  /// still resolves its targetId instead of the fire-once probe missing it.
+  private func scheduleTargetIdRetry(_ browserId: UInt32, _ epoch: Int, attemptsLeft: Int) {
+    guard attemptsLeft > 0 else { return }
+    DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) { [weak self] in
+      guard let self = self else { return }
+      self.targetIdLock.lock()
+      let stillPending =
+        self.targetIdEpoch[browserId] == epoch && self.pendingTargetId[browserId] != nil
+      self.targetIdLock.unlock()
+      guard stillPending else { return }  // resolved or superseded — stop
+      self.send(browserId, Self.opResolveTargetId, [])
+      self.scheduleTargetIdRetry(browserId, epoch, attemptsLeft: attemptsLeft - 1)
     }
   }
 
