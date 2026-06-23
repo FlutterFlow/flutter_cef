@@ -108,6 +108,12 @@ class CefWebController {
   /// `"crashed"` for a generic process death.
   void Function(String reason)? onProcessGone;
 
+  /// C1: the browser was created but never painted its first frame, even after the
+  /// native host re-kicked a repaint. The texture is (still) blank with no other
+  /// signal — the consumer can use this to recover (e.g. recreate the view) rather
+  /// than leaving a permanently blank tile.
+  VoidCallback? onPaintStalled;
+
   /// The caret rect (view-local logical px) of the active IME composition.
   /// Wired by [CefWebView] to position the OS candidate window under the text;
   /// you generally don't set this yourself.
@@ -234,9 +240,16 @@ class CefWebController {
         ));
         break;
       case 'processGone':
-        // The native host dropped this session (crash or cache-lock loss). The
-        // texture is dead; let the consumer react (show a reload affordance).
+        // The native host dropped this session (crash, cache-lock loss, or a
+        // create that failed — reason 'createFailed'). The texture is dead; let the
+        // consumer react (show a reload affordance / recreate).
         onProcessGone?.call(a['reason'] as String? ?? 'crashed');
+        break;
+      case 'paintStalled':
+        // C1: the browser came up but never delivered its first frame even after a
+        // re-kick — the texture is (still) blank with no other signal. Surface it so
+        // the consumer can recover (e.g. recreate the view) instead of a silent blank.
+        onPaintStalled?.call();
         break;
     }
   }

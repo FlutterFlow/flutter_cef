@@ -26,6 +26,10 @@ final class CefProfileHost {
   static let opResize: UInt8 = 0x11
   static let opTargetId: UInt8 = 0x1b         // cef_host -> us: a browser's CDP targetId (CEF-2b)
   static let opResolveTargetId: UInt8 = 0x36  // us -> cef_host: resolve this browser's CDP targetId
+  static let opPresent: UInt8 = 0x01          // cef_host -> us: a browser painted a frame (C1 watchdog peek)
+  static let opCreated: UInt8 = 0x1c          // cef_host -> us: OnAfterCreated — advance the create pacer (H3)
+  static let opCreateFailed: UInt8 = 0x1d     // cef_host -> us: create dispatch failed — drop the session (H7)
+  static let opInvalidate: UInt8 = 0x37       // us -> cef_host: force a repaint to re-kick a stalled first frame (C1)
 
   // Profile identity / config.
   let profileId: String
@@ -122,17 +126,25 @@ final class CefProfileHost {
   private var adhocHost = false  // host reported a mock-keychain (ad-hoc) build
   private var createEnqueued: Set<UInt32> = []  // browserIds whose create has been sent
 
-  // Per-host create pacing (guarded by writeLock). A BURST of opCreateBrowser
-  // frames makes cef_host run a queue of blocking CreateBrowserSync calls on its
-  // single CEF UI thread: they serialize and contend the one shared GPU/Viz
-  // accelerated-surface handshake, so later browsers can get NO surface and never
-  // paint (blank tile), and their resize/paint/targetId tasks wedge behind the
-  // create backlog. So we send creates ONE AT A TIME, spaced by `createSpacing`,
-  // instead of all at once — each browser's create + surface handshake completes
-  // before the next starts. (2-per-host always worked; 7-at-once is what fails.)
+  // Per-host create pacing (guarded by writeLock). A BURST of opCreateBrowser frames
+  // would otherwise make cef_host run a pile of browser creates concurrently, contending
+  // the one shared GPU/Viz accelerated-surface handshake so later browsers get NO surface
+  // and never paint. So we send creates ONE AT A TIME and advance only when cef_host acks
+  // the create (H3: opCreated, off OnAfterCreated) — serialized by COMPLETION, not a
+  // wall-clock guess. `createAckTimeout` is a backstop so a create that never acks (a
+  // wedged renderer) can't stall the queue forever. `createInFlight` is the browserId we
+  // are currently awaiting the ack for.
   private var createSendQueue: [(id: UInt32, session: CefWebSession, url: String)] = []
   private var createPacerRunning = false
-  private let createSpacing: TimeInterval = 0.18
+  private var createInFlight: UInt32?
+  private let createAckTimeout: TimeInterval = 8
+
+  // C1 first-present watchdog (guarded by presentLock). browserIds awaiting their FIRST
+  // opPresent: if none arrives within the deadline we re-kick via opInvalidate, then (if
+  // still blank) surface paintStalled to Dart — converting a silent never-painted tile
+  // into self-healing-or-signalled.
+  private let presentLock = NSLock()
+  private var firstPresentPending: Set<UInt32> = []
 
   // Invoked (off the reader thread) when an ad-hoc host refuses to load a named
   // profile (no creds were written — see F.5). The plugin tears this host down
@@ -147,6 +159,14 @@ final class CefProfileHost {
   // host so the profile_in_use guard unblocks. Fires at most once per host.
   var onHostDied: ((Int32) -> Void)?
   private var diedFired = false  // guarded by writeLock; one onHostDied per host
+
+  // H7: a SINGLE browser's create failed (the host is otherwise fine) — the plugin drops
+  // that one session + emits processGone for it. C1: a browser never painted its first
+  // frame despite a re-kick — the plugin surfaces paintStalled so the consumer can
+  // recover (e.g. recreate the view) instead of staring at a silent blank tile. Both
+  // carry the wire browserId; invoked off the reader / a timer thread.
+  var onBrowserFailed: ((UInt32) -> Void)?
+  var onPaintStalled: ((UInt32) -> Void)?
 
   init(profileId: String, profileDir: String, isEphemeral: Bool) {
     self.profileId = profileId
@@ -413,7 +433,14 @@ final class CefProfileHost {
     // CEF-2b relayId<->target binding (CdpRelay's pipeId = relayId<<21 | localSeq)
     // relies on this for global uniqueness across N concurrent relays, so guard it —
     // the slot we're about to hand out must be FREE (never previously registered).
-    assert(browsers[id] == nil, "browserId must be monotonic / never reused")
+    // H8: a UInt32 wrap (or any bug) reusing an id would SILENTLY overwrite a live
+    // sibling's slot in a release build (the old guard was a debug-only `assert`,
+    // compiled out) → the reader misroutes that wire id's frames (paint/cookies/CDP)
+    // to the wrong tile, and CdpRelay's `relayId<<21` pipeId collides → cross-tile
+    // agent-control leak. Make it a hard runtime invariant (a free, non-reserved slot).
+    // Unreachable in practice (2^32 creates per host), so fail-fast >> silent corruption.
+    precondition(id != 0 && browsers[id] == nil,
+                 "cef browserId space exhausted/occupied — refusing to corrupt cross-tile routing")
     nextBrowserId += 1
     browsers[id] = session
     browsersLock.unlock()
@@ -451,11 +478,17 @@ final class CefProfileHost {
     // Any resize after this lands after the create, so cef_host has a slot and
     // self-heals the surface via DoResize. (writeLock→bufferLock here is safe: no
     // path holds bufferLock then takes writeLock.)
+    // H4: read (w, h, dpr, surfaceId) as ONE atomic snapshot rather than four separate
+    // bufferLock acquisitions — otherwise a resize interleaving between the reads could
+    // ship e.g. old width + new surfaceId, blitting the first paint into a mis-sized
+    // surface. (create-pacing widened this window: a browser can sit queued for N×
+    // spacing, giving layout resizes more time to interleave.)
+    let g = session.createSnapshot()
     var payload = [UInt8]()
-    appendU32(&payload, UInt32(session.w))
-    appendU32(&payload, UInt32(session.h))
-    appendF64(&payload, Double(session.scale))
-    appendU32(&payload, session.surfaceId)
+    appendU32(&payload, UInt32(g.w))
+    appendU32(&payload, UInt32(g.h))
+    appendF64(&payload, Double(g.dpr))
+    appendU32(&payload, g.sid)
     payload.append(contentsOf: Array(url.utf8))
     createEnqueued.insert(id)
     let frame = frameBytes(id, Self.opCreateBrowser, payload)
@@ -481,36 +514,108 @@ final class CefProfileHost {
     pumpCreateQueue()
   }
 
-  /// Send the NEXT queued create, then schedule the following one after
-  /// `createSpacing`, so cef_host creates browsers one-at-a-time and each
-  /// accelerated-surface handshake completes before the next contends the shared
-  /// GPU/Viz process. A create whose browser was disposed while queued (rapid
-  /// create/close churn) is skipped without consuming a spacing interval.
+  /// Send the NEXT queued create and wait for cef_host to ack it (opCreated) before
+  /// sending the following one (H3) — so browsers create one-at-a-time and each one's
+  /// render + accelerated-surface handshake completes before the next contends the shared
+  /// GPU/Viz process. `createAckTimeout` backstops a create that never acks (wedged
+  /// renderer). A create whose browser was disposed while queued is skipped.
   private func pumpCreateQueue() {
     writeLock.lock()
-    if createPacerRunning || createSendQueue.isEmpty {
+    // H6: never pump on a dead/dying host — the queue was abandoned in
+    // shutdown()/handleHostDeath(); pumping would sendCreate into a closed pipe and a
+    // stuck `createPacerRunning` could wedge a reused host.
+    if !running || crashed || createPacerRunning || createSendQueue.isEmpty {
       writeLock.unlock()
       return
     }
     createPacerRunning = true
     let next = createSendQueue.removeFirst()
+    createInFlight = next.id
     writeLock.unlock()
 
     browsersLock.lock()
     let stillLive = browsers[next.id] != nil
     browsersLock.unlock()
     guard stillLive else {
-      // Disposed while queued — drop it and advance immediately (no spacing).
-      writeLock.lock(); createPacerRunning = false; writeLock.unlock()
-      pumpCreateQueue()
+      // Disposed while queued — drop it and advance. M1: trampoline rather than
+      // recurse synchronously (a "close all tiles" mid-burst could skip many disposed
+      // creates and blow the stack).
+      writeLock.lock(); createPacerRunning = false; createInFlight = nil; writeLock.unlock()
+      DispatchQueue.global().async { [weak self] in self?.pumpCreateQueue() }
       return
     }
 
     sendCreate(next.id, next.session, next.url)
-    DispatchQueue.global().asyncAfter(deadline: .now() + createSpacing) { [weak self] in
-      guard let self = self else { return }
-      self.writeLock.lock(); self.createPacerRunning = false; self.writeLock.unlock()
-      self.pumpCreateQueue()
+    armFirstPresentWatchdog(next.id)  // C1
+    // H3: advance on the create ack (opCreated, via advanceCreatePacer in the reader);
+    // this timer is only the backstop if that ack never comes.
+    DispatchQueue.global().asyncAfter(deadline: .now() + createAckTimeout) { [weak self] in
+      self?.advanceCreatePacer(after: next.id, timedOut: true)
+    }
+  }
+
+  /// H3: the in-flight create for `browserId` completed (opCreated), failed
+  /// (opCreateFailed), or timed out — release the pacer and send the next queued create.
+  /// Idempotent: only the FIRST of {ack, timeout} for the current in-flight id advances.
+  private func advanceCreatePacer(after browserId: UInt32, timedOut: Bool) {
+    writeLock.lock()
+    guard createInFlight == browserId else { writeLock.unlock(); return }
+    createInFlight = nil
+    createPacerRunning = false
+    writeLock.unlock()
+    if timedOut {
+      NSLog("[cef] profile '\(profileId)': create-ack timeout for browser \(browserId) — advancing pacer")
+    }
+    // Dispatch the next create OFF the reader thread (advanceCreatePacer is called from
+    // it on opCreated): pumpCreateQueue -> sendCreate writes to the same pipe the reader
+    // reads, and the reader must never block on a write.
+    DispatchQueue.global().async { [weak self] in self?.pumpCreateQueue() }
+  }
+
+  /// H7: cef_host couldn't create this browser — drop the session (the plugin emits
+  /// processGone) and advance the pacer so the rest of the burst still proceeds.
+  private func handleCreateFailed(_ browserId: UInt32) {
+    firstPresentArrived(browserId)  // cancel the C1 watchdog for a browser that won't paint
+    onBrowserFailed?(browserId)
+    advanceCreatePacer(after: browserId, timedOut: false)
+  }
+
+  // MARK: C1 first-present watchdog
+
+  /// Arm the first-present watchdog for a freshly-sent create. If no opPresent arrives
+  /// within ~3s we re-kick a repaint (opInvalidate); if still blank ~4s later we surface
+  /// paintStalled so the consumer can recover (recreate) instead of a silent blank tile.
+  private func armFirstPresentWatchdog(_ browserId: UInt32) {
+    presentLock.lock(); firstPresentPending.insert(browserId); presentLock.unlock()
+    DispatchQueue.global().asyncAfter(deadline: .now() + 3) { [weak self] in
+      self?.checkFirstPresent(browserId, phase: 1)
+    }
+  }
+
+  /// Reader: a browser painted its first frame — cancel its watchdog.
+  private func firstPresentArrived(_ browserId: UInt32) {
+    presentLock.lock(); firstPresentPending.remove(browserId); presentLock.unlock()
+  }
+
+  private func checkFirstPresent(_ browserId: UInt32, phase: Int) {
+    presentLock.lock()
+    let stillBlank = firstPresentPending.contains(browserId)
+    if stillBlank && phase >= 2 { firstPresentPending.remove(browserId) }
+    presentLock.unlock()
+    guard stillBlank else { return }  // it painted — nothing to do
+    // Only act while the browser is still live + the host healthy.
+    browsersLock.lock(); let live = browsers[browserId] != nil; browsersLock.unlock()
+    writeLock.lock(); let healthy = running && !crashed; writeLock.unlock()
+    guard live, healthy else { firstPresentArrived(browserId); return }
+    if phase == 1 {
+      NSLog("[cef] profile '\(profileId)': browser \(browserId) hasn't painted — re-kicking (opInvalidate)")
+      send(browserId, Self.opInvalidate, [])
+      DispatchQueue.global().asyncAfter(deadline: .now() + 4) { [weak self] in
+        self?.checkFirstPresent(browserId, phase: 2)
+      }
+    } else {
+      NSLog("[cef] profile '\(profileId)': browser \(browserId) never painted — surfacing paintStalled")
+      onPaintStalled?(browserId)
     }
   }
 
@@ -587,8 +692,13 @@ final class CefProfileHost {
     // guards on `running`, so flipping it false here keeps onHostDied from firing
     // on the shutdown path (C1).
     writeLock.lock()
-    let wasRunning = running
     running = false
+    // H6: abandon any paced creates so a stuck pacer can't wedge a reused host and
+    // queued-never-sent sessions don't linger. The browsers map still holds them, so
+    // disposeSession/onHostDied path cleans them up.
+    createSendQueue.removeAll()
+    createPacerRunning = false
+    createInFlight = nil
     writeLock.unlock()
     // CEF-2a/b: drop ALL relays (each a listener + any client) before tearing down
     // the pipe, so none keeps bridging into a closing fd. Snapshot under the lock,
@@ -608,10 +718,19 @@ final class CefProfileHost {
     // which Swift would otherwise resolve these unqualified calls to.
     if c >= 0 { Darwin.shutdown(c, SHUT_RDWR) }
     if l >= 0 { Darwin.shutdown(l, SHUT_RDWR) }
-    if readerStarted && wasRunning { _ = readerDone.wait(timeout: .now() + 2) }
+    // H1: gate the join on `readerStarted` ALONE (not the old `wasRunning`). The
+    // semaphore is level-triggered — if the reader already exited (e.g. it drove the
+    // crash path and signalled readerDone before this runs), wait() returns at once.
+    // Gating on `wasRunning` could SKIP the join while the reader is still blocked in
+    // read()/accept() on these fds and then close them under it (use-after-free). And
+    // on a join TIMEOUT the reader is, by definition, still inside read()/accept() on
+    // these fds — so do NOT close them; leak the fd rather than risk an fd-reuse UAF
+    // (the same discipline CdpRelay.stop() uses). The fds were already Darwin.shutdown
+    // -ed above to wake the reader, so a timeout here is genuinely pathological.
+    let readerJoined = !readerStarted || readerDone.wait(timeout: .now() + 2) == .success
     writeLock.lock()
-    if connFd >= 0 { close(connFd); connFd = -1 }
-    if listenFd >= 0 { close(listenFd); listenFd = -1 }
+    if connFd >= 0 { if readerJoined { close(connFd) }; connFd = -1 }
+    if listenFd >= 0 { if readerJoined { close(listenFd) }; listenFd = -1 }
     writeLock.unlock()
     if !socketPath.isEmpty { unlink(socketPath); socketPath = "" }
     if isEphemeral && !profileDir.isEmpty {
@@ -630,16 +749,24 @@ final class CefProfileHost {
     // which closes its CDP write end (fd 4) and yields EOF on cdpReadFd so the
     // CDP reader loop returns. Done before the CDP reader join for that reason.
     terminateProcess()
-    if cdpReaderStarted && wasRunning { _ = cdpReaderDone.wait(timeout: .now() + 2) }
-    if cdpReadFd >= 0 { close(cdpReadFd); cdpReadFd = -1 }
+    // H1: same discipline for the CDP reader — gate on cdpReaderStarted alone, and
+    // never close the read fd on a join timeout (the reader is still in read() on it).
+    let cdpJoined = !cdpReaderStarted || cdpReaderDone.wait(timeout: .now() + 2) == .success
+    if cdpReadFd >= 0 { if cdpJoined { close(cdpReadFd) }; cdpReadFd = -1 }
   }
 
   /// SIGTERM (then SIGKILL escalation) the cef_host process. Handles BOTH launch
   /// paths: `process` (Foundation.Process, default) and `spawnedPid` (posix_spawn,
   /// agent-control). Idempotent — clears whichever handle it used.
   private func terminateProcess() {
-    if let p = process {
-      process = nil
+    // H5: take BOTH handles atomically under writeLock so this is the sole owner of
+    // its terminate/waitpid — handleHostDeath's reaper can't be reaping the same pid
+    // concurrently (it took ownership the same way, or handed it back to us).
+    writeLock.lock()
+    let p = process; process = nil
+    let pid = spawnedPid; spawnedPid = 0
+    writeLock.unlock()
+    if let p = p {
       p.terminate()  // SIGTERM
       // Escalate to SIGKILL if the host is wedged and ignores SIGTERM.
       DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) {
@@ -650,9 +777,7 @@ final class CefProfileHost {
     // posix_spawn path: we own a raw pid, not a Process. SIGTERM then SIGKILL.
     // Reap with a non-blocking waitpid so the child doesn't linger as a zombie
     // (Foundation.Process reaps for us; for a bare pid we must do it ourselves).
-    let pid = spawnedPid
     guard pid > 0 else { return }
-    spawnedPid = 0
     kill(pid, SIGTERM)
     DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) {
       var status: Int32 = 0
@@ -762,7 +887,14 @@ final class CefProfileHost {
       if !readAll(fd, &hdr, 4) { break }
       let bodyLen = (Int(hdr[0]) << 24) | (Int(hdr[1]) << 16) | (Int(hdr[2]) << 8) | Int(hdr[3])
       // Minimum valid body is 5 bytes (4 browserId + 1 op + 0 payload).
-      if bodyLen <= 4 || bodyLen > (64 << 20) { break }
+      // H9: a malformed/oversized length means a wire desync and tears down EVERY
+      // browser on this host — log the rejected length first so it isn't a silent,
+      // breadcrumb-less all-tiles crash (the IPC peer is trusted, so this only fires
+      // on a genuine framing bug).
+      if bodyLen <= 4 || bodyLen > (64 << 20) {
+        NSLog("[cef] profile '\(profileId)': rejecting malformed IPC frame, bodyLen=\(bodyLen) — tearing down host")
+        break
+      }
       var body = [UInt8](repeating: 0, count: bodyLen)
       if !readAll(fd, &body, bodyLen) { break }
       let bid = beU32(body, 0)
@@ -774,7 +906,12 @@ final class CefProfileHost {
         // CEF-2b: a targetId resolution result — route to the pending completion,
         // not the session.
         handleTargetId(bid, String(bytes: payload, encoding: .utf8))
+      } else if op == Self.opCreated {
+        advanceCreatePacer(after: bid, timedOut: false)  // H3: create acked → send the next
+      } else if op == Self.opCreateFailed {
+        handleCreateFailed(bid)  // H7
       } else {
+        if op == Self.opPresent { firstPresentArrived(bid) }  // C1: cancel the watchdog
         browsersLock.lock()
         let session = browsers[bid]
         browsersLock.unlock()
@@ -803,8 +940,19 @@ final class CefProfileHost {
     guard running, !diedFired else { writeLock.unlock(); return }
     diedFired = true
     crashed = true  // forces hasLiveBrowser false so the named profile reopens
+    // H6: abandon paced creates — the host is gone. Sessions stay in `browsers`, so
+    // the onHostDied → plugin path still emits processGone for each queued one.
+    createSendQueue.removeAll()
+    createPacerRunning = false
+    createInFlight = nil
     let p = process
+    // H5: TAKE the posix_spawn pid (zero it) so this reaper is the SOLE owner of its
+    // waitpid — a later terminateProcess()/shutdown() then sees 0 and won't
+    // double-reap a pid this thread is about to harvest (which could kill an
+    // OS-recycled pid). If it's wedged and we can't reap within the grace window
+    // below, we hand it back (restoreSpawnedPid) so terminateProcess can SIGKILL it.
     let pid = spawnedPid
+    spawnedPid = 0
     let died = onHostDied
     writeLock.unlock()
     // Resolve the exit status + invoke onHostDied off the caller's thread: this
@@ -827,33 +975,36 @@ final class CefProfileHost {
           usleep(50_000)
         }
       } else if pid > 0 {
+        // We already TOOK ownership of `pid` (zeroed spawnedPid under writeLock), so
+        // we are the only thread that may waitpid it here.
+        var reaped = false
         for _ in 0 ..< 20 {  // up to ~1s
           var raw: Int32 = 0
           let r = waitpid(pid, &raw, WNOHANG)
           if r == pid {
             // Reaped. Mirror terminationStatus: exit code, or -1 if signaled.
             status = (raw & 0o177) == 0 ? ((raw >> 8) & 0xff) : -1
-            // We reaped the pid, freeing it for OS reuse — clear the shared handle so a
-            // subsequent terminateProcess() (via onHostDied -> shutdown) doesn't
-            // kill()/waitpid() a now-reaped, possibly-recycled pid.
-            self?.clearReapedPid(pid)
-            break
+            reaped = true; break
           } else if r < 0 {
-            break  // already reaped by terminateProcess() (or no child) — give up.
+            reaped = true; break  // ECHILD / already gone — nothing to hand back.
           }
           usleep(50_000)
         }
+        // H5: still alive after the grace window (wedged child that didn't exit on
+        // EOF) — hand the pid back so terminateProcess()/shutdown() can SIGTERM/SIGKILL
+        // + reap it. Without this, a taken-but-unreaped pid would never be killed.
+        if !reaped { self?.restoreSpawnedPid(pid) }
       }
       DispatchQueue.main.async { died?(status) }
     }
   }
 
-  /// Clear `spawnedPid` once we've reaped it, so no later kill()/waitpid() targets a
-  /// reaped (possibly OS-recycled) pid. Guarded by writeLock and matched against `pid`
-  /// so a racing relaunch's new pid is never cleared.
-  private func clearReapedPid(_ pid: pid_t) {
+  /// H5: hand a TAKEN-but-unreaped pid back to `spawnedPid` so terminateProcess() can
+  /// finish it (SIGTERM/SIGKILL + reap). No-op if a relaunch already installed a new
+  /// pid (so a racing relaunch is never clobbered).
+  private func restoreSpawnedPid(_ pid: pid_t) {
     writeLock.lock()
-    if spawnedPid == pid { spawnedPid = 0 }
+    if spawnedPid == 0 { spawnedPid = pid }
     writeLock.unlock()
   }
 

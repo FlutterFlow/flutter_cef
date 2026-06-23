@@ -129,7 +129,9 @@ final class CefWebSession: NSObject, FlutterTexture {
     self.dpr = dpr
     self.registry = registry
     super.init()
-    _ = allocateBuffers(self.width, self.height)
+    if let (surf, buffer) = makeBuffers(self.width, self.height) {
+      publishBuffers(surf, buffer, self.width, self.height)
+    }
     self.textureId = registry.register(self)
   }
 
@@ -158,15 +160,12 @@ final class CefWebSession: NSObject, FlutterTexture {
     let unchanged = (w == width && h == height)
     bufferLock.unlock()
     if unchanged { return }
-    guard allocateBuffers(w, h) else { return }  // takes bufferLock internally
-    // Publish the new geometry and read the fresh surface id under bufferLock so a
-    // concurrent host read (sendCreate on the reader thread) sees a consistent
-    // (w, h, surfaceId). Released before sendFrame — no bufferLock→writeLock nest.
-    bufferLock.lock()
-    width = w
-    height = h
-    let sid = ioSurface.map { IOSurfaceGetID($0) } ?? 0
-    bufferLock.unlock()
+    // H4: create the new surface OUTSIDE the lock (expensive), then publish surface +
+    // new dims ATOMICALLY in one bufferLock section — so a concurrent host read
+    // (sendCreate's createSnapshot on the reader thread) can never see the new surface
+    // with the old dims. Released before sendFrame — no bufferLock→writeLock nest.
+    guard let (surf, buffer) = makeBuffers(w, h) else { return }
+    let sid = publishBuffers(surf, buffer, w, h)
     guard sid != 0 else { return }
     var payload = [UInt8]()
     appendU32(&payload, UInt32(w))
@@ -311,7 +310,10 @@ final class CefWebSession: NSObject, FlutterTexture {
 
   // MARK: Buffers
 
-  private func allocateBuffers(_ w: Int, _ h: Int) -> Bool {
+  /// H4: CREATE an IOSurface + CVPixelBuffer for (w,h) but do NOT publish them — the
+  /// caller publishes surface + geometry atomically via publishBuffers so a concurrent
+  /// createSnapshot()/copyPixelBuffer never sees a surface and dims out of sync.
+  private func makeBuffers(_ w: Int, _ h: Int) -> (IOSurfaceRef, CVPixelBuffer)? {
     // Allocate at PHYSICAL (Retina) resolution = logical * dpr, so the texture
     // is crisp on HiDPI displays; cef_host renders the OSR buffer at the same
     // scale (via GetScreenInfo.device_scale_factor). 64-byte-aligned stride keeps
@@ -330,7 +332,7 @@ final class CefWebSession: NSObject, FlutterTexture {
     ]
     guard let surf = IOSurfaceCreate(props as CFDictionary) else {
       NSLog("[cef] IOSurfaceCreate failed \(w)x\(h)")
-      return false
+      return nil
     }
     var pbOut: Unmanaged<CVPixelBuffer>?
     let attrs: [CFString: Any] = [
@@ -341,14 +343,33 @@ final class CefWebSession: NSObject, FlutterTexture {
       kCFAllocatorDefault, surf, attrs as CFDictionary, &pbOut)
     guard rc == kCVReturnSuccess, let buffer = pbOut?.takeRetainedValue() else {
       NSLog("[cef] CVPixelBufferCreateWithIOSurface failed rc=\(rc)")
-      return false
+      return nil
     }
-    bufferLock.lock()
+    NSLog("[cef] allocated IOSurface id=\(IOSurfaceGetID(surf)) \(pw)x\(ph) (logical \(w)x\(h) @\(dpr)x) stride=\(bytesPerRow)")
+    return (surf, buffer)
+  }
+
+  /// H4: publish a new (surface, buffer, width, height) as ONE atomic update, so a
+  /// concurrent createSnapshot()/copyPixelBuffer never observes the new surface with
+  /// the old dims (or vice-versa). Returns the new surface id. The old IOSurface/
+  /// CVPixelBuffer are released by the overwrite.
+  @discardableResult
+  private func publishBuffers(_ surf: IOSurfaceRef, _ buffer: CVPixelBuffer,
+                              _ w: Int, _ h: Int) -> UInt32 {
+    bufferLock.lock(); defer { bufferLock.unlock() }
     ioSurface = surf
     pixelBuffer = buffer
-    bufferLock.unlock()
-    NSLog("[cef] allocated IOSurface id=\(IOSurfaceGetID(surf)) \(pw)x\(ph) (logical \(w)x\(h) @\(dpr)x) stride=\(bytesPerRow)")
-    return true
+    width = w
+    height = h
+    return IOSurfaceGetID(surf)
+  }
+
+  /// H4: read (w, h, dpr, surfaceId) as ONE consistent tuple under a single bufferLock
+  /// acquisition — the host builds opCreateBrowser from this so its payload can't
+  /// capture a torn mix of stale dims + a freshly-reallocated surface id.
+  func createSnapshot() -> (w: Int, h: Int, dpr: CGFloat, sid: UInt32) {
+    bufferLock.lock(); defer { bufferLock.unlock() }
+    return (width, height, dpr, ioSurface.map { IOSurfaceGetID($0) } ?? 0)
   }
 
   // MARK: Inbound frames

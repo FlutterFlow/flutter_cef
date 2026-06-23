@@ -18,6 +18,14 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   private var sessions: [String: CefWebSession] = [:]     // sessionId -> session (verb routing)
   private var sessionHost: [String: CefProfileHost] = [:] // sessionId -> its host
   private var sessionKey: [String: String] = [:]          // sessionId -> profiles[] key, for teardown
+  // C2: per-session create args, so when a shared host turns out to be ad-hoc and
+  // refuses its named profile we can re-home EVERY session on it onto ephemeral hosts
+  // (not just the last one whose closure was installed), preserving each session's
+  // url + schemes + agent-control transport.
+  private var sessionCreateArgs: [String: (url: String, allowedSchemes: String, agentControl: Bool)] = [:]
+  // C2: named profiles a running ad-hoc host already refused — future creates for them
+  // go straight to ephemeral instead of racing onto a doomed shared host.
+  private var adhocBlockedProfiles: Set<String> = []
 
   public static func register(with registrar: FlutterPluginRegistrar) {
     let instance = FlutterCefPlugin()
@@ -293,8 +301,11 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     // per-target CDP relay (one relay per browserId, demuxed over the shared pipe
     // by the per-relay CDP-id rewrite — see CdpRelay's multiplex note).
 
-    let (profileDir, isEphemeral) = resolveProfileDir(namedProfile ? profile : nil)
-    let key = namedProfile ? profile! : "~ephemeral~" + sessionId
+    // C2: if a running ad-hoc host already refused this named profile, don't race onto
+    // a doomed shared host — go ephemeral directly.
+    let effectiveNamed = namedProfile && !adhocBlockedProfiles.contains(profile ?? "")
+    let (profileDir, isEphemeral) = resolveProfileDir(effectiveNamed ? profile : nil)
+    let key = effectiveNamed ? profile! : "~ephemeral~" + sessionId
 
     guard let host = resolveOrSpawnHost(
       key: key, profileDir: profileDir, isEphemeral: isEphemeral,
@@ -311,11 +322,14 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     // When that fires, tear the host down and respawn an EPHEMERAL host for this
     // same session, then re-issue createBrowser. Wired only for named profiles;
     // an already-ephemeral host never refuses.
-    if namedProfile {
-      host.onInsecureProfileRefused = { [weak self] in
+    if effectiveNamed {
+      // C2: re-home the WHOLE shared host's sessions onto ephemeral hosts on refusal —
+      // not just this one. The closure captures the host, not a single sessionId, so a
+      // burst of tiles that all attached before opReady are all rescued.
+      host.onInsecureProfileRefused = { [weak self, weak host] in
         DispatchQueue.main.async {
-          self?.respawnEphemeral(sessionId: sessionId, url: url,
-                                 allowedSchemes: allowedSchemes)
+          guard let self = self, let host = host, let prof = profile else { return }
+          self.respawnHostEphemeral(host, refusedProfile: prof)
         }
       }
     }
@@ -396,6 +410,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     sessions[sessionId] = session
     sessionHost[sessionId] = host
     sessionKey[sessionId] = key
+    sessionCreateArgs[sessionId] = (url, allowedSchemes, agentControl)  // C2 re-home
     result([
       "textureId": session.textureId, "width": width, "height": height,
       "cdpPort": host.cdpPort,
@@ -451,6 +466,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
         self.sessions[sid] = nil
         self.sessionHost[sid] = nil
         self.sessionKey[sid] = nil
+        self.sessionCreateArgs[sid] = nil
       }
       // Drop the host from the profile registry so a re-create spawns a fresh
       // one. Snapshot the matching keys first — never mutate a Dictionary while
@@ -460,42 +476,78 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       // Reap: idempotent SIGTERM(+SIGKILL escalation), a no-op if already exited.
       host.shutdown()
     }
+    // H7: a SINGLE browser's create failed (host otherwise healthy) — drop just that
+    // session + emit processGone for it, so Dart stops waiting on a browser that will
+    // never paint (the host's create-pacer already advanced).
+    host.onBrowserFailed = { [weak self, weak host] browserId in
+      DispatchQueue.main.async {
+        guard let self = self, let host = host,
+              let sid = self.sessionId(forBrowserId: browserId, on: host) else { return }
+        self.emit("processGone", ["sessionId": sid, "reason": "createFailed"])
+        let session = self.sessions[sid]
+        self.sessions[sid] = nil
+        self.sessionHost[sid] = nil
+        self.sessionKey[sid] = nil
+        self.sessionCreateArgs[sid] = nil
+        _ = host.removeBrowser(browserId)
+        session?.dispose()
+      }
+    }
+    // C1: a browser never painted its first frame despite a re-kick — surface
+    // paintStalled so Dart/the consumer can recover (e.g. recreate the view) instead of
+    // a silent, unrecoverable blank tile. The browser stays alive (it may yet paint).
+    host.onPaintStalled = { [weak self, weak host] browserId in
+      DispatchQueue.main.async {
+        guard let self = self, let host = host,
+              let sid = self.sessionId(forBrowserId: browserId, on: host) else { return }
+        self.emit("paintStalled", ["sessionId": sid])
+      }
+    }
   }
 
-  /// F.5: the running cef_host turned out to be an ad-hoc (mock-keychain) build
-  /// and refused the named profile. Tear that host down and recreate this session
-  /// on a fresh EPHEMERAL host (recomputing dir/key), then re-issue createBrowser
-  /// with the original url/allowedSchemes. Because nothing was written to the
-  /// persistent dir, no creds leak.
-  private func respawnEphemeral(sessionId: String, url: String,
-                                allowedSchemes: String) {
-    // The unlocked session/profile dictionaries are confined to the main thread
-    // (H3); this is reached from onInsecureProfileRefused via DispatchQueue.main.
+  /// Find the sessionId of the session bound to `browserId` on `host` (main-thread maps).
+  private func sessionId(forBrowserId browserId: UInt32, on host: CefProfileHost) -> String? {
+    for (sid, s) in sessions where s.browserId == browserId && sessionHost[sid] === host {
+      return sid
+    }
+    return nil
+  }
+
+  /// C2/F.5: a running cef_host turned out to be an ad-hoc (mock-keychain) build and
+  /// refused its named profile (at opReady, BEFORE any browser was created — so nothing
+  /// rendered or leaked). Re-home EVERY session that was on that shared host onto its
+  /// own ephemeral host, preserving each session's url/schemes/agent-control, and
+  /// remember the profile so later creates skip the doomed shared host. This replaces
+  /// the old per-session respawn that shut the whole shared host down — which stranded
+  /// every sibling tile blank-and-dead with no error.
+  private func respawnHostEphemeral(_ oldHost: CefProfileHost, refusedProfile: String) {
+    // The unlocked session/profile dictionaries are confined to the main thread (H3);
+    // reached from onInsecureProfileRefused via DispatchQueue.main.
     dispatchPrecondition(condition: .onQueue(.main))
-    guard let session = sessions[sessionId],
-          let cefHost = resolveCefHostPath() else { return }
-    // Tear down the refused (named) host and forget it.
-    if let oldKey = sessionKey[sessionId], let oldHost = profiles[oldKey] {
-      oldHost.shutdown()
-      profiles[oldKey] = nil
+    guard let cefHost = resolveCefHostPath() else { return }
+    adhocBlockedProfiles.insert(refusedProfile)
+    let victims = sessionHost.compactMap { $0.value === oldHost ? $0.key : nil }
+    // Forget + tear down the refused host (every session on it is about to move off).
+    let goneKeys = profiles.compactMap { $0.value === oldHost ? $0.key : nil }
+    for k in goneKeys { profiles[k] = nil }
+    oldHost.shutdown()
+    for sid in victims {
+      guard let session = sessions[sid], let args = sessionCreateArgs[sid] else { continue }
+      let (profileDir, isEphemeral) = resolveProfileDir(nil)
+      let key = "~ephemeral~" + sid
+      let host = CefProfileHost(profileId: key, profileDir: profileDir, isEphemeral: isEphemeral)
+      guard host.spawn(cefHostPath: cefHost, enableCdp: false,
+                       allowedSchemes: args.allowedSchemes,
+                       agentControl: args.agentControl) else {
+        NSLog("[cef] C2 respawn ephemeral host failed for \(sid)")
+        continue
+      }
+      wireHostDied(host)
+      profiles[key] = host
+      _ = host.createBrowser(session, url: args.url, allowedSchemes: args.allowedSchemes)
+      sessionHost[sid] = host
+      sessionKey[sid] = key
     }
-    // The slimmed session keeps its texture/buffers; just re-bind it to a fresh
-    // ephemeral host. CDP is never enabled here (a named profile rejects CDP, so
-    // a refused-then-downgraded session had none).
-    let (profileDir, isEphemeral) = resolveProfileDir(nil)
-    let key = "~ephemeral~" + sessionId
-    let host = CefProfileHost(
-      profileId: key, profileDir: profileDir, isEphemeral: isEphemeral)
-    guard host.spawn(cefHostPath: cefHost, enableCdp: false,
-                     allowedSchemes: allowedSchemes) else {
-      NSLog("[cef] respawn ephemeral host failed for \(sessionId)")
-      return
-    }
-    wireHostDied(host)
-    profiles[key] = host
-    _ = host.createBrowser(session, url: url, allowedSchemes: allowedSchemes)
-    sessionHost[sessionId] = host
-    sessionKey[sessionId] = key
   }
 
   private func navigate(_ a: [String: Any], _ result: @escaping FlutterResult) {
@@ -544,6 +596,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     sessions[id] = nil
     sessionHost[id] = nil
     sessionKey[id] = nil
+    sessionCreateArgs[id] = nil
     guard let host = host else {
       // No host on record (shouldn't happen) — just release the session.
       session.dispose()

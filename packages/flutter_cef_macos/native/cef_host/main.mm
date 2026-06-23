@@ -116,6 +116,8 @@ constexpr uint8_t kOpDownload = 0x18;   // {utf8 suggestedName} a download start
 constexpr uint8_t kOpImeBounds = 0x19;  // {u32 x}{u32 y}{u32 w}{u32 h} caret rect (DIP)
 constexpr uint8_t kOpCookies = 0x1a;    // {u32 id}{utf8 json-array} visitAllCookies result
 constexpr uint8_t kOpTargetId = 0x1b;   // {utf8 targetId} -> plugin: this browser's CDP targetId (CEF-2b)
+constexpr uint8_t kOpCreated = 0x1c;    // {} H3: OnAfterCreated — browser is up; host's pacer sends the next create
+constexpr uint8_t kOpCreateFailed = 0x1d; // {} H7: async CreateBrowser dispatch failed; host drops the session
 constexpr uint8_t kOpPointer = 0x10;
 constexpr uint8_t kOpResize = 0x11;
 constexpr uint8_t kOpKey = 0x12;
@@ -145,6 +147,7 @@ constexpr uint8_t kOpShowDevTools = 0x33;   // {} open DevTools in a window
 constexpr uint8_t kOpLoadTrusted = 0x34;    // {utf8 url} host content-load, exempt from allowlist
 constexpr uint8_t kOpSetVisible = 0x35;     // {u8 visible} -> CefBrowserHost::WasHidden(!visible)
 constexpr uint8_t kOpResolveTargetId = 0x36;  // {} resolve this browser's CDP targetId (CEF-2b) -> kOpTargetId
+constexpr uint8_t kOpInvalidate = 0x37;       // {} C1: force a repaint (Invalidate PET_VIEW) to re-kick a stalled first frame
 
 // ---- Shared runtime state ----
 // Atomic: the reader thread reads it (ReadAll), SendFrame on any thread reads it,
@@ -321,8 +324,15 @@ bool ReadAll(int fd, void* buf, size_t len) {
 // payloadLen, counting every byte after the length prefix.
 void SendFrame(uint32_t browser_id, uint8_t opcode, const void* payload,
                uint32_t payload_len) {
-  if (g_ipc_fd < 0) return;
+  if (g_ipc_fd < 0) return;  // racy early-out; the authoritative check is under the lock
   std::lock_guard<std::mutex> lock(g_ipc_write_mutex);
+  // C3: SNAPSHOT the fd under the write lock and write to the snapshot, never re-loading
+  // g_ipc_fd at write time. Teardown sets g_ipc_fd=-1 (exchange) and close()s the old fd
+  // under this same lock, so once we hold it the fd is either still valid (write) or
+  // already -1 (skip) — a paint thread can no longer pass the early-out and then write
+  // into a closed/recycled fd.
+  int fd = g_ipc_fd.load();
+  if (fd < 0) return;
   uint32_t body_len = 4 + 1 + payload_len;
   // Assemble the whole frame and write it in one WriteAll so a partial write
   // never leaves the peer with a length prefix it can't satisfy (stream desync).
@@ -337,7 +347,7 @@ void SendFrame(uint32_t browser_id, uint8_t opcode, const void* payload,
   frame[7] = static_cast<uint8_t>(browser_id & 0xff);
   frame[8] = opcode;
   if (payload_len) memcpy(frame.data() + 9, payload, payload_len);
-  WriteAll(g_ipc_fd, frame.data(), frame.size());
+  WriteAll(fd, frame.data(), frame.size());
 }
 
 void SendLog(uint32_t browser_id, const std::string& msg) {
@@ -776,10 +786,15 @@ class HostClient : public CefClient,
     // (Re)install JS-channel shims for this freshly-loaded frame.
     for (const auto& name : g_channels) InjectChannelShim(frame, name);
   }
-  void OnLoadEnd(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
+  void OnLoadEnd(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame,
                  int /*httpStatusCode*/) override {
-    if (frame && frame->IsMain())
+    if (frame && frame->IsMain()) {
       SendUtf8(slot_->browser_id, kOpPageFinish, frame->GetURL().ToString());
+      // C1: force a repaint when the main frame finishes — a first paint dropped
+      // during load (e.g. a GPU surface not yet ready) self-heals here instead of
+      // leaving a permanently blank texture with no signal.
+      if (browser && browser->GetHost()) browser->GetHost()->Invalidate(PET_VIEW);
+    }
   }
   void OnLoadError(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, ErrorCode code,
                    const CefString& text, const CefString& url) override {
@@ -813,6 +828,16 @@ class HostClient : public CefClient,
                     static_cast<uint8_t>((pct >> 8) & 0xff),
                     static_cast<uint8_t>(pct & 0xff)};
     SendFrame(slot_->browser_id, kOpProgress, p, 4);
+  }
+
+  // H3: async create completes here on the CEF UI thread. Bind the browser to its slot
+  // (DoCreateBrowser no longer does — it dropped the blocking CreateBrowserSync) and ack
+  // the host so its create-pacer sends the NEXT create: creates serialize by COMPLETION
+  // (each browser's render + GPU/Viz accelerated-surface handshake done before the next
+  // contends the shared GPU process), not a wall-clock guess.
+  void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
+    slot_->browser = browser;
+    SendFrame(slot_->browser_id, kOpCreated, nullptr, 0);
   }
 
   // CefLifeSpanHandler: route popups (window.open / target=_blank) to the host
@@ -1079,15 +1104,22 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr, uint32_t sid,
   CefBrowserSettings settings;
   settings.windowless_frame_rate = 60;
   CefRefPtr<HostClient> client = new HostClient(slot);
-  CefRefPtr<CefBrowser> browser = CefBrowserHost::CreateBrowserSync(
+  // H3: ASYNC create. CreateBrowserSync BLOCKS this (the single CEF UI) thread until
+  // the renderer + GPU/Viz accelerated-surface handshake completes — so a burst of
+  // creates serialized here, contended the one shared GPU process (later browsers got
+  // no surface, never painted), and one hung create wedged input/resize/dispose for
+  // every sibling. CreateBrowser returns immediately; the browser is bound to its slot
+  // in HostClient::OnAfterCreated, which acks kOpCreated so the host's pacer sends the
+  // NEXT create — serialized by COMPLETION, not a wall-clock guess.
+  bool dispatched = CefBrowserHost::CreateBrowser(
       window_info, client, url, settings, nullptr, nullptr);
-  slot->browser = browser;
-  if (!browser) {
-    // CreateBrowserSync failed: OnBeforeClose (the only path that erases the
-    // wire-id entry and releases slot->surface) can never fire without a
-    // browser, so reclaim here or the slot + the looked-up IOSurface (+1 ref)
-    // leak forever and the wire id is stranded.
-    SendLog(wire_id, "createBrowser: CreateBrowserSync returned null");
+  if (!dispatched) {
+    // H7: the create couldn't even be dispatched — OnAfterCreated/OnBeforeClose will
+    // never fire, so reclaim the slot + the looked-up IOSurface (+1 ref) here (else
+    // they leak and the wire id is stranded) and tell the host so it drops the session
+    // (processGone) and its create-pacer advances instead of stalling on the ack.
+    SendLog(wire_id, "createBrowser: CreateBrowser dispatch failed");
+    SendFrame(wire_id, kOpCreateFailed, nullptr, 0);
     {
       std::lock_guard<std::mutex> lock(g_slots_mutex);
       g_slots_by_wire_id.erase(wire_id);
@@ -1099,8 +1131,8 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr, uint32_t sid,
     }
   }
   if (std::getenv("FLUTTER_CEF_DEBUG"))
-    fprintf(stderr, "[cef_host] createBrowser wire=%u browser=%p\n", wire_id,
-            (void*)browser.get());
+    fprintf(stderr, "[cef_host] createBrowser wire=%u dispatched=%d\n", wire_id,
+            dispatched);
 }
 
 // Close one browser (kOpDisposeBrowser). Runs on the CEF UI thread. The actual
@@ -1493,6 +1525,15 @@ void DoKey(const std::shared_ptr<Slot>& slot, int type, uint32_t modifiers,
   slot->browser->GetHost()->SendKeyEvent(ev);
 }
 
+// C1: force a repaint. The host's first-present watchdog sends kOpInvalidate when a
+// browser hasn't delivered its first frame within the deadline — re-requesting the
+// frame self-heals a dropped/raced first paint instead of a permanently blank texture.
+void DoInvalidate(const std::shared_ptr<Slot>& slot) {
+  CEF_REQUIRE_UI_THREAD();
+  if (slot && slot->browser && slot->browser->GetHost())
+    slot->browser->GetHost()->Invalidate(PET_VIEW);
+}
+
 // Tear down the WHOLE process: close every browser, then quit the message loop.
 // Each browser's per-slot cleanup (maps, surface, retain-cycle break) runs in
 // OnBeforeClose as CEF processes the CloseBrowser(true). Sent when the host
@@ -1517,7 +1558,14 @@ void IpcReadLoop() {
     if (!ReadAll(g_ipc_fd, hdr, 4)) break;
     uint32_t body_len = ReadU32BE(hdr);
     // Minimum valid body is 5 bytes (4 browserId + 1 op + 0 payload).
-    if (body_len < 5 || body_len > (64u << 20)) break;
+    // H9: a malformed/oversized length is a wire desync and tears down EVERY browser in
+    // this process — log it first so it isn't a silent, breadcrumb-less all-tiles exit
+    // (the IPC peer is trusted, so this only fires on a genuine framing bug).
+    if (body_len < 5 || body_len > (64u << 20)) {
+      fprintf(stderr, "[cef_host] rejecting malformed IPC frame, body_len=%u — exiting\n",
+              body_len);
+      break;
+    }
     std::vector<uint8_t> body(body_len);
     if (!ReadAll(g_ipc_fd, body.data(), body_len)) break;
     uint32_t wire_id = ReadU32BE(body.data());
@@ -1698,6 +1746,10 @@ void IpcReadLoop() {
       case kOpResolveTargetId:
         if (!slot) break;
         CefPostTask(TID_UI, base::BindOnce(&DoResolveTargetId, slot));
+        break;
+      case kOpInvalidate:
+        if (!slot) break;
+        CefPostTask(TID_UI, base::BindOnce(&DoInvalidate, slot));
         break;
       case kOpImeCancel:
         if (!slot) break;
@@ -2026,10 +2078,13 @@ int main(int argc, char* argv[]) {
     // (no concurrent SendFrame) and clear the fd so any late write is a no-op.
     {
       std::lock_guard<std::mutex> lock(g_ipc_write_mutex);
-      if (g_ipc_fd >= 0) {
-        close(g_ipc_fd);
-        g_ipc_fd = -1;
-      }
+      // C3: store -1 FIRST (atomic exchange), THEN close — so a SendFrame that snapshots
+      // the fd under this lock never holds a value that's already closed/recycled. The
+      // GPU/compositor threads that call SendFrame aren't joined until CefShutdown below,
+      // so this ordering (not close-then-clear) is what makes a late paint write a safe
+      // no-op instead of a write into an unrelated recycled fd.
+      int fd = g_ipc_fd.exchange(-1);
+      if (fd >= 0) close(fd);
     }
     CefShutdown();
   }

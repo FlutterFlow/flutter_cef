@@ -95,6 +95,12 @@ final class CdpRelay {
   private var pipeIdToClientId: [Int: Int] = [:]
   private var nextLocalId = 0
   private let multiplexLock = NSLock()
+  // H2: this relay's OWN Target.attachToTarget pipe id (used to learn our page's CDP
+  // session order-independently, instead of passively witnessing a fire-once
+  // browser-wide attachedToTarget event we may register too late to see), plus the
+  // client's browser-level setAutoAttach id to ack once we've attached. multiplexLock.
+  private var selfAttachPipeId: Int?
+  private var pendingAutoAttachClientId: Int?
 
   init(sendToPipe: @escaping (String) -> Void, scopeTargetId: String? = nil, relayId: Int = 0) {
     self.sendToPipe = sendToPipe
@@ -459,6 +465,10 @@ final class CdpRelay {
   func demuxPipeToClient(_ json: String) -> String? {
     if scopeTargetId != nil, let m = parseJson(json), m["method"] == nil,
        let pipeId = m["id"] as? Int {
+      // H2: our OWN Target.attachToTarget response — learn the page session + hand the
+      // client the synthesized attachedToTarget; never forward the raw response.
+      multiplexLock.lock(); let isSelfAttach = (pipeId == selfAttachPipeId); multiplexLock.unlock()
+      if isSelfAttach { handleSelfAttachResponse(m); return nil }
       multiplexLock.lock(); let clientId = pipeIdToClientId.removeValue(forKey: pipeId); multiplexLock.unlock()
       guard let clientId = clientId else { return nil }  // sibling relay's response — drop
       var restored = m; restored["id"] = clientId
@@ -549,10 +559,14 @@ final class CdpRelay {
     case "Target.attachedToTarget":
       let attachedTid = (params?["targetInfo"] as? [String: Any])?["targetId"] as? String
       let childSession = params?["sessionId"] as? String
-      if sid == nil {  // browser-level auto-attach of a top-level target (a tile)
+      if sid == nil {  // browser-level attach of a top-level target (a tile)
         guard attachedTid == tid else { return nil }  // sibling tile — hide
+        // H2: learn our page session, but DON'T forward the raw browser-level event —
+        // we hand the client exactly one SYNTHESIZED attachedToTarget (beginPageAttach /
+        // handleSelfAttachResponse), so a real one our active attach may have triggered
+        // isn't delivered as a duplicate.
         if let cs = childSession { allowedSessions.insert(cs); ourSessionId = cs }
-        return json
+        return nil
       }
       guard let s = sid, allowedSessions.contains(s) else { return nil }  // sub-target of ours
       if let cs = childSession { allowedSessions.insert(cs) }
@@ -629,7 +643,17 @@ final class CdpRelay {
         guard (params?["flatten"] as? Bool) == true else {
           sendClientError(id, "non-flatten setAutoAttach is not permitted"); return nil
         }
-        return json
+        // H2: a BROWSER-LEVEL setAutoAttach (no sessionId — reached here because the
+        // sessionId branch above didn't claim it) is browser-context-wide. Forwarding
+        // it (a) lets us change a SIBLING tile's auto-attach params (cross-tile control
+        // leak) and (b) relies on a fire-once attachedToTarget storm we'll miss if we
+        // registered after a sibling already triggered it ("No page found"). Instead we
+        // don't forward it: we actively attach to OUR target and synthesize the page's
+        // attachedToTarget to the client ourselves (order-independent + scoped). A
+        // SESSION-scoped setAutoAttach for our page's sub-frames (sid != nil, our
+        // session) is forwarded by the session-routed branch above.
+        beginPageAttach(clientAutoAttachId: id)
+        return nil
       case "Target.attachToTarget":
         guard qTid == scopeTargetId else { sendClientError(id, "No target with given id found"); return nil }
         guard (params?["flatten"] as? Bool) == true else {
@@ -685,6 +709,60 @@ final class CdpRelay {
     let info: [String: Any] = ["targetId": tid, "type": "page", "title": "", "url": "",
                                "attached": true, "canAccessOpener": false, "browserContextId": ""]
     sendClientJson(["id": id, "result": ["targetInfos": [info]]])
+  }
+
+  /// H2: ensure this relay knows its page's CDP session, then hand the client the page's
+  /// Target.attachedToTarget directly — independent of the browser-wide auto-attach
+  /// storm (fire-once, and which we must not forward: it would change sibling tiles'
+  /// auto-attach). If we already learned our session, synthesize now; otherwise issue
+  /// our OWN scoped Target.attachToTarget and finish on its response. attachToTarget on
+  /// an already-attached target idempotently returns the existing sessionId, so this
+  /// resolves regardless of relay creation order (the "No page found" fix).
+  private func beginPageAttach(clientAutoAttachId: Int?) {
+    filterLock.lock(); let known = ourSessionId; filterLock.unlock()
+    if let s = known {
+      synthesizeAttachedToTarget(sessionId: s)
+      synthesizeOk(clientAutoAttachId)
+      return
+    }
+    guard let tid = scopeTargetId else { synthesizeOk(clientAutoAttachId); return }
+    multiplexLock.lock()
+    let pipeId = (relayId << 21) | (nextLocalId & 0x1FFFFF)
+    nextLocalId &+= 1
+    selfAttachPipeId = pipeId
+    pendingAutoAttachClientId = clientAutoAttachId
+    multiplexLock.unlock()
+    let cmd: [String: Any] = ["id": pipeId, "method": "Target.attachToTarget",
+                              "params": ["targetId": tid, "flatten": true]]
+    if let s = jsonString(cmd) { sendToPipe(s) }
+  }
+
+  /// H2: our scoped attachToTarget came back — record the page session, hand the client
+  /// the synthesized attachedToTarget, and ack its pending setAutoAttach.
+  private func handleSelfAttachResponse(_ m: [String: Any]) {
+    let sessionId = (m["result"] as? [String: Any])?["sessionId"] as? String
+    multiplexLock.lock()
+    selfAttachPipeId = nil
+    let clientAckId = pendingAutoAttachClientId
+    pendingAutoAttachClientId = nil
+    multiplexLock.unlock()
+    if let s = sessionId {
+      filterLock.lock(); allowedSessions.insert(s); ourSessionId = s; filterLock.unlock()
+      synthesizeAttachedToTarget(sessionId: s)
+    }
+    synthesizeOk(clientAckId)
+  }
+
+  /// H2: fabricate the page's Target.attachedToTarget for the client (flatten mode) so
+  /// Playwright/connectOverCDP discovers our page without us forwarding the browser-wide
+  /// auto-attach — mirrors synthesizeGetTargets' single-tile view.
+  private func synthesizeAttachedToTarget(sessionId: String) {
+    guard let tid = scopeTargetId else { return }
+    let info: [String: Any] = ["targetId": tid, "type": "page", "title": "", "url": "",
+                               "attached": true, "canAccessOpener": false, "browserContextId": ""]
+    sendClientJson(["method": "Target.attachedToTarget",
+                    "params": ["sessionId": sessionId, "targetInfo": info,
+                               "waitingForDebugger": false]])
   }
 
   /// Send a CDP error reply to the client. Built via JSONSerialization so the message
