@@ -80,6 +80,10 @@ final class CdpRelay {
   private let scopeTargetId: String?
   private var ourSessionId: String?            // learned from our target's attachedToTarget
   private var allowedSessions = Set<String>()  // our session + descendant sub-target sessions
+  // Captured from our page's real attachedToTarget event. Playwright's
+  // CRBrowser._onAttachedToTarget asserts targetInfo.browserContextId is non-empty, so
+  // the synthesized event MUST carry the real one (an empty string crashes the daemon).
+  private var ourBrowserContextId: String?
   private let filterLock = NSLock()
 
   // CEF-2b multiplex: this relay's identity in the shared pipe's CDP id space (the
@@ -585,12 +589,19 @@ final class CdpRelay {
       let childSession = params?["sessionId"] as? String
       if sid == nil {  // browser-level attach of a top-level target (a tile)
         guard attachedTid == tid else { return nil }  // sibling tile — hide
-        // H2: learn our page session, but DON'T forward the raw browser-level event —
-        // we hand the client exactly one SYNTHESIZED attachedToTarget (beginPageAttach /
-        // handleSelfAttachResponse), so a real one our active attach may have triggered
-        // isn't delivered as a duplicate.
+        // H2: our active Target.attachToTarget (beginPageAttach) triggers THIS real
+        // browser-level event for our page. FORWARD it as-is — it carries the genuine
+        // targetInfo (incl. a non-empty browserContextId that Playwright's
+        // CRBrowser._onAttachedToTarget asserts on; a synthesized empty one crashes the
+        // daemon). Learn our session + cache the browserContextId so a later RECONNECT
+        // (page already attached → no fresh event) can synthesize a correct one. Only
+        // OUR own active attach triggers this, so it's never a duplicate.
         if let cs = childSession { allowedSessions.insert(cs); ourSessionId = cs }
-        return nil
+        if let bctx = (params?["targetInfo"] as? [String: Any])?["browserContextId"] as? String,
+           !bctx.isEmpty {
+          ourBrowserContextId = bctx
+        }
+        return json
       }
       guard let s = sid, allowedSessions.contains(s) else { return nil }  // sub-target of ours
       if let cs = childSession { allowedSessions.insert(cs) }
@@ -766,11 +777,12 @@ final class CdpRelay {
     if let s = jsonString(cmd) { sendToPipe(s) }
   }
 
-  /// H2: our scoped attachToTarget came back — record the page session, and (if the
-  /// client that issued it is still attached) hand it the synthesized attachedToTarget +
-  /// ack every queued setAutoAttach. If that client has since detached
-  /// (clientGeneration moved on), learn the session but write NOTHING — otherwise we'd
-  /// deliver a stale ack / spurious event to whatever client connected next.
+  /// H2: our scoped attachToTarget came back — record the page session and (if the
+  /// client that issued it is still attached) ack every queued setAutoAttach. The page's
+  /// attachedToTarget is delivered by FORWARDING the real browser-level event (see the
+  /// filter), not synthesized here — so the client gets the genuine targetInfo. If the
+  /// issuing client has since detached (clientGeneration moved on), learn the session but
+  /// write nothing (no stale ack to its successor).
   private func handleSelfAttachResponse(_ m: [String: Any]) {
     let sessionId = (m["result"] as? [String: Any])?["sessionId"] as? String
     multiplexLock.lock()
@@ -781,11 +793,8 @@ final class CdpRelay {
     multiplexLock.unlock()
     if let s = sessionId {
       filterLock.lock(); allowedSessions.insert(s); ourSessionId = s; filterLock.unlock()
-      guard sameClient else { return }  // issuing client gone — don't write to its successor
-      synthesizeAttachedToTarget(sessionId: s)
-    } else if !sameClient {
-      return
     }
+    guard sameClient else { return }  // issuing client gone — don't write to its successor
     for ack in acks { synthesizeOk(ack) }
   }
 
@@ -794,8 +803,14 @@ final class CdpRelay {
   /// auto-attach — mirrors synthesizeGetTargets' single-tile view.
   private func synthesizeAttachedToTarget(sessionId: String) {
     guard let tid = scopeTargetId else { return }
+    // Reuse the REAL browserContextId captured from our page's first attach event —
+    // Playwright's CRBrowser._onAttachedToTarget asserts it's non-empty (an empty string
+    // crashes the daemon). Only reached on RECONNECT, where the page is already attached
+    // so no fresh event fires and ourBrowserContextId is already cached.
+    filterLock.lock(); let bctx = ourBrowserContextId; filterLock.unlock()
     let info: [String: Any] = ["targetId": tid, "type": "page", "title": "", "url": "",
-                               "attached": true, "canAccessOpener": false, "browserContextId": ""]
+                               "attached": true, "canAccessOpener": false,
+                               "browserContextId": bctx ?? ""]
     sendClientJson(["method": "Target.attachedToTarget",
                     "params": ["sessionId": sessionId, "targetInfo": info,
                                "waitingForDebugger": false]])
