@@ -181,6 +181,12 @@ struct Slot {
   // (not a single global) so paints on independent browsers don't contend.
   std::mutex surface_mutex;
   IOSurfaceRef surface = nullptr;  // host-shared IOSurface we paint into
+  // Cached Metal wrap of `surface` for the GPU-blit DEST. Wrapping it fresh every
+  // frame is pure churn (the surface is stable except on resize), so cache it and
+  // recreate only when the wrapped IOSurface id changes. Released wherever `surface`
+  // is. Guarded by surface_mutex. MRC: holds the +1 from newTextureWithDescriptor.
+  id<MTLTexture> dst_mtl = nil;
+  uint32_t dst_mtl_sid = 0;
   int width = 800;   // logical (DIP) — GetViewRect; CEF scales by dpr.
   int height = 600;
   double dpr = 1.0;  // device pixel ratio; the IOSurface is logical*dpr px.
@@ -676,18 +682,28 @@ class HostRenderHandler : public CefRenderHandler {
                                         height:sh
                                      mipmapped:NO];
         sd.storageMode = MTLStorageModeShared;
-        MTLTextureDescriptor* dd = [MTLTextureDescriptor
-            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                         width:dw
-                                        height:dh
-                                     mipmapped:NO];
-        dd.storageMode = MTLStorageModeShared;
+        // src wraps CEF's pooled view_src — it rotates, so wrap per-call.
         id<MTLTexture> src = [g_mtl_device newTextureWithDescriptor:sd
                                                           iosurface:view_src
                                                               plane:0];
-        id<MTLTexture> dst = [g_mtl_device newTextureWithDescriptor:dd
-                                                          iosurface:slot_->surface
-                                                              plane:0];
+        // dst wraps slot_->surface (stable except on resize) — cache it and only
+        // recreate when the wrapped surface id changes, halving per-frame texture
+        // churn on the GPU thread.
+        const uint32_t dsid = IOSurfaceGetID(slot_->surface);
+        if (slot_->dst_mtl == nil || slot_->dst_mtl_sid != dsid) {
+          [slot_->dst_mtl release];
+          MTLTextureDescriptor* dd = [MTLTextureDescriptor
+              texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                           width:dw
+                                          height:dh
+                                       mipmapped:NO];
+          dd.storageMode = MTLStorageModeShared;
+          slot_->dst_mtl = [g_mtl_device newTextureWithDescriptor:dd
+                                                        iosurface:slot_->surface
+                                                            plane:0];
+          slot_->dst_mtl_sid = dsid;
+        }
+        id<MTLTexture> dst = slot_->dst_mtl;  // cached (released on resize/close)
         if (src && dst) {
           const int cw = std::min(sw, dw), ch = std::min(sh, dh);
           id<MTLCommandBuffer> cb = [g_mtl_queue commandBuffer];
@@ -707,7 +723,7 @@ class HostRenderHandler : public CefRenderHandler {
           blitted = true;
         }
         [src release];
-        [dst release];
+        // dst is cached on the Slot (released on resize/close), not per-frame.
       }
     }
     if (blitted) {
@@ -1079,6 +1095,9 @@ class HostClient : public CefClient,
       IOSurfaceRef old = slot_->surface;
       slot_->surface = nullptr;
       if (old) CFRelease(old);
+      [slot_->dst_mtl release];
+      slot_->dst_mtl = nil;
+      slot_->dst_mtl_sid = 0;
     }
     slot_->browser = nullptr;
   }
@@ -1300,6 +1319,9 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr, uint32_t sid,
       CFRelease(slot->surface);
       slot->surface = nullptr;
     }
+    [slot->dst_mtl release];
+    slot->dst_mtl = nil;
+    slot->dst_mtl_sid = 0;
   }
   if (std::getenv("FLUTTER_CEF_DEBUG"))
     fprintf(stderr, "[cef_host] createBrowser wire=%u dispatched=%d\n", wire_id,
@@ -1342,6 +1364,9 @@ void DoResize(const std::shared_ptr<Slot>& slot, int w, int h,
     slot->surface = next;  // owns the +1 from Lookup
     slot->width = w;
     slot->height = h;
+    [slot->dst_mtl release];  // stale: wrapped the old surface
+    slot->dst_mtl = nil;
+    slot->dst_mtl_sid = 0;
   }
   if (slot->browser) {
     slot->browser->GetHost()->WasResized();
