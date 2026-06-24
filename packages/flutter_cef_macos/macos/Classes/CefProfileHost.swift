@@ -996,7 +996,7 @@ final class CefProfileHost {
     // waitpid — a later terminateProcess()/shutdown() then sees 0 and won't
     // double-reap a pid this thread is about to harvest (which could kill an
     // OS-recycled pid). If it's wedged and we can't reap within the grace window
-    // below, we hand it back (restoreSpawnedPid) so terminateProcess can SIGKILL it.
+    // below, we SIGKILL + reap it ourselves so it never leaks as a zombie/orphan.
     let pid = spawnedPid
     spawnedPid = 0
     let died = onHostDied
@@ -1053,22 +1053,19 @@ final class CefProfileHost {
           }
           usleep(50_000)
         }
-        // H5: still alive after the grace window (wedged child that didn't exit on
-        // EOF) — hand the pid back so terminateProcess()/shutdown() can SIGTERM/SIGKILL
-        // + reap it. Without this, a taken-but-unreaped pid would never be killed.
-        if !reaped { self?.restoreSpawnedPid(pid) }
+        // H5: still alive after the grace window (a wedged child that didn't exit on
+        // EOF). Don't merely hand it back — the clean-shutdown path may never call
+        // terminateProcess() again, leaving a zombie/orphan cef_host. SIGKILL + reap it
+        // right here. We exclusively own this pid (spawnedPid was zeroed above) and it
+        // is still unreaped, so it can't be a recycled or relaunched pid.
+        if !reaped {
+          kill(pid, SIGKILL)
+          var raw: Int32 = 0
+          waitpid(pid, &raw, 0)  // blocking reap, off the main thread
+        }
       }
       DispatchQueue.main.async { died?(status) }
     }
-  }
-
-  /// H5: hand a TAKEN-but-unreaped pid back to `spawnedPid` so terminateProcess() can
-  /// finish it (SIGTERM/SIGKILL + reap). No-op if a relaunch already installed a new
-  /// pid (so a racing relaunch is never clobbered).
-  private func restoreSpawnedPid(_ pid: pid_t) {
-    writeLock.lock()
-    if spawnedPid == 0 { spawnedPid = pid }
-    writeLock.unlock()
   }
 
   /// Process/profile-level inbound frames (browserId 0): opReady (carries the

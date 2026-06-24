@@ -27,7 +27,22 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   // go straight to ephemeral instead of racing onto a doomed shared host.
   private var adhocBlockedProfiles: Set<String> = []
 
+  /// Raise the soft open-file limit toward the hard cap (best-effort, once at plugin
+  /// registration). Each cef_host costs several fds (IPC + CDP pipes + per-relay
+  /// listener), so many agent-controlled tiles can approach a GUI app's default soft
+  /// RLIMIT_NOFILE (often 256) and fail spawns with EMFILE.
+  private static func raiseOpenFileLimit() {
+    var rl = rlimit()
+    guard getrlimit(RLIMIT_NOFILE, &rl) == 0 else { return }
+    let want: rlim_t = 4096
+    if rl.rlim_cur < want {
+      rl.rlim_cur = min(want, rl.rlim_max)
+      _ = setrlimit(RLIMIT_NOFILE, &rl)
+    }
+  }
+
   public static func register(with registrar: FlutterPluginRegistrar) {
+    raiseOpenFileLimit()
     let instance = FlutterCefPlugin()
     instance.textureRegistry = registrar.textures
     let channel = FlutterMethodChannel(
