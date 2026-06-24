@@ -216,6 +216,19 @@ CefWebView(url: startUrl, controller: c);
   by **one `cef_host` process with one cookie jar** — they share one login.
   Cookie writes are therefore process-wide: `clearCookies()` /
   `deleteCookie()` clear the cookie for *all* views in the profile, by design.
+- **One trust domain per profile.** Because a named profile is one process with
+  one cookie jar, sessions sharing a profile are **not isolated from each
+  other**. The cookie jar is common (a page in one view can read another's
+  cookies via `getCookies`), and registered JS channels
+  (`addJavaScriptChannel`) are process-global, so a page in one view can observe
+  a channel name another view registered. Per-message *routing* stays
+  per-session — a channel message is delivered only to the view whose page sent
+  it (`OnQuery` stamps the originating browser), so this is an information-
+  sharing boundary, not a message-spoofing one — but the rule is the same:
+  **co-locate only mutually-trusting content on one profile.** For
+  mutually-distrusting content (e.g. arbitrary third-party pages from different
+  authors), give each its own `profile`, or use the ephemeral default — each
+  gets its own process, cookie jar, and channel namespace.
 
 ### Secrets at rest
 
