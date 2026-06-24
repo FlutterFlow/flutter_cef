@@ -1440,21 +1440,14 @@ void DoAddChannel(const std::shared_ptr<Slot>& slot, const std::string& name) {
     return;
   }
   // Register process-globally: OnLoadStart injects every g_channels entry into
-  // each freshly-loaded frame, so this lands the shim on future loads even when
-  // the op arrived with browserId=0 (sent before the session's attach() — its
-  // createBrowser was still queued on a shared host) and `slot` is null.
+  // each freshly-loaded frame, so the shim lands on the next load. This also
+  // keeps the op null-safe — if `slot` is somehow absent the registration still
+  // takes (defense; the Swift session now buffers addChannel until attach(), so
+  // in practice the op carries a valid browserId and `slot` is set).
   g_channels.insert(name);
-  // Also inject into every browser that has ALREADY loaded a page, so a late
-  // registration (op arriving after a page's OnLoadStart) isn't missed. The
-  // channel is process-global, so this mirrors OnLoadStart's per-frame behavior.
-  // Copy out under the lock, then inject (ExecuteJavaScript) without holding it.
-  std::vector<CefRefPtr<CefBrowser>> browsers;
-  {
-    std::lock_guard<std::mutex> lock(g_slots_mutex);
-    for (const auto& kv : g_slots_by_wire_id)
-      if (kv.second && kv.second->browser) browsers.push_back(kv.second->browser);
-  }
-  for (const auto& b : browsers) InjectChannelShim(b->GetMainFrame(), name);
+  // Inject into the registering session's CURRENT frame too, covering the case
+  // where the channel is registered after its page has already loaded.
+  if (slot && slot->browser) InjectChannelShim(slot->browser->GetMainFrame(), name);
 }
 // Cookie ops act on the GLOBAL cookie manager (= the shared profile jar), so a
 // login in one browser is visible to every browser sharing this profile. They
