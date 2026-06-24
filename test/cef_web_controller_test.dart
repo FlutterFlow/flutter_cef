@@ -592,6 +592,38 @@ void main() {
     expect(await c.enableAgentControl(), isNull);
   });
 
+  test('removeJavaScriptChannel stops delivery to the handler', () async {
+    final c = CefWebController(sessionId: 'rmch');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    final got = <String>[];
+    await c.addJavaScriptChannel('Bridge', onMessageReceived: got.add);
+    await emit('rmch', 'channelMessage', {'payload': 'Bridge:one'});
+    c.removeJavaScriptChannel('Bridge');
+    await emit('rmch', 'channelMessage', {'payload': 'Bridge:two'});
+    expect(got, ['one'], reason: 'messages after removal must be dropped');
+  });
+
+  test('processGone defaults the reason to "crashed" / passes it through',
+      () async {
+    final c = CefWebController(sessionId: 'pgr');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    String? reason;
+    c.onProcessGone = (r) => reason = r;
+    await emit('pgr', 'processGone', <String, Object?>{}); // no reason
+    expect(reason, 'crashed');
+    await emit('pgr', 'processGone', {'reason': 'locked'});
+    expect(reason, 'locked');
+  });
+
+  test('paintStalled event invokes onPaintStalled', () async {
+    final c = CefWebController(sessionId: 'pstall');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    var stalled = false;
+    c.onPaintStalled = () => stalled = true;
+    await emit('pstall', 'paintStalled', <String, Object?>{});
+    expect(stalled, isTrue);
+  });
+
   test('alert dialog routes to the handler and acks', () async {
     final c = CefWebController(sessionId: 'al');
     await c.create(url: 'about:blank', width: 1, height: 1);

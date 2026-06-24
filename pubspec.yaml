@@ -17,6 +17,7 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  meta: ^1.12.0 # @internal / annotations on the public API
   # Federation members are wired as path deps: the repo is consumed from source
   # (path / git), not pub.dev. PUBLISHING (when it happens): `pub publish`
   # rejects path deps, so publish bottom-up — flutter_cef_platform_interface,

@@ -3,6 +3,7 @@ import 'dart:convert';
 
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
+import 'package:meta/meta.dart';
 
 import 'package:flutter_cef_platform_interface/flutter_cef_platform_interface.dart';
 
@@ -598,6 +599,16 @@ class CefWebController {
         'addJavaScriptChannel', {'sessionId': sessionId, 'name': name});
   }
 
+  /// Stop delivering a JS channel registered with [addJavaScriptChannel]:
+  /// [onMessageReceived] is no longer invoked for [name]. The page-side
+  /// `window.<name>` shim is intentionally NOT torn down — it is process-global on
+  /// a shared profile, so tearing it down here would also remove it from sibling
+  /// views — so the page can still call `window.<name>.postMessage`, but those
+  /// messages are dropped.
+  void removeJavaScriptChannel(String name) {
+    _channels.remove(name);
+  }
+
   /// Scroll the page to an absolute pixel position.
   Future<void> scrollTo(int x, int y) =>
       executeJavaScript('window.scrollTo($x, $y)');
@@ -767,7 +778,10 @@ class CefWebController {
         'dpr': dpr,
       });
 
+  /// Internal — driven by [CefWebView]'s gesture forwarding; not part of the
+  /// supported public API (raw wire encoding).
   /// type: 0=move 1=down 2=up 3=wheel 4=leave; button: 0=left 1=middle 2=right.
+  @internal
   void sendPointer({
     required int type,
     required double x,
@@ -791,7 +805,10 @@ class CefWebController {
     });
   }
 
+  /// Internal — driven by [CefWebView]'s key forwarding; not part of the
+  /// supported public API (raw wire encoding).
   /// type: 0=rawkeydown 2=keyup 3=char.
+  @internal
   void sendKey({
     required int type,
     int modifiers = 0,
