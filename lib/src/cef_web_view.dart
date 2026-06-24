@@ -1,3 +1,4 @@
+
 import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
@@ -229,6 +230,9 @@ class _CefWebViewState extends State<CefWebView>
     }
     if (_textureId != null && _lastSize != size) {
       _lastSize = size;
+      // Resize on every layout change. The native session (CefWebSession) flow-controls the
+      // sends to cef_host's paint rate — it keeps one resize in flight and coalesces to the
+      // latest size — so the page reflows live during the drag without us pacing here.
       _controller.resize(w, h, dpr: dpr);
     }
   }
