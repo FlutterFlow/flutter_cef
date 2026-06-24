@@ -46,6 +46,7 @@
 
 #import <Cocoa/Cocoa.h>
 #import <IOSurface/IOSurface.h>
+#import <Metal/Metal.h>
 
 #include <algorithm>
 #include <atomic>
@@ -223,6 +224,13 @@ struct Slot {
   // so reusing a fixed id silently drops the 2nd+ probe, which hung a re-enable of
   // agent-control (disable then enable again). UI-thread only, like dialog_next.
   int target_info_msg = 0;
+
+  // External begin-frame pump (see PumpBeginFrame). With external_begin_frame_enabled, CEF's
+  // internal frame timer is OFF — frames are produced ONLY when we drive them — so a per-slot
+  // pump calls SendExternalBeginFrame on a cadence. `visible` gates it (UI-thread only, set by
+  // DoSetVisible); `begin_frame_pump_started` guards a double-start. UI-thread only.
+  bool visible = true;
+  bool begin_frame_pump_started = false;
 };
 
 // Routing map from a wire browser id to its Slot. MUTATED ONLY ON THE CEF UI
@@ -242,6 +250,39 @@ std::shared_ptr<Slot> LookupWireId(uint32_t wire_id) {
   std::lock_guard<std::mutex> lock(g_slots_mutex);
   auto it = g_slots_by_wire_id.find(wire_id);
   return it == g_slots_by_wire_id.end() ? nullptr : it->second;
+}
+
+// External begin-frame pump. window_info.external_begin_frame_enabled (set in DoCreateBrowser)
+// turns OFF CEF's internal frame timer, so the GPU/Viz compositor produces a frame ONLY when we
+// call SendExternalBeginFrame — which, unlike Invalidate(), deterministically drives one frame
+// the scheduler cannot coalesce away. We are now the frame clock. This re-posts itself per live
+// slot on the CEF UI thread; it dies when the slot is disposed (LookupWireId -> null) and idles
+// to a slow poll while the tile is hidden (no begin-frame -> the off-screen browser costs ~zero,
+// and WasHidden(true) already stopped its rendering). Started in HostClient::OnAfterCreated.
+// Runs on TID_UI, so slot->visible / slot->browser need no lock (only UI-thread code touches them).
+void PumpBeginFrame(uint32_t wire_id) {
+  std::shared_ptr<Slot> slot = LookupWireId(wire_id);
+  if (!slot || !slot->browser) return;  // disposed mid-flight — let the pump die
+  if (slot->visible) slot->browser->GetHost()->SendExternalBeginFrame();
+  CefPostDelayedTask(TID_UI, base::BindOnce(&PumpBeginFrame, wire_id),
+                     slot->visible ? 16 : 100);
+}
+
+// Process-wide Metal context for the GPU-blit present path (CompositeMetalLocked). One device +
+// queue for the whole cef_host process; created lazily on first accelerated paint. MRC build, so
+// these are owned singletons we intentionally never release. EnsureMetal() returns false (once,
+// then cached) if Metal is unavailable — callers fall back to the CPU composite.
+static id<MTLDevice> g_mtl_device = nil;
+static id<MTLCommandQueue> g_mtl_queue = nil;
+static bool EnsureMetal() {
+  static bool tried = false;
+  if (g_mtl_device) return true;
+  if (tried) return false;
+  tried = true;
+  g_mtl_device = MTLCreateSystemDefaultDevice();
+  if (!g_mtl_device) return false;
+  g_mtl_queue = [g_mtl_device newCommandQueue];
+  return g_mtl_queue != nil;
 }
 
 // Host-set navigation scheme allowlist (lowercased; `--allowed-schemes=a,b`).
@@ -480,6 +521,20 @@ class HostRenderHandler : public CefRenderHandler {
     return true;
   }
 
+  // Present the just-painted slot surface, TAGGING the frame with its IOSurface id
+  // (BE u32). The host (Swift) uses this to promote a resized "pending" surface to the
+  // Flutter texture only once a paint into THAT surface has actually landed — until
+  // then it keeps serving the old surface, so a resize never flashes the fresh,
+  // zero-filled IOSurface. Caller holds slot_->surface_mutex.
+  void SendPresentLocked() {
+    uint32_t sid = slot_->surface ? IOSurfaceGetID(slot_->surface) : 0;
+    uint8_t p[4] = {static_cast<uint8_t>((sid >> 24) & 0xff),
+                    static_cast<uint8_t>((sid >> 16) & 0xff),
+                    static_cast<uint8_t>((sid >> 8) & 0xff),
+                    static_cast<uint8_t>(sid & 0xff)};
+    SendFrame(slot_->browser_id, kOpPresent, p, 4);
+  }
+
   void OnPaint(CefRefPtr<CefBrowser>, PaintElementType type, const RectList&,
                const void* buffer, int width, int height) override {
     std::lock_guard<std::mutex> lock(slot_->surface_mutex);
@@ -512,7 +567,7 @@ class HostRenderHandler : public CefRenderHandler {
                popup_py);
     }
     IOSurfaceUnlock(slot_->surface, 0, nullptr);
-    SendFrame(slot_->browser_id, kOpPresent, nullptr, 0);
+    SendPresentLocked();
   }
 
   void OnPopupShow(CefRefPtr<CefBrowser> browser, bool show) override {
@@ -587,7 +642,90 @@ class HostRenderHandler : public CefRenderHandler {
                slot_->popup_h, px, py);
     }
     IOSurfaceUnlock(slot_->surface, 0, nullptr);
-    SendFrame(slot_->browser_id, kOpPresent, nullptr, 0);
+    SendPresentLocked();
+  }
+
+  // GPU-blit composite: copy CEF's accelerated view surface into the host-owned slot_->surface
+  // with a Metal blit instead of the CPU IOSurfaceLock+memcpy in CompositeSoftwareLocked. CEF's
+  // contract reclaims view_src back to its pool when this callback returns, so the blit's GPU READ
+  // of view_src MUST complete before we return — hence waitUntilCompleted (the existing CPU path's
+  // IOSurfaceLock+memcpy is likewise synchronous). The win is keeping frame data on the GPU
+  // end-to-end: on discrete-GPU / Windows / Linux this avoids the GPU->CPU readback the memcpy
+  // forces; on unified-memory Apple Silicon it's ~neutral. Caller holds slot_->surface_mutex.
+  // Falls back to the CPU composite if Metal is unavailable or the IOSurface->texture wrap fails.
+  // Popups never take this path — an open <select> dropdown is CPU-composited over the view.
+  //
+  // PORTING: this is the macOS half of the cross-platform "copy CEF's accelerated surface into a
+  // client-owned texture via a GPU blit, INSIDE the callback" pattern that CEF's pool contract
+  // mandates on every platform. A port swaps only this one method: Windows takes the D3D11 shared
+  // HANDLE from CefAcceleratedPaintInfo -> ID3D11DeviceContext::CopyResource; Linux takes the
+  // dmabuf fd -> import as a GL/VK image -> blit. The OnAcceleratedPaint call site, the
+  // reclaim-at-return contract, and the present protocol are identical across platforms.
+  void CompositeMetalLocked(IOSurfaceRef view_src) {
+    if (!slot_->surface) return;
+    bool blitted = false;
+    if (view_src && EnsureMetal()) {
+      @autoreleasepool {
+        const int sw = static_cast<int>(IOSurfaceGetWidth(view_src));
+        const int sh = static_cast<int>(IOSurfaceGetHeight(view_src));
+        const int dw = static_cast<int>(IOSurfaceGetWidth(slot_->surface));
+        const int dh = static_cast<int>(IOSurfaceGetHeight(slot_->surface));
+        MTLTextureDescriptor* sd = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                         width:sw
+                                        height:sh
+                                     mipmapped:NO];
+        sd.storageMode = MTLStorageModeShared;
+        MTLTextureDescriptor* dd = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                         width:dw
+                                        height:dh
+                                     mipmapped:NO];
+        dd.storageMode = MTLStorageModeShared;
+        id<MTLTexture> src = [g_mtl_device newTextureWithDescriptor:sd
+                                                          iosurface:view_src
+                                                              plane:0];
+        id<MTLTexture> dst = [g_mtl_device newTextureWithDescriptor:dd
+                                                          iosurface:slot_->surface
+                                                              plane:0];
+        if (src && dst) {
+          const int cw = std::min(sw, dw), ch = std::min(sh, dh);
+          id<MTLCommandBuffer> cb = [g_mtl_queue commandBuffer];
+          id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+          [blit copyFromTexture:src
+                    sourceSlice:0
+                    sourceLevel:0
+                   sourceOrigin:MTLOriginMake(0, 0, 0)
+                     sourceSize:MTLSizeMake(cw, ch, 1)
+                      toTexture:dst
+               destinationSlice:0
+               destinationLevel:0
+              destinationOrigin:MTLOriginMake(0, 0, 0)];
+          [blit endEncoding];
+          [cb commit];
+          [cb waitUntilCompleted];
+          blitted = true;
+        }
+        [src release];
+        [dst release];
+      }
+    }
+    if (blitted) {
+      static bool logged = false;
+      if (!logged) {
+        logged = true;
+        SendLog(slot_->browser_id, "present: GPU Metal blit path active");
+      }
+      SendPresentLocked();
+    } else {
+      static bool loggedFb = false;
+      if (!loggedFb) {
+        loggedFb = true;
+        SendLog(slot_->browser_id,
+                "present: CPU composite fallback (Metal unavailable or IOSurface wrap failed)");
+      }
+      CompositeSoftwareLocked(view_src);
+    }
   }
 
   // GPU-accelerated OSR. With shared_texture_enabled, CEF's GPU/Viz process
@@ -615,7 +753,13 @@ class HostRenderHandler : public CefRenderHandler {
       CompositeSoftwareLocked(nullptr);  // popup over latest view in slot->surface
       return;
     }
-    CompositeSoftwareLocked(src);  // GPU-composited view (+ any open popup)
+    // View frame. While a <select> dropdown is open we must CPU-composite so the popup is drawn
+    // over the view; otherwise take the GPU-blit path (no CPU readback).
+    if (slot_->popup_visible) {
+      CompositeSoftwareLocked(src);  // GPU-composited view + the open popup
+    } else {
+      CompositeMetalLocked(src);  // GPU blit, no CPU readback
+    }
   }
 
   // Report the composition caret rect (DIP, view coords) so the host can place
@@ -848,7 +992,16 @@ class HostClient : public CefClient,
     // H3: a dispose arrived during the async-create window and recorded intent — honor
     // it now (OnBeforeClose then does the normal map-erase + surface release + retain-
     // cycle break) so we don't leak a live orphan browser the Swift side already forgot.
-    if (slot_->close_requested) browser->GetHost()->CloseBrowser(true);
+    if (slot_->close_requested) {
+      browser->GetHost()->CloseBrowser(true);
+      return;
+    }
+    // Start the external begin-frame pump now that the browser is bound. We turned the internal
+    // frame timer OFF (external_begin_frame_enabled), so without this nothing ever paints.
+    if (!slot_->begin_frame_pump_started) {
+      slot_->begin_frame_pump_started = true;
+      PumpBeginFrame(slot_->browser_id);
+    }
   }
 
   // CefLifeSpanHandler: route popups (window.open / target=_blank) to the host
@@ -1112,6 +1265,13 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr, uint32_t sid,
   // at runtime under a signed build — see CONTRACT H.6).
   window_info.shared_texture_enabled = true;
 #endif
+  // Own the frame clock. Without this CEF's internal scheduler decides when to paint and can
+  // skip the frame after a resize (a resize is viewport-only damage on an idle page), leaving
+  // the tile stuck at the old size until real input forces a tick. With external begin-frame WE
+  // drive every frame via SendExternalBeginFrame (the per-slot PumpBeginFrame), so a resize —
+  // and all rendering — always produces a frame. NOTE: this turns the internal timer OFF, so the
+  // pump MUST run for anything to render at all (started in OnAfterCreated).
+  window_info.external_begin_frame_enabled = true;
   CefBrowserSettings settings;
   settings.windowless_frame_rate = 60;
   CefRefPtr<HostClient> client = new HostClient(slot);
@@ -1183,7 +1343,13 @@ void DoResize(const std::shared_ptr<Slot>& slot, int w, int h,
     slot->width = w;
     slot->height = h;
   }
-  if (slot->browser) slot->browser->GetHost()->WasResized();
+  if (slot->browser) {
+    slot->browser->GetHost()->WasResized();
+    // Drive a frame right now at the new size. With external begin-frame this is a guaranteed
+    // tick (not a coalesce-able Invalidate request), so the re-laid-out content composites into
+    // the new surface immediately; PumpBeginFrame's ongoing ticks cover the heavy-page settle.
+    slot->browser->GetHost()->SendExternalBeginFrame();
+  }
 }
 
 void DoNavigate(const std::shared_ptr<Slot>& slot, const std::string& url) {
@@ -1230,6 +1396,7 @@ void DoSetZoom(const std::shared_ptr<Slot>& slot, double level) {
 // alive, so this is a cheap pause/resume — not a teardown. The host pauses a
 // tile that scrolls fully out of the canvas viewport and resumes it on return.
 void DoSetVisible(const std::shared_ptr<Slot>& slot, bool visible) {
+  slot->visible = visible;  // PumpBeginFrame reads this to idle the begin-frame pump while hidden
   if (slot->browser) slot->browser->GetHost()->WasHidden(!visible);
 }
 void DoFind(const std::shared_ptr<Slot>& slot, const std::string& text,
@@ -1550,8 +1717,12 @@ void DoKey(const std::shared_ptr<Slot>& slot, int type, uint32_t modifiers,
 // frame self-heals a dropped/raced first paint instead of a permanently blank texture.
 void DoInvalidate(const std::shared_ptr<Slot>& slot) {
   CEF_REQUIRE_UI_THREAD();
-  if (slot && slot->browser && slot->browser->GetHost())
+  if (slot && slot->browser && slot->browser->GetHost()) {
     slot->browser->GetHost()->Invalidate(PET_VIEW);
+    // With external begin-frame the internal timer is off, so Invalidate alone may never paint —
+    // drive a guaranteed frame so a watchdog re-kick actually delivers.
+    slot->browser->GetHost()->SendExternalBeginFrame();
+  }
 }
 
 // Tear down the WHOLE process: close every browser, then quit the message loop.

@@ -39,6 +39,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   private static let opNewWindow: UInt8 = 0x0d
   private static let opPointer: UInt8 = 0x10
   private static let opResize: UInt8 = 0x11
+  private static let opInvalidate: UInt8 = 0x37  // us -> cef_host: force a repaint (re-kick a stuck resize)
   private static let opKey: UInt8 = 0x12
   private static let opFindResult: UInt8 = 0x0e
   private static let opJsDialog: UInt8 = 0x0f
@@ -110,6 +111,28 @@ final class CefWebSession: NSObject, FlutterTexture {
 
   private var ioSurface: IOSurfaceRef?
   private var pixelBuffer: CVPixelBuffer?
+  // Resize-flash fix: on resize we point cef_host at a fresh (zero-filled) surface but
+  // keep SERVING the old `pixelBuffer` to Flutter until cef_host has actually painted
+  // the new one — otherwise Flutter composites the blank surface for the frames before
+  // the async cross-process repaint lands. `pendingBuffer` is the new buffer, promoted
+  // to `pixelBuffer` in handleFrame(opPresent) when a present arrives tagged with
+  // `pendingSurfaceId` (the new surface's id). All under bufferLock.
+  private var pendingBuffer: CVPixelBuffer?
+  private var pendingSurfaceId: UInt32 = 0
+  // Resize flow-control: keep at most ONE resize in flight (sent, not yet promoted by its
+  // present). cef_host coalesces rapid resizes and only paints the latest, so sending at the
+  // full drag rate left every present tagged with an already-superseded surface id → the
+  // texture promoted only at drag pauses (~1-2s). Instead send one resize, wait for its
+  // present, then send the latest size requested since — so every paint promotes and the page
+  // reflows at cef_host's actual rate. All guarded by bufferLock.
+  private var resizeInFlight = false
+  private var pendingRequestedW = 0
+  private var pendingRequestedH = 0
+  private var resizeSentAtNs: UInt64 = 0
+  // Bumped on every sendResize. The resize watchdog captures it and bails if a newer resize
+  // has since gone out — so during a smoothly-advancing drag the watchdog is a no-op, and it
+  // only acts when a resize wedges (generation stops advancing because no present came).
+  private var resizeGen: UInt64 = 0
   private let bufferLock = NSLock()
 
   /// The live IOSurface id this session's buffer is backed by, or 0 before
@@ -161,22 +184,108 @@ final class CefWebSession: NSObject, FlutterTexture {
   func resize(width newW: Int, height newH: Int) {
     let w = max(1, newW), h = max(1, newH)
     bufferLock.lock()
-    let unchanged = (w == width && h == height)
+    // Always record the latest requested size; it's what maybeSendNextResize sends when the
+    // in-flight resize promotes.
+    pendingRequestedW = w
+    pendingRequestedH = h
+    let blocked = resizeInFlight
+    let same = (w == width && h == height)
     bufferLock.unlock()
-    if unchanged { return }
-    // H4: create the new surface OUTSIDE the lock (expensive), then publish surface +
-    // new dims ATOMICALLY in one bufferLock section — so a concurrent host read
-    // (sendCreate's createSnapshot on the reader thread) can never see the new surface
-    // with the old dims. Released before sendFrame — no bufferLock→writeLock nest.
+    // While a resize is still painting, just record the latest size (above). Its present sends
+    // the next one (maybeSendNextResize); if cef_host drops that paint, the resizeWatchdog
+    // re-kicks it. This one-in-flight pacing keeps the page reflowing at cef_host's actual rate
+    // instead of racing ahead (which tagged every present with an already-superseded surface id
+    // → froze mid-drag). NOTE: no inline timeout here — racing ahead on a slow/heavy page is
+    // exactly what desynced the presents and left the page stuck; the watchdog handles wedges.
+    if blocked || same { return }
+    sendResize(w, h)
+  }
+
+  /// Allocate the new surface, point cef_host at it, and send the resize — marking it
+  /// in-flight so the next size waits for this one's present (see resize()/maybeSendNextResize).
+  /// Only ever called on the main thread (resize / maybeSendNextResize), so sendFrame stays
+  /// serialized.
+  private func sendResize(_ w: Int, _ h: Int) {
+    // Create the new surface OUTSIDE the lock (expensive). H4: publish surface id + new
+    // dims ATOMICALLY in one bufferLock section so a concurrent host read (createSnapshot
+    // on the reader thread) can't see new dims with the old surface id.
     guard let (surf, buffer) = makeBuffers(w, h) else { return }
-    let sid = publishBuffers(surf, buffer, w, h)
+    let sid = IOSurfaceGetID(surf)
     guard sid != 0 else { return }
+    // Resize-flash fix: point the host at the NEW surface (ioSurface drives surfaceId /
+    // createSnapshot → cef_host paints into it) and adopt the new dims, but DON'T swap
+    // the live `pixelBuffer` — keep serving the OLD surface to Flutter (the old
+    // CVPixelBuffer retains its IOSurface, so it stays valid) until cef_host paints the
+    // new one. The new buffer is promoted in handleFrame(opPresent) on the matching present.
+    bufferLock.lock()
+    ioSurface = surf
+    pendingBuffer = buffer
+    pendingSurfaceId = sid
+    width = w
+    height = h
+    resizeInFlight = true
+    resizeSentAtNs = nowNs()
+    resizeGen &+= 1
+    let gen = resizeGen
+    bufferLock.unlock()
     var payload = [UInt8]()
     appendU32(&payload, UInt32(w))
     appendU32(&payload, UInt32(h))
     appendU32(&payload, sid)
     sendFrame(Self.opResize, payload)
+    // Re-kick this resize if its present never lands (see resizeWatchdog). During a smoothly
+    // advancing drag gen keeps moving and this no-ops; it only bites a genuine wedge.
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+      self?.resizeWatchdog(gen)
+    }
   }
+
+  /// Re-kick a wedged resize. Bails immediately if a newer resize has gone out (gen advanced)
+  /// or this one already promoted (not in flight). Otherwise the post-resize present never
+  /// matched — nudge cef_host to repaint the pending surface (opInvalidate), retrying every
+  /// ~80ms. After ~0.3s of failed re-kicks, FORCE-promote the pending surface: cef_host's
+  /// begin-frame pump has been painting into it the whole time, so it holds the correct new-size
+  /// content — a single dropped/mis-tagged present (the failure mode on a STATIC page like
+  /// flutter.dev, which produces exactly one frame per resize) can't leave the tile wedged.
+  /// Main-thread only, so sendFrame / textureFrameAvailable stay serialized.
+  private func resizeWatchdog(_ gen: UInt64) {
+    bufferLock.lock()
+    let active = resizeInFlight && gen == resizeGen
+    let givenUp = active && (nowNs() &- resizeSentAtNs) > 300_000_000
+    var promotedTid: Int64 = 0
+    if givenUp {
+      if let pending = pendingBuffer {
+        pixelBuffer = pending
+        pendingBuffer = nil
+        pendingSurfaceId = 0
+        promotedTid = textureId
+      }
+      resizeInFlight = false
+    }
+    bufferLock.unlock()
+    if givenUp {
+      if promotedTid != 0 { registry?.textureFrameAvailable(promotedTid) }
+      maybeSendNextResize()
+      return
+    }
+    guard active else { return }
+    sendFrame(Self.opInvalidate, [])
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+      self?.resizeWatchdog(gen)
+    }
+  }
+
+  /// Main-thread follow-up after a present promotes: if the page was resized again while the
+  /// last resize painted, send the newest size now so the reflow keeps pace with the drag.
+  private func maybeSendNextResize() {
+    bufferLock.lock()
+    let w = pendingRequestedW, h = pendingRequestedH
+    let need = !resizeInFlight && w > 0 && (w != width || h != height)
+    bufferLock.unlock()
+    if need { sendResize(w, h) }
+  }
+
+  private func nowNs() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
 
   func navigate(_ url: String) {
     sendFrame(Self.opNavigate, Array(url.utf8))
@@ -308,6 +417,11 @@ final class CefWebSession: NSObject, FlutterTexture {
     textureId = 0
     pixelBuffer = nil
     ioSurface = nil
+    pendingBuffer = nil  // drop any un-promoted resized surface
+    pendingSurfaceId = 0
+    resizeInFlight = false
+    pendingRequestedW = 0
+    pendingRequestedH = 0
     bufferLock.unlock()
     if tid != 0 { registry?.unregisterTexture(tid) }
   }
@@ -349,7 +463,8 @@ final class CefWebSession: NSObject, FlutterTexture {
       NSLog("[cef] CVPixelBufferCreateWithIOSurface failed rc=\(rc)")
       return nil
     }
-    NSLog("[cef] allocated IOSurface id=\(IOSurfaceGetID(surf)) \(pw)x\(ph) (logical \(w)x\(h) @\(dpr)x) stride=\(bytesPerRow)")
+    // NOTE: no success log here — makeBuffers runs once PER resize step (~60/s during a drag),
+    // and a synchronous NSLog on that hot path measurably hurts resize smoothness.
     return (surf, buffer)
   }
 
@@ -387,6 +502,20 @@ final class CefWebSession: NSObject, FlutterTexture {
       // Read textureId under bufferLock — dispose() writes it under the same
       // lock on the main thread, so this avoids a data race on the Int64.
       bufferLock.lock()
+      // Resize-flash fix: the present is tagged with the surface id cef_host painted
+      // (BE u32). If it's our pending (resized) surface, promote it to live now — we
+      // kept serving the old surface until this exact frame so Flutter never sampled the
+      // blank new one. A present for the old/current surface just advances the frame.
+      if payload.count >= 4 {
+        let psid = (UInt32(payload[0]) << 24) | (UInt32(payload[1]) << 16)
+          | (UInt32(payload[2]) << 8) | UInt32(payload[3])
+        if let pending = pendingBuffer, psid != 0, psid == pendingSurfaceId {
+          pixelBuffer = pending
+          pendingBuffer = nil
+          pendingSurfaceId = 0
+          resizeInFlight = false  // its paint landed; free to send the next size
+        }
+      }
       let tid = textureId
       bufferLock.unlock()
       if tid != 0 {
@@ -399,6 +528,9 @@ final class CefWebSession: NSObject, FlutterTexture {
           let live = self.textureId
           self.bufferLock.unlock()
           if live != 0 { self.registry?.textureFrameAvailable(live) }
+          // A resize may have promoted above — send the newest requested size now so the
+          // reflow advances at cef_host's paint rate (on main, so sendFrame stays serialized).
+          self.maybeSendNextResize()
         }
       }
     case Self.opLog:
