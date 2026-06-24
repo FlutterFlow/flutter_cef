@@ -1001,6 +1001,23 @@ final class CefProfileHost {
     spawnedPid = 0
     let died = onHostDied
     writeLock.unlock()
+    // The host is gone: tear down CDP relays (free their localhost listeners +
+    // clients) and FAIL any in-flight targetId waiters so enableAgentControl
+    // callers don't hang forever. Mirrors shutdown()'s teardown — snapshot under
+    // each lock, act OUTSIDE it (stop()/completions may block + take other locks).
+    // Idempotent: a later shutdown()/terminate finds the dicts already empty.
+    cdpHandlerLock.lock()
+    let deadRelays = Array(cdpRelays.values)
+    cdpRelays.removeAll()
+    onCdpMessage = nil
+    cdpHandlerLock.unlock()
+    for r in deadRelays { r.stop() }
+    targetIdLock.lock()
+    let strandedWaiters = pendingTargetId.values.flatMap { $0 }
+    pendingTargetId.removeAll()
+    targetIdEpoch.removeAll()
+    targetIdLock.unlock()
+    for w in strandedWaiters { w(nil) }  // nil = resolution failed (host died)
     // Resolve the exit status + invoke onHostDied off the caller's thread: this
     // can be the MAIN thread (a writeAll failure in send()/sendCreate()), and
     // terminationStatus traps if read while the process is still running — so we
@@ -1390,7 +1407,12 @@ final class CefProfileHost {
       let n = buf.withUnsafeMutableBytes { ptr -> Int in
         read(fd, ptr.baseAddress!.advanced(by: off), len - off)
       }
-      if n <= 0 { return false }
+      if n <= 0 {
+        // A signal (SIGALRM/SIGCHLD/…) interrupts the syscall: retry rather than
+        // treat it as a dead pipe (which would tear down the whole shared host).
+        if n < 0 && errno == EINTR { continue }
+        return false
+      }
       off += n
     }
     return true
@@ -1400,7 +1422,12 @@ final class CefProfileHost {
     var off = 0
     while off < len {
       let n = write(fd, buf.advanced(by: off), len - off)
-      if n <= 0 { return false }
+      if n <= 0 {
+        // Same EINTR resilience as readAll: a signal mid-write must not be
+        // mistaken for a dead pipe (matches the C++ WriteAll on the host side).
+        if n < 0 && errno == EINTR { continue }
+        return false
+      }
       off += n
     }
     return true
