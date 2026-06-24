@@ -3,6 +3,7 @@ import 'dart:convert';
 
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
+import 'package:meta/meta.dart';
 
 import 'package:flutter_cef_platform_interface/flutter_cef_platform_interface.dart';
 
@@ -241,8 +242,12 @@ class CefWebController {
         break;
       case 'processGone':
         // The native host dropped this session (crash, cache-lock loss, or a
-        // create that failed — reason 'createFailed'). The texture is dead; let the
-        // consumer react (show a reload affordance / recreate).
+        // create that failed — reason 'createFailed'). The texture is dead. Fail
+        // any in-flight eval/cookie round-trips FIRST — there is no host left to
+        // answer them, so they would otherwise hang forever (this is the single
+        // most likely failure) — then let the consumer react (reload / recreate).
+        _failPendingEvals('the cef_host process is gone');
+        _failPendingCookies('the cef_host process is gone');
         onProcessGone?.call(a['reason'] as String? ?? 'crashed');
         break;
       case 'paintStalled':
@@ -285,6 +290,15 @@ class CefWebController {
     }
   }
 
+  void _failPendingCookies(String reason) {
+    if (_cookiePending.isEmpty) return;
+    final pending = _cookiePending.values.toList();
+    _cookiePending.clear();
+    for (final c in pending) {
+      if (!c.isCompleted) c.completeError(StateError(reason));
+    }
+  }
+
   /// Deliver a JS-channel post. Payload is `"name:message"`.
   void _handleChannelMessage(String payload) {
     final i = payload.indexOf(':');
@@ -318,8 +332,16 @@ class CefWebController {
         default:
           await onJavaScriptAlertDialog?.call(req);
       }
-    } catch (_) {
+    } catch (e, st) {
+      // Fail closed (dismiss the dialog), but DON'T swallow the error — a throwing
+      // app dialog handler is a consumer bug they should see, not a silent dismiss.
       ok = false;
+      FlutterError.reportError(FlutterErrorDetails(
+        exception: e,
+        stack: st,
+        library: 'flutter_cef',
+        context: ErrorDescription('handling a JavaScript dialog from the page'),
+      ));
     }
     if (_disposed) return; // controller torn down while the callback awaited
     await _channel.invokeMethod('respondJsDialog',
@@ -497,11 +519,14 @@ class CefWebController {
   /// `/json/version`). Idempotent: repeated calls return the same live endpoint.
   /// Tear down with [disableAgentControl].
   ///
-  /// Security: vanilla agent-browser can't attach a secret to a CDP connection, so
-  /// the gate is the ephemeral loopback port + grant lifecycle + single active
-  /// client, not the token. The returned [token] is validated only **if** a client
-  /// passes `?token=` (defense-in-depth for a token-capable client); it's embedded
-  /// in [wsUrl] for that case.
+  /// Security: the [token] is **required**. The relay rejects the ws upgrade with
+  /// `401` unless the client presents it as an `Authorization: Bearer <token>`
+  /// header (a `?token=` query is an accepted fallback). The token is minted per
+  /// grant, held only in memory, and embedded in [wsUrl]. CDP discovery
+  /// (`/json/*`) stays token-free, so a local port-scanner can learn the ws-url
+  /// but cannot upgrade. On top of the token the relay binds loopback only, allows
+  /// a single active client, and exists only while enabled — so even a same-UID
+  /// local process can't attach without the in-memory token.
   ///
   /// Per-tile isolation: the relay is scoped to THIS tile's CDP target (resolved
   /// natively), and applies a deny-by-default / fail-closed / flatten-only Target-domain
@@ -513,12 +538,13 @@ class CefWebController {
   Future<({String wsUrl, String token, int port})?> enableAgentControl() async {
     final res = await _channel.invokeMapMethod<String, dynamic>(
         'enableAgentControl', {'sessionId': sessionId});
-    if (res == null) return null;
-    return (
-      wsUrl: res['wsUrl'] as String,
-      token: res['token'] as String,
-      port: res['port'] as int,
-    );
+    // A partial/empty native reply returns null rather than throwing an
+    // uncatchable TypeError on a missing key.
+    final wsUrl = res?['wsUrl'] as String?;
+    final token = res?['token'] as String?;
+    final port = res?['port'] as int?;
+    if (wsUrl == null || token == null || port == null) return null;
+    return (wsUrl: wsUrl, token: token, port: port);
   }
 
   /// CEF-2a — tear down the agent-control relay (closes the listener and any client,
@@ -571,6 +597,16 @@ class CefWebController {
     _channels[name] = onMessageReceived;
     return _channel.invokeMethod(
         'addJavaScriptChannel', {'sessionId': sessionId, 'name': name});
+  }
+
+  /// Stop delivering a JS channel registered with [addJavaScriptChannel]:
+  /// [onMessageReceived] is no longer invoked for [name]. The page-side
+  /// `window.<name>` shim is intentionally NOT torn down — it is process-global on
+  /// a shared profile, so tearing it down here would also remove it from sibling
+  /// views — so the page can still call `window.<name>.postMessage`, but those
+  /// messages are dropped.
+  void removeJavaScriptChannel(String name) {
+    _channels.remove(name);
   }
 
   /// Scroll the page to an absolute pixel position.
@@ -742,7 +778,10 @@ class CefWebController {
         'dpr': dpr,
       });
 
+  /// Internal — driven by [CefWebView]'s gesture forwarding; not part of the
+  /// supported public API (raw wire encoding).
   /// type: 0=move 1=down 2=up 3=wheel 4=leave; button: 0=left 1=middle 2=right.
+  @internal
   void sendPointer({
     required int type,
     required double x,
@@ -766,7 +805,10 @@ class CefWebController {
     });
   }
 
+  /// Internal — driven by [CefWebView]'s key forwarding; not part of the
+  /// supported public API (raw wire encoding).
   /// type: 0=rawkeydown 2=keyup 3=char.
+  @internal
   void sendKey({
     required int type,
     int modifiers = 0,
@@ -788,13 +830,13 @@ class CefWebController {
   /// texture). Pending [runJavaScriptReturningResult] / [getCookies] futures
   /// fail with a [StateError], and the controller is unusable afterwards.
   Future<void> dispose() async {
+    if (_disposed) return; // Idempotent: a controller can be disposed twice
+    // (e.g. an externally-owned controller torn down by both the app and a stale
+    // view). A second pass must not throw via the ValueNotifier dispose asserts.
     _disposed = true;
     _bySession.remove(sessionId);
     _failPendingEvals('controller disposed');
-    for (final c in _cookiePending.values) {
-      if (!c.isCompleted) c.completeError(StateError('controller disposed'));
-    }
-    _cookiePending.clear();
+    _failPendingCookies('controller disposed');
     _channels.clear();
     cursor.dispose();
     cdpPort.dispose();

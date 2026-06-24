@@ -906,7 +906,10 @@ final class CdpRelay {
     var off = 0
     while off < bytes.count {
       let n = bytes.withUnsafeBytes { write(fd, $0.baseAddress!.advanced(by: off), bytes.count - off) }
-      if n <= 0 { return false }  // EPIPE/EBADF (SO_NOSIGPIPE keeps it from signaling)
+      if n <= 0 {
+        if n < 0 && errno == EINTR { continue }  // signal: retry, not a dead pipe
+        return false  // EPIPE/EBADF (SO_NOSIGPIPE keeps it from signaling)
+      }
       off += n
     }
     return true

@@ -552,6 +552,78 @@ void main() {
     expect(called, false, reason: 'events after dispose must be ignored');
   });
 
+  test('processGone fails pending eval + cookie futures (no indefinite hang)',
+      () async {
+    // The host crashing is the single most likely failure; in-flight round-trips
+    // have no one left to answer them and must fail, not hang forever.
+    final c = CefWebController(sessionId: 'pg');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    final evalF = c.runJavaScriptReturningResult('slow()');
+    final cookieF = c.getCookies(url: 'https://x.test/');
+    final evalExp = expectLater(evalF, throwsA(isA<StateError>()));
+    final cookieExp = expectLater(cookieF, throwsA(isA<StateError>()));
+    String? reason;
+    c.onProcessGone = (r) => reason = r;
+    await emit('pg', 'processGone', {'reason': 'crashed'});
+    await evalExp;
+    await cookieExp;
+    expect(reason, 'crashed');
+  });
+
+  test('dispose() is idempotent — a second call does not throw', () async {
+    // Externally-owned controllers can be disposed twice (app + a stale view);
+    // the second pass must not throw via the ValueNotifier dispose asserts.
+    final c = CefWebController(sessionId: 'dd');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    await c.dispose();
+    await expectLater(c.dispose(), completes);
+  });
+
+  test('enableAgentControl returns null on a partial native reply', () async {
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      log.add(call);
+      if (call.method == 'enableAgentControl') {
+        return <String, dynamic>{'wsUrl': 'ws://x', 'token': 'abc'}; // no port
+      }
+      return null;
+    });
+    final c = CefWebController(sessionId: 'acp');
+    // A missing key must yield null, not an uncatchable TypeError.
+    expect(await c.enableAgentControl(), isNull);
+  });
+
+  test('removeJavaScriptChannel stops delivery to the handler', () async {
+    final c = CefWebController(sessionId: 'rmch');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    final got = <String>[];
+    await c.addJavaScriptChannel('Bridge', onMessageReceived: got.add);
+    await emit('rmch', 'channelMessage', {'payload': 'Bridge:one'});
+    c.removeJavaScriptChannel('Bridge');
+    await emit('rmch', 'channelMessage', {'payload': 'Bridge:two'});
+    expect(got, ['one'], reason: 'messages after removal must be dropped');
+  });
+
+  test('processGone defaults the reason to "crashed" / passes it through',
+      () async {
+    final c = CefWebController(sessionId: 'pgr');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    String? reason;
+    c.onProcessGone = (r) => reason = r;
+    await emit('pgr', 'processGone', <String, Object?>{}); // no reason
+    expect(reason, 'crashed');
+    await emit('pgr', 'processGone', {'reason': 'locked'});
+    expect(reason, 'locked');
+  });
+
+  test('paintStalled event invokes onPaintStalled', () async {
+    final c = CefWebController(sessionId: 'pstall');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    var stalled = false;
+    c.onPaintStalled = () => stalled = true;
+    await emit('pstall', 'paintStalled', <String, Object?>{});
+    expect(stalled, isTrue);
+  });
+
   test('alert dialog routes to the handler and acks', () async {
     final c = CefWebController(sessionId: 'al');
     await c.create(url: 'about:blank', width: 1, height: 1);

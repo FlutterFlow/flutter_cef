@@ -33,6 +33,7 @@ c.executeJavaScript('document.body.style.zoom = 1.2');
 final title = await c.runJavaScriptReturningResult('document.title'); // String/num/List/Map
 c.addJavaScriptChannel('Native', onMessageReceived: (m) => print('JS says $m'));
 // then in the page: window.Native.postMessage('hello')
+c.removeJavaScriptChannel('Native'); // stop delivering (page-side shim stays; see Profiles)
 
 // page state (ValueListenables) + lifecycle/dialog callbacks
 c.isLoading;  c.url;  c.title;  c.canGoBack;  c.canGoForward;
@@ -41,6 +42,13 @@ c.onUrlChange = (u) {}; c.onCreateWindow = (u) => c.navigate(u); // target=_blan
 c.onLoadError = (e) => print('${e.errorCode} ${e.url}');
 c.onConsoleMessage = (m) => print(m.message);
 c.onJavaScriptConfirmDialog = (req) async => askUser(req.message); // alert/confirm/prompt
+
+// process liveness + paint recovery
+c.onProcessGone = (reason) {};   // host died: 'locked' (profile open elsewhere) / 'crashed'
+c.onPaintStalled = () {};        // created but never painted — recreate the view to recover
+
+// pause/resume frame production without tearing down (DOM + JS state kept)
+c.setVisible(false); c.setVisible(true);
 
 // cookies + scroll + storage
 c.setCookie(url: 'https://example.com/', name: 'sid', value: 'abc');
@@ -52,6 +60,13 @@ c.onDownload = (suggestedName) {}; // downloads land in ~/Downloads
 
 // open the Chrome DevTools inspector for this view in its own window
 c.openDevTools();
+
+// Raw Chrome DevTools Protocol over a TCP port — opt in at construction with
+// CefWebView(..., enableCdp: true), then connect a CDP client to 127.0.0.1:<port>:
+final cdpPort = c.cdpPort.value; // ValueListenable<int>; 0 until created
+// NOTE: enableCdp is an UNAUTHENTICATED localhost port and is rejected on a named
+// `profile:`. To drive a logged-in tile from an agent, prefer agentControl +
+// enableAgentControl() (CDP over a private pipe, token-gated) — see "Agent control".
 
 // open the macOS emoji & symbols picker over the focused page (same as ⌃⌘Space)
 c.showEmojiPicker();
@@ -78,7 +93,8 @@ Same pattern JCEF (JetBrains) and CefSharp use to render Chromium into a non-nat
 
 ## Building
 
-CEF (~200 MB) is **fetched**, not vendored. Build the renderer once:
+CEF (~200 MB) is **fetched**, not vendored. Build the renderer once (needs
+`cmake` + `ninja` — `brew install cmake ninja`):
 
 ```sh
 # The macOS implementation lives in packages/flutter_cef_macos.
@@ -326,6 +342,56 @@ own CDP target, all multiplexed over the single browser-wide `--remote-debugging
 (per-tile sessionId scoping + a per-relay CDP-id rewrite so a sibling's traffic can
 neither be seen nor driven). See the `CdpRelay` multiplex notes and
 `CdpRelayFilterTests` for the isolation boundary.
+
+## Troubleshooting
+
+### Blank / black texture — the page never appears
+
+`cef_host` couldn't be found, so no renderer subprocess spawned. Build it and make
+it discoverable — in a dev checkout export `$FLUTTER_CEF_HOST` (see
+[Building](#building)); in a shipped `.app`, `cef_host.app` must live in
+`Contents/Frameworks` (run `tool/bundle_cef_host.sh`). Resolution order:
+`$FLUTTER_CEF_HOST` → pod resources → `Contents/Frameworks` → `Contents/Helpers`.
+
+### App crashes shortly after a page touches hardware (SIGABRT)
+
+`cef_host` runs as a child of your app, so macOS attributes hardware access (e.g.
+WebAuthn/passkeys reaching Bluetooth, camera, microphone) to your app and reads
+the usage string from **your** app's `Info.plist`. If it's missing, the process is
+SIGABRT'd the instant the hardware is touched. Declare
+`NSBluetoothAlwaysUsageDescription` / `NSCameraUsageDescription` /
+`NSMicrophoneUsageDescription` in your app's `Info.plist` (see
+`example/macos/Runner/Info.plist`), plus the matching
+`com.apple.security.device.*` entitlements if the access must actually function.
+
+### A named `profile:` silently behaves as ephemeral (login doesn't persist)
+
+The default ad-hoc dev build (`CEF_HOST_ADHOC=ON`) has only a mock keychain and
+can't encrypt cookies at rest, so it **downgrades a named profile to ephemeral**
+rather than persisting a login to a plaintext store (it logs a warning). For real
+persistence ship a signed release build (`CEF_HOST_ADHOC=OFF`, real
+Keychain/OSCrypt). For dev only, set `FLUTTER_CEF_ALLOW_INSECURE_PROFILE=1` —
+**never ship that override.**
+
+### `onProcessGone` fires with reason `'locked'`
+
+The persistent profile is already open in another process/instance — a named
+profile is one `cef_host` with one cross-process cache lock. Close the other
+holder and recreate the view to retry (vs. `'crashed'` for a generic death).
+
+### Page loads but never paints (permanently blank, no crash)
+
+The browser was created but never delivered a first frame even after a re-kick.
+Wire `controller.onPaintStalled` and recreate the view to recover, rather than
+leaving a blank tile.
+
+### Agent-control CDP client gets `401` on the WebSocket upgrade
+
+The relay **requires a token**. Present the token from `enableAgentControl()` as
+`Authorization: Bearer <token>` (a `?token=` query is an accepted fallback) on the
+upgrade; CDP discovery (`/json/*`) stays token-free. The token is minted per
+grant, held only in memory, and embedded in `grant.wsUrl` — deliver it
+out-of-band (never on disk/argv/env). See [Agent control](#agent-control).
 
 ## Roadmap
 

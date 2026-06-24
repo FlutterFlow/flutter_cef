@@ -65,7 +65,12 @@ class CefWebView extends StatefulWidget {
   final String url;
 
   /// Optional external controller (to script the view). If null, one is created
-  /// and owned internally.
+  /// and owned internally (and disposed with the view).
+  ///
+  /// When you supply a controller **you own its lifecycle** — the view only
+  /// auto-disposes a controller it created itself. Call `controller.dispose()`
+  /// when you're done with it, otherwise the per-view `cef_host` process tree,
+  /// the texture, and the controller's notifiers leak.
   final CefWebController? controller;
 
   /// Optional focus node. Provide one when an outer surface manages focus

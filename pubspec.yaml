@@ -1,5 +1,5 @@
 name: flutter_cef
-description: "Embed a live Chromium (CEF) browser as a Flutter Texture on macOS: composites and clips like any widget, with input forwarding, a JS bridge, navigation and page events."
+description: "Embed a Chromium (CEF) browser as a Flutter Texture on macOS: composites and clips like a widget, with input forwarding, a JS bridge, and navigation events."
 version: 0.2.0
 homepage: https://github.com/FlutterFlow/flutter_cef
 repository: https://github.com/FlutterFlow/flutter_cef
@@ -17,6 +17,7 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  meta: ^1.12.0 # @internal / annotations on the public API
   # Federation members are wired as path deps: the repo is consumed from source
   # (path / git), not pub.dev. PUBLISHING (when it happens): `pub publish`
   # rejects path deps, so publish bottom-up — flutter_cef_platform_interface,
