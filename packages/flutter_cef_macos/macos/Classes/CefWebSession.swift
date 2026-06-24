@@ -99,6 +99,13 @@ final class CefWebSession: NSObject, FlutterTexture {
   // CefProfileHost.createBrowser() allocates the id.
   private weak var host: CefProfileHost?
   private(set) var browserId: UInt32 = 0
+  // JS-channel names registered for this session. Buffered here so a registration
+  // that arrives BEFORE attach() assigns the wire browserId — which happens on a
+  // shared host, where createBrowser is queued (pendingCreates) — is flushed with
+  // a VALID browserId once attached (and re-sent on a re-home to a new host).
+  // Without this the addChannel op would go out with browserId=0 and the host
+  // couldn't bind it to this browser, so the window.<name> shim was never injected.
+  private var channels: Set<String> = []
   // C1: set once when this browser delivers its first present frame. Owned/guarded by
   // CefProfileHost under its browsersLock (the reader flips it there) — a cheap per-frame
   // first-paint check that avoids a second lock on the hot paint path.
@@ -168,6 +175,9 @@ final class CefWebSession: NSObject, FlutterTexture {
   func attach(host: CefProfileHost, browserId: UInt32) {
     self.host = host
     self.browserId = browserId
+    // Flush channels registered before the wire id existed (and re-send them on a
+    // re-home to a new host) now that sendFrame can route with a valid browserId.
+    for name in channels { sendFrame(Self.opAddChannel, Array(name.utf8)) }
   }
 
   // MARK: FlutterTexture
@@ -344,7 +354,9 @@ final class CefWebSession: NSObject, FlutterTexture {
   }
 
   func addChannel(_ name: String) {
-    sendFrame(Self.opAddChannel, Array(name.utf8))
+    channels.insert(name)
+    // Ship now only if we already have a wire id; otherwise attach() flushes it.
+    if browserId != 0 { sendFrame(Self.opAddChannel, Array(name.utf8)) }
   }
 
   func setCookie(url: String, name: String, value: String, domain: String,

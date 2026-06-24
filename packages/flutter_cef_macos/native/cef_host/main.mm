@@ -1434,12 +1434,20 @@ void DoEvalReturning(const std::shared_ptr<Slot>& slot, uint32_t id,
 }
 void DoAddChannel(const std::shared_ptr<Slot>& slot, const std::string& name) {
   if (!IsValidChannelName(name)) {
-    SendLog(slot->browser_id, "addJavaScriptChannel: rejected invalid name '" +
-                                  name + "' (must be a JS identifier)");
+    if (slot)
+      SendLog(slot->browser_id, "addJavaScriptChannel: rejected invalid name '" +
+                                    name + "' (must be a JS identifier)");
     return;
   }
+  // Register process-globally: OnLoadStart injects every g_channels entry into
+  // each freshly-loaded frame, so the shim lands on the next load. This also
+  // keeps the op null-safe — if `slot` is somehow absent the registration still
+  // takes (defense; the Swift session now buffers addChannel until attach(), so
+  // in practice the op carries a valid browserId and `slot` is set).
   g_channels.insert(name);
-  if (slot->browser) InjectChannelShim(slot->browser->GetMainFrame(), name);
+  // Inject into the registering session's CURRENT frame too, covering the case
+  // where the channel is registered after its page has already loaded.
+  if (slot && slot->browser) InjectChannelShim(slot->browser->GetMainFrame(), name);
 }
 // Cookie ops act on the GLOBAL cookie manager (= the shared profile jar), so a
 // login in one browser is visible to every browser sharing this profile. They
@@ -1876,7 +1884,13 @@ void IpcReadLoop() {
         break;
       }
       case kOpAddChannel: {
-        if (!slot) break;
+        // Do NOT require `slot`: on a shared host a session's createBrowser may
+        // still be queued (pendingCreates) when this op arrives, and dropping it
+        // here is exactly why a peer/secondary session's window.<name> shim was
+        // never injected (campus.emit silently dead). DoAddChannel registers the
+        // name in the process-global g_channels — OnLoadStart injects it into the
+        // frame once the browser loads — and injects into the current frame only
+        // if the browser already exists.
         std::string name(reinterpret_cast<const char*>(p), plen);
         CefPostTask(TID_UI, base::BindOnce(&DoAddChannel, slot, name));
         break;
