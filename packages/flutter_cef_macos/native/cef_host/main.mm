@@ -1434,12 +1434,27 @@ void DoEvalReturning(const std::shared_ptr<Slot>& slot, uint32_t id,
 }
 void DoAddChannel(const std::shared_ptr<Slot>& slot, const std::string& name) {
   if (!IsValidChannelName(name)) {
-    SendLog(slot->browser_id, "addJavaScriptChannel: rejected invalid name '" +
-                                  name + "' (must be a JS identifier)");
+    if (slot)
+      SendLog(slot->browser_id, "addJavaScriptChannel: rejected invalid name '" +
+                                    name + "' (must be a JS identifier)");
     return;
   }
+  // Register process-globally: OnLoadStart injects every g_channels entry into
+  // each freshly-loaded frame, so this lands the shim on future loads even when
+  // the op arrived with browserId=0 (sent before the session's attach() — its
+  // createBrowser was still queued on a shared host) and `slot` is null.
   g_channels.insert(name);
-  if (slot->browser) InjectChannelShim(slot->browser->GetMainFrame(), name);
+  // Also inject into every browser that has ALREADY loaded a page, so a late
+  // registration (op arriving after a page's OnLoadStart) isn't missed. The
+  // channel is process-global, so this mirrors OnLoadStart's per-frame behavior.
+  // Copy out under the lock, then inject (ExecuteJavaScript) without holding it.
+  std::vector<CefRefPtr<CefBrowser>> browsers;
+  {
+    std::lock_guard<std::mutex> lock(g_slots_mutex);
+    for (const auto& kv : g_slots_by_wire_id)
+      if (kv.second && kv.second->browser) browsers.push_back(kv.second->browser);
+  }
+  for (const auto& b : browsers) InjectChannelShim(b->GetMainFrame(), name);
 }
 // Cookie ops act on the GLOBAL cookie manager (= the shared profile jar), so a
 // login in one browser is visible to every browser sharing this profile. They
@@ -1876,7 +1891,13 @@ void IpcReadLoop() {
         break;
       }
       case kOpAddChannel: {
-        if (!slot) break;
+        // Do NOT require `slot`: on a shared host a session's createBrowser may
+        // still be queued (pendingCreates) when this op arrives, and dropping it
+        // here is exactly why a peer/secondary session's window.<name> shim was
+        // never injected (campus.emit silently dead). DoAddChannel registers the
+        // name in the process-global g_channels — OnLoadStart injects it into the
+        // frame once the browser loads — and injects into the current frame only
+        // if the browser already exists.
         std::string name(reinterpret_cast<const char*>(p), plen);
         CefPostTask(TID_UI, base::BindOnce(&DoAddChannel, slot, name));
         break;
