@@ -454,6 +454,26 @@ void main() {
     expect(got, 'hello world');
   });
 
+  test('a channel added BEFORE create() is re-registered on create() '
+      '(call-order independence — the shared-host channel regression)', () async {
+    // On a SHARED host the session attaches LATE (createBrowser is queued), so an
+    // addJavaScriptChannel issued before the widget mounts reaches the host before
+    // the browser exists. The controller must re-register every channel on
+    // create() so the host binds it to the now-attached browser; if this re-send
+    // is dropped, the window.<name> shim is never injected and page->host messages
+    // die — the exact B->A Campus regression. (Native end-to-end delivery on a
+    // real cef_host is covered by test/run_channel_integration.sh.)
+    final c = CefWebController(sessionId: 'prech');
+    await c.addJavaScriptChannel('Early', onMessageReceived: (_) {});
+    log.clear();
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    final reSent = log.where((m) =>
+        m.method == 'addJavaScriptChannel' &&
+        (m.arguments as Map)['name'] == 'Early');
+    expect(reSent, isNotEmpty,
+        reason: 'a channel registered before create() must be re-sent on create()');
+  });
+
   test('scroll + storage conveniences forward as JavaScript', () async {
     final c = CefWebController(sessionId: 'sc');
     await c.scrollTo(0, 100);
