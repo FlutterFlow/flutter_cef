@@ -59,6 +59,12 @@ final class CdpRelay {
   /// Guarded by `clientLock`, which also serializes writes to it.
   private var clientFd: Int32 = -1
   private let clientLock = NSLock()
+  // Per-relay SERIAL queue for client writes. sendRawToClient hops onto this so a
+  // stuck client (writeFrameLocked blocks up to SO_SNDTIMEO ~2s) can't stall the
+  // SHARED CDP reader thread — which fans delivery to every relay — and thereby
+  // starve sibling agent-controlled tiles on the same host. Serial = frame order
+  // for this client is preserved; per-relay = one wedged client is isolated.
+  private let clientWriteQueue = DispatchQueue(label: "flutter_cef.cdp-relay.client-write")
 
   /// In-flight connection (handler-thread) count, guarded by `stateLock`. Caps
   /// concurrent handshakes so a flood of half-open connections can't exhaust
@@ -506,10 +512,18 @@ final class CdpRelay {
   }
 
   /// Write a raw (already-filtered / self-originated) JSON text frame to the client.
+  /// Hops onto the per-relay serial queue so the SHARED CDP reader thread is never
+  /// blocked by a stuck client; clientFd is re-validated under clientLock inside, so
+  /// a concurrent stop()/handler-close makes this a graceful no-op (or a failed
+  /// write that writeFrameLocked already handles).
   private func sendRawToClient(_ json: String) {
-    clientLock.lock(); defer { clientLock.unlock() }
-    guard clientFd >= 0 else { return }
-    writeFrameLocked(clientFd, opcode: 0x1, payload: Array(json.utf8))
+    let payload = Array(json.utf8)
+    clientWriteQueue.async { [weak self] in
+      guard let self = self else { return }
+      self.clientLock.lock(); defer { self.clientLock.unlock() }
+      guard self.clientFd >= 0 else { return }
+      self.writeFrameLocked(self.clientFd, opcode: 0x1, payload: payload)
+    }
   }
 
   /// Write a server frame (unmasked). Takes clientLock itself (callers that already
@@ -808,9 +822,15 @@ final class CdpRelay {
     // crashes the daemon). Only reached on RECONNECT, where the page is already attached
     // so no fresh event fires and ourBrowserContextId is already cached.
     filterLock.lock(); let bctx = ourBrowserContextId; filterLock.unlock()
+    // Playwright's CRBrowser._onAttachedToTarget asserts a NON-EMPTY
+    // browserContextId; synthesizing one with "" crashes the daemon. If we never
+    // captured the real id for this relay (the page's own attach event hadn't
+    // fired yet), SKIP the synthesized event rather than emit a poisoned one — the
+    // real Target.attachedToTarget will carry the correct id when it arrives.
+    guard let bctx = bctx, !bctx.isEmpty else { return }
     let info: [String: Any] = ["targetId": tid, "type": "page", "title": "", "url": "",
                                "attached": true, "canAccessOpener": false,
-                               "browserContextId": bctx ?? ""]
+                               "browserContextId": bctx]
     sendClientJson(["method": "Target.attachedToTarget",
                     "params": ["sessionId": sessionId, "targetInfo": info,
                                "waitingForDebugger": false]])
