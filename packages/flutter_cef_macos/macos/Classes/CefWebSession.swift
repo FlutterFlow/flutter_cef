@@ -90,6 +90,12 @@ final class CefWebSession: NSObject, FlutterTexture {
   var onDownload: ((String) -> Void)?  // suggested name
   var onImeBounds: ((Int, Int, Int, Int) -> Void)?  // caret rect x,y,w,h (DIP)
   var onCookies: ((Int, String) -> Void)?  // request id, json array
+  // Fired when the backing IOSurface is (re)allocated — at create and on every
+  // resize() (which reallocs). Args are the live global surface id and the
+  // PHYSICAL (Retina) pixel dims. A consumer that mirrors the live frame
+  // (e.g. an off-Flutter capturer) reads the surface by id and must re-read on
+  // each fire, since resize() frees the old surface and allocs a new one.
+  var onSurface: ((UInt32, Int, Int) -> Void)?  // surfaceId, physW, physH
 
   let sessionId: String
   private(set) var textureId: Int64 = 0
@@ -487,12 +493,20 @@ final class CefWebSession: NSObject, FlutterTexture {
   @discardableResult
   private func publishBuffers(_ surf: IOSurfaceRef, _ buffer: CVPixelBuffer,
                               _ w: Int, _ h: Int) -> UInt32 {
-    bufferLock.lock(); defer { bufferLock.unlock() }
+    bufferLock.lock()
     ioSurface = surf
     pixelBuffer = buffer
     width = w
     height = h
-    return IOSurfaceGetID(surf)
+    let sid = IOSurfaceGetID(surf)
+    bufferLock.unlock()
+    // WebRTC frame export: notify any consumer that the surface (re)allocated —
+    // fires on init + each resize, both of which publish here. Outside
+    // bufferLock so the callback can read session accessors without
+    // self-deadlock. Physical (Retina) dims = logical * dpr.
+    onSurface?(sid, Int((Double(w) * Double(dpr)).rounded()),
+               Int((Double(h) * Double(dpr)).rounded()))
+    return sid
   }
 
   /// H4: read (w, h, dpr, surfaceId) as ONE consistent tuple under a single bufferLock

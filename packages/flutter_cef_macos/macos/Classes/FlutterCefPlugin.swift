@@ -100,6 +100,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     case "navigate": navigate(args, result)
     case "loadTrusted": loadTrusted(args, result)
     case "resize": resize(args, result)
+    case "getFrameSurface": getFrameSurface(args, result)
     case "dispose": destroy(args, result)
     case "pointer": pointer(args, result)
     case "key": key(args, result)
@@ -403,6 +404,12 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     session.onCookies = { [weak self] id, json in
       self?.emit("cookies", ["sessionId": sessionId, "id": id, "json": json])
     }
+    session.onSurface = { [weak self] surfaceId, width, height in
+      self?.emit("onSurface", [
+        "sessionId": sessionId, "surfaceId": Int(surfaceId),
+        "width": width, "height": height,
+      ])
+    }
     // Allocate the wire browserId + (when ready) issue opCreateBrowser. The
     // process arg --allowed-schemes is shared by every browser in the profile;
     // it's taken from the first browser that triggered the spawn.
@@ -582,6 +589,23 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     } else {
       result(nil)
     }
+  }
+
+  /// Read the session's live frame surface synchronously: the global IOSurface
+  /// id its CVPixelBuffer is backed by, plus the PHYSICAL (Retina) pixel dims
+  /// (logical w/h * dpr, matching allocateBuffers' rounding). A frame-export
+  /// consumer resolves the surface by id; the `onSurface` event fires it on each
+  /// (re)alloc, this verb is the on-demand pull. Returns nil for an unknown
+  /// session, or `surfaceId: 0` before the buffer is allocated.
+  private func getFrameSurface(_ a: [String: Any], _ result: @escaping FlutterResult) {
+    guard let id = a["sessionId"] as? String, let s = sessions[id] else {
+      result(nil)
+      return
+    }
+    let dpr = Double(s.scale)
+    let pw = max(1, Int((Double(s.w) * dpr).rounded()))
+    let ph = max(1, Int((Double(s.h) * dpr).rounded()))
+    result(["surfaceId": Int(s.surfaceId), "width": pw, "height": ph])
   }
 
   private func destroy(_ a: [String: Any], _ result: @escaping FlutterResult) {
