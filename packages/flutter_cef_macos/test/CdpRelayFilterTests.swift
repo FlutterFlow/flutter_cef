@@ -74,7 +74,12 @@ enum CdpRelayFilterTests {
     fwd("Target.getTargetInfo(no id)", #"{"id":1,"method":"Target.getTargetInfo"}"#)
     drop("Target.getTargets (synthesized, not forwarded)", #"{"id":1,"method":"Target.getTargets"}"#)
     drop("Target.setAutoAttach non-flatten", #"{"id":1,"method":"Target.setAutoAttach","params":{"flatten":false}}"#)
-    fwd("Target.setAutoAttach flatten", #"{"id":1,"method":"Target.setAutoAttach","params":{"flatten":true}}"#)
+    // Browser-level setAutoAttach(flatten) is INTERCEPTED, not forwarded: the relay
+    // self-attaches to our target + synthesizes attachedToTarget (H2), so a client
+    // can't change a sibling tile's auto-attach. Forwarding would be a cross-tile
+    // control leak — this is the per-tile isolation boundary, so it must return nil.
+    drop("Target.setAutoAttach flatten (self-attached + synthesized, not forwarded)",
+      #"{"id":1,"method":"Target.setAutoAttach","params":{"flatten":true}}"#)
 
     // ── C→R: page-scoped driving on OUR session is allowed; foreign session denied ──
     fwd("Page.navigate on our session", #"{"id":1,"method":"Page.navigate","sessionId":"SESS-A","params":{"url":"https://x"}}"#)
