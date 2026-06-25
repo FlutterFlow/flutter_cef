@@ -592,7 +592,8 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
 
   private func resize(_ a: [String: Any], _ result: @escaping FlutterResult) {
     if let id = a["sessionId"] as? String, let s = sessions[id] {
-      s.resize(width: a["width"] as? Int ?? 800, height: a["height"] as? Int ?? 600)
+      s.resize(width: a["width"] as? Int ?? 800, height: a["height"] as? Int ?? 600,
+               dpr: (a["dpr"] as? Double).map { CGFloat($0) } ?? 0)
       result(["textureId": s.textureId])
     } else {
       result(nil)

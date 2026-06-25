@@ -237,6 +237,16 @@ struct Slot {
   // DoSetVisible); `begin_frame_pump_started` guards a double-start. UI-thread only.
   bool visible = true;
   bool begin_frame_pump_started = false;
+  // Per-slot pump-tick + accelerated-paint counters, logged from PumpBeginFrame when
+  // FLUTTER_CEF_DEBUG is set — diagnostics for paint-stall investigation at scale.
+  uint64_t diag_pump_ticks = 0;
+  uint64_t diag_paint_count = 0;
+  // about:blank-first (FLUTTER_CEF_BLANK_FIRST): the real URL to navigate to AFTER the
+  // browser establishes on about:blank. Establishing on blank makes the first-frame GPU
+  // handshake near-instant (so the create-pacer releases its slot fast), decoupling
+  // establishment from the real page's load time. Navigated + cleared on first paint.
+  // UI-thread only.
+  std::string pending_nav_url;
 };
 
 // Routing map from a wire browser id to its Slot. MUTATED ONLY ON THE CEF UI
@@ -258,6 +268,7 @@ std::shared_ptr<Slot> LookupWireId(uint32_t wire_id) {
   return it == g_slots_by_wire_id.end() ? nullptr : it->second;
 }
 
+void SendLog(uint32_t browser_id, const std::string& msg);  // DIAG fwd decl (defined below)
 // External begin-frame pump. window_info.external_begin_frame_enabled (set in DoCreateBrowser)
 // turns OFF CEF's internal frame timer, so the GPU/Viz compositor produces a frame ONLY when we
 // call SendExternalBeginFrame — which, unlike Invalidate(), deterministically drives one frame
@@ -270,6 +281,12 @@ void PumpBeginFrame(uint32_t wire_id) {
   std::shared_ptr<Slot> slot = LookupWireId(wire_id);
   if (!slot || !slot->browser) return;  // disposed mid-flight — let the pump die
   if (slot->visible) slot->browser->GetHost()->SendExternalBeginFrame();
+  slot->diag_pump_ticks++;  // DIAG
+  if (std::getenv("FLUTTER_CEF_DEBUG") && slot->diag_pump_ticks % 120 == 0)
+    SendLog(wire_id, "diag wire=" + std::to_string(wire_id) +
+                         " pumpTicks=" + std::to_string(slot->diag_pump_ticks) +
+                         " paints=" + std::to_string(slot->diag_paint_count) +
+                         " visible=" + std::to_string(slot->visible ? 1 : 0));
   CefPostDelayedTask(TID_UI, base::BindOnce(&PumpBeginFrame, wire_id),
                      slot->visible ? 16 : 100);
 }
@@ -756,6 +773,16 @@ class HostRenderHandler : public CefRenderHandler {
   void OnAcceleratedPaint(CefRefPtr<CefBrowser>, PaintElementType type,
                           const RectList&,
                           const CefAcceleratedPaintInfo& info) override {
+    slot_->diag_paint_count++;  // DIAG
+    // about:blank-first: the browser has established (first paint on about:blank) — now
+    // navigate to the real URL. The establishment slot has already been released by this
+    // paint, so the real page loads WITHOUT holding a serial slot (concurrent with the
+    // other tiles' loads). Fires once (pending_nav_url cleared). UI thread.
+    if (!slot_->pending_nav_url.empty() && slot_->browser) {
+      std::string nav = slot_->pending_nav_url;
+      slot_->pending_nav_url.clear();
+      if (auto frame = slot_->browser->GetMainFrame()) frame->LoadURL(nav);
+    }
     IOSurfaceRef src =
         reinterpret_cast<IOSurfaceRef>(info.shared_texture_io_surface);
     if (!src) {
@@ -1153,6 +1180,19 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
   }
   void OnBeforeCommandLineProcessing(
       const CefString&, CefRefPtr<CefCommandLine> command_line) override {
+    // OSR establishment-latency: OSR views have no real OS window, so Chromium's scheduler
+    // treats every renderer as backgrounded/occluded and LOWERS its process priority during
+    // the critical first load — delaying the first frame of a tile that's actually visible
+    // in our canvas. Keeping the renderer at full priority ~halved time-to-first-paint for a
+    // 20-real-site board (measured), with no race/security change. Default ON; opt out with
+    // FLUTTER_CEF_KEEP_BG_THROTTLE for debugging. NOTE: we deliberately do NOT add
+    // --disable-background-timer-throttling — that would keep HIDDEN (off-screen, WasHidden)
+    // tiles' JS timers running hot, fighting the off-screen-is-cheap property; the priority
+    // flags below are what speed establishment without that cost.
+    if (!std::getenv("FLUTTER_CEF_KEEP_BG_THROTTLE")) {
+      command_line->AppendSwitch("disable-renderer-backgrounding");
+      command_line->AppendSwitch("disable-backgrounding-occluded-windows");
+    }
 #ifdef CEF_HOST_ADHOC
     // Dev / ad-hoc-only (CEF_HOST_ADHOC is ON by default; a signed release sets
     // -DCEF_HOST_ADHOC=OFF). Mock keychain + basic password store so a launch
@@ -1293,6 +1333,16 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr, uint32_t sid,
   window_info.external_begin_frame_enabled = true;
   CefBrowserSettings settings;
   settings.windowless_frame_rate = 60;
+  // about:blank-first: for a real http(s) URL, establish on about:blank (near-instant
+  // first frame → the pacer's establishment slot frees fast) and defer the real
+  // navigation to first paint. Skip for data:/file:/about: (already instant) and when the
+  // env flag is off.
+  std::string create_url = url;
+  if (std::getenv("FLUTTER_CEF_BLANK_FIRST") &&
+      (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0)) {
+    slot->pending_nav_url = url;
+    create_url = "about:blank";
+  }
   CefRefPtr<HostClient> client = new HostClient(slot);
   // H3: ASYNC create. CreateBrowserSync BLOCKS this (the single CEF UI) thread until
   // the renderer + GPU/Viz accelerated-surface handshake completes — so a burst of
@@ -1302,7 +1352,7 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr, uint32_t sid,
   // in HostClient::OnAfterCreated, which acks kOpCreated so the host's pacer sends the
   // NEXT create — serialized by COMPLETION, not a wall-clock guess.
   bool dispatched = CefBrowserHost::CreateBrowser(
-      window_info, client, url, settings, nullptr, nullptr);
+      window_info, client, create_url, settings, nullptr, nullptr);
   if (!dispatched) {
     // H7: the create couldn't even be dispatched — OnAfterCreated/OnBeforeClose will
     // never fire, so reclaim the slot + the looked-up IOSurface (+1 ref) here (else
@@ -1346,7 +1396,7 @@ void DoDisposeBrowser(uint32_t wire_id) {
 }
 
 void DoResize(const std::shared_ptr<Slot>& slot, int w, int h,
-              uint32_t surface_id) {
+              uint32_t surface_id, double dpr) {
   if (w < 1 || w > 16384 || h < 1 || h > 16384) {
     SendLog(slot->browser_id, "resize: out-of-range dims " + std::to_string(w) +
                                   "x" + std::to_string(h));
@@ -1358,17 +1408,28 @@ void DoResize(const std::shared_ptr<Slot>& slot, int w, int h,
             "resize: IOSurfaceLookup failed for id " + std::to_string(surface_id));
     return;
   }
+  // dpr <= 0 means "unchanged" (older/short wire frames). A new dpr (a canvas-zoom
+  // crispness re-render: same logical w/h, higher device-scale) makes GetScreenInfo
+  // report the new scale so CEF re-rasterizes the page at logical*dpr to fill the
+  // host's freshly-reallocated (bigger) IOSurface.
+  bool dpr_changed = false;
   {
     std::lock_guard<std::mutex> lock(slot->surface_mutex);
     if (slot->surface) CFRelease(slot->surface);
     slot->surface = next;  // owns the +1 from Lookup
     slot->width = w;
     slot->height = h;
+    if (dpr > 0.0 && dpr != slot->dpr) {
+      slot->dpr = dpr;
+      dpr_changed = true;
+    }
     [slot->dst_mtl release];  // stale: wrapped the old surface
     slot->dst_mtl = nil;
     slot->dst_mtl_sid = 0;
   }
   if (slot->browser) {
+    // A device-scale change needs the renderer told (screen info), not just a relayout.
+    if (dpr_changed) slot->browser->GetHost()->NotifyScreenInfoChanged();
     slot->browser->GetHost()->WasResized();
     // Drive a frame right now at the new size. With external begin-frame this is a guaranteed
     // tick (not a coalesce-able Invalidate request), so the re-laid-out content composites into
@@ -1828,7 +1889,10 @@ void IpcReadLoop() {
         int w = static_cast<int>(ReadU32BE(p));
         int h = static_cast<int>(ReadU32BE(p + 4));
         uint32_t sid = ReadU32BE(p + 8);
-        CefPostTask(TID_UI, base::BindOnce(&DoResize, slot, w, h, sid));
+        // Optional trailing f64 dpr (crispness re-render); 0 / absent = unchanged.
+        double dpr = (plen >= 20) ? ReadF64BE(p + 12) : 0.0;
+        if (dpr < 0.0 || dpr > 8.0) dpr = 0.0;  // guard a bad/forged dpr
+        CefPostTask(TID_UI, base::BindOnce(&DoResize, slot, w, h, sid, dpr));
         break;
       }
       case kOpNavigate: {

@@ -110,11 +110,20 @@ final class CefWebSession: NSObject, FlutterTexture {
   // CefProfileHost under its browsersLock (the reader flips it there) — a cheap per-frame
   // first-paint check that avoids a second lock on the hot paint path.
   var firstPresentSeen = false
+  // Count of present frames delivered (guarded by CefProfileHost.browsersLock, like
+  // firstPresentSeen). The create-pacer advances to the next browser only once this
+  // reaches a small threshold — i.e. the browser is STABLY producing, not just one
+  // first frame — so the next create's first-frame GPU allocation can't knock a barely-
+  // established browser back out.
+  var presentCount = 0
 
   private weak var registry: FlutterTextureRegistry?
   private var width: Int
   private var height: Int
-  private let dpr: CGFloat
+  // Device pixel ratio. Mutable: a canvas-zoom crispness re-render changes it (same logical
+  // w/h, higher density) so the surface reallocates at logical*dpr px. Guarded by bufferLock
+  // (read on the host reader thread via `scale`/createSnapshot).
+  private var dpr: CGFloat
 
   private var ioSurface: IOSurfaceRef?
   private var pixelBuffer: CVPixelBuffer?
@@ -135,6 +144,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   private var resizeInFlight = false
   private var pendingRequestedW = 0
   private var pendingRequestedH = 0
+  private var pendingRequestedDpr: CGFloat = 0  // 0 = no dpr change requested
   private var resizeSentAtNs: UInt64 = 0
   // Bumped on every sendResize. The resize watchdog captures it and bails if a newer resize
   // has since gone out — so during a smoothly-advancing drag the watchdog is a no-op, and it
@@ -148,12 +158,12 @@ final class CefWebSession: NSObject, FlutterTexture {
     bufferLock.lock(); defer { bufferLock.unlock() }
     return ioSurface.map { IOSurfaceGetID($0) } ?? 0
   }
-  // Geometry, exposed for the host's opCreateBrowser payload. width/height are
+  // Geometry, exposed for the host's opCreateBrowser payload. width/height/dpr are
   // mutated by resize() on the main thread and read by the host on its reader
-  // thread, so guard them with bufferLock (dpr is immutable, so scale needn't).
+  // thread, so guard them with bufferLock.
   var w: Int { bufferLock.lock(); defer { bufferLock.unlock() }; return width }
   var h: Int { bufferLock.lock(); defer { bufferLock.unlock() }; return height }
-  var scale: CGFloat { dpr }
+  var scale: CGFloat { bufferLock.lock(); defer { bufferLock.unlock() }; return dpr }
 
   init(sessionId: String, width: Int, height: Int, dpr: CGFloat,
        registry: FlutterTextureRegistry) {
@@ -163,7 +173,7 @@ final class CefWebSession: NSObject, FlutterTexture {
     self.dpr = dpr
     self.registry = registry
     super.init()
-    if let (surf, buffer) = makeBuffers(self.width, self.height) {
+    if let (surf, buffer) = makeBuffers(self.width, self.height, self.dpr) {
       publishBuffers(surf, buffer, self.width, self.height)
     }
     self.textureId = registry.register(self)
@@ -182,24 +192,36 @@ final class CefWebSession: NSObject, FlutterTexture {
 
   // MARK: FlutterTexture
 
+  private var diagCopyCount = 0  // DIAG
+  private var diagPresentCount = 0  // DIAG
   func copyPixelBuffer() -> Unmanaged<CVPixelBuffer>? {
     bufferLock.lock()
     defer { bufferLock.unlock() }
+    diagCopyCount += 1  // DIAG — logged BEFORE the nil guard so a nil-buffer session shows
+    if ProcessInfo.processInfo.environment["FLUTTER_CEF_DEBUG"] != nil
+      && diagCopyCount % 120 == 0 {
+      let liveSid = pixelBuffer.flatMap { CVPixelBufferGetIOSurface($0) }.map { IOSurfaceGetID($0.takeUnretainedValue()) } ?? 0
+      let latestSid = ioSurface.map { IOSurfaceGetID($0) } ?? 0
+      NSLog("[cefdiag] copy bid=\(browserId) tex=\(textureId) hasPB=\(pixelBuffer != nil) liveSurf=\(liveSid) latestSurf=\(latestSid) inFlight=\(resizeInFlight) pendSurf=\(pendingSurfaceId)")
+    }
     guard let pb = pixelBuffer else { return nil }
     return Unmanaged.passRetained(pb)
   }
 
   // MARK: Public control
 
-  func resize(width newW: Int, height newH: Int) {
+  func resize(width newW: Int, height newH: Int, dpr newDpr: CGFloat) {
     let w = max(1, newW), h = max(1, newH)
+    let d = newDpr > 0 ? newDpr : dpr  // 0/invalid keeps the current density
     bufferLock.lock()
-    // Always record the latest requested size; it's what maybeSendNextResize sends when the
-    // in-flight resize promotes.
+    // Always record the latest requested size+dpr; it's what maybeSendNextResize sends when
+    // the in-flight resize promotes.
     pendingRequestedW = w
     pendingRequestedH = h
+    pendingRequestedDpr = d
     let blocked = resizeInFlight
-    let same = (w == width && h == height)
+    // A dpr change (canvas-zoom crispness) needs a reallocation just like a size change.
+    let same = (w == width && h == height && d == dpr)
     bufferLock.unlock()
     // While a resize is still painting, just record the latest size (above). Its present sends
     // the next one (maybeSendNextResize); if cef_host drops that paint, the resizeWatchdog
@@ -208,18 +230,18 @@ final class CefWebSession: NSObject, FlutterTexture {
     // → froze mid-drag). NOTE: no inline timeout here — racing ahead on a slow/heavy page is
     // exactly what desynced the presents and left the page stuck; the watchdog handles wedges.
     if blocked || same { return }
-    sendResize(w, h)
+    sendResize(w, h, d)
   }
 
   /// Allocate the new surface, point cef_host at it, and send the resize — marking it
   /// in-flight so the next size waits for this one's present (see resize()/maybeSendNextResize).
   /// Only ever called on the main thread (resize / maybeSendNextResize), so sendFrame stays
   /// serialized.
-  private func sendResize(_ w: Int, _ h: Int) {
-    // Create the new surface OUTSIDE the lock (expensive). H4: publish surface id + new
-    // dims ATOMICALLY in one bufferLock section so a concurrent host read (createSnapshot
-    // on the reader thread) can't see new dims with the old surface id.
-    guard let (surf, buffer) = makeBuffers(w, h) else { return }
+  private func sendResize(_ w: Int, _ h: Int, _ d: CGFloat) {
+    // Create the new surface OUTSIDE the lock (expensive) at the requested density. H4:
+    // publish surface id + new dims ATOMICALLY in one bufferLock section so a concurrent
+    // host read (createSnapshot on the reader thread) can't see new dims with the old id.
+    guard let (surf, buffer) = makeBuffers(w, h, d) else { return }
     let sid = IOSurfaceGetID(surf)
     guard sid != 0 else { return }
     // Resize-flash fix: point the host at the NEW surface (ioSurface drives surfaceId /
@@ -233,6 +255,7 @@ final class CefWebSession: NSObject, FlutterTexture {
     pendingSurfaceId = sid
     width = w
     height = h
+    dpr = d
     resizeInFlight = true
     resizeSentAtNs = nowNs()
     resizeGen &+= 1
@@ -242,6 +265,7 @@ final class CefWebSession: NSObject, FlutterTexture {
     appendU32(&payload, UInt32(w))
     appendU32(&payload, UInt32(h))
     appendU32(&payload, sid)
+    appendF64(&payload, Double(d))  // cef_host updates slot->dpr → re-renders at new density
     sendFrame(Self.opResize, payload)
     // Re-kick this resize if its present never lands (see resizeWatchdog). During a smoothly
     // advancing drag gen keeps moving and this no-ops; it only bites a genuine wedge.
@@ -290,9 +314,10 @@ final class CefWebSession: NSObject, FlutterTexture {
   private func maybeSendNextResize() {
     bufferLock.lock()
     let w = pendingRequestedW, h = pendingRequestedH
-    let need = !resizeInFlight && w > 0 && (w != width || h != height)
+    let d = pendingRequestedDpr > 0 ? pendingRequestedDpr : dpr
+    let need = !resizeInFlight && w > 0 && (w != width || h != height || d != dpr)
     bufferLock.unlock()
-    if need { sendResize(w, h) }
+    if need { sendResize(w, h, d) }
   }
 
   private func nowNs() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
@@ -443,13 +468,18 @@ final class CefWebSession: NSObject, FlutterTexture {
   /// H4: CREATE an IOSurface + CVPixelBuffer for (w,h) but do NOT publish them — the
   /// caller publishes surface + geometry atomically via publishBuffers so a concurrent
   /// createSnapshot()/copyPixelBuffer never sees a surface and dims out of sync.
-  private func makeBuffers(_ w: Int, _ h: Int) -> (IOSurfaceRef, CVPixelBuffer)? {
+  private func makeBuffers(_ w: Int, _ h: Int, _ scale: CGFloat) -> (IOSurfaceRef, CVPixelBuffer)? {
     // Allocate at PHYSICAL (Retina) resolution = logical * dpr, so the texture
     // is crisp on HiDPI displays; cef_host renders the OSR buffer at the same
     // scale (via GetScreenInfo.device_scale_factor). 64-byte-aligned stride keeps
-    // the IOSurface Metal/CVPixelBuffer-compatible.
-    let pw = max(1, Int((Double(w) * Double(dpr)).rounded()))
-    let ph = max(1, Int((Double(h) * Double(dpr)).rounded()))
+    // the IOSurface Metal/CVPixelBuffer-compatible. `scale` is passed (not read from
+    // self.dpr) so a resize that changes dpr allocates at the NEW density. Clamp to the
+    // same ceiling cef_host enforces (dpr<=8): the shipped widget already clamps, but the
+    // public CefWebController.resize(dpr:) does not, and an unclamped dpr is an O(dpr^2)
+    // allocation AND would desync the host scale (host caps at 8, surface wouldn't).
+    let s = min(max(Double(scale), 0.5), 8.0)
+    let pw = max(1, Int((Double(w) * s).rounded()))
+    let ph = max(1, Int((Double(h) * s).rounded()))
     let bytesPerRow = ((pw * 4) + 63) & ~63
     let props: [CFString: Any] = [
       kIOSurfaceWidth: pw,
@@ -530,6 +560,11 @@ final class CefWebSession: NSObject, FlutterTexture {
       }
       let tid = textureId
       bufferLock.unlock()
+      diagPresentCount += 1  // DIAG
+      if ProcessInfo.processInfo.environment["FLUTTER_CEF_DEBUG"] != nil
+        && diagPresentCount % 120 == 0 {
+        NSLog("[cefdiag] present bid=\(browserId) tex=\(tid) count=\(diagPresentCount)")
+      }
       if tid != 0 {
         DispatchQueue.main.async { [weak self] in
           // Re-read on main (serialized with dispose()): the texture may have

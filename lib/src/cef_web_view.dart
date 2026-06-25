@@ -55,6 +55,7 @@ class CefWebView extends StatefulWidget {
     this.enableCdp = false,
     this.agentControl = false,
     this.profile,
+    this.renderScale,
   }) : assert(!(enableCdp && !agentControl && profile != null && profile != ''),
             'enableCdp cannot be combined with a named profile: CDP-over-TCP '
             'exposes an unauthenticated localhost port that could read the '
@@ -121,6 +122,19 @@ class CefWebView extends StatefulWidget {
   /// [enableCdp] (open port), but compatible with [agentControl] (private pipe).
   final String? profile;
 
+  /// Device-pixel-ratio the page renders at, overriding the screen dpr from
+  /// [MediaQuery]. Set this for crispness when the view is visually SCALED by an
+  /// ancestor transform rather than relaid out — e.g. an infinite-canvas zoom that
+  /// applies `Transform.scale`: the widget's logical size is unchanged, so without
+  /// this the OSR buffer stays at 1×-zoom resolution and the transform upscales it
+  /// (blurry). Pass `screenDpr × zoom` to render at the on-screen pixel density.
+  ///
+  /// The OSR buffer is `logicalSize × renderScale` pixels, so cost/memory grow with
+  /// the square — the consumer should clamp it (and quantize/debounce zoom so it
+  /// doesn't re-render every frame of a pinch). The native side guards `dpr ≤ 8`.
+  /// Null (default) uses `MediaQuery.devicePixelRatio`.
+  final double? renderScale;
+
   @override
   State<CefWebView> createState() => _CefWebViewState();
 }
@@ -133,6 +147,7 @@ class _CefWebViewState extends State<CefWebView>
   FocusNode? _ownFocusNode;
   int? _textureId;
   Size? _lastSize;
+  double? _lastDpr;
   bool _creating = false;
 
   // ── IME / text input ─────────────────────────────────────────────
@@ -207,7 +222,11 @@ class _CefWebViewState extends State<CefWebView>
     // controller so we don't read a deactivated MediaQuery or resize a
     // torn-down session.
     if (!mounted) return;
-    final dpr = MediaQuery.maybeOf(context)?.devicePixelRatio ?? 1.0;
+    // Effective render dpr: an explicit [renderScale] (e.g. screenDpr × canvas zoom,
+    // for crispness when an ancestor transform scales the view) overrides the screen
+    // dpr from MediaQuery. Clamped to the native guard range (dpr ≤ 8).
+    final dpr = (widget.renderScale ?? MediaQuery.maybeOf(context)?.devicePixelRatio ?? 1.0)
+        .clamp(0.5, 8.0);
     final w = size.width.round();
     final h = size.height.round();
     if (w <= 0 || h <= 0) return;
@@ -233,11 +252,13 @@ class _CefWebViewState extends State<CefWebView>
       }
       return;
     }
-    if (_textureId != null && _lastSize != size) {
+    if (_textureId != null && (_lastSize != size || _lastDpr != dpr)) {
       _lastSize = size;
-      // Resize on every layout change. The native session (CefWebSession) flow-controls the
-      // sends to cef_host's paint rate — it keeps one resize in flight and coalesces to the
-      // latest size — so the page reflows live during the drag without us pacing here.
+      _lastDpr = dpr;
+      // Resize on every layout OR dpr change (the latter = a zoom that re-renders the page
+      // at a higher pixel density for crispness). The native session (CefWebSession)
+      // flow-controls the sends to cef_host's paint rate — it keeps one resize in flight and
+      // coalesces to the latest — so the page reflows/re-rasterizes live without us pacing.
       _controller.resize(w, h, dpr: dpr);
     }
   }
