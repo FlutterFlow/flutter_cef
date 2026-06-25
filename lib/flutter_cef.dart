@@ -13,6 +13,7 @@ export 'package:flutter_cef_platform_interface/flutter_cef_platform_interface.da
         CefConsoleMessage,
         CefFindResult,
         CefJsDialogRequest,
-        CefLoadError;
+        CefLoadError,
+        CefSurfaceInfo;
 export 'src/cef_web_controller.dart' show CefWebController;
 export 'src/cef_web_view.dart' show CefWebView;

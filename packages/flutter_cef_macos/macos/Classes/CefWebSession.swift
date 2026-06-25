@@ -269,9 +269,14 @@ final class CefWebSession: NSObject, FlutterTexture {
     let active = resizeInFlight && gen == resizeGen
     let givenUp = active && (nowNs() &- resizeSentAtNs) > 300_000_000
     var promotedTid: Int64 = 0
+    var promotedSid: UInt32 = 0
+    var promotedW = 0, promotedH = 0
     if givenUp {
       if let pending = pendingBuffer {
         pixelBuffer = pending
+        promotedSid = pendingSurfaceId  // capture before clearing
+        promotedW = width
+        promotedH = height
         pendingBuffer = nil
         pendingSurfaceId = 0
         promotedTid = textureId
@@ -281,6 +286,8 @@ final class CefWebSession: NSObject, FlutterTexture {
     bufferLock.unlock()
     if givenUp {
       if promotedTid != 0 { registry?.textureFrameAvailable(promotedTid) }
+      // R2: force-promoted a resized surface — notify WebRTC consumers (same as opPresent).
+      if promotedSid != 0 { notifySurface(promotedSid, promotedW, promotedH) }
       maybeSendNextResize()
       return
     }
@@ -500,13 +507,29 @@ final class CefWebSession: NSObject, FlutterTexture {
     height = h
     let sid = IOSurfaceGetID(surf)
     bufferLock.unlock()
-    // WebRTC frame export: notify any consumer that the surface (re)allocated —
-    // fires on init + each resize, both of which publish here. Outside
-    // bufferLock so the callback can read session accessors without
-    // self-deadlock. Physical (Retina) dims = logical * dpr.
-    onSurface?(sid, Int((Double(w) * Double(dpr)).rounded()),
-               Int((Double(h) * Double(dpr)).rounded()))
+    notifySurface(sid, w, h)
     return sid
+  }
+
+  /// WebRTC frame export: notify any consumer that the live surface (re)allocated, so it
+  /// can IOSurfaceLookup the new id and re-point its capture (R2). Call OUTSIDE bufferLock
+  /// so the callback can read session accessors without self-deadlock. Reports PHYSICAL
+  /// (Retina) pixel dims = logical * dpr.
+  private func notifySurface(_ sid: UInt32, _ logicalW: Int, _ logicalH: Int) {
+    guard sid != 0 else { return }
+    onSurface?(sid, Int((Double(logicalW) * Double(dpr)).rounded()),
+               Int((Double(logicalH) * Double(dpr)).rounded()))
+  }
+
+  /// Re-emit the current live surface to a just-attached onSurface consumer. The init
+  /// publish fires before the plugin wires onSurface, so the plugin calls this right
+  /// after assigning the callback to deliver the initial surface.
+  func emitCurrentSurface() {
+    bufferLock.lock()
+    let surf = ioSurface
+    let w = width, h = height
+    bufferLock.unlock()
+    if let surf = surf { notifySurface(IOSurfaceGetID(surf), w, h) }
   }
 
   /// H4: read (w, h, dpr, surfaceId) as ONE consistent tuple under a single bufferLock
@@ -532,6 +555,8 @@ final class CefWebSession: NSObject, FlutterTexture {
       // (BE u32). If it's our pending (resized) surface, promote it to live now — we
       // kept serving the old surface until this exact frame so Flutter never sampled the
       // blank new one. A present for the old/current surface just advances the frame.
+      var promotedSid: UInt32 = 0
+      var promotedW = 0, promotedH = 0
       if payload.count >= 4 {
         let psid = (UInt32(payload[0]) << 24) | (UInt32(payload[1]) << 16)
           | (UInt32(payload[2]) << 8) | UInt32(payload[3])
@@ -540,10 +565,16 @@ final class CefWebSession: NSObject, FlutterTexture {
           pendingBuffer = nil
           pendingSurfaceId = 0
           resizeInFlight = false  // its paint landed; free to send the next size
+          promotedSid = psid
+          promotedW = width
+          promotedH = height
         }
       }
       let tid = textureId
       bufferLock.unlock()
+      // R2: a resized surface just went live — tell WebRTC consumers to re-point their
+      // IOSurface capture at the new id (this is the "fires on each resize" half).
+      if promotedSid != 0 { notifySurface(promotedSid, promotedW, promotedH) }
       if tid != 0 {
         DispatchQueue.main.async { [weak self] in
           // Re-read on main (serialized with dispose()): the texture may have

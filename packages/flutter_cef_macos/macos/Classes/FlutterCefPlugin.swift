@@ -410,6 +410,9 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
         "width": width, "height": height,
       ])
     }
+    // The session's init publish fired onSurface before the callback above existed, so
+    // deliver the current surface now (no-op until the first surface is allocated).
+    session.emitCurrentSurface()
     // Allocate the wire browserId + (when ready) issue opCreateBrowser. The
     // process arg --allowed-schemes is shared by every browser in the profile;
     // it's taken from the first browser that triggered the spawn.
