@@ -128,17 +128,37 @@ final class CefProfileHost {
   private var createEnqueued: Set<UInt32> = []  // browserIds whose create has been sent
 
   // Per-host create pacing (guarded by writeLock). A BURST of opCreateBrowser frames
-  // would otherwise make cef_host run a pile of browser creates concurrently, contending
-  // the one shared GPU/Viz accelerated-surface handshake so later browsers get NO surface
-  // and never paint. So we send creates ONE AT A TIME and advance only when cef_host acks
-  // the create (H3: opCreated, off OnAfterCreated) — serialized by COMPLETION, not a
-  // wall-clock guess. `createAckTimeout` is a backstop so a create that never acks (a
-  // wedged renderer) can't stall the queue forever. `createInFlight` is the browserId we
-  // are currently awaiting the ack for.
+  // would otherwise make cef_host run a pile of browser creates concurrently, each doing
+  // its first-frame GPU shared-image allocation against the one shared GPU/Viz process at
+  // the same instant — that allocation RACES and the losers silently Stop() (permanent
+  // blank tile). PROVEN: 12 animated tiles created concurrently → ~9/12 paint; created
+  // ONE AT A TIME → 12/12 (and all 12 then animate at 60fps — steady state is fine, only
+  // concurrent ESTABLISHMENT was the problem). So we admit creates through a SLIDING
+  // WINDOW: at most `maxCreateInFlight` browsers may be establishing (awaiting first paint)
+  // at once, and we gate each slot's release on that browser's FIRST PAINT
+  // (firstPresentArrived), NOT the bind ack (opCreated). Window=1 is strict serial. A
+  // window of K is materially safer than "K all-at-once": only the K still-establishing
+  // browsers contend the first-frame allocator (established ones just blit from an existing
+  // surface), and the K creates stagger by create+first-paint latency rather than firing
+  // simultaneously. `createAckTimeout` is the per-browser paint backstop so a
+  // bound-but-never-painting browser can't hold its slot forever. `createInFlight` is the
+  // set of browserIds currently occupying an establishment slot.
   private var createSendQueue: [(id: UInt32, session: CefWebSession, url: String)] = []
-  private var createPacerRunning = false
-  private var createInFlight: UInt32?
-  private let createAckTimeout: TimeInterval = 8
+  private var createInFlight: Set<UInt32> = []
+  private let maxCreateInFlight: Int = {
+    if let s = ProcessInfo.processInfo.environment["FLUTTER_CEF_ESTAB_WINDOW"],
+       let n = Int(s), n > 0 { return n }
+    return 3  // K=3: ~3x faster cascade than strict serial on BOTH median and last-tile
+              // first-paint for real-site boards (measured: median 36→10s, last 41→21s,
+              // 20 real sites). The rare all-animation-burst knock-out is caught by the
+              // watchdog→recreate (never blank). See specs/osr-many-views.md.
+  }()
+  private let createAckTimeout: TimeInterval = {
+    if let s = ProcessInfo.processInfo.environment["FLUTTER_CEF_CREATE_TIMEOUT_MS"],
+       let ms = Double(s) { return ms / 1000.0 }
+    return 8  // backstop for a browser that binds but never first-paints; generous so a
+              // heavy real site that's slow to composite isn't de-serialized prematurely.
+  }()
 
   // C1 first-present watchdog (guarded by presentLock). browserIds awaiting their FIRST
   // opPresent: if none arrives within the deadline we re-kick via opInvalidate, then (if
@@ -151,6 +171,12 @@ final class CefProfileHost {
   // the watchdog must NOT treat that as a stall (work_canvas creates tiles already
   // off-screen as a normal lazy-spawn pattern). Guarded by presentLock.
   private var hiddenBrowsers: Set<UInt32> = []
+  // At most one live checkFirstPresent chain per browserId. The watchdog re-arms itself
+  // (repeating paintStalled signal) and noteVisibility re-arms on unhide, so without this
+  // a hide/show flap of a still-blank tile would accumulate parallel chains (each one
+  // re-kicking + logging + emitting paintStalled every firstPaintGrace forever). Guarded
+  // by presentLock; cleared when a chain terminates (paint / hidden / dead / dispose).
+  private var watchdogArmed: Set<UInt32> = []
 
   // Invoked (off the reader thread) when an ad-hoc host refuses to load a named
   // profile (no creds were written — see F.5). The plugin tears this host down
@@ -520,43 +546,50 @@ final class CefProfileHost {
     pumpCreateQueue()
   }
 
-  /// Send the NEXT queued create and wait for cef_host to ack it (opCreated) before
-  /// sending the following one (H3) — so browsers create one-at-a-time and each one's
-  /// render + accelerated-surface handshake completes before the next contends the shared
-  /// GPU/Viz process. `createAckTimeout` backstops a create that never acks (wedged
-  /// renderer). A create whose browser was disposed while queued is skipped.
+  /// Send the NEXT queued create and wait for that browser's FIRST PAINT (firstPresentArrived,
+  /// off opPresent) before sending the following one — so each browser's first-frame GPU
+  /// allocation completes before the next one contends, serializing establishment and
+  /// avoiding the concurrent-first-frame race. `createAckTimeout` backstops a browser that
+  /// binds but never paints so it can't stall the queue forever. A create whose browser was
+  /// disposed while queued is skipped.
   private func pumpCreateQueue() {
-    writeLock.lock()
-    // H6: never pump on a dead/dying host — the queue was abandoned in
-    // shutdown()/handleHostDeath(); pumping would sendCreate into a closed pipe and a
-    // stuck `createPacerRunning` could wedge a reused host.
-    if !running || crashed || createPacerRunning || createSendQueue.isEmpty {
+    // Fill the sliding window: dispatch creates while a slot is free. Each dispatched
+    // browser holds its slot until its first paint (or backstop) releases it via
+    // advanceCreatePacer, which re-pumps.
+    while true {
+      writeLock.lock()
+      // H6: never pump on a dead/dying host — the queue was abandoned in
+      // shutdown()/handleHostDeath(); pumping would sendCreate into a closed pipe and a
+      // stuck slot could wedge a reused host.
+      if !running || crashed || createInFlight.count >= maxCreateInFlight ||
+          createSendQueue.isEmpty {
+        writeLock.unlock()
+        return
+      }
+      let next = createSendQueue.removeFirst()
+      createInFlight.insert(next.id)
       writeLock.unlock()
-      return
-    }
-    createPacerRunning = true
-    let next = createSendQueue.removeFirst()
-    createInFlight = next.id
-    writeLock.unlock()
 
-    browsersLock.lock()
-    let stillLive = browsers[next.id] != nil
-    browsersLock.unlock()
-    guard stillLive else {
-      // Disposed while queued — drop it and advance. M1: trampoline rather than
-      // recurse synchronously (a "close all tiles" mid-burst could skip many disposed
-      // creates and blow the stack).
-      writeLock.lock(); createPacerRunning = false; createInFlight = nil; writeLock.unlock()
-      DispatchQueue.global().async { [weak self] in self?.pumpCreateQueue() }
-      return
-    }
+      browsersLock.lock()
+      let stillLive = browsers[next.id] != nil
+      browsersLock.unlock()
+      guard stillLive else {
+        // Disposed while queued — free the slot and continue filling (no recursion;
+        // a "close all tiles" mid-burst could skip many disposed creates).
+        writeLock.lock(); createInFlight.remove(next.id); writeLock.unlock()
+        continue
+      }
 
-    sendCreate(next.id, next.session, next.url)
-    armFirstPresentWatchdog(next.id)  // C1
-    // H3: advance on the create ack (opCreated, via advanceCreatePacer in the reader);
-    // this timer is only the backstop if that ack never comes.
-    DispatchQueue.global().asyncAfter(deadline: .now() + createAckTimeout) { [weak self] in
-      self?.advanceCreatePacer(after: next.id, timedOut: true)
+      // Arm the watchdog (insert into firstPresentPending) BEFORE sendCreate so a first
+      // opPresent can never be observed before the id is registered as pending (which would
+      // leave a healthy painting tile stuck "pending" → false perpetual paintStalled).
+      armFirstPresentWatchdog(next.id)  // C1
+      sendCreate(next.id, next.session, next.url)
+      // Release this slot on the browser's FIRST PAINT (firstPresentArrived, in the
+      // reader); this timer is only the backstop if it binds but never paints in time.
+      DispatchQueue.global().asyncAfter(deadline: .now() + createAckTimeout) { [weak self] in
+        self?.advanceCreatePacer(after: next.id, timedOut: true)
+      }
     }
   }
 
@@ -565,16 +598,15 @@ final class CefProfileHost {
   /// Idempotent: only the FIRST of {ack, timeout} for the current in-flight id advances.
   private func advanceCreatePacer(after browserId: UInt32, timedOut: Bool) {
     writeLock.lock()
-    guard createInFlight == browserId else { writeLock.unlock(); return }
-    createInFlight = nil
-    createPacerRunning = false
+    // Idempotent: only the FIRST of {first-paint, timeout} for this id frees its slot.
+    guard createInFlight.remove(browserId) != nil else { writeLock.unlock(); return }
     writeLock.unlock()
     if timedOut {
-      NSLog("[cef] profile '\(profileId)': create-ack timeout for browser \(browserId) — advancing pacer")
+      NSLog("[cef] profile '\(profileId)': create-ack timeout for browser \(browserId) — freeing establishment slot")
     }
-    // Dispatch the next create OFF the reader thread (advanceCreatePacer is called from
-    // it on opCreated): pumpCreateQueue -> sendCreate writes to the same pipe the reader
-    // reads, and the reader must never block on a write.
+    // Refill the freed slot OFF the reader thread (advanceCreatePacer is called from it on
+    // first paint): pumpCreateQueue -> sendCreate writes to the same pipe the reader reads,
+    // and the reader must never block on a write.
     DispatchQueue.global().async { [weak self] in self?.pumpCreateQueue() }
   }
 
@@ -588,20 +620,64 @@ final class CefProfileHost {
 
   // MARK: C1 first-present watchdog
 
-  /// Arm the first-present watchdog for a freshly-sent create. If no opPresent arrives
-  /// within ~3s we re-kick a repaint (opInvalidate); if still blank ~4s later we surface
-  /// paintStalled so the consumer can recover (recreate) instead of a silent blank tile.
+  /// Total grace for a browser to deliver its FIRST frame before the watchdog declares it
+  /// stalled (→ consumer recreates). Cancelled the instant ANY frame arrives, so this only
+  /// bounds the GENUINELY-blank case — it does NOT slow content that paints quickly.
+  /// Must be generous: a heavy real site (WebGL, 3D, huge bundle) can take several seconds
+  /// to composite its first frame, and recreating it just restarts that heavy load (churn).
+  /// Env-tunable.
+  private let firstPaintGrace: TimeInterval = {
+    if let s = ProcessInfo.processInfo.environment["FLUTTER_CEF_FIRSTPAINT_MS"],
+       let ms = Double(s) { return ms / 1000.0 }
+    return 10.0
+  }()
+
+  /// Arm the first-present watchdog for a freshly-sent create: after `firstPaintGrace`
+  /// with no frame at all, run a liveness check.
   private func armFirstPresentWatchdog(_ browserId: UInt32) {
-    presentLock.lock(); firstPresentPending.insert(browserId); presentLock.unlock()
-    DispatchQueue.global().asyncAfter(deadline: .now() + 3) { [weak self] in
-      self?.checkFirstPresent(browserId, phase: 1)
+    presentLock.lock()
+    firstPresentPending.insert(browserId)
+    let already = watchdogArmed.contains(browserId)
+    if !already { watchdogArmed.insert(browserId) }
+    presentLock.unlock()
+    guard !already else { return }  // a chain is already live for this id
+    DispatchQueue.global().asyncAfter(deadline: .now() + firstPaintGrace) { [weak self] in
+      self?.checkFirstPresent(browserId)
     }
   }
 
-  /// Reader: a browser painted its first frame — cancel its watchdog.
+  /// Reader: a browser painted its first frame — cancel its watchdog. (Advancing the
+  /// create pacer is NOT done here: the pacer advances on a SETTLE delay after first
+  /// paint — see the reader — because a 1-frame-old browser isn't stably established yet
+  /// and would be knocked out by the next create's contention.)
   private func firstPresentArrived(_ browserId: UInt32) {
-    presentLock.lock(); firstPresentPending.remove(browserId); presentLock.unlock()
+    presentLock.lock()
+    firstPresentPending.remove(browserId)
+    watchdogArmed.remove(browserId)  // the chain ends; an unhide may re-arm a fresh one
+    presentLock.unlock()
   }
+
+  /// How many present frames a browser must deliver before the pacer admits the next
+  /// create. Gating on the bare first frame advances too eagerly — a 1-frame-old browser
+  /// gets knocked back out by the next create's first-frame GPU allocation (paints 1-2
+  /// frames then stops). Requiring a few consecutive frames proves it's stably producing
+  /// before the next contends. Adaptive + fast: a healthy 60fps tile trips this in a few
+  /// frames (~tens of ms) vs a fixed time settle. Env-tunable.
+  private let estabStableFrames: Int = {
+    if let s = ProcessInfo.processInfo.environment["FLUTTER_CEF_ESTAB_FRAMES"],
+       let n = Int(s), n > 0 { return n }
+    return 6
+  }()
+  /// Settle window after a browser's FIRST paint as the OTHER pacer-advance trigger (the
+  /// pacer advances on stable-frames OR this settle, whichever comes first). The frame
+  /// threshold is the fast path for continuously-animating content (hits it in ~tens of
+  /// ms); the settle is the path for STATIC content that paints a short burst on load then
+  /// idles (a real website) and would never reach the frame threshold. Env-tunable.
+  private let estabSettle: TimeInterval = {
+    if let s = ProcessInfo.processInfo.environment["FLUTTER_CEF_ESTAB_SETTLE_MS"],
+       let ms = Double(s) { return ms / 1000.0 }
+    return 0.4
+  }()
 
   /// C1: track WasHidden state (peeked from opSetVisible). A hidden browser produces no
   /// frames, so the watchdog suspends rather than flagging it stalled. On UNHIDE, re-arm
@@ -612,40 +688,59 @@ final class CefProfileHost {
     if !visible {
       hiddenBrowsers.insert(browserId)
       presentLock.unlock()
+      // A browser hidden BEFORE its first paint produces no frames (PumpBeginFrame gates
+      // on slot->visible), so it would never advance the create-pacer via first-paint and
+      // the watchdog suspends it too — pinning its establishment slot until the backstop.
+      // A hidden tile isn't contending the first-frame GPU allocator, so it must not count
+      // against the window: free its slot now (idempotent no-op if it already painted /
+      // wasn't in flight). This is the dominant case — work_canvas creates tiles off-screen.
+      advanceCreatePacer(after: browserId, timedOut: false)
       return
     }
     hiddenBrowsers.remove(browserId)
-    let reArm = firstPresentPending.contains(browserId)
+    // Re-arm only if still blank AND no chain is already live (dedup across flapping).
+    let reArm = firstPresentPending.contains(browserId) && !watchdogArmed.contains(browserId)
+    if reArm { watchdogArmed.insert(browserId) }
     presentLock.unlock()
     guard reArm else { return }
-    DispatchQueue.global().asyncAfter(deadline: .now() + 3) { [weak self] in
-      self?.checkFirstPresent(browserId, phase: 1)
+    DispatchQueue.global().asyncAfter(deadline: .now() + firstPaintGrace) { [weak self] in
+      self?.checkFirstPresent(browserId)
     }
   }
 
-  private func checkFirstPresent(_ browserId: UInt32, phase: Int) {
+  /// Liveness check for a browser that hasn't produced its first frame within the grace.
+  /// PATIENCE, not destruction: the create-pacer serializes establishment so a blank tile
+  /// is almost always merely SLOW (heavy page, saturated GPU), not dead — and the
+  /// begin-frame pump keeps running, so it paints on its own once resources free. So we:
+  ///   1) advance the pacer ONCE (a slow tile must not block the rest of the queue), then
+  ///   2) send a cheap re-kick and REPORT paintStalled — a REPEATING signal (re-armed each
+  ///      grace while still blank) so the consumer owns recovery policy (e.g. a bounded,
+  ///      backed-off recreate) without this layer ever churning a still-loading page.
+  /// `firstPresentArrived` (real first frame) removes it from the pending set, ending the
+  /// loop. Suspended (not retired) while hidden; re-armed on unhide.
+  private func checkFirstPresent(_ browserId: UInt32) {
     presentLock.lock()
     let stillBlank = firstPresentPending.contains(browserId)
     let hidden = hiddenBrowsers.contains(browserId)
-    // Don't retire the watch while hidden — a hidden browser is suspended, not stalled;
-    // noteVisibility re-arms it on unhide if still blank.
-    if stillBlank && !hidden && phase >= 2 { firstPresentPending.remove(browserId) }
+    // This chain terminates on paint or hide (re-armed fresh on unhide); release the
+    // single-instance flag so a later unhide can start one new chain. The continuing
+    // (still-blank, visible) path below keeps it armed by NOT clearing here.
+    if !stillBlank || hidden { watchdogArmed.remove(browserId) }
     presentLock.unlock()
     guard stillBlank else { return }  // it painted — nothing to do
     guard !hidden else { return }     // hidden by design — suspended; re-armed on unhide
-    // Only act while the browser is still live + the host healthy.
     browsersLock.lock(); let live = browsers[browserId] != nil; browsersLock.unlock()
     writeLock.lock(); let healthy = running && !crashed; writeLock.unlock()
     guard live, healthy else { firstPresentArrived(browserId); return }
-    if phase == 1 {
-      NSLog("[cef] profile '\(profileId)': browser \(browserId) hasn't painted — re-kicking (opInvalidate)")
-      send(browserId, Self.opInvalidate, [])
-      DispatchQueue.global().asyncAfter(deadline: .now() + 4) { [weak self] in
-        self?.checkFirstPresent(browserId, phase: 2)
-      }
-    } else {
-      NSLog("[cef] profile '\(profileId)': browser \(browserId) never painted — surfacing paintStalled")
-      onPaintStalled?(browserId)
+    // Unblock the queue once (idempotent: only the in-flight id advances).
+    advanceCreatePacer(after: browserId, timedOut: false)
+    // Cheap nudge (harmless if it's just slow; helps a merely-dropped first frame).
+    send(browserId, Self.opInvalidate, [])
+    NSLog("[cef] profile '\(profileId)': browser \(browserId) still blank after \(Int(firstPaintGrace))s — reporting paintStalled (consumer may recreate)")
+    onPaintStalled?(browserId)
+    // Re-arm: keep watching on a backoff until it paints (firstPresentArrived clears it).
+    DispatchQueue.global().asyncAfter(deadline: .now() + firstPaintGrace) { [weak self] in
+      self?.checkFirstPresent(browserId)
     }
   }
 
@@ -715,7 +810,14 @@ final class CefProfileHost {
     presentLock.lock()
     firstPresentPending.remove(browserId)
     hiddenBrowsers.remove(browserId)
+    watchdogArmed.remove(browserId)
     presentLock.unlock()
+    // Free any create-pacer establishment slot this browser still held (disposed before
+    // first paint) and re-fill the window — otherwise the slot stays pinned until the 8s
+    // backstop, throttling new creates on this host. Idempotent (no-op if not in flight);
+    // takes writeLock + re-pumps off-thread, so it must be OUTSIDE all locks here. Mirrors
+    // the createInFlight.removeAll() that shutdown()/handleHostDeath() already do.
+    advanceCreatePacer(after: browserId, timedOut: false)
     return remaining
   }
 
@@ -738,8 +840,7 @@ final class CefProfileHost {
     // queued-never-sent sessions don't linger. The browsers map still holds them, so
     // disposeSession/onHostDied path cleans them up.
     createSendQueue.removeAll()
-    createPacerRunning = false
-    createInFlight = nil
+    createInFlight.removeAll()
     writeLock.unlock()
     // CEF-2a/b: drop ALL relays (each a listener + any client) before tearing down
     // the pipe, so none keeps bridging into a closing fd. Snapshot under the lock,
@@ -948,7 +1049,11 @@ final class CefProfileHost {
         // not the session.
         handleTargetId(bid, String(bytes: payload, encoding: .utf8))
       } else if op == Self.opCreated {
-        advanceCreatePacer(after: bid, timedOut: false)  // H3: create acked → send the next
+        // Bind ack only — intentionally does NOT advance the pacer anymore. We gate the
+        // next create on this browser's first PAINT (firstPresentArrived), not its bind,
+        // so establishment is serialized. opCreateFailed / the paint-timeout backstop
+        // still advance for the bound-but-never-painted / failed cases. (No-op here.)
+        _ = bid
       } else if op == Self.opCreateFailed {
         handleCreateFailed(bid)  // H7
       } else {
@@ -957,10 +1062,32 @@ final class CefProfileHost {
         // C1: detect the FIRST present under the browsersLock we already hold, via a
         // per-session flag, so the watchdog-cancel (presentLock) fires once per browser
         // instead of acquiring a second lock on every (up to 60fps) present frame.
-        let firstPaint = op == Self.opPresent && session != nil && !session!.firstPresentSeen
-        if firstPaint { session!.firstPresentSeen = true }
+        var firstPaint = false
+        var reachedStableFrames = false
+        if op == Self.opPresent, let s = session {
+          s.presentCount += 1
+          if s.presentCount == 1 { s.firstPresentSeen = true; firstPaint = true }
+          if s.presentCount == estabStableFrames { reachedStableFrames = true }
+        }
         browsersLock.unlock()
-        if firstPaint { firstPresentArrived(bid) }  // cancel the watchdog (once)
+        if firstPaint {
+          if ProcessInfo.processInfo.environment["FLUTTER_CEF_DEBUG"] != nil {
+            NSLog("[cef] FIRSTPAINT browser \(bid)")  // one-shot, timestamped — cascade probe
+          }
+          // A browser that painted ANY frame is alive + has content (NOT blank) — cancel
+          // the watchdog now. (Gating the cancel on the frame threshold falsely recreated
+          // STATIC real sites that paint a short burst < threshold then idle.)
+          firstPresentArrived(bid)
+          // Pacer settle path: admit the next create after the settle window — covers
+          // static content that won't reach the frame threshold. The threshold below is
+          // the faster path for continuously-animating content; whichever fires first
+          // wins (advanceCreatePacer is idempotent).
+          let id = bid
+          DispatchQueue.global().asyncAfter(deadline: .now() + estabSettle) { [weak self] in
+            self?.advanceCreatePacer(after: id, timedOut: false)
+          }
+        }
+        if reachedStableFrames { advanceCreatePacer(after: bid, timedOut: false) }
         session?.handleFrame(op, payload)
       }
     }
@@ -989,14 +1116,13 @@ final class CefProfileHost {
     // H6: abandon paced creates — the host is gone. Sessions stay in `browsers`, so
     // the onHostDied → plugin path still emits processGone for each queued one.
     createSendQueue.removeAll()
-    createPacerRunning = false
-    createInFlight = nil
+    createInFlight.removeAll()
     let p = process
     // H5: TAKE the posix_spawn pid (zero it) so this reaper is the SOLE owner of its
     // waitpid — a later terminateProcess()/shutdown() then sees 0 and won't
     // double-reap a pid this thread is about to harvest (which could kill an
     // OS-recycled pid). If it's wedged and we can't reap within the grace window
-    // below, we hand it back (restoreSpawnedPid) so terminateProcess can SIGKILL it.
+    // below, we SIGKILL + reap it ourselves so it never leaks as a zombie/orphan.
     let pid = spawnedPid
     spawnedPid = 0
     let died = onHostDied
@@ -1053,22 +1179,19 @@ final class CefProfileHost {
           }
           usleep(50_000)
         }
-        // H5: still alive after the grace window (wedged child that didn't exit on
-        // EOF) — hand the pid back so terminateProcess()/shutdown() can SIGTERM/SIGKILL
-        // + reap it. Without this, a taken-but-unreaped pid would never be killed.
-        if !reaped { self?.restoreSpawnedPid(pid) }
+        // H5: still alive after the grace window (a wedged child that didn't exit on
+        // EOF). Don't merely hand it back — the clean-shutdown path may never call
+        // terminateProcess() again, leaving a zombie/orphan cef_host. SIGKILL + reap it
+        // right here. We exclusively own this pid (spawnedPid was zeroed above) and it
+        // is still unreaped, so it can't be a recycled or relaunched pid.
+        if !reaped {
+          kill(pid, SIGKILL)
+          var raw: Int32 = 0
+          waitpid(pid, &raw, 0)  // blocking reap, off the main thread
+        }
       }
       DispatchQueue.main.async { died?(status) }
     }
-  }
-
-  /// H5: hand a TAKEN-but-unreaped pid back to `spawnedPid` so terminateProcess() can
-  /// finish it (SIGTERM/SIGKILL + reap). No-op if a relaunch already installed a new
-  /// pid (so a racing relaunch is never clobbered).
-  private func restoreSpawnedPid(_ pid: pid_t) {
-    writeLock.lock()
-    if spawnedPid == 0 { spawnedPid = pid }
-    writeLock.unlock()
   }
 
   /// Process/profile-level inbound frames (browserId 0): opReady (carries the

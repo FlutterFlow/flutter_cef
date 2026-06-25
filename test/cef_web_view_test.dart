@@ -78,6 +78,44 @@ void main() {
     expect(args['height'], 300);
   });
 
+  testWidgets('renderScale overrides the device-pixel-ratio in create',
+      (tester) async {
+    await tester.pumpWidget(
+        boxed(const CefWebView(url: 'about:blank', renderScale: 2.5)));
+    await tester.pumpAndSettle();
+    final args = (callsTo('create').single.arguments as Map);
+    expect(args['dpr'], 2.5);
+  });
+
+  testWidgets('changing renderScale alone re-resizes at the new dpr',
+      (tester) async {
+    // Regression: the widget used to resize only on SIZE change, so a canvas zoom
+    // (which changes effective dpr via an ancestor transform, not the laid-out size)
+    // never re-rendered → blurry. It must now resize when dpr changes at fixed size.
+    const key = ValueKey('v');
+    await tester.pumpWidget(boxed(
+        const CefWebView(key: key, url: 'about:blank', renderScale: 1.0)));
+    await tester.pumpAndSettle();
+    await tester.pumpWidget(boxed(
+        const CefWebView(key: key, url: 'about:blank', renderScale: 3.0)));
+    await tester.pumpAndSettle();
+    final resizes = callsTo('resize');
+    expect(resizes, isNotEmpty,
+        reason: 'a dpr-only change must trigger a resize');
+    final args = (resizes.last.arguments as Map);
+    expect(args['dpr'], 3.0);
+    expect(args['width'], 320, reason: 'same logical size');
+    expect(args['height'], 240);
+  });
+
+  testWidgets('renderScale is clamped to the native ceiling (<= 8)',
+      (tester) async {
+    await tester.pumpWidget(
+        boxed(const CefWebView(url: 'about:blank', renderScale: 99)));
+    await tester.pumpAndSettle();
+    expect((callsTo('create').single.arguments as Map)['dpr'], 8.0);
+  });
+
   testWidgets('navigates when the url property changes', (tester) async {
     const key = ValueKey('v');
     await tester

@@ -109,10 +109,16 @@ class CefWebController {
   /// `"crashed"` for a generic process death.
   void Function(String reason)? onProcessGone;
 
-  /// C1: the browser was created but never painted its first frame, even after the
-  /// native host re-kicked a repaint. The texture is (still) blank with no other
-  /// signal — the consumer can use this to recover (e.g. recreate the view) rather
-  /// than leaving a permanently blank tile.
+  /// The browser was created but still hasn't painted its first frame after the
+  /// native host's grace window (~10s, env-tunable via `FLUTTER_CEF_FIRSTPAINT_MS`),
+  /// so the texture is (still) blank. The consumer can recover by recreating the view.
+  ///
+  /// REPEATING signal: this fires again roughly every grace window for as long as the
+  /// view stays blank, and stops only once it paints (or the controller is disposed).
+  /// So any DESTRUCTIVE recovery (recreate) MUST be bounded/debounced — keep a per-view
+  /// attempt counter or backoff rather than recreating on every call (recreating a
+  /// merely-slow heavy page on each tick just restarts its load and churns). See
+  /// `example/lib/stress_probe.dart` (`_recreateCount` / `kMaxRecreates`) for the pattern.
   VoidCallback? onPaintStalled;
 
   /// The caret rect (view-local logical px) of the active IME composition.
