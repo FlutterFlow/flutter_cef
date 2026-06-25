@@ -72,6 +72,33 @@ class CefJsDialogRequest {
   String toString() => 'CefJsDialogRequest($message)';
 }
 
+/// The live frame surface backing a session: the global IOSurface id its
+/// off-screen CVPixelBuffer is wrapped over, plus the surface's PHYSICAL
+/// (Retina) pixel dimensions. Delivered by [CefWebController.onSurface] on each
+/// (re)allocation (create + every resize) and pullable on demand via
+/// [CefWebController.getFrameSurface]. A consumer resolves the surface by id
+/// (e.g. `IOSurfaceLookup`) to mirror the live page pixels off-Flutter; it must
+/// re-read on every change, since a resize frees the old surface.
+class CefSurfaceInfo {
+  const CefSurfaceInfo({
+    required this.surfaceId,
+    required this.width,
+    required this.height,
+  });
+
+  /// The global IOSurface id, resolvable cross-process. 0 before allocation.
+  final int surfaceId;
+
+  /// Physical (Retina) pixel width of the surface.
+  final int width;
+
+  /// Physical (Retina) pixel height of the surface.
+  final int height;
+
+  @override
+  String toString() => 'CefSurfaceInfo($surfaceId, ${width}x$height)';
+}
+
 /// A cookie returned by [CefWebController.getCookies].
 class CefCookie {
   const CefCookie({

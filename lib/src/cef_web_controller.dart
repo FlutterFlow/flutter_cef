@@ -120,6 +120,15 @@ class CefWebController {
   /// you generally don't set this yourself.
   void Function(Rect caretRect)? onImeCompositionBounds;
 
+  /// Called whenever the off-screen frame surface is (re)allocated — once at
+  /// session create and again on every resize (which frees the old IOSurface
+  /// and allocs a new one). Carries the new global IOSurface id and its
+  /// PHYSICAL (Retina) pixel dims. A consumer that mirrors the live page pixels
+  /// off-Flutter (e.g. a WebRTC capturer) resolves the surface by id and must
+  /// re-read on every fire — never cache the surface across frames. Pull the
+  /// current surface on demand with [getFrameSurface].
+  void Function(CefSurfaceInfo info)? onSurface;
+
   /// Handle a page `alert(...)`. Show your UI, then return to dismiss it. If
   /// unset, alerts are auto-dismissed.
   Future<void> Function(CefJsDialogRequest request)? onJavaScriptAlertDialog;
@@ -238,6 +247,13 @@ class CefWebController {
           (a['y'] as num? ?? 0).toDouble(),
           (a['w'] as num? ?? 0).toDouble(),
           (a['h'] as num? ?? 0).toDouble(),
+        ));
+        break;
+      case 'onSurface':
+        onSurface?.call(CefSurfaceInfo(
+          surfaceId: a['surfaceId'] as int? ?? 0,
+          width: a['width'] as int? ?? 0,
+          height: a['height'] as int? ?? 0,
         ));
         break;
       case 'processGone':
@@ -551,6 +567,24 @@ class CefWebController {
   /// invalidates the token). The tile itself keeps running. Idempotent.
   Future<void> disableAgentControl() =>
       _channel.invokeMethod('disableAgentControl', {'sessionId': sessionId});
+
+  /// Read the live off-screen frame surface: the global IOSurface id this
+  /// session's CVPixelBuffer is backed by, plus its PHYSICAL (Retina) pixel
+  /// dims. The on-demand pull counterpart to the [onSurface] event (which fires
+  /// on each (re)alloc). Returns null if the session doesn't exist yet, or a
+  /// [CefSurfaceInfo] with `surfaceId: 0` before the buffer is allocated. A
+  /// consumer mirroring the live pixels off-Flutter resolves the surface by id
+  /// and must re-read after any resize — the surface is freed and reallocated.
+  Future<CefSurfaceInfo?> getFrameSurface() async {
+    final res = await _channel.invokeMapMethod<String, dynamic>(
+        'getFrameSurface', {'sessionId': sessionId});
+    if (res == null) return null;
+    return CefSurfaceInfo(
+      surfaceId: res['surfaceId'] as int? ?? 0,
+      width: res['width'] as int? ?? 0,
+      height: res['height'] as int? ?? 0,
+    );
+  }
 
   /// Load host-trusted content, bypassing the navigation scheme allowlist.
   /// Backs [loadHtmlString] (data:) and [loadFile] (file:): the host explicitly
