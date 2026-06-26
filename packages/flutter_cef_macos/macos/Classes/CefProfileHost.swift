@@ -303,6 +303,7 @@ final class CefProfileHost {
     running = true
     readerStarted = true
     Thread.detachNewThread { [weak self] in self?.acceptAndRead() }
+    startLivenessSweep()  // F-6: steady-state post-establishment liveness watchdog
     // Agent-control: drain CDP off fd 3/4's parent ends on a dedicated reader,
     // splitting the NUL-delimited JSON stream into messages. Started only after
     // a successful spawn (the fds exist). Joined in shutdown() before close.
@@ -744,6 +745,85 @@ final class CefProfileHost {
     }
   }
 
+  // ── F-6: steady-state liveness watchdog ─────────────────────────────────────────────
+  // The first-paint watchdog above RETIRES at first paint (firstPresentArrived), so a
+  // browser that painted ≥1 frame then WEDGES (renderer/GPU stall inside a shared host
+  // that keeps the pipe alive, so no processGone) had NO detector — silent blank until
+  // relaunch. This periodic sweep covers steady state. A static page legitimately idles
+  // (no presents), so staleness alone isn't a wedge: a discriminating opInvalidate is sent
+  // first (a healthy page repaints → a present lands → cleared); only if no present follows
+  // within the grace is paintStalled reported, routing into the consumer's BOUNDED recover.
+  // Decision logic is in LivenessProbePolicy (standalone-unit-tested).
+  private let livenessStalenessNs: UInt64 = {
+    if let s = ProcessInfo.processInfo.environment["FLUTTER_CEF_LIVENESS_MS"],
+       let ms = Double(s), ms > 0 { return UInt64(ms * 1_000_000) }
+    return 10_000_000_000  // 10s — generous; a wedge is rare + a healthy idle page only
+                           // costs one forced repaint per window.
+  }()
+  private let livenessGraceNs: UInt64 = 3_000_000_000  // 3s after the nudge → declare wedged
+  private let livenessSweepInterval: TimeInterval = 2.0
+  private var livenessSweepStarted = false  // guarded by browsersLock
+
+  /// Start the periodic liveness sweep once (idempotent). Called after the reader is up.
+  private func startLivenessSweep() {
+    browsersLock.lock()
+    let already = livenessSweepStarted
+    livenessSweepStarted = true
+    browsersLock.unlock()
+    guard !already else { return }
+    scheduleLivenessSweep()
+  }
+
+  private func scheduleLivenessSweep() {
+    writeLock.lock(); let alive = running && !crashed; writeLock.unlock()
+    guard alive else { return }  // host gone → stop sweeping
+    DispatchQueue.global().asyncAfter(deadline: .now() + livenessSweepInterval) { [weak self] in
+      self?.livenessSweep()
+    }
+  }
+
+  private func livenessSweep() {
+    let now = DispatchTime.now().uptimeNanoseconds
+    // 1) Snapshot ESTABLISHED browsers + their liveness state under browsersLock.
+    browsersLock.lock()
+    var cands: [(bid: UInt32, sinceLast: UInt64, nudgedAt: UInt64)] = []
+    for (bid, s) in browsers where s.firstPresentSeen {
+      cands.append((bid, now &- s.lastPresentNs, s.livenessNudgedAt))
+    }
+    browsersLock.unlock()
+    if !cands.isEmpty {
+      // 2) Exclude hidden (legitimately frameless) + still-first-paint-pending (the first-
+      //    paint watchdog owns those). presentLock is taken AFTER releasing browsersLock —
+      //    never nested — matching the host's browsersLock→presentLock order, so no deadlock.
+      presentLock.lock()
+      let hidden = hiddenBrowsers
+      let pending = firstPresentPending
+      presentLock.unlock()
+      for c in cands where !hidden.contains(c.bid) && !pending.contains(c.bid) {
+        let nudged = c.nudgedAt != 0
+        let action = LivenessProbePolicy.evaluate(
+          sinceLastPresentNs: c.sinceLast, stalenessThresholdNs: livenessStalenessNs,
+          nudged: nudged, sinceNudgeNs: nudged ? (now &- c.nudgedAt) : 0,
+          nudgeGraceNs: livenessGraceNs)
+        switch action {
+        case .healthy:
+          break
+        case .nudge:
+          // Discriminate: a healthy idle page repaints (clearing the nudge on the present);
+          // a wedged one stays blank.
+          send(c.bid, Self.opInvalidate, [])
+          browsersLock.lock(); browsers[c.bid]?.livenessNudgedAt = now; browsersLock.unlock()
+        case .declareStalled:
+          NSLog("[cef] profile '\(profileId)': browser \(c.bid) painted then wedged — reporting paintStalled (consumer may recreate)")
+          onPaintStalled?(c.bid)
+          // Re-discriminate next cycle; the consumer's recover() is bounded (kMaxCefRecreate).
+          browsersLock.lock(); browsers[c.bid]?.livenessNudgedAt = 0; browsersLock.unlock()
+        }
+      }
+    }
+    scheduleLivenessSweep()
+  }
+
   /// Frame `[u32 bodyLen=4+1+payload.count][u32 browserId][op][payload]` and
   /// write it, or queue it if the pipe isn't up yet. A pre-connect opResize whose
   /// browserId hasn't had its create enqueued is DROPPED — that create carries
@@ -1068,6 +1148,9 @@ final class CefProfileHost {
           s.presentCount += 1
           if s.presentCount == 1 { s.firstPresentSeen = true; firstPaint = true }
           if s.presentCount == estabStableFrames { reachedStableFrames = true }
+          // F-6: any present clears the liveness-stall state — the browser is alive.
+          s.lastPresentNs = DispatchTime.now().uptimeNanoseconds
+          s.livenessNudgedAt = 0
         }
         browsersLock.unlock()
         if firstPaint {

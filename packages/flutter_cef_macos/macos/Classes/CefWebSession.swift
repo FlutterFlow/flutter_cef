@@ -122,6 +122,13 @@ final class CefWebSession: NSObject, FlutterTexture {
   // first frame — so the next create's first-frame GPU allocation can't knock a barely-
   // established browser back out.
   var presentCount = 0
+  // F-6 steady-state liveness watchdog (guarded by CefProfileHost.browsersLock, like
+  // presentCount). `lastPresentNs` = the most recent present's uptime; `livenessNudgedAt`
+  // = uptime of an outstanding discriminating opInvalidate (0 = none). The host's periodic
+  // sweep reads these to catch a browser that painted ≥1 frame then WEDGED (the first-paint
+  // watchdog retires at first paint, so post-establishment wedges had no detector).
+  var lastPresentNs: UInt64 = 0
+  var livenessNudgedAt: UInt64 = 0
 
   private weak var registry: FlutterTextureRegistry?
   private var width: Int
