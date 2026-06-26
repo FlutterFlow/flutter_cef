@@ -295,13 +295,17 @@ final class CefWebSession: NSObject, FlutterTexture {
   /// Main-thread only, so sendFrame / textureFrameAvailable stay serialized.
   private func resizeWatchdog(_ gen: UInt64) {
     bufferLock.lock()
-    let active = resizeInFlight && gen == resizeGen
-    // F-4: never force-promote while hidden — the pending surface is zero-filled (the gated
-    // pump never painted it), so promoting it wedges the texture permanently blank. Wait
-    // instead; the native hidden->visible repaint (F-1) drives a real present that promotes
-    // the pending buffer through the normal present path.
     let isHidden = hidden
-    let givenUp = active && !isHidden && (nowNs() &- resizeSentAtNs) > 300_000_000
+    // F-4 (gating extracted to ResizeWatchdogPolicy for standalone unit tests): never
+    // force-promote while hidden — the pending surface is zero-filled (the gated pump never
+    // painted it), so promoting it wedges the texture permanently blank. Wait instead; the
+    // native hidden->visible repaint (F-1) drives a real present that promotes the pending
+    // buffer through the normal present path.
+    let active = ResizeWatchdogPolicy.shouldKeepWaiting(
+      inFlight: resizeInFlight, gen: gen, currentGen: resizeGen)
+    let givenUp = ResizeWatchdogPolicy.shouldForcePromote(
+      inFlight: resizeInFlight, gen: gen, currentGen: resizeGen,
+      hidden: isHidden, elapsedNs: nowNs() &- resizeSentAtNs, thresholdNs: 300_000_000)
     var promotedTid: Int64 = 0
     var promotedSid: UInt32 = 0
     var promotedW = 0, promotedH = 0
