@@ -237,6 +237,12 @@ struct Slot {
   // DoSetVisible); `begin_frame_pump_started` guards a double-start. UI-thread only.
   bool visible = true;
   bool begin_frame_pump_started = false;
+  // F-1/F-2: a dpr/screen-info change that lands while the slot is HIDDEN is deferred —
+  // the begin-frame pump is gated off while hidden, so notifying + painting now would
+  // composite into a surface nothing displays and mislead the Swift resize watchdog into
+  // promoting a never-painted buffer. DoResize sets this while hidden; DoSetVisible's
+  // hidden->visible edge re-asserts screen info before forcing a full repaint. UI-thread only.
+  bool needs_screen_info_on_show = false;
   // Per-slot pump-tick + accelerated-paint counters, logged from PumpBeginFrame when
   // FLUTTER_CEF_DEBUG is set — diagnostics for paint-stall investigation at scale.
   uint64_t diag_pump_ticks = 0;
@@ -1039,6 +1045,12 @@ class HostClient : public CefClient,
       browser->GetHost()->CloseBrowser(true);
       return;
     }
+    // F-3: reconcile a visibility intent that arrived before the browser bound. A
+    // setVisible(false) on a still-creating slot ran DoSetVisible with browser==null
+    // (WasHidden skipped), so slot_->visible is already false but CEF never heard it —
+    // the slot would establish VISIBLE and pump at 60fps off-screen until the next flip.
+    // Honor the recorded intent now (mirrors the close_requested deferred-intent pattern).
+    if (!slot_->visible) browser->GetHost()->WasHidden(true);
     // Start the external begin-frame pump now that the browser is bound. We turned the internal
     // frame timer OFF (external_begin_frame_enabled), so without this nothing ever paints.
     if (!slot_->begin_frame_pump_started) {
@@ -1428,13 +1440,24 @@ void DoResize(const std::shared_ptr<Slot>& slot, int w, int h,
     slot->dst_mtl_sid = 0;
   }
   if (slot->browser) {
-    // A device-scale change needs the renderer told (screen info), not just a relayout.
-    if (dpr_changed) slot->browser->GetHost()->NotifyScreenInfoChanged();
-    slot->browser->GetHost()->WasResized();
-    // Drive a frame right now at the new size. With external begin-frame this is a guaranteed
-    // tick (not a coalesce-able Invalidate request), so the re-laid-out content composites into
-    // the new surface immediately; PumpBeginFrame's ongoing ticks cover the heavy-page settle.
-    slot->browser->GetHost()->SendExternalBeginFrame();
+    if (slot->visible) {
+      // A device-scale change needs the renderer told (screen info), not just a relayout.
+      if (dpr_changed) slot->browser->GetHost()->NotifyScreenInfoChanged();
+      slot->browser->GetHost()->WasResized();
+      // Drive a frame right now at the new size. With external begin-frame this is a guaranteed
+      // tick (not a coalesce-able Invalidate request), so the re-laid-out content composites into
+      // the new surface immediately; PumpBeginFrame's ongoing ticks cover the heavy-page settle.
+      slot->browser->GetHost()->SendExternalBeginFrame();
+    } else {
+      // F-2: HIDDEN — the begin-frame pump is gated off (PumpBeginFrame skips while
+      // !visible), so WasResized()+SendExternalBeginFrame() here would never paint the
+      // freshly-swapped (blank) surface, yet the Swift resizeWatchdog would force-promote
+      // it to the live texture → permanent blank on a static page. The surface + dims are
+      // already swapped above (geometry is current); defer the screen-info re-assert + the
+      // repaint to DoSetVisible's hidden->visible edge (F-1). WasResized while hidden is
+      // pointless (no frame can result), so it is dropped, not deferred.
+      if (dpr_changed) slot->needs_screen_info_on_show = true;
+    }
   }
 }
 
@@ -1482,8 +1505,28 @@ void DoSetZoom(const std::shared_ptr<Slot>& slot, double level) {
 // alive, so this is a cheap pause/resume — not a teardown. The host pauses a
 // tile that scrolls fully out of the canvas viewport and resumes it on return.
 void DoSetVisible(const std::shared_ptr<Slot>& slot, bool visible) {
+  const bool was_visible = slot->visible;
   slot->visible = visible;  // PumpBeginFrame reads this to idle the begin-frame pump while hidden
-  if (slot->browser) slot->browser->GetHost()->WasHidden(!visible);
+  if (!slot->browser) return;
+  slot->browser->GetHost()->WasHidden(!visible);
+  // F-1 (keystone): on the hidden->visible edge, FORCE a fresh full-viewport repaint at the
+  // current geometry. WasHidden(false) alone does NOT repaint, and three things can have left
+  // the live texture blank/stale while hidden: (a) a resize landed while the pump was gated off
+  // (F-2 deferred its paint here); (b) a dpr/screen-info change was deferred; (c) Chromium's
+  // FrameEvictionManager reclaimed the off-screen compositor frame entirely (happens past ~5
+  // browsers / under memory pressure) so there is nothing to show even though geometry is
+  // unchanged. Re-assert screen info (if a dpr change was deferred) + size, then drive a
+  // guaranteed frame — mirrors DoResize/DoInvalidate. Unconditional on the edge because the
+  // eviction case carries no resize to key off.
+  if (visible && !was_visible) {
+    if (slot->needs_screen_info_on_show) {
+      slot->browser->GetHost()->NotifyScreenInfoChanged();
+      slot->needs_screen_info_on_show = false;
+    }
+    slot->browser->GetHost()->WasResized();
+    slot->browser->GetHost()->Invalidate(PET_VIEW);
+    slot->browser->GetHost()->SendExternalBeginFrame();
+  }
 }
 void DoFind(const std::shared_ptr<Slot>& slot, const std::string& text,
             bool forward, bool match_case, bool find_next) {

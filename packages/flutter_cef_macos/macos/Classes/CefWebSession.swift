@@ -156,6 +156,11 @@ final class CefWebSession: NSObject, FlutterTexture {
   // has since gone out — so during a smoothly-advancing drag the watchdog is a no-op, and it
   // only acts when a resize wedges (generation stops advancing because no present came).
   private var resizeGen: UInt64 = 0
+  // F-4: mirrors the cef_host slot's hidden state (set by setVisible). While hidden the
+  // begin-frame pump is gated off so no present can land — the resize watchdog must NOT
+  // force-promote a never-painted (blank) buffer; it waits for the native un-hide repaint
+  // (F-1) to drive a real present. Guarded by bufferLock like the rest of the buffer state.
+  private var hidden = false
   private let bufferLock = NSLock()
 
   /// The live IOSurface id this session's buffer is backed by, or 0 before
@@ -291,7 +296,12 @@ final class CefWebSession: NSObject, FlutterTexture {
   private func resizeWatchdog(_ gen: UInt64) {
     bufferLock.lock()
     let active = resizeInFlight && gen == resizeGen
-    let givenUp = active && (nowNs() &- resizeSentAtNs) > 300_000_000
+    // F-4: never force-promote while hidden — the pending surface is zero-filled (the gated
+    // pump never painted it), so promoting it wedges the texture permanently blank. Wait
+    // instead; the native hidden->visible repaint (F-1) drives a real present that promotes
+    // the pending buffer through the normal present path.
+    let isHidden = hidden
+    let givenUp = active && !isHidden && (nowNs() &- resizeSentAtNs) > 300_000_000
     var promotedTid: Int64 = 0
     var promotedSid: UInt32 = 0
     var promotedW = 0, promotedH = 0
@@ -316,7 +326,10 @@ final class CefWebSession: NSObject, FlutterTexture {
       return
     }
     guard active else { return }
-    sendFrame(Self.opInvalidate, [])
+    // While hidden, opInvalidate can't paint (the pump is gated) — skip the nudge but keep
+    // the watchdog alive so it resumes promoting once visible; the un-hide repaint promotes
+    // via the present path first, after which resizeInFlight clears and this self-terminates.
+    if !isHidden { sendFrame(Self.opInvalidate, []) }
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
       self?.resizeWatchdog(gen)
     }
@@ -363,6 +376,9 @@ final class CefWebSession: NSObject, FlutterTexture {
   /// CefBrowserHost::WasHidden(true) so an off-screen tile stops rendering; the
   /// session and browser stay alive, so it's a cheap toggle, not a teardown.
   func setVisible(_ visible: Bool) {
+    bufferLock.lock()
+    hidden = !visible
+    bufferLock.unlock()
     sendFrame(Self.opSetVisible, [visible ? 1 : 0])
   }
 
