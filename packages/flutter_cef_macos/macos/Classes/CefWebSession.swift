@@ -312,27 +312,23 @@ final class CefWebSession: NSObject, FlutterTexture {
   }
 
   /// Re-kick a wedged resize. Bails immediately if a newer resize has gone out (gen advanced)
-  /// or this one already promoted (not in flight). Otherwise the post-resize present never
-  /// matched — nudge cef_host to repaint the pending surface (opInvalidate), retrying every
-  /// ~80ms. After ~0.3s of failed re-kicks, FORCE-promote the pending surface: cef_host's
-  /// begin-frame pump has been painting into it the whole time, so it holds the correct new-size
-  /// content — a single dropped/mis-tagged present (the failure mode on a STATIC page like
-  /// flutter.dev, which produces exactly one frame per resize) can't leave the tile wedged.
-  /// Main-thread only, so sendFrame / textureFrameAvailable stay serialized.
+  /// or this one already promoted (not in flight). Otherwise cef_host hasn't yet painted into
+  /// the new (pending) surface — nudge it to repaint (opInvalidate), retrying every ~80ms.
+  /// Under ALWAYS-LATEST promotion the resulting paint into the pending surface promotes it on
+  /// sid match (handleFrame), so this re-kick is what rescues a STATIC page (one frame per
+  /// resize) whose single post-resize frame was dropped. No force-promote needed: we never have
+  /// to guess: a real paint into the new surface always promotes it. Main-thread only.
   private func resizeWatchdog(_ gen: UInt64) {
     bufferLock.lock()
     let isHidden = hidden
     let active = ResizeWatchdogPolicy.shouldKeepWaiting(
       inFlight: resizeInFlight, gen: gen, currentGen: resizeGen)
     bufferLock.unlock()
-    // The SIZE-GATED promotion in handleFrame is now the ONLY promoter: it refuses a present
-    // whose composited dims don't match the new surface, so the watchdog must NOT force-promote
-    // — that would show the renderer's pre-re-raster WRONG-SCALE frame (too big/small) or a
-    // blank surface (the old behavior + F-4 hidden-guard are superseded by the size gate). If a
-    // correct frame already landed, handleFrame cleared resizeInFlight and `active` is false →
-    // stop. Otherwise re-kick a possibly-dropped frame (the 16ms begin-frame pump also drives
-    // the re-raster); F-6 liveness recovers a genuinely wedged tile. The texture meanwhile keeps
-    // the last correct-scale buffer (geometrically right, momentarily softer) — never wrong.
+    // If a paint already landed in the pending surface, handleFrame promoted it + cleared
+    // resizeInFlight → `active` is false → stop. Otherwise re-kick (opInvalidate forces cef_host
+    // to repaint the pending surface; the 16ms begin-frame pump also drives it), and the next
+    // present promotes via sid match. The texture meanwhile keeps serving the last good surface
+    // scaled to the tile (momentarily soft if the box grew) — never blank, never frozen-wrong.
     guard active else { return }
     // While hidden the pump is gated off, so opInvalidate can't paint — skip the nudge but keep
     // the watchdog alive; the native un-hide repaint (F-1) drives a real present that promotes.
@@ -613,37 +609,35 @@ final class CefWebSession: NSObject, FlutterTexture {
       // blank new one. A present for the old/current surface just advances the frame.
       var promotedSid: UInt32 = 0
       var promotedW = 0, promotedH = 0
-      if payload.count >= 12 {
+      if payload.count >= 4 {
         let psid = (UInt32(payload[0]) << 24) | (UInt32(payload[1]) << 16)
           | (UInt32(payload[2]) << 8) | UInt32(payload[3])
-        let srcW = Int((UInt32(payload[4]) << 24) | (UInt32(payload[5]) << 16)
-          | (UInt32(payload[6]) << 8) | UInt32(payload[7]))
-        let srcH = Int((UInt32(payload[8]) << 24) | (UInt32(payload[9]) << 16)
-          | (UInt32(payload[10]) << 8) | UInt32(payload[11]))
-        // SIZE-GATED PROMOTION: only promote the pending (resized) surface when the present's
-        // COMPOSITED frame dims match the new surface (round(logical*dpr)). On a device-scale
-        // (zoom) resize the host swaps to the new surface synchronously while the renderer
-        // re-rasters async, so the FIRST present after the resize carries the renderer's
-        // OLD-scale frame in the new surface — promoting it renders too big/small (and can
-        // freeze there). Gating on dims keeps Flutter sampling the last correct-scale buffer
-        // (geometrically right, momentarily softer) until the re-rastered frame lands.
-        let expW = Int((Double(width) * dpr).rounded())
-        let expH = Int((Double(height) * dpr).rounded())
-        let scaleOk = abs(srcW - expW) <= 1 && abs(srcH - expH) <= 1
-        // DIAG: while a resize is pending, log every present's actual composited dims vs the
-        // expected new-surface dims, so a soak test can see whether the size-match ever
-        // succeeds (if `view_src` is pool-sized, src never equals exp and the resize sticks).
+        let srcW = payload.count >= 12 ? Int((UInt32(payload[4]) << 24) | (UInt32(payload[5]) << 16)
+          | (UInt32(payload[6]) << 8) | UInt32(payload[7])) : 0
+        let srcH = payload.count >= 12 ? Int((UInt32(payload[8]) << 24) | (UInt32(payload[9]) << 16)
+          | (UInt32(payload[10]) << 8) | UInt32(payload[11])) : 0
+        // ALWAYS-LATEST PROMOTION (the unified model — see prior art: webview_cef / cefclient /
+        // Ultralight / video swapchains all do this): promote the pending (resized) surface as
+        // soon as cef_host paints INTO it (sid match), WITHOUT gating on exact composited dims.
+        // The surface is already the correct PHYSICAL size (we allocated it at logical×dpr); the
+        // content within it is scaled to the logical tile box by Flutter's Texture, so a frame
+        // whose page-raster momentarily lags the new dpr shows briefly SOFT — never wrong-size,
+        // never stuck. The old SIZE-GATED rule refused promotion until painted dims == round(
+        // logical×dpr) exactly, which for a STATIC page (one frame per resize, dims off by
+        // rounding, or the exact-match frame never re-arriving) kept serving the OLD small
+        // surface forever → stretched-and-frozen (live input, dead pixels). Newest sid wins;
+        // convergence to crisp is driven by the begin-frame pump, not a gate.
         if pendingBuffer != nil,
            ProcessInfo.processInfo.environment["FLUTTER_CEF_DEBUG"] != nil {
-          NSLog("[cefdiag-resize] bid=\(browserId) src=\(srcW)x\(srcH) exp=\(expW)x\(expH) "
-            + "match=\(scaleOk) logical=\(width)x\(height) dpr=\(dpr) "
+          NSLog("[cefdiag-resize] bid=\(browserId) src=\(srcW)x\(srcH) "
+            + "logical=\(width)x\(height) dpr=\(dpr) "
             + "psid=\(psid) pendSid=\(pendingSurfaceId) sidMatch=\(psid == pendingSurfaceId)")
         }
-        if let pending = pendingBuffer, psid != 0, psid == pendingSurfaceId, scaleOk {
+        if let pending = pendingBuffer, psid != 0, psid == pendingSurfaceId {
           pixelBuffer = pending
           pendingBuffer = nil
           pendingSurfaceId = 0
-          resizeInFlight = false  // its CORRECT-SCALE paint landed; free to send the next size
+          resizeInFlight = false  // its paint landed; free to send the next size
           promotedSid = psid
           promotedW = width
           promotedH = height
