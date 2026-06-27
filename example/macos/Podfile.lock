@@ -1,5 +1,5 @@
 PODS:
-  - flutter_cef_macos (0.1.3):
+  - flutter_cef_macos (0.2.0):
     - FlutterMacOS
   - FlutterMacOS (1.0.0)
 
@@ -14,7 +14,7 @@ EXTERNAL SOURCES:
     :path: Flutter/ephemeral
 
 SPEC CHECKSUMS:
-  flutter_cef_macos: 326855d498418476cd4a2f1e47bf72997ec4bab3
+  flutter_cef_macos: f4ec14a9d75c0a198b6c8ba620ec4e56d4ad22f0
   FlutterMacOS: d0db08ddef1a9af05a5ec4b724367152bb0500b1
 
 PODFILE CHECKSUM: 54d867c82ac51cbd61b565781b9fada492027009

@@ -47,10 +47,25 @@ class _WedgeAppState extends State<WedgeApp> {
   bool _big = false;
   String _status = 'ready';
 
+  int _autoCyclesDone = 0;
+
   @override
   void initState() {
     super.initState();
     _controller.onPageStarted = (_) => _controller.loadHtmlString(_html);
+    // Self-driving evidence run: a few seconds after first paint, run several wedge
+    // cycles back-to-back then settle SHOWN, so a screenshot of the final state proves the
+    // page repainted (F-1) rather than wedged blank — no clicking needed.
+    Future<void>.delayed(const Duration(seconds: 4), _runAutoCycles);
+  }
+
+  Future<void> _runAutoCycles() async {
+    for (var i = 0; i < 4; i++) {
+      await _wedgeCycle();
+      setState(() => _autoCyclesDone = i + 1);
+      await Future<void>.delayed(const Duration(milliseconds: 900));
+    }
+    setState(() => _status = 'auto: $_autoCyclesDone wedge cycles done — page MUST be visible');
   }
 
   @override

@@ -67,6 +67,7 @@
 #include <mach-o/dyld.h>
 #include <sys/event.h>
 #include <sys/file.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -719,6 +720,39 @@ class HostRenderHandler : public CefRenderHandler {
     // scope since `sw/sh` below are inside the @autoreleasepool.
     const int srcW = view_src ? static_cast<int>(IOSurfaceGetWidth(view_src)) : 0;
     const int srcH = view_src ? static_cast<int>(IOSurfaceGetHeight(view_src)) : 0;
+    // DIAG (screen-independent verification — the box may be display-asleep, so a screenshot
+    // can't tell content from blank): sample the renderer's composited frame on a throttle and
+    // classify a 9-point grid. content>0 means real pixels landed; white==9 means only the
+    // opaque background (page didn't paint content); clear==9 means a zero-filled / never-
+    // committed frame (the shared-GPU multiplex failure). Under FLUTTER_CEF_DEBUG only.
+    if (view_src && (slot_->diag_paint_count % 60) == 2 &&
+        std::getenv("FLUTTER_CEF_DEBUG") &&
+        IOSurfaceLock(view_src, kIOSurfaceLockReadOnly, nullptr) == kIOReturnSuccess) {
+      const auto* base = static_cast<const uint8_t*>(IOSurfaceGetBaseAddress(view_src));
+      const size_t bpr = IOSurfaceGetBytesPerRow(view_src);
+      int content = 0, white = 0, clear = 0;
+      uint32_t center = 0;
+      const int xs[3] = {srcW / 4, srcW / 2, (3 * srcW) / 4};
+      const int ys[3] = {srcH / 4, srcH / 2, (3 * srcH) / 4};
+      for (int yi = 0; yi < 3; ++yi)
+        for (int xi = 0; xi < 3; ++xi) {
+          const uint8_t* p = base + static_cast<size_t>(ys[yi]) * bpr +
+                             static_cast<size_t>(xs[xi]) * 4;  // BGRA8
+          const uint8_t b = p[0], g = p[1], r = p[2], a = p[3];
+          if (xi == 1 && yi == 1)
+            center = (uint32_t)b | ((uint32_t)g << 8) | ((uint32_t)r << 16) | ((uint32_t)a << 24);
+          if (a == 0) clear++;
+          else if (r > 240 && g > 240 && b > 240) white++;
+          else if (r < 12 && g < 12 && b < 12) clear++;  // black == empty too
+          else content++;
+        }
+      IOSurfaceUnlock(view_src, kIOSurfaceLockReadOnly, nullptr);
+      char buf[160];
+      snprintf(buf, sizeof(buf),
+               "diagpx wire=%u %dx%d content=%d white=%d clear=%d center=0x%08x",
+               slot_->browser_id, srcW, srcH, content, white, clear, center);
+      SendLog(slot_->browser_id, buf);
+    }
     if (view_src && EnsureMetal()) {
       @autoreleasepool {
         const int sw = static_cast<int>(IOSurfaceGetWidth(view_src));
@@ -1007,19 +1041,32 @@ class HostClient : public CefClient,
   void OnLoadStart(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
                    TransitionType) override {
     if (!frame) return;
-    if (frame->IsMain())
+    if (frame->IsMain()) {
       SendUtf8(slot_->browser_id, kOpPageStart, frame->GetURL().ToString());
-    // (Re)install JS-channel shims for this freshly-loaded frame.
-    for (const auto& name : g_channels) InjectChannelShim(frame, name);
+      // SECURITY: install the JS-channel shims ONLY into the MAIN frame. The shims expose the
+      // privileged campusHost bridge (window.<name> -> window.cefQuery 'ch:'); injecting them
+      // into cross-origin SUBFRAMES would hand an untrusted embedded iframe that bridge. (The
+      // previous code injected into every frame.) OnQuery also refuses subframe 'ch:'/'eval:'.
+      for (const auto& name : g_channels) InjectChannelShim(frame, name);
+    }
   }
   void OnLoadEnd(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame,
                  int /*httpStatusCode*/) override {
     if (frame && frame->IsMain()) {
       SendUtf8(slot_->browser_id, kOpPageFinish, frame->GetURL().ToString());
-      // C1: force a repaint when the main frame finishes — a first paint dropped
-      // during load (e.g. a GPU surface not yet ready) self-heals here instead of
-      // leaving a permanently blank texture with no signal.
-      if (browser && browser->GetHost()) browser->GetHost()->Invalidate(PET_VIEW);
+      // C1 + RENDER FLOOR: force a repaint when the main frame finishes. Invalidate(PET_VIEW)
+      // ALONE is coalesce-able — the scheduler can drop it, which on a shared GPU/Viz process
+      // under a multi-browser establishment burst is exactly when the real-content first frame
+      // gets lost, leaving a permanently blank tile though the page loaded. Mirror the proven
+      // DoSetVisible visibility-edge kick: re-assert size + damage + a NON-coalesce-able
+      // SendExternalBeginFrame, which deterministically drives one renderer frame the scheduler
+      // cannot swallow. (slot_->visible gate: a hidden tile must stay paused — F-2.)
+      if (browser && browser->GetHost() && slot_->visible) {
+        auto h = browser->GetHost();
+        h->WasResized();
+        h->Invalidate(PET_VIEW);
+        h->SendExternalBeginFrame();
+      }
     }
   }
   void OnLoadError(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, ErrorCode code,
@@ -1118,16 +1165,23 @@ class HostClient : public CefClient,
   // window.cefQuery; queries land here. We forward the request string to the
   // host: "eval:<id>:<json>" for a runJavaScriptReturningResult result,
   // "ch:<name>:<message>" for a JS-channel post.
-  bool OnQuery(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, int64_t,
+  bool OnQuery(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame, int64_t,
                const CefString& request, bool,
                CefRefPtr<Callback> callback) override {
     std::string r = request.ToString();
+    // SECURITY: 'eval:' (host-eval result channel) and 'ch:' (campusHost bridge) are
+    // PRIVILEGED — they reach the trusted host eval/result path and the agent_ui reducer. The
+    // shim is injected per-frame, so a cross-origin / untrusted IFRAME could forge them. Honor
+    // them ONLY from the MAIN frame (the host-trusted document); refuse subframe queries.
+    const bool main_frame = !frame || frame->IsMain();
     if (r.rfind("eval:", 0) == 0) {
+      if (!main_frame) { callback->Failure(403, "subframe"); return true; }
       SendUtf8(slot_->browser_id, kOpEvalResult, r.substr(5));
       callback->Success(CefString());
       return true;
     }
     if (r.rfind("ch:", 0) == 0) {
+      if (!main_frame) { callback->Failure(403, "subframe"); return true; }
       SendUtf8(slot_->browser_id, kOpChannelMsg, r.substr(3));
       callback->Success(CefString());
       return true;
@@ -1331,6 +1385,19 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
 void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr, uint32_t sid,
                      std::string url) {
   CEF_REQUIRE_UI_THREAD();
+  // WIRE-ID REUSE GUARD: the Swift side allocates ids monotonically, so a collision should be
+  // impossible — but if one ever happened, registering the new slot would let the OLD browser's
+  // OnBeforeClose later erase the NEW slot (g_slots_by_wire_id.erase(id)), leaving an unroutable
+  // browser + a leaked IOSurface/dst_mtl. Fail loudly + tell the host (kOpCreateFailed advances
+  // its pacer / drops the session) instead of silently corrupting cross-tile routing.
+  {
+    std::lock_guard<std::mutex> lock(g_slots_mutex);
+    if (g_slots_by_wire_id.count(wire_id)) {
+      SendLog(wire_id, "createBrowser: wire id already in use — refusing (id-reuse bug)");
+      SendFrame(wire_id, kOpCreateFailed, nullptr, 0);
+      return;
+    }
+  }
   auto slot = std::make_shared<Slot>();
   slot->browser_id = wire_id;
   slot->width = w < 1 ? 1 : w;
@@ -1371,6 +1438,13 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr, uint32_t sid,
   window_info.external_begin_frame_enabled = true;
   CefBrowserSettings settings;
   settings.windowless_frame_rate = 60;
+  // RENDER FLOOR: paint an OPAQUE background. With the default (alpha 0) a windowless
+  // browser paints transparent, so a DROPPED renderer frame — the shared-GPU multiplex
+  // failure where the 2nd+ browser's CompositorFrame never lands — is INVISIBLE (the canvas
+  // shows through) and indistinguishable from "loading". Opaque means a missing frame reads
+  // as a blank white tile (correct-looking for a not-yet-painted page) instead of a ghost,
+  // and makes the failure diagnosable. Pages with their own bg paint over this normally.
+  settings.background_color = CefColorSetARGB(255, 255, 255, 255);
   // about:blank-first: for a real http(s) URL, establish on about:blank (near-instant
   // first frame → the pacer's establishment slot frees fast) and defer the real
   // navigation to first paint. Skip for data:/file:/about: (already instant) and when the
@@ -1488,7 +1562,15 @@ void DoResize(const std::shared_ptr<Slot>& slot, int w, int h,
 }
 
 void DoNavigate(const std::shared_ptr<Slot>& slot, const std::string& url) {
-  if (!slot->browser) return;
+  if (!slot->browser) {
+    // The slot exists but the browser is not yet BOUND (OnAfterCreated pending) — e.g. a
+    // loadHtmlString that arrived right behind a queued createBrowser in a shared-host burst
+    // (6 agent_ui tiles created at once). Defer instead of dropping: the first-paint handler
+    // applies pending_nav_url once the browser binds, and a trusted load keeps its armed
+    // exemption in trusted_pending. Dropping here is exactly why such a burst stayed blank.
+    slot->pending_nav_url = url;
+    return;
+  }
   CefRefPtr<CefFrame> f = slot->browser->GetMainFrame();
   if (f) f->LoadURL(url);
 }
@@ -1504,6 +1586,22 @@ void DoNavigateTrusted(const std::shared_ptr<Slot>& slot,
                        const std::string& url) {
   if (!g_allowed_schemes.empty()) slot->trusted_pending.insert(url);
   DoNavigate(slot, url);
+}
+
+// Navigate / loadTrusted resolved by wire id ON the UI thread, not the reader thread. On a
+// shared host the createBrowser for this id is queued ahead of us on TID_UI (FIFO ordering),
+// so LookupWireId is null on the reader thread but registered by the time this task runs —
+// dropping the op on the reader thread (the old `if (!slot) break`) is why a burst of tiles
+// that loadHtmlString right after create stayed blank. Mirrors the kOpAddChannel fix. With
+// trusted=true the allowlist exemption is armed and a not-yet-bound browser is tolerated via
+// pending_nav_url (DoNavigate above).
+void DoNavigateByWireId(uint32_t wire_id, std::string url, bool trusted) {
+  auto slot = LookupWireId(wire_id);
+  if (!slot) return;  // genuinely disposed before the nav landed
+  if (trusted)
+    DoNavigateTrusted(slot, url);
+  else
+    DoNavigate(slot, url);
 }
 
 void DoReload(const std::shared_ptr<Slot>& slot) {
@@ -1965,15 +2063,20 @@ void IpcReadLoop() {
         break;
       }
       case kOpNavigate: {
-        if (!slot) break;
+        // Resolve by wire id on TID_UI (see DoNavigateByWireId): do NOT require the slot
+        // here, or a nav landing behind a still-queued create on a shared host is dropped.
         std::string url(reinterpret_cast<const char*>(p), plen);
-        CefPostTask(TID_UI, base::BindOnce(&DoNavigate, slot, url));
+        CefPostTask(TID_UI,
+                    base::BindOnce(&DoNavigateByWireId, wire_id, url, false));
         break;
       }
       case kOpLoadTrusted: {
-        if (!slot) break;
+        // Same: a loadHtmlString right behind a queued create (a 6-tile agent_ui burst)
+        // must not be dropped — that was the blank-tile bug. Resolved on TID_UI, FIFO-after
+        // the create, and tolerant of a not-yet-bound browser via pending_nav_url.
         std::string url(reinterpret_cast<const char*>(p), plen);
-        CefPostTask(TID_UI, base::BindOnce(&DoNavigateTrusted, slot, url));
+        CefPostTask(TID_UI,
+                    base::BindOnce(&DoNavigateByWireId, wire_id, url, true));
         break;
       }
       case kOpReload:
@@ -2219,6 +2322,22 @@ int ConnectUnixSocket(const std::string& path) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
+  // Raise the open-file limit early. A busy shared host runs many OSR browsers, each holding
+  // sockets/pipes plus IOSurfaces, against macOS's low default soft limit (256) — and an
+  // fd-heavy campus reaches the documented non-fatal WebRTC select() fd>=1024 fault. Lift the
+  // soft limit toward the hard limit so fd headroom isn't the reachable ceiling.
+  {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+      const rlim_t kCap = 10240;  // macOS caps RLIMIT_NOFILE at OPEN_MAX (10240)
+      rlim_t target =
+          (rl.rlim_max == RLIM_INFINITY || rl.rlim_max > kCap) ? kCap : rl.rlim_max;
+      if (rl.rlim_cur < target) {
+        rl.rlim_cur = target;
+        setrlimit(RLIMIT_NOFILE, &rl);
+      }
+    }
+  }
 #if defined(CEF_HOST_MULTIPROCESS) && defined(CEF_HOST_ADHOC)
   // Disable Chromium 144's Mach-port peer-requirement validation for the whole
   // process tree. The child processes read this policy from an env var (NOT the

@@ -922,6 +922,12 @@ final class CefProfileHost {
     createSendQueue.removeAll()
     createInFlight.removeAll()
     writeLock.unlock()
+    // Also abandon pre-opReady queued creates (pendingCreates is browsersLock-guarded, not
+    // writeLock) so a host dying between spawn and opReady tears down all THREE create-state
+    // queues symmetrically — the old asymmetry left these closures dangling.
+    browsersLock.lock()
+    pendingCreates.removeAll()
+    browsersLock.unlock()
     // CEF-2a/b: drop ALL relays (each a listener + any client) before tearing down
     // the pipe, so none keeps bridging into a closing fd. Snapshot under the lock,
     // clear the dict + onCdpMessage, then stop each OUTSIDE the lock (stop() may
@@ -1210,6 +1216,12 @@ final class CefProfileHost {
     spawnedPid = 0
     let died = onHostDied
     writeLock.unlock()
+    // Abandon pre-opReady queued creates too (pendingCreates is browsersLock-guarded) —
+    // symmetric with the createSendQueue/createInFlight teardown above; the onHostDied path
+    // still emits processGone for the sessions left in `browsers`.
+    browsersLock.lock()
+    pendingCreates.removeAll()
+    browsersLock.unlock()
     // The host is gone: tear down CDP relays (free their localhost listeners +
     // clients) and FAIL any in-flight targetId waiters so enableAgentControl
     // callers don't hang forever. Mirrors shutdown()'s teardown — snapshot under
