@@ -116,7 +116,11 @@ class _HarnessAppState extends State<HarnessApp> {
     ];
     final next = order[(order.indexOf(_phase) + 1) % order.length];
     _setPhase(next);
-    Future<void>.delayed(const Duration(seconds: 6), _cyclePhases);
+    // Hold IDLE long enough (>13s = liveness staleness 10s + nudge grace 3s) to exercise the
+    // steady-state liveness: a static idle tile must NOT be flagged "painted then wedged" /
+    // recreated. Storms get 6s.
+    final hold = next == Phase.idle ? 16 : 6;
+    Future<void>.delayed(Duration(seconds: hold), _cyclePhases);
   }
 
   void _setPhase(Phase p) {

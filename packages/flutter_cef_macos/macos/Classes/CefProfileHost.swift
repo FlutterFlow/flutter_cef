@@ -809,15 +809,27 @@ final class CefProfileHost {
         case .healthy:
           break
         case .nudge:
-          // Discriminate: a healthy idle page repaints (clearing the nudge on the present);
-          // a wedged one stays blank.
+          // A browser that has PAINTED but produced no frame for a while: nudge it once with a
+          // full-view repaint. A genuinely wedged/evicted VISIBLE surface has real damage to
+          // repair, so this produces a present (recovered → healthy next cycle). A STATIC idle
+          // page (a counter, a finished form) has nothing new to paint, so it produces NO present
+          // — and that is HEALTHY, not wedged (it is showing correct content; the begin-frame
+          // pump simply has nothing to draw). See .declareStalled.
           send(c.bid, Self.opInvalidate, [])
           browsersLock.lock(); browsers[c.bid]?.livenessNudgedAt = now; browsersLock.unlock()
         case .declareStalled:
-          NSLog("[cef] profile '\(profileId)': browser \(c.bid) painted then wedged — reporting paintStalled (consumer may recreate)")
-          onPaintStalled?(c.bid)
-          // Re-discriminate next cycle; the consumer's recover() is bounded (kMaxCefRecreate).
-          browsersLock.lock(); browsers[c.bid]?.livenessNudgedAt = 0; browsersLock.unlock()
+          // The nudge above did NOT extract a frame. For an ESTABLISHED (already-painted) tile
+          // this means STATIC-IDLE, not wedged — escalating to onPaintStalled here recreate-
+          // looped every static tile (counter / status / checklist): paintStalled → recover →
+          // paint → idle → paintStalled, ~every 10s, forever (observed: 36 stalls / 33 browsers
+          // in one session). A converged idle tile is healthy by definition; we keep serving its
+          // last good frame. Do NOT recreate. (Never-painted tiles are owned by the separate
+          // first-paint watchdog via firstPresentPending; genuine renderer death is caught by
+          // OnRenderProcessTerminated; eviction-while-hidden by the F-1 un-hide repaint.) Leave
+          // nudgedAt set so we don't re-nudge every cycle; a real future repaint clears it.
+          if ProcessInfo.processInfo.environment["FLUTTER_CEF_DEBUG"] != nil {
+            NSLog("[cef] profile '\(profileId)': browser \(c.bid) idle (no frames) — accepting as healthy-static (not recreating)")
+          }
         }
       }
     }
