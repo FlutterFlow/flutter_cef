@@ -725,7 +725,12 @@ class HostRenderHandler : public CefRenderHandler {
     // classify a 9-point grid. content>0 means real pixels landed; white==9 means only the
     // opaque background (page didn't paint content); clear==9 means a zero-filled / never-
     // committed frame (the shared-GPU multiplex failure). Under FLUTTER_CEF_DEBUG only.
-    if (view_src && (slot_->diag_paint_count % 60) == 2 &&
+    static const int kDiagEvery = []() {
+      const char* e = std::getenv("FLUTTER_CEF_DIAGPX_EVERY");
+      int n = e ? atoi(e) : 60;
+      return n > 0 ? n : 60;  // sample 1-in-N accelerated paints (default 60 ≈ 1/s; set 6 ≈ 10/s)
+    }();
+    if (view_src && (slot_->diag_paint_count % kDiagEvery) == 2 &&
         std::getenv("FLUTTER_CEF_DEBUG") &&
         IOSurfaceLock(view_src, kIOSurfaceLockReadOnly, nullptr) == kIOReturnSuccess) {
       const auto* base = static_cast<const uint8_t*>(IOSurfaceGetBaseAddress(view_src));
@@ -747,10 +752,16 @@ class HostRenderHandler : public CefRenderHandler {
           else content++;
         }
       IOSurfaceUnlock(view_src, kIOSurfaceLockReadOnly, nullptr);
-      char buf[160];
+      // want = the requested OSR surface dims (logical × dpr). Comparing painted (srcWxsrcH)
+      // against want is the WRONG-SIZE oracle: painted << want past a grace = the small-surface-
+      // scaled-up "4x" bug. content==0 with want>0 = BLANK. Both are screen-independent.
+      const int wantW = static_cast<int>(slot_->width * slot_->dpr + 0.5);
+      const int wantH = static_cast<int>(slot_->height * slot_->dpr + 0.5);
+      char buf[200];
       snprintf(buf, sizeof(buf),
-               "diagpx wire=%u %dx%d content=%d white=%d clear=%d center=0x%08x",
-               slot_->browser_id, srcW, srcH, content, white, clear, center);
+               "diagpx wire=%u painted=%dx%d want=%dx%d content=%d white=%d clear=%d "
+               "center=0x%08x",
+               slot_->browser_id, srcW, srcH, wantW, wantH, content, white, clear, center);
       SendLog(slot_->browser_id, buf);
     }
     if (view_src && EnsureMetal()) {

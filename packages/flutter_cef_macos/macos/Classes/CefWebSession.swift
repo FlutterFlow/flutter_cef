@@ -237,10 +237,29 @@ final class CefWebSession: NSObject, FlutterTexture {
     pendingRequestedW = w
     pendingRequestedH = h
     pendingRequestedDpr = d
-    let blocked = resizeInFlight
+    var blocked = resizeInFlight
     // A dpr change (canvas-zoom crispness) needs a reallocation just like a size change.
     let same = (w == width && h == height && d == dpr)
+    // SUPERSEDE A WEDGED RESIZE: the resizeWatchdog no longer force-promotes a wrong-scale
+    // surface, so if a resize's size-matched present never lands (a GPU/establishment wedge),
+    // resizeInFlight would stay true FOREVER — and the `blocked` guard below would then drop
+    // EVERY later resize. The surface freezes at the old size while the tile keeps growing, so
+    // the old (small) surface is scaled up into the bigger tile → wrong-scale + clipped (the
+    // "4x" symptom). If the in-flight resize has been stuck past a grace window, abandon its
+    // pending surface and let this newer size go out instead of blocking on it forever.
+    let wedged = resizeInFlight && (nowNs() &- resizeSentAtNs) > 450_000_000  // 450ms grace
+    if wedged {
+      pendingBuffer = nil
+      pendingSurfaceId = 0
+      resizeInFlight = false
+      blocked = false
+    }
+    let curW = width, curH = height, curD = dpr
     bufferLock.unlock()
+    if ProcessInfo.processInfo.environment["FLUTTER_CEF_DEBUG"] != nil {
+      NSLog("[cefdiag-rsz] bid=\(browserId) req=\(w)x\(h)@\(d) cur=\(curW)x\(curH)@\(curD) "
+        + "blocked=\(blocked) same=\(same) wedged=\(wedged)")
+    }
     // While a resize is still painting, just record the latest size (above). Its present sends
     // the next one (maybeSendNextResize); if cef_host drops that paint, the resizeWatchdog
     // re-kicks it. This one-in-flight pacing keeps the page reflowing at cef_host's actual rate
