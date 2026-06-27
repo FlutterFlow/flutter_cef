@@ -521,7 +521,9 @@ final class CefProfileHost {
     appendU32(&payload, UInt32(g.w))
     appendU32(&payload, UInt32(g.h))
     appendF64(&payload, Double(g.dpr))
-    appendU32(&payload, g.sid)
+    // Producer-allocates: no sid — cef_host mints its own surface on first paint and the
+    // consumer adopts it from the present. (Sending only geometry also dissolves the
+    // resize-before-create / since-freed-sid race the snapshot was guarding.)
     payload.append(contentsOf: Array(url.utf8))
     createEnqueued.insert(id)
     let frame = frameBytes(id, Self.opCreateBrowser, payload)
