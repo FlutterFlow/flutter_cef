@@ -303,43 +303,20 @@ final class CefWebSession: NSObject, FlutterTexture {
   private func resizeWatchdog(_ gen: UInt64) {
     bufferLock.lock()
     let isHidden = hidden
-    // F-4 (gating extracted to ResizeWatchdogPolicy for standalone unit tests): never
-    // force-promote while hidden — the pending surface is zero-filled (the gated pump never
-    // painted it), so promoting it wedges the texture permanently blank. Wait instead; the
-    // native hidden->visible repaint (F-1) drives a real present that promotes the pending
-    // buffer through the normal present path.
     let active = ResizeWatchdogPolicy.shouldKeepWaiting(
       inFlight: resizeInFlight, gen: gen, currentGen: resizeGen)
-    let givenUp = ResizeWatchdogPolicy.shouldForcePromote(
-      inFlight: resizeInFlight, gen: gen, currentGen: resizeGen,
-      hidden: isHidden, elapsedNs: nowNs() &- resizeSentAtNs, thresholdNs: 300_000_000)
-    var promotedTid: Int64 = 0
-    var promotedSid: UInt32 = 0
-    var promotedW = 0, promotedH = 0
-    if givenUp {
-      if let pending = pendingBuffer {
-        pixelBuffer = pending
-        promotedSid = pendingSurfaceId  // capture before clearing
-        promotedW = width
-        promotedH = height
-        pendingBuffer = nil
-        pendingSurfaceId = 0
-        promotedTid = textureId
-      }
-      resizeInFlight = false
-    }
     bufferLock.unlock()
-    if givenUp {
-      if promotedTid != 0 { registry?.textureFrameAvailable(promotedTid) }
-      // R2: force-promoted a resized surface — notify WebRTC consumers (same as opPresent).
-      if promotedSid != 0 { notifySurface(promotedSid, promotedW, promotedH) }
-      maybeSendNextResize()
-      return
-    }
+    // The SIZE-GATED promotion in handleFrame is now the ONLY promoter: it refuses a present
+    // whose composited dims don't match the new surface, so the watchdog must NOT force-promote
+    // — that would show the renderer's pre-re-raster WRONG-SCALE frame (too big/small) or a
+    // blank surface (the old behavior + F-4 hidden-guard are superseded by the size gate). If a
+    // correct frame already landed, handleFrame cleared resizeInFlight and `active` is false →
+    // stop. Otherwise re-kick a possibly-dropped frame (the 16ms begin-frame pump also drives
+    // the re-raster); F-6 liveness recovers a genuinely wedged tile. The texture meanwhile keeps
+    // the last correct-scale buffer (geometrically right, momentarily softer) — never wrong.
     guard active else { return }
-    // While hidden, opInvalidate can't paint (the pump is gated) — skip the nudge but keep
-    // the watchdog alive so it resumes promoting once visible; the un-hide repaint promotes
-    // via the present path first, after which resizeInFlight clears and this self-terminates.
+    // While hidden the pump is gated off, so opInvalidate can't paint — skip the nudge but keep
+    // the watchdog alive; the native un-hide repaint (F-1) drives a real present that promotes.
     if !isHidden { sendFrame(Self.opInvalidate, []) }
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
       self?.resizeWatchdog(gen)
@@ -617,14 +594,28 @@ final class CefWebSession: NSObject, FlutterTexture {
       // blank new one. A present for the old/current surface just advances the frame.
       var promotedSid: UInt32 = 0
       var promotedW = 0, promotedH = 0
-      if payload.count >= 4 {
+      if payload.count >= 12 {
         let psid = (UInt32(payload[0]) << 24) | (UInt32(payload[1]) << 16)
           | (UInt32(payload[2]) << 8) | UInt32(payload[3])
-        if let pending = pendingBuffer, psid != 0, psid == pendingSurfaceId {
+        let srcW = Int((UInt32(payload[4]) << 24) | (UInt32(payload[5]) << 16)
+          | (UInt32(payload[6]) << 8) | UInt32(payload[7]))
+        let srcH = Int((UInt32(payload[8]) << 24) | (UInt32(payload[9]) << 16)
+          | (UInt32(payload[10]) << 8) | UInt32(payload[11]))
+        // SIZE-GATED PROMOTION: only promote the pending (resized) surface when the present's
+        // COMPOSITED frame dims match the new surface (round(logical*dpr)). On a device-scale
+        // (zoom) resize the host swaps to the new surface synchronously while the renderer
+        // re-rasters async, so the FIRST present after the resize carries the renderer's
+        // OLD-scale frame in the new surface — promoting it renders too big/small (and can
+        // freeze there). Gating on dims keeps Flutter sampling the last correct-scale buffer
+        // (geometrically right, momentarily softer) until the re-rastered frame lands.
+        let expW = Int((Double(width) * dpr).rounded())
+        let expH = Int((Double(height) * dpr).rounded())
+        let scaleOk = abs(srcW - expW) <= 1 && abs(srcH - expH) <= 1
+        if let pending = pendingBuffer, psid != 0, psid == pendingSurfaceId, scaleOk {
           pixelBuffer = pending
           pendingBuffer = nil
           pendingSurfaceId = 0
-          resizeInFlight = false  // its paint landed; free to send the next size
+          resizeInFlight = false  // its CORRECT-SCALE paint landed; free to send the next size
           promotedSid = psid
           promotedW = width
           promotedH = height

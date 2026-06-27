@@ -555,13 +555,26 @@ class HostRenderHandler : public CefRenderHandler {
   // Flutter texture only once a paint into THAT surface has actually landed — until
   // then it keeps serving the old surface, so a resize never flashes the fresh,
   // zero-filled IOSurface. Caller holds slot_->surface_mutex.
-  void SendPresentLocked() {
+  // The present carries the SID of the surface presented AND the PHYSICAL pixel dims of the
+  // frame that was actually composited into it (srcW/srcH). On a device-scale (zoom) resize
+  // the host swaps to the new-size surface synchronously while the renderer re-rasters
+  // async, so the first frame after a resize is the renderer's OLD-scale frame landing in
+  // the NEW surface. With only a sid the consumer can't tell that provisional wrong-scale
+  // frame from a correct one and promotes it → content renders too big/small. Carrying the
+  // composited dims lets the consumer promote ONLY a frame whose dims match the new surface
+  // (round(logical*dpr)), so it keeps serving the last correct-scale buffer until the real
+  // re-rastered frame lands. UI thread; caller holds slot_->surface_mutex.
+  void SendPresentLocked(int srcW, int srcH) {
     uint32_t sid = slot_->surface ? IOSurfaceGetID(slot_->surface) : 0;
-    uint8_t p[4] = {static_cast<uint8_t>((sid >> 24) & 0xff),
-                    static_cast<uint8_t>((sid >> 16) & 0xff),
-                    static_cast<uint8_t>((sid >> 8) & 0xff),
-                    static_cast<uint8_t>(sid & 0xff)};
-    SendFrame(slot_->browser_id, kOpPresent, p, 4);
+    auto be32 = [](uint8_t* o, uint32_t v) {
+      o[0] = (v >> 24) & 0xff; o[1] = (v >> 16) & 0xff;
+      o[2] = (v >> 8) & 0xff;  o[3] = v & 0xff;
+    };
+    uint8_t p[12];
+    be32(p, sid);
+    be32(p + 4, static_cast<uint32_t>(srcW < 0 ? 0 : srcW));
+    be32(p + 8, static_cast<uint32_t>(srcH < 0 ? 0 : srcH));
+    SendFrame(slot_->browser_id, kOpPresent, p, 12);
   }
 
   void OnPaint(CefRefPtr<CefBrowser>, PaintElementType type, const RectList&,
@@ -596,7 +609,10 @@ class HostRenderHandler : public CefRenderHandler {
                popup_py);
     }
     IOSurfaceUnlock(slot_->surface, 0, nullptr);
-    SendPresentLocked();
+    // PET_VIEW reports the painted view-frame dims (the size-gate signal); a PET_POPUP
+    // repaint didn't rescale the view, so report the surface dims (always correct-scale).
+    SendPresentLocked(type == PET_VIEW ? width : surf_w,
+                      type == PET_VIEW ? height : surf_h);
   }
 
   void OnPopupShow(CefRefPtr<CefBrowser> browser, bool show) override {
@@ -650,9 +666,15 @@ class HostRenderHandler : public CefRenderHandler {
     const size_t ds = IOSurfaceGetBytesPerRow(slot_->surface);
     const int dw = static_cast<int>(IOSurfaceGetWidth(slot_->surface));
     const int dh = static_cast<int>(IOSurfaceGetHeight(slot_->surface));
+    // The composited frame's physical dims (for the size-gated present). A popup-only
+    // repaint (view_src == null) re-presents the existing view surface as-is → report the
+    // surface dims so it counts as correct-scale.
+    int srcW = dw, srcH = dh;
     if (view_src &&
         IOSurfaceLock(view_src, kIOSurfaceLockReadOnly, nullptr) ==
             kIOReturnSuccess) {
+      srcW = static_cast<int>(IOSurfaceGetWidth(view_src));
+      srcH = static_cast<int>(IOSurfaceGetHeight(view_src));
       const auto* s = static_cast<const uint8_t*>(IOSurfaceGetBaseAddress(view_src));
       const size_t ss = IOSurfaceGetBytesPerRow(view_src);
       const int rows = std::min<int>(dh, IOSurfaceGetHeight(view_src));
@@ -671,7 +693,7 @@ class HostRenderHandler : public CefRenderHandler {
                slot_->popup_h, px, py);
     }
     IOSurfaceUnlock(slot_->surface, 0, nullptr);
-    SendPresentLocked();
+    SendPresentLocked(srcW, srcH);
   }
 
   // GPU-blit composite: copy CEF's accelerated view surface into the host-owned slot_->surface
@@ -693,6 +715,10 @@ class HostRenderHandler : public CefRenderHandler {
   void CompositeMetalLocked(IOSurfaceRef view_src) {
     if (!slot_->surface) return;
     bool blitted = false;
+    // Composited frame's physical dims (for the size-gated present) — captured at function
+    // scope since `sw/sh` below are inside the @autoreleasepool.
+    const int srcW = view_src ? static_cast<int>(IOSurfaceGetWidth(view_src)) : 0;
+    const int srcH = view_src ? static_cast<int>(IOSurfaceGetHeight(view_src)) : 0;
     if (view_src && EnsureMetal()) {
       @autoreleasepool {
         const int sw = static_cast<int>(IOSurfaceGetWidth(view_src));
@@ -755,7 +781,7 @@ class HostRenderHandler : public CefRenderHandler {
         logged = true;
         SendLog(slot_->browser_id, "present: GPU Metal blit path active");
       }
-      SendPresentLocked();
+      SendPresentLocked(srcW, srcH);
     } else {
       static bool loggedFb = false;
       if (!loggedFb) {
