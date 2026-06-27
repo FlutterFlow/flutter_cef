@@ -488,6 +488,14 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       let goneSessions = self.sessionHost.compactMap { $0.value === host ? $0.key : nil }
       for sid in goneSessions {
         self.emit("processGone", ["sessionId": sid, "reason": reason])
+        // F-5: dispose the session BEFORE niling the maps. dispose() is the only caller of
+        // registry.unregisterTexture (+ frees the CVPixelBuffer / IOSurface / any pending
+        // buffer). If we just nil sessions[sid], the later Dart controller.dispose ->
+        // disposeSession early-returns on the now-missing session, so the texture + surfaces
+        // leak for the engine's lifetime — on EVERY host crash, exactly when recovery (a
+        // fresh create) happens most. (onBrowserFailed / respawn-failure already dispose;
+        // this path was the asymmetric leak.)
+        self.sessions[sid]?.dispose()
         self.sessions[sid] = nil
         self.sessionHost[sid] = nil
         self.sessionKey[sid] = nil

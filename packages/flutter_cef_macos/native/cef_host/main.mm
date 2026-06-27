@@ -67,6 +67,7 @@
 #include <mach-o/dyld.h>
 #include <sys/event.h>
 #include <sys/file.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -120,9 +121,9 @@ constexpr uint8_t kOpTargetId = 0x1b;   // {utf8 targetId} -> plugin: this brows
 constexpr uint8_t kOpCreated = 0x1c;    // {} H3: OnAfterCreated — browser is up; host's pacer sends the next create
 constexpr uint8_t kOpCreateFailed = 0x1d; // {} H7: async CreateBrowser dispatch failed; host drops the session
 constexpr uint8_t kOpPointer = 0x10;
-constexpr uint8_t kOpResize = 0x11;
+constexpr uint8_t kOpResize = 0x11;          // {u32 w}{u32 h}{f64 dpr} — producer-allocates: no sid
 constexpr uint8_t kOpKey = 0x12;
-constexpr uint8_t kOpCreateBrowser = 0x13;  // {u32 w}{u32 h}{f64 dpr}{u32 iosurfaceId}{utf8 url}; frame browserId = NEW id
+constexpr uint8_t kOpCreateBrowser = 0x13;  // {u32 w}{u32 h}{f64 dpr}{utf8 url}; producer-allocates (no sid); frame browserId = NEW id
 constexpr uint8_t kOpShutdown = 0x14;       // {} tear down the whole PROCESS (all browsers); frame browserId 0
 constexpr uint8_t kOpDisposeBrowser = 0x15;  // {} close ONE browser (target = frame browserId); process survives
 constexpr uint8_t kOpNavigate = 0x20;
@@ -180,7 +181,12 @@ struct Slot {
   // Guards surface / width / height / dpr / popup_* for THIS browser. Per-slot
   // (not a single global) so paints on independent browsers don't contend.
   std::mutex surface_mutex;
-  IOSurfaceRef surface = nullptr;  // host-shared IOSurface we paint into
+  IOSurfaceRef surface = nullptr;  // host-OWNED IOSurface we paint into (producer-allocates;
+                                   // minted lazily in EnsureSurfaceForPaint on the first paint)
+  // Set under surface_mutex in OnBeforeClose BEFORE nulling `surface`, so a paint racing teardown
+  // (EnsureSurfaceForPaint) doesn't re-mint a surface for a closing browser (which would leak —
+  // OnBeforeClose already released the last one). Producer-allocates lifetime guard.
+  bool closing = false;
   // Cached Metal wrap of `surface` for the GPU-blit DEST. Wrapping it fresh every
   // frame is pure churn (the surface is stable except on resize), so cache it and
   // recreate only when the wrapped IOSurface id changes. Released wherever `surface`
@@ -237,6 +243,12 @@ struct Slot {
   // DoSetVisible); `begin_frame_pump_started` guards a double-start. UI-thread only.
   bool visible = true;
   bool begin_frame_pump_started = false;
+  // F-1/F-2: a dpr/screen-info change that lands while the slot is HIDDEN is deferred —
+  // the begin-frame pump is gated off while hidden, so notifying + painting now would
+  // composite into a surface nothing displays and mislead the Swift resize watchdog into
+  // promoting a never-painted buffer. DoResize sets this while hidden; DoSetVisible's
+  // hidden->visible edge re-asserts screen info before forcing a full repaint. UI-thread only.
+  bool needs_screen_info_on_show = false;
   // Per-slot pump-tick + accelerated-paint counters, logged from PumpBeginFrame when
   // FLUTTER_CEF_DEBUG is set — diagnostics for paint-stall investigation at scale.
   uint64_t diag_pump_ticks = 0;
@@ -549,18 +561,35 @@ class HostRenderHandler : public CefRenderHandler {
   // Flutter texture only once a paint into THAT surface has actually landed — until
   // then it keeps serving the old surface, so a resize never flashes the fresh,
   // zero-filled IOSurface. Caller holds slot_->surface_mutex.
-  void SendPresentLocked() {
+  // The present carries the SID of the surface presented AND the PHYSICAL pixel dims of the
+  // frame that was actually composited into it (srcW/srcH). On a device-scale (zoom) resize
+  // the host swaps to the new-size surface synchronously while the renderer re-rasters
+  // async, so the first frame after a resize is the renderer's OLD-scale frame landing in
+  // the NEW surface. With only a sid the consumer can't tell that provisional wrong-scale
+  // frame from a correct one and promotes it → content renders too big/small. Carrying the
+  // composited dims lets the consumer promote ONLY a frame whose dims match the new surface
+  // (round(logical*dpr)), so it keeps serving the last correct-scale buffer until the real
+  // re-rastered frame lands. UI thread; caller holds slot_->surface_mutex.
+  void SendPresentLocked(int srcW, int srcH) {
     uint32_t sid = slot_->surface ? IOSurfaceGetID(slot_->surface) : 0;
-    uint8_t p[4] = {static_cast<uint8_t>((sid >> 24) & 0xff),
-                    static_cast<uint8_t>((sid >> 16) & 0xff),
-                    static_cast<uint8_t>((sid >> 8) & 0xff),
-                    static_cast<uint8_t>(sid & 0xff)};
-    SendFrame(slot_->browser_id, kOpPresent, p, 4);
+    auto be32 = [](uint8_t* o, uint32_t v) {
+      o[0] = (v >> 24) & 0xff; o[1] = (v >> 16) & 0xff;
+      o[2] = (v >> 8) & 0xff;  o[3] = v & 0xff;
+    };
+    uint8_t p[12];
+    be32(p, sid);
+    be32(p + 4, static_cast<uint32_t>(srcW < 0 ? 0 : srcW));
+    be32(p + 8, static_cast<uint32_t>(srcH < 0 ? 0 : srcH));
+    SendFrame(slot_->browser_id, kOpPresent, p, 12);
   }
 
   void OnPaint(CefRefPtr<CefBrowser>, PaintElementType type, const RectList&,
                const void* buffer, int width, int height) override {
     std::lock_guard<std::mutex> lock(slot_->surface_mutex);
+    // PRODUCER-ALLOCATES (software path): mint/resize the surface to the painted VIEW dims
+    // before the guard, mirroring OnAcceleratedPaint — else the surface is never created and
+    // nothing paints. A POPUP paint composites onto the existing view surface (don't resize).
+    if (type == PET_VIEW) EnsureSurfaceForPaint(width, height);
     if (!slot_->surface) return;
     if (IOSurfaceLock(slot_->surface, 0, nullptr) != kIOReturnSuccess) return;
     uint8_t* dst = static_cast<uint8_t*>(IOSurfaceGetBaseAddress(slot_->surface));
@@ -590,7 +619,10 @@ class HostRenderHandler : public CefRenderHandler {
                popup_py);
     }
     IOSurfaceUnlock(slot_->surface, 0, nullptr);
-    SendPresentLocked();
+    // PET_VIEW reports the painted view-frame dims (the size-gate signal); a PET_POPUP
+    // repaint didn't rescale the view, so report the surface dims (always correct-scale).
+    SendPresentLocked(type == PET_VIEW ? width : surf_w,
+                      type == PET_VIEW ? height : surf_h);
   }
 
   void OnPopupShow(CefRefPtr<CefBrowser> browser, bool show) override {
@@ -633,20 +665,70 @@ class HostRenderHandler : public CefRenderHandler {
     IOSurfaceUnlock(src, kIOSurfaceLockReadOnly, nullptr);
   }
 
+  // PRODUCER-ALLOCATES: ensure slot_->surface is EXACTLY sw x sh — the dims CEF actually
+  // painted (view_src). cef_host owns this surface (it mints it, the consumer adopts it by id
+  // from the present). Because the blit dst is then the same size as the src, the copy is 1:1
+  // and can NEVER crop (src>dst) or leave stale margins (src<dst) — the entire wrong-size class
+  // is structurally gone. Reallocates on first paint or any size/dpr change (CEF re-rasters at
+  // the new logical×dpr → a new view_src size → here). Caller holds slot_->surface_mutex.
+  // Releases cef_host's ref on the OLD surface immediately; the consumer's CVPixelBuffer keeps
+  // the old one alive (independent refcount) until it adopts the new id, so no UAF.
+  void EnsureSurfaceForPaint(int sw, int sh) {
+    if (sw < 1 || sh < 1) return;  // popup-only repaint (view_src null) keeps the current surface
+    if (slot_->closing) return;    // a paint racing teardown must not re-mint a surface (leak)
+    IOSurfaceRef cur = slot_->surface;
+    if (cur && static_cast<int>(IOSurfaceGetWidth(cur)) == sw &&
+        static_cast<int>(IOSurfaceGetHeight(cur)) == sh) {
+      return;  // already the right size — the common steady-state path, zero allocation
+    }
+    const size_t bpr = ((static_cast<size_t>(sw) * 4) + 63) & ~static_cast<size_t>(63);
+    NSDictionary* props = @{
+      (id)kIOSurfaceWidth : @(sw),
+      (id)kIOSurfaceHeight : @(sh),
+      (id)kIOSurfaceBytesPerElement : @(4),
+      (id)kIOSurfaceBytesPerRow : @(static_cast<long>(bpr)),
+      (id)kIOSurfaceAllocSize : @(static_cast<long>(bpr * sh)),
+      (id)kIOSurfacePixelFormat : @(0x42475241),  // 'BGRA' = kCVPixelFormatType_32BGRA
+      @"IOSurfaceIsGlobal" : @YES,                // resolvable cross-process by id (consumer Lookups it)
+    };
+    IOSurfaceRef fresh = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+    if (!fresh) {
+      SendLog(slot_->browser_id, "EnsureSurfaceForPaint: IOSurfaceCreate failed");
+      return;  // keep the old surface; next paint retries
+    }
+    slot_->surface = fresh;  // cef_host's +1 (mint, not Lookup)
+    [slot_->dst_mtl release];
+    slot_->dst_mtl = nil;
+    slot_->dst_mtl_sid = 0;  // the cached Metal wrap pointed at `cur`; rebuilt this same paint
+    if (cur) CFRelease(cur);  // drop cef_host's +1 on the old; consumer's CVPixelBuffer still holds it
+  }
+
   // Software-composite the view (optional GPU surface, stride-aware) and the open
   // popup into the host-allocated slot_->surface and present it. Used only while
   // a <select> dropdown is open, since a popup can't ride the zero-copy texture.
   // Caller holds slot_->surface_mutex.
   void CompositeSoftwareLocked(IOSurfaceRef view_src) {
+    // Producer-allocates: size the host surface to the painted view BEFORE compositing, so the
+    // memcpy below is 1:1 (no crop/partial). Popup-only repaint (view_src null) keeps the surface.
+    if (view_src) {
+      EnsureSurfaceForPaint(static_cast<int>(IOSurfaceGetWidth(view_src)),
+                            static_cast<int>(IOSurfaceGetHeight(view_src)));
+    }
     if (!slot_->surface) return;
     if (IOSurfaceLock(slot_->surface, 0, nullptr) != kIOReturnSuccess) return;
     auto* dst = static_cast<uint8_t*>(IOSurfaceGetBaseAddress(slot_->surface));
     const size_t ds = IOSurfaceGetBytesPerRow(slot_->surface);
     const int dw = static_cast<int>(IOSurfaceGetWidth(slot_->surface));
     const int dh = static_cast<int>(IOSurfaceGetHeight(slot_->surface));
+    // The composited frame's physical dims (for the size-gated present). A popup-only
+    // repaint (view_src == null) re-presents the existing view surface as-is → report the
+    // surface dims so it counts as correct-scale.
+    int srcW = dw, srcH = dh;
     if (view_src &&
         IOSurfaceLock(view_src, kIOSurfaceLockReadOnly, nullptr) ==
             kIOReturnSuccess) {
+      srcW = static_cast<int>(IOSurfaceGetWidth(view_src));
+      srcH = static_cast<int>(IOSurfaceGetHeight(view_src));
       const auto* s = static_cast<const uint8_t*>(IOSurfaceGetBaseAddress(view_src));
       const size_t ss = IOSurfaceGetBytesPerRow(view_src);
       const int rows = std::min<int>(dh, IOSurfaceGetHeight(view_src));
@@ -665,7 +747,7 @@ class HostRenderHandler : public CefRenderHandler {
                slot_->popup_h, px, py);
     }
     IOSurfaceUnlock(slot_->surface, 0, nullptr);
-    SendPresentLocked();
+    SendPresentLocked(srcW, srcH);
   }
 
   // GPU-blit composite: copy CEF's accelerated view surface into the host-owned slot_->surface
@@ -685,8 +767,61 @@ class HostRenderHandler : public CefRenderHandler {
   // dmabuf fd -> import as a GL/VK image -> blit. The OnAcceleratedPaint call site, the
   // reclaim-at-return contract, and the present protocol are identical across platforms.
   void CompositeMetalLocked(IOSurfaceRef view_src) {
+    // Producer-allocates: size the host surface to the painted view first → the blit is 1:1.
+    if (view_src) {
+      EnsureSurfaceForPaint(static_cast<int>(IOSurfaceGetWidth(view_src)),
+                            static_cast<int>(IOSurfaceGetHeight(view_src)));
+    }
     if (!slot_->surface) return;
     bool blitted = false;
+    // Composited frame's physical dims — now ALWAYS == slot_->surface dims (producer-allocated),
+    // so the present's srcW/srcH the consumer adopts always match the surface it Lookups.
+    const int srcW = view_src ? static_cast<int>(IOSurfaceGetWidth(view_src)) : 0;
+    const int srcH = view_src ? static_cast<int>(IOSurfaceGetHeight(view_src)) : 0;
+    // DIAG (screen-independent verification — the box may be display-asleep, so a screenshot
+    // can't tell content from blank): sample the renderer's composited frame on a throttle and
+    // classify a 9-point grid. content>0 means real pixels landed; white==9 means only the
+    // opaque background (page didn't paint content); clear==9 means a zero-filled / never-
+    // committed frame (the shared-GPU multiplex failure). Under FLUTTER_CEF_DEBUG only.
+    static const int kDiagEvery = []() {
+      const char* e = std::getenv("FLUTTER_CEF_DIAGPX_EVERY");
+      int n = e ? atoi(e) : 60;
+      return n > 0 ? n : 60;  // sample 1-in-N accelerated paints (default 60 ≈ 1/s; set 6 ≈ 10/s)
+    }();
+    if (view_src && (slot_->diag_paint_count % kDiagEvery) == 2 &&
+        std::getenv("FLUTTER_CEF_DEBUG") &&
+        IOSurfaceLock(view_src, kIOSurfaceLockReadOnly, nullptr) == kIOReturnSuccess) {
+      const auto* base = static_cast<const uint8_t*>(IOSurfaceGetBaseAddress(view_src));
+      const size_t bpr = IOSurfaceGetBytesPerRow(view_src);
+      int content = 0, white = 0, clear = 0;
+      uint32_t center = 0;
+      const int xs[3] = {srcW / 4, srcW / 2, (3 * srcW) / 4};
+      const int ys[3] = {srcH / 4, srcH / 2, (3 * srcH) / 4};
+      for (int yi = 0; yi < 3; ++yi)
+        for (int xi = 0; xi < 3; ++xi) {
+          const uint8_t* p = base + static_cast<size_t>(ys[yi]) * bpr +
+                             static_cast<size_t>(xs[xi]) * 4;  // BGRA8
+          const uint8_t b = p[0], g = p[1], r = p[2], a = p[3];
+          if (xi == 1 && yi == 1)
+            center = (uint32_t)b | ((uint32_t)g << 8) | ((uint32_t)r << 16) | ((uint32_t)a << 24);
+          if (a == 0) clear++;
+          else if (r > 240 && g > 240 && b > 240) white++;
+          else if (r < 12 && g < 12 && b < 12) clear++;  // black == empty too
+          else content++;
+        }
+      IOSurfaceUnlock(view_src, kIOSurfaceLockReadOnly, nullptr);
+      // want = the requested OSR surface dims (logical × dpr). Comparing painted (srcWxsrcH)
+      // against want is the WRONG-SIZE oracle: painted << want past a grace = the small-surface-
+      // scaled-up "4x" bug. content==0 with want>0 = BLANK. Both are screen-independent.
+      const int wantW = static_cast<int>(slot_->width * slot_->dpr + 0.5);
+      const int wantH = static_cast<int>(slot_->height * slot_->dpr + 0.5);
+      char buf[200];
+      snprintf(buf, sizeof(buf),
+               "diagpx wire=%u painted=%dx%d want=%dx%d content=%d white=%d clear=%d "
+               "center=0x%08x",
+               slot_->browser_id, srcW, srcH, wantW, wantH, content, white, clear, center);
+      SendLog(slot_->browser_id, buf);
+    }
     if (view_src && EnsureMetal()) {
       @autoreleasepool {
         const int sw = static_cast<int>(IOSurfaceGetWidth(view_src));
@@ -723,6 +858,13 @@ class HostRenderHandler : public CefRenderHandler {
         id<MTLTexture> dst = slot_->dst_mtl;  // cached (released on resize/close)
         if (src && dst) {
           const int cw = std::min(sw, dw), ch = std::min(sh, dh);
+          // DIAG: a src≠dst blit crops (src>dst → top-left only) or partial-fills (src<dst →
+          // stale margins). On a static page this single mismatched frame sticks. Log it.
+          if ((sw != dw || sh != dh) && std::getenv("FLUTTER_CEF_DEBUG")) {
+            char b[160];
+            snprintf(b, sizeof(b), "blitmismatch src=%dx%d dst=%dx%d copy=%dx%d", sw, sh, dw, dh, cw, ch);
+            SendLog(slot_->browser_id, b);
+          }
           id<MTLCommandBuffer> cb = [g_mtl_queue commandBuffer];
           id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
           [blit copyFromTexture:src
@@ -749,7 +891,7 @@ class HostRenderHandler : public CefRenderHandler {
         logged = true;
         SendLog(slot_->browser_id, "present: GPU Metal blit path active");
       }
-      SendPresentLocked();
+      SendPresentLocked(srcW, srcH);
     } else {
       static bool loggedFb = false;
       if (!loggedFb) {
@@ -790,7 +932,16 @@ class HostRenderHandler : public CefRenderHandler {
       return;
     }
     std::lock_guard<std::mutex> lock(slot_->surface_mutex);
-    if (!slot_->surface) return;  // disposed under us (see OnBeforeClose)
+    // PRODUCER-ALLOCATES: the surface is minted lazily by the FIRST view paint (and re-minted on
+    // any size change) inside the composite path — so we must NOT early-return on a null surface
+    // before reaching it (that would deadlock: no surface → no paint → no surface). For a VIEW
+    // paint, ensure the surface to the painted dims here; EnsureSurfaceForPaint no-ops if the
+    // browser is closing. For a POPUP paint (no view dims) the view surface must already exist.
+    if (type != PET_POPUP) {
+      EnsureSurfaceForPaint(static_cast<int>(IOSurfaceGetWidth(src)),
+                            static_cast<int>(IOSurfaceGetHeight(src)));
+    }
+    if (!slot_->surface) return;  // closing, or alloc failed — drop this frame
     if (type == PET_POPUP) {
       CopyAccelToPopupBuf(src);
       CompositeSoftwareLocked(nullptr);  // popup over latest view in slot->surface
@@ -975,19 +1126,32 @@ class HostClient : public CefClient,
   void OnLoadStart(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
                    TransitionType) override {
     if (!frame) return;
-    if (frame->IsMain())
+    if (frame->IsMain()) {
       SendUtf8(slot_->browser_id, kOpPageStart, frame->GetURL().ToString());
-    // (Re)install JS-channel shims for this freshly-loaded frame.
-    for (const auto& name : g_channels) InjectChannelShim(frame, name);
+      // SECURITY: install the JS-channel shims ONLY into the MAIN frame. The shims expose the
+      // privileged campusHost bridge (window.<name> -> window.cefQuery 'ch:'); injecting them
+      // into cross-origin SUBFRAMES would hand an untrusted embedded iframe that bridge. (The
+      // previous code injected into every frame.) OnQuery also refuses subframe 'ch:'/'eval:'.
+      for (const auto& name : g_channels) InjectChannelShim(frame, name);
+    }
   }
   void OnLoadEnd(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame,
                  int /*httpStatusCode*/) override {
     if (frame && frame->IsMain()) {
       SendUtf8(slot_->browser_id, kOpPageFinish, frame->GetURL().ToString());
-      // C1: force a repaint when the main frame finishes — a first paint dropped
-      // during load (e.g. a GPU surface not yet ready) self-heals here instead of
-      // leaving a permanently blank texture with no signal.
-      if (browser && browser->GetHost()) browser->GetHost()->Invalidate(PET_VIEW);
+      // C1 + RENDER FLOOR: force a repaint when the main frame finishes. Invalidate(PET_VIEW)
+      // ALONE is coalesce-able — the scheduler can drop it, which on a shared GPU/Viz process
+      // under a multi-browser establishment burst is exactly when the real-content first frame
+      // gets lost, leaving a permanently blank tile though the page loaded. Mirror the proven
+      // DoSetVisible visibility-edge kick: re-assert size + damage + a NON-coalesce-able
+      // SendExternalBeginFrame, which deterministically drives one renderer frame the scheduler
+      // cannot swallow. (slot_->visible gate: a hidden tile must stay paused — F-2.)
+      if (browser && browser->GetHost() && slot_->visible) {
+        auto h = browser->GetHost();
+        h->WasResized();
+        h->Invalidate(PET_VIEW);
+        h->SendExternalBeginFrame();
+      }
     }
   }
   void OnLoadError(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, ErrorCode code,
@@ -1039,6 +1203,12 @@ class HostClient : public CefClient,
       browser->GetHost()->CloseBrowser(true);
       return;
     }
+    // F-3: reconcile a visibility intent that arrived before the browser bound. A
+    // setVisible(false) on a still-creating slot ran DoSetVisible with browser==null
+    // (WasHidden skipped), so slot_->visible is already false but CEF never heard it —
+    // the slot would establish VISIBLE and pump at 60fps off-screen until the next flip.
+    // Honor the recorded intent now (mirrors the close_requested deferred-intent pattern).
+    if (!slot_->visible) browser->GetHost()->WasHidden(true);
     // Start the external begin-frame pump now that the browser is bound. We turned the internal
     // frame timer OFF (external_begin_frame_enabled), so without this nothing ever paints.
     if (!slot_->begin_frame_pump_started) {
@@ -1080,16 +1250,23 @@ class HostClient : public CefClient,
   // window.cefQuery; queries land here. We forward the request string to the
   // host: "eval:<id>:<json>" for a runJavaScriptReturningResult result,
   // "ch:<name>:<message>" for a JS-channel post.
-  bool OnQuery(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, int64_t,
+  bool OnQuery(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame, int64_t,
                const CefString& request, bool,
                CefRefPtr<Callback> callback) override {
     std::string r = request.ToString();
+    // SECURITY: 'eval:' (host-eval result channel) and 'ch:' (campusHost bridge) are
+    // PRIVILEGED — they reach the trusted host eval/result path and the agent_ui reducer. The
+    // shim is injected per-frame, so a cross-origin / untrusted IFRAME could forge them. Honor
+    // them ONLY from the MAIN frame (the host-trusted document); refuse subframe queries.
+    const bool main_frame = !frame || frame->IsMain();
     if (r.rfind("eval:", 0) == 0) {
+      if (!main_frame) { callback->Failure(403, "subframe"); return true; }
       SendUtf8(slot_->browser_id, kOpEvalResult, r.substr(5));
       callback->Success(CefString());
       return true;
     }
     if (r.rfind("ch:", 0) == 0) {
+      if (!main_frame) { callback->Failure(403, "subframe"); return true; }
       SendUtf8(slot_->browser_id, kOpChannelMsg, r.substr(3));
       callback->Success(CefString());
       return true;
@@ -1119,9 +1296,10 @@ class HostClient : public CefClient,
     }
     {
       std::lock_guard<std::mutex> lock(slot_->surface_mutex);
+      slot_->closing = true;  // BEFORE nulling: a paint racing this must not re-mint a surface
       IOSurfaceRef old = slot_->surface;
       slot_->surface = nullptr;
-      if (old) CFRelease(old);
+      if (old) CFRelease(old);  // drop cef_host's last +1; consumer's CVPixelBuffer keeps it alive
       [slot_->dst_mtl release];
       slot_->dst_mtl = nil;
       slot_->dst_mtl_sid = 0;
@@ -1290,20 +1468,30 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
 // sid is the host's IOSurface for this view (0 / lookup-failure -> no surface
 // until the first resize). Builds the Slot, registers it in both routing maps,
 // and creates the CEF browser bound to a HostClient that holds the slot.
-void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr, uint32_t sid,
+void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr,
                      std::string url) {
   CEF_REQUIRE_UI_THREAD();
+  // WIRE-ID REUSE GUARD: the Swift side allocates ids monotonically, so a collision should be
+  // impossible — but if one ever happened, registering the new slot would let the OLD browser's
+  // OnBeforeClose later erase the NEW slot (g_slots_by_wire_id.erase(id)), leaving an unroutable
+  // browser + a leaked IOSurface/dst_mtl. Fail loudly + tell the host (kOpCreateFailed advances
+  // its pacer / drops the session) instead of silently corrupting cross-tile routing.
+  {
+    std::lock_guard<std::mutex> lock(g_slots_mutex);
+    if (g_slots_by_wire_id.count(wire_id)) {
+      SendLog(wire_id, "createBrowser: wire id already in use — refusing (id-reuse bug)");
+      SendFrame(wire_id, kOpCreateFailed, nullptr, 0);
+      return;
+    }
+  }
   auto slot = std::make_shared<Slot>();
   slot->browser_id = wire_id;
   slot->width = w < 1 ? 1 : w;
   slot->height = h < 1 ? 1 : h;
   slot->dpr = dpr;
-  if (sid) {
-    slot->surface = IOSurfaceLookup(sid);  // owns the +1 from Lookup
-    if (!slot->surface)
-      SendLog(wire_id, "createBrowser: IOSurfaceLookup failed for id " +
-                           std::to_string(sid));
-  }
+  // PRODUCER-ALLOCATES: no surface is created here. slot->surface stays nullptr until the first
+  // OnAcceleratedPaint, where EnsureSurfaceForPaint mints it sized to the actual painted view.
+  // The consumer adopts that surface's id from the first present.
   {
     std::lock_guard<std::mutex> lock(g_slots_mutex);
     g_slots_by_wire_id[wire_id] = slot;
@@ -1333,6 +1521,13 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr, uint32_t sid,
   window_info.external_begin_frame_enabled = true;
   CefBrowserSettings settings;
   settings.windowless_frame_rate = 60;
+  // RENDER FLOOR: paint an OPAQUE background. With the default (alpha 0) a windowless
+  // browser paints transparent, so a DROPPED renderer frame — the shared-GPU multiplex
+  // failure where the 2nd+ browser's CompositorFrame never lands — is INVISIBLE (the canvas
+  // shows through) and indistinguishable from "loading". Opaque means a missing frame reads
+  // as a blank white tile (correct-looking for a not-yet-painted page) instead of a ghost,
+  // and makes the failure diagnosable. Pages with their own bg paint over this normally.
+  settings.background_color = CefColorSetARGB(255, 255, 255, 255);
   // about:blank-first: for a real http(s) URL, establish on about:blank (near-instant
   // first frame → the pacer's establishment slot frees fast) and defer the real
   // navigation to first paint. Skip for data:/file:/about: (already instant) and when the
@@ -1395,51 +1590,64 @@ void DoDisposeBrowser(uint32_t wire_id) {
   }
 }
 
-void DoResize(const std::shared_ptr<Slot>& slot, int w, int h,
-              uint32_t surface_id, double dpr) {
+void DoResize(const std::shared_ptr<Slot>& slot, int w, int h, double dpr) {
   if (w < 1 || w > 16384 || h < 1 || h > 16384) {
     SendLog(slot->browser_id, "resize: out-of-range dims " + std::to_string(w) +
                                   "x" + std::to_string(h));
     return;
   }
-  IOSurfaceRef next = IOSurfaceLookup(surface_id);
-  if (!next) {
-    SendLog(slot->browser_id,
-            "resize: IOSurfaceLookup failed for id " + std::to_string(surface_id));
-    return;
-  }
-  // dpr <= 0 means "unchanged" (older/short wire frames). A new dpr (a canvas-zoom
-  // crispness re-render: same logical w/h, higher device-scale) makes GetScreenInfo
-  // report the new scale so CEF re-rasterizes the page at logical*dpr to fill the
-  // host's freshly-reallocated (bigger) IOSurface.
+  // PRODUCER-ALLOCATES: resize no longer touches the surface — it only updates the logical
+  // geometry + dpr and kicks CEF to re-raster. CEF then paints a new-size view_src, and
+  // EnsureSurfaceForPaint (in the composite path) reallocates slot->surface to match + the next
+  // present hands the consumer the new id. So there is no IOSurfaceLookup/CFRelease-swap here
+  // (that was the consumer-allocates handoff that could crop when src≠dst). dpr<=0 = unchanged.
   bool dpr_changed = false;
   {
     std::lock_guard<std::mutex> lock(slot->surface_mutex);
-    if (slot->surface) CFRelease(slot->surface);
-    slot->surface = next;  // owns the +1 from Lookup
     slot->width = w;
     slot->height = h;
     if (dpr > 0.0 && dpr != slot->dpr) {
       slot->dpr = dpr;
       dpr_changed = true;
     }
-    [slot->dst_mtl release];  // stale: wrapped the old surface
+    // dst_mtl is rebuilt by EnsureSurfaceForPaint on the realloc; nil it here too so a same-size
+    // relayout that doesn't realloc still drops a wrap that could be mid-rebuild (belt + suspenders).
+    [slot->dst_mtl release];
     slot->dst_mtl = nil;
     slot->dst_mtl_sid = 0;
   }
   if (slot->browser) {
-    // A device-scale change needs the renderer told (screen info), not just a relayout.
-    if (dpr_changed) slot->browser->GetHost()->NotifyScreenInfoChanged();
-    slot->browser->GetHost()->WasResized();
-    // Drive a frame right now at the new size. With external begin-frame this is a guaranteed
-    // tick (not a coalesce-able Invalidate request), so the re-laid-out content composites into
-    // the new surface immediately; PumpBeginFrame's ongoing ticks cover the heavy-page settle.
-    slot->browser->GetHost()->SendExternalBeginFrame();
+    if (slot->visible) {
+      // A device-scale change needs the renderer told (screen info), not just a relayout.
+      if (dpr_changed) slot->browser->GetHost()->NotifyScreenInfoChanged();
+      slot->browser->GetHost()->WasResized();
+      // Drive a frame right now at the new size. With external begin-frame this is a guaranteed
+      // tick (not a coalesce-able Invalidate request), so the re-laid-out content composites into
+      // the new surface immediately; PumpBeginFrame's ongoing ticks cover the heavy-page settle.
+      slot->browser->GetHost()->SendExternalBeginFrame();
+    } else {
+      // F-2: HIDDEN — the begin-frame pump is gated off (PumpBeginFrame skips while
+      // !visible), so WasResized()+SendExternalBeginFrame() here would never paint the
+      // freshly-swapped (blank) surface, yet the Swift resizeWatchdog would force-promote
+      // it to the live texture → permanent blank on a static page. The surface + dims are
+      // already swapped above (geometry is current); defer the screen-info re-assert + the
+      // repaint to DoSetVisible's hidden->visible edge (F-1). WasResized while hidden is
+      // pointless (no frame can result), so it is dropped, not deferred.
+      if (dpr_changed) slot->needs_screen_info_on_show = true;
+    }
   }
 }
 
 void DoNavigate(const std::shared_ptr<Slot>& slot, const std::string& url) {
-  if (!slot->browser) return;
+  if (!slot->browser) {
+    // The slot exists but the browser is not yet BOUND (OnAfterCreated pending) — e.g. a
+    // loadHtmlString that arrived right behind a queued createBrowser in a shared-host burst
+    // (6 agent_ui tiles created at once). Defer instead of dropping: the first-paint handler
+    // applies pending_nav_url once the browser binds, and a trusted load keeps its armed
+    // exemption in trusted_pending. Dropping here is exactly why such a burst stayed blank.
+    slot->pending_nav_url = url;
+    return;
+  }
   CefRefPtr<CefFrame> f = slot->browser->GetMainFrame();
   if (f) f->LoadURL(url);
 }
@@ -1455,6 +1663,22 @@ void DoNavigateTrusted(const std::shared_ptr<Slot>& slot,
                        const std::string& url) {
   if (!g_allowed_schemes.empty()) slot->trusted_pending.insert(url);
   DoNavigate(slot, url);
+}
+
+// Navigate / loadTrusted resolved by wire id ON the UI thread, not the reader thread. On a
+// shared host the createBrowser for this id is queued ahead of us on TID_UI (FIFO ordering),
+// so LookupWireId is null on the reader thread but registered by the time this task runs —
+// dropping the op on the reader thread (the old `if (!slot) break`) is why a burst of tiles
+// that loadHtmlString right after create stayed blank. Mirrors the kOpAddChannel fix. With
+// trusted=true the allowlist exemption is armed and a not-yet-bound browser is tolerated via
+// pending_nav_url (DoNavigate above).
+void DoNavigateByWireId(uint32_t wire_id, std::string url, bool trusted) {
+  auto slot = LookupWireId(wire_id);
+  if (!slot) return;  // genuinely disposed before the nav landed
+  if (trusted)
+    DoNavigateTrusted(slot, url);
+  else
+    DoNavigate(slot, url);
 }
 
 void DoReload(const std::shared_ptr<Slot>& slot) {
@@ -1482,8 +1706,28 @@ void DoSetZoom(const std::shared_ptr<Slot>& slot, double level) {
 // alive, so this is a cheap pause/resume — not a teardown. The host pauses a
 // tile that scrolls fully out of the canvas viewport and resumes it on return.
 void DoSetVisible(const std::shared_ptr<Slot>& slot, bool visible) {
+  const bool was_visible = slot->visible;
   slot->visible = visible;  // PumpBeginFrame reads this to idle the begin-frame pump while hidden
-  if (slot->browser) slot->browser->GetHost()->WasHidden(!visible);
+  if (!slot->browser) return;
+  slot->browser->GetHost()->WasHidden(!visible);
+  // F-1 (keystone): on the hidden->visible edge, FORCE a fresh full-viewport repaint at the
+  // current geometry. WasHidden(false) alone does NOT repaint, and three things can have left
+  // the live texture blank/stale while hidden: (a) a resize landed while the pump was gated off
+  // (F-2 deferred its paint here); (b) a dpr/screen-info change was deferred; (c) Chromium's
+  // FrameEvictionManager reclaimed the off-screen compositor frame entirely (happens past ~5
+  // browsers / under memory pressure) so there is nothing to show even though geometry is
+  // unchanged. Re-assert screen info (if a dpr change was deferred) + size, then drive a
+  // guaranteed frame — mirrors DoResize/DoInvalidate. Unconditional on the edge because the
+  // eviction case carries no resize to key off.
+  if (visible && !was_visible) {
+    if (slot->needs_screen_info_on_show) {
+      slot->browser->GetHost()->NotifyScreenInfoChanged();
+      slot->needs_screen_info_on_show = false;
+    }
+    slot->browser->GetHost()->WasResized();
+    slot->browser->GetHost()->Invalidate(PET_VIEW);
+    slot->browser->GetHost()->SendExternalBeginFrame();
+  }
 }
 void DoFind(const std::shared_ptr<Slot>& slot, const std::string& text,
             bool forward, bool match_case, bool find_next) {
@@ -1864,16 +2108,16 @@ void IpcReadLoop() {
     std::shared_ptr<Slot> slot = LookupWireId(wire_id);
     switch (opcode) {
       case kOpCreateBrowser: {
-        if (plen < 20) break;  // {u32 w}{u32 h}{f64 dpr}{u32 sid}{utf8 url}
+        // Producer-allocates: no sid on the wire. {u32 w}{u32 h}{f64 dpr}{utf8 url}.
+        if (plen < 16) break;
         int w = static_cast<int>(ReadU32BE(p));
         int h = static_cast<int>(ReadU32BE(p + 4));
         double dpr = ReadF64BE(p + 8);
         if (dpr <= 0.0 || dpr > 8.0) dpr = 1.0;  // guard a bad/forged dpr
-        uint32_t sid = ReadU32BE(p + 16);
-        std::string url(reinterpret_cast<const char*>(p + 20), plen - 20);
+        std::string url(reinterpret_cast<const char*>(p + 16), plen - 16);
         if (url.empty()) url = "about:blank";
-        CefPostTask(TID_UI, base::BindOnce(&DoCreateBrowser, wire_id, w, h, dpr,
-                                           sid, url));
+        CefPostTask(TID_UI,
+                    base::BindOnce(&DoCreateBrowser, wire_id, w, h, dpr, url));
         break;
       }
       case kOpDisposeBrowser:
@@ -1884,27 +2128,31 @@ void IpcReadLoop() {
         CefPostTask(TID_UI, base::BindOnce(&DoShutdown));
         return;
       case kOpResize: {
+        // Producer-allocates: no sid. {u32 w}{u32 h}{f64 dpr}. dpr 0/absent = unchanged.
         if (!slot) break;
-        if (plen < 12) break;
+        if (plen < 8) break;
         int w = static_cast<int>(ReadU32BE(p));
         int h = static_cast<int>(ReadU32BE(p + 4));
-        uint32_t sid = ReadU32BE(p + 8);
-        // Optional trailing f64 dpr (crispness re-render); 0 / absent = unchanged.
-        double dpr = (plen >= 20) ? ReadF64BE(p + 12) : 0.0;
+        double dpr = (plen >= 16) ? ReadF64BE(p + 8) : 0.0;
         if (dpr < 0.0 || dpr > 8.0) dpr = 0.0;  // guard a bad/forged dpr
-        CefPostTask(TID_UI, base::BindOnce(&DoResize, slot, w, h, sid, dpr));
+        CefPostTask(TID_UI, base::BindOnce(&DoResize, slot, w, h, dpr));
         break;
       }
       case kOpNavigate: {
-        if (!slot) break;
+        // Resolve by wire id on TID_UI (see DoNavigateByWireId): do NOT require the slot
+        // here, or a nav landing behind a still-queued create on a shared host is dropped.
         std::string url(reinterpret_cast<const char*>(p), plen);
-        CefPostTask(TID_UI, base::BindOnce(&DoNavigate, slot, url));
+        CefPostTask(TID_UI,
+                    base::BindOnce(&DoNavigateByWireId, wire_id, url, false));
         break;
       }
       case kOpLoadTrusted: {
-        if (!slot) break;
+        // Same: a loadHtmlString right behind a queued create (a 6-tile agent_ui burst)
+        // must not be dropped — that was the blank-tile bug. Resolved on TID_UI, FIFO-after
+        // the create, and tolerant of a not-yet-bound browser via pending_nav_url.
         std::string url(reinterpret_cast<const char*>(p), plen);
-        CefPostTask(TID_UI, base::BindOnce(&DoNavigateTrusted, slot, url));
+        CefPostTask(TID_UI,
+                    base::BindOnce(&DoNavigateByWireId, wire_id, url, true));
         break;
       }
       case kOpReload:
@@ -2150,6 +2398,22 @@ int ConnectUnixSocket(const std::string& path) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
+  // Raise the open-file limit early. A busy shared host runs many OSR browsers, each holding
+  // sockets/pipes plus IOSurfaces, against macOS's low default soft limit (256) — and an
+  // fd-heavy campus reaches the documented non-fatal WebRTC select() fd>=1024 fault. Lift the
+  // soft limit toward the hard limit so fd headroom isn't the reachable ceiling.
+  {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+      const rlim_t kCap = 10240;  // macOS caps RLIMIT_NOFILE at OPEN_MAX (10240)
+      rlim_t target =
+          (rl.rlim_max == RLIM_INFINITY || rl.rlim_max > kCap) ? kCap : rl.rlim_max;
+      if (rl.rlim_cur < target) {
+        rl.rlim_cur = target;
+        setrlimit(RLIMIT_NOFILE, &rl);
+      }
+    }
+  }
 #if defined(CEF_HOST_MULTIPROCESS) && defined(CEF_HOST_ADHOC)
   // Disable Chromium 144's Mach-port peer-requirement validation for the whole
   // process tree. The child processes read this policy from an env var (NOT the
