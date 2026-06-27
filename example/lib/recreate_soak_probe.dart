@@ -82,6 +82,11 @@ class _AppState extends State<App> {
     _wire(i);
     // ignore: discarded_futures
     old.dispose();
+    // Emit a running total so the leak-soak gate can confirm the dispose+create churn actually
+    // happened (the lifetime stress that producer-allocates mint/release must survive bounded).
+    final total = _tiles.fold<int>(0, (s, x) => s + x.recreates);
+    // ignore: avoid_print
+    print('PROBE recreates_total=$total');
   }
 
   void _step() {
