@@ -803,7 +803,7 @@ final class CefProfileHost {
         let nudged = c.nudgedAt != 0
         let action = LivenessProbePolicy.evaluate(
           sinceLastPresentNs: c.sinceLast, stalenessThresholdNs: livenessStalenessNs,
-          nudged: nudged, sinceNudgeNs: nudged ? (now &- c.nudgedAt) : 0,
+          nudged: nudged, sinceNudgeNs: nudged ? (now &- c.nudgedAt) : UInt64(0),
           nudgeGraceNs: livenessGraceNs)
         switch action {
         case .healthy:

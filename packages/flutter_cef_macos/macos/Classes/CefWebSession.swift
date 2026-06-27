@@ -611,6 +611,15 @@ final class CefWebSession: NSObject, FlutterTexture {
         let expW = Int((Double(width) * dpr).rounded())
         let expH = Int((Double(height) * dpr).rounded())
         let scaleOk = abs(srcW - expW) <= 1 && abs(srcH - expH) <= 1
+        // DIAG: while a resize is pending, log every present's actual composited dims vs the
+        // expected new-surface dims, so a soak test can see whether the size-match ever
+        // succeeds (if `view_src` is pool-sized, src never equals exp and the resize sticks).
+        if pendingBuffer != nil,
+           ProcessInfo.processInfo.environment["FLUTTER_CEF_DEBUG"] != nil {
+          NSLog("[cefdiag-resize] bid=\(browserId) src=\(srcW)x\(srcH) exp=\(expW)x\(expH) "
+            + "match=\(scaleOk) logical=\(width)x\(height) dpr=\(dpr) "
+            + "psid=\(psid) pendSid=\(pendingSurfaceId) sidMatch=\(psid == pendingSurfaceId)")
+        }
         if let pending = pendingBuffer, psid != 0, psid == pendingSurfaceId, scaleOk {
           pixelBuffer = pending
           pendingBuffer = nil
