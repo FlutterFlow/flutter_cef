@@ -54,6 +54,29 @@ enum LivenessProbePolicyTests {
     check("one ns under staleness → healthy",
           act(sinceLastPresentNs: staleness - 1) == .healthy)
 
+    // Grace boundary (audit P3): one ns under grace still waits; at/over grace declares.
+    check("nudged, one ns UNDER grace → wait (healthy)",
+          act(sinceLastPresentNs: 14_000_000_000, nudged: true, sinceNudgeNs: grace - 1)
+            == .healthy)
+    check("nudged, exactly at grace → declareStalled",
+          act(sinceLastPresentNs: 14_000_000_000, nudged: true, sinceNudgeNs: grace)
+            == .declareStalled)
+    check("nudged, one ns over grace → declareStalled",
+          act(sinceLastPresentNs: 14_000_000_000, nudged: true, sinceNudgeNs: grace + 1)
+            == .declareStalled)
+
+    // WEDGE-vs-IDLE INDISTINGUISHABILITY (audit P3, documented as a test so the limitation is
+    // explicit + locked): a static-idle tile and a hung-renderer tile present the SAME inputs to
+    // this policy (stale, nudged, no present within grace) → BOTH reach .declareStalled. The
+    // policy CANNOT tell them apart by timing alone; the consumer (CefProfileHost) deliberately
+    // does NOT escalate .declareStalled to a recreate (that resurrected the recreate-storm), so a
+    // visible hung renderer is accepted as healthy-static. If a future "should-have-painted"
+    // discriminator is added, THIS is where the divergence must be encoded — update this test.
+    let idleInputs = act(sinceLastPresentNs: 20_000_000_000, nudged: true, sinceNudgeNs: 5_000_000_000)
+    let wedgedInputs = act(sinceLastPresentNs: 20_000_000_000, nudged: true, sinceNudgeNs: 5_000_000_000)
+    check("static-idle and hung-renderer are INDISTINGUISHABLE here (same Action)",
+          idleInputs == wedgedInputs && idleInputs == .declareStalled)
+
     print(failures == 0
       ? "\nALL LivenessProbePolicy TESTS PASSED"
       : "\n\(failures) LivenessProbePolicy TEST(S) FAILED")

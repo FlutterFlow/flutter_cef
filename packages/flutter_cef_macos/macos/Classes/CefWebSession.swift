@@ -241,7 +241,8 @@ final class CefWebSession: NSObject, FlutterTexture {
     // later resize — the tile would stop tracking its size. Past a grace, clear the flag so this
     // newer size goes out. (Producer-allocates: there's no consumer pending buffer to drop; the
     // newest opResize + the producer's next paint converge the surface.)
-    let wedged = resizeInFlight && (nowNs() &- resizeSentAtNs) > 450_000_000  // 450ms grace
+    let wedged = ResizeSupersedePolicy.shouldClearWedged(
+      inFlight: resizeInFlight, elapsedNs: nowNs() &- resizeSentAtNs, graceNs: 450_000_000)
     if wedged {
       resizeInFlight = false
       blocked = false
@@ -300,8 +301,20 @@ final class CefWebSession: NSObject, FlutterTexture {
   private func resizeWatchdog(_ gen: UInt64) {
     bufferLock.lock()
     let isHidden = hidden
-    let active = ResizeWatchdogPolicy.shouldKeepWaiting(
+    var active = ResizeWatchdogPolicy.shouldKeepWaiting(
       inFlight: resizeInFlight, gen: gen, currentGen: resizeGen)
+    // SELF-HEAL a wedged resize whose adopt never landed (producer freed the surface racing the
+    // present, or a dropped frame with no follow-up paint). Without this, resizeInFlight would
+    // stay true until the NEXT resize() call — blocking coalescing + re-kicking opInvalidate
+    // forever. Clearing is safe under producer-allocates: always-latest adopts on the next
+    // present regardless of the flag. (Previously this clear lived ONLY in resize(), so a tile
+    // the user stopped interacting with could stay wedged-in-flight indefinitely.)
+    if active, gen == resizeGen,
+       ResizeSupersedePolicy.shouldClearWedged(
+        inFlight: resizeInFlight, elapsedNs: nowNs() &- resizeSentAtNs, graceNs: 450_000_000) {
+      resizeInFlight = false
+      active = false
+    }
     bufferLock.unlock()
     // If a paint already landed in the pending surface, handleFrame promoted it + cleared
     // resizeInFlight → `active` is false → stop. Otherwise re-kick (opInvalidate forces cef_host

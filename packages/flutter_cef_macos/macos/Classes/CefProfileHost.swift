@@ -829,6 +829,15 @@ final class CefProfileHost {
           // first-paint watchdog via firstPresentPending; genuine renderer death is caught by
           // OnRenderProcessTerminated; eviction-while-hidden by the F-1 un-hide repaint.) Leave
           // nudgedAt set so we don't re-nudge every cycle; a real future repaint clears it.
+          //
+          // KNOWN LIMITATION (audited, accepted): a VISIBLE renderer that HANGS post-establishment
+          // (a GPU/JS deadlock that keeps the process alive, so OnRenderProcessTerminated never
+          // fires) is indistinguishable HERE from a healthy static-idle tile — both produce no
+          // present after the nudge — so it is silently accepted. We do NOT escalate, because the
+          // nudge cannot tell "nothing to paint" from "can't paint", and blind escalation
+          // resurrects the recreate-storm above. A proper fix needs a "should-have-painted"
+          // discriminator (e.g. a content/damage probe, or correlating with a pending unsatisfied
+          // resize) — tracked as a fast-follow, not shipped as naive escalation.
           if ProcessInfo.processInfo.environment["FLUTTER_CEF_DEBUG"] != nil {
             NSLog("[cef] profile '\(profileId)': browser \(c.bid) idle (no frames) — accepting as healthy-static (not recreating)")
           }
