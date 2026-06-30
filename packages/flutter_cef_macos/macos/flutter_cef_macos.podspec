@@ -27,6 +27,12 @@ rendering when off-screen. macOS only.
   s.swift_version = '5.0'
   s.resource_bundles = {'flutter_cef_privacy' => ['Resources/PrivacyInfo.xcprivacy']}
 
+  # Fetch the prebuilt, version-matched cef_host.app at `pod install` (downloads + SHA256-verifies
+  # the artifact named in cef_host_prebuilt.json into native/cef_host/prebuilt/). Fail-open + cached;
+  # FLUTTER_CEF_FROM_SOURCE=1 skips it for co-dev. The :after_compile phase below embeds whatever
+  # lands there, so `flutter pub get` + `flutter build macos` is turnkey with no make/host steps.
+  s.prepare_command = 'bash ../tool/fetch_cef_host.sh'
+
   # Auto-embed cef_host.app into the consuming app's Contents/Frameworks. cef_host.app is a
   # nested SIGNED app (Chromium + 5 helper apps) — CocoaPods can't auto-embed a nested .app the
   # way it does a .framework (resource_bundles would nest it inside this pod's framework and break
