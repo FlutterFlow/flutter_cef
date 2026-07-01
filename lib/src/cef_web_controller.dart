@@ -30,6 +30,16 @@ class CefWebController {
   static int _counter = 0;
   bool _disposed = false;
 
+  // Last visibility the consumer requested, and whether it was ever set
+  // explicitly. Re-asserted to the native side once the browser binds (see
+  // [_createSession]) so a `setVisible` that raced or was lost during the create
+  // burst can't leave the slot latched hidden — a permanently blank on-screen
+  // tile. Only re-asserted when explicitly set: a never-set slot keeps CEF's
+  // default-shown, so a fresh/recovered OFF-screen slot isn't briefly forced
+  // visible (which would pump it at 60fps until its cull edge lands).
+  bool _lastVisible = true;
+  bool _visibilityExplicitlySet = false;
+
   /// Stable id for this session, echoed in every host message.
   final String sessionId;
 
@@ -520,6 +530,19 @@ class CefWebController {
       _channel.invokeMethod(
           'addJavaScriptChannel', {'sessionId': sessionId, 'name': name});
     }
+    // Re-assert the last-known visibility now the browser is bound — but only if
+    // the consumer ever set it. A setVisible that landed before the browser bound
+    // (recorded as intent only) or was lost / mis-ordered under the create burst
+    // would otherwise leave the slot latched hidden — a permanently blank
+    // on-screen tile. Idempotent when already in sync (the native hidden->visible
+    // edge repaints; a matching state is a no-op). Gated on the explicit-set flag
+    // so a fresh/recovered slot that was never told a visibility keeps CEF's
+    // default-shown instead of being force-repainted. Pairs with the consumer-side
+    // direct drive in the agent_ui tile.
+    if (_visibilityExplicitlySet) {
+      _channel.invokeMethod(
+          'setVisible', {'sessionId': sessionId, 'visible': _lastVisible});
+    }
     return textureId;
   }
 
@@ -783,8 +806,12 @@ class CefWebController {
   /// teardown. Use it to stop an off-screen view from burning GPU while keeping
   /// its DOM, scroll position, and JS state intact; call `setVisible(true)` to
   /// resume (CEF repaints the current frame). Visibility defaults to shown.
-  Future<void> setVisible(bool visible) => _channel
-      .invokeMethod('setVisible', {'sessionId': sessionId, 'visible': visible});
+  Future<void> setVisible(bool visible) {
+    _lastVisible = visible;
+    _visibilityExplicitlySet = true;
+    return _channel.invokeMethod(
+        'setVisible', {'sessionId': sessionId, 'visible': visible});
+  }
 
   /// Start (or advance) a find-in-page search for [text]. Results arrive on
   /// [onFindResult]. Pass `findNext: true` to move to the next/previous match of
