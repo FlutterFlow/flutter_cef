@@ -1,0 +1,96 @@
+# Private Codemagic pipeline for flutter_cef: builds the SANDBOXED, Developer-ID
+# cef_host and publishes it to public GCS keyed by a content hash of the build
+# inputs (packages/flutter_cef_macos/tool/publish-cef-host.sh). Consumers fetch
+# it at `pod install` (fetch_cef_host.sh) — so `pub get` + `flutter build macos`
+# is turnkey, no `make cef-host`, no FLUTTER_CEF_HOST, no drift.
+#
+# Signing material + the GCS service account live ONLY in Codemagic (the
+# `cef_host_publish` env group), never in this public repo. Publish is
+# idempotent (skips when the hashed object already exists), so a main push and a
+# later tag over the same tree are safe no-ops after the first build.
+workflows:
+  publish-cef-host:
+    name: Publish prebuilt cef_host (macOS arm64, Developer-ID)
+    instance_type: mac_mini_m2
+    max_build_duration: 90
+    environment:
+      groups:
+        - cef_host_publish        # GOOGLE_CREDENTIALS_BODY, CAMPUS_CODESIGN_P12_BASE64,
+                                  # CAMPUS_CODESIGN_P12_PASSWORD, [SLACK_WEBHOOK_URL]
+    triggering:
+      events:
+        - push
+        - tag
+      branch_patterns:
+        - pattern: 'main'
+          include: true
+      tag_patterns:
+        - pattern: 'cef-host-v*'
+          include: true
+    cache:
+      cache_paths:
+        - $HOME/.cache/flutter_cef      # CEF binary dist (pinned by CEF_VERSION)
+    scripts:
+      - name: Install build tools
+        script: |
+          set -euo pipefail
+          command -v cmake >/dev/null 2>&1 || brew install cmake
+          command -v ninja >/dev/null 2>&1 || brew install ninja
+
+      - name: Set up GCP service account
+        script: |
+          set -euo pipefail
+          GCP_KEY_FILE="$HOME/.gcp-publisher-key.json"
+          printf '%s' "$GOOGLE_CREDENTIALS_BODY" > "$GCP_KEY_FILE"
+          chmod 600 "$GCP_KEY_FILE"
+          gcloud auth activate-service-account --key-file="$GCP_KEY_FILE"
+          echo "export GOOGLE_APPLICATION_CREDENTIALS=$GCP_KEY_FILE" >> "$CM_ENV"
+
+      - name: Set up codesigning keychain (Developer ID)
+        script: |
+          set -euo pipefail
+          keychain initialize
+          CM_KEYCHAIN="$(security list-keychains -d user | awk -F\" 'NF>1 {print $2}' | grep codemagic-cli-tools | head -1)"
+          security unlock-keychain -p "" "$CM_KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$CM_KEYCHAIN"
+          # Apple's Developer ID intermediates (so the imported cert chains to a trusted root).
+          for url in \
+              https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer \
+              https://www.apple.com/certificateauthority/DeveloperIDCA.cer; do
+            f="/tmp/$(basename "$url")"
+            curl -fsSL "$url" -o "$f"
+            security import "$f" -k "$CM_KEYCHAIN" 2>/dev/null || true
+          done
+          P12_PATH="$HOME/campus-developer-id.p12"
+          printf '%s' "$CAMPUS_CODESIGN_P12_BASE64" | base64 -D > "$P12_PATH"
+          security import "$P12_PATH" \
+            -P "$CAMPUS_CODESIGN_P12_PASSWORD" \
+            -k "$CM_KEYCHAIN" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security unlock-keychain -p "" "$CM_KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" "$CM_KEYCHAIN"
+          rm -f "$P12_PATH"
+          IDENTITY="$(security find-identity -v -p codesigning | grep 'Developer ID Application' | head -1 | awk '{print $2}')"
+          [ -n "$IDENTITY" ] || { echo "::error:: Developer ID Application identity missing"; exit 1; }
+          echo "export CODESIGN_ID=$IDENTITY" >> "$CM_ENV"
+
+      - name: Build + publish cef_host (idempotent)
+        script: |
+          set -euo pipefail
+          bash packages/flutter_cef_macos/tool/publish-cef-host.sh
+          touch "$HOME/.cef_host_publish_succeeded"
+
+    publishing:
+      scripts:
+        - name: Notify Slack
+          script: |
+            [ -n "${SLACK_WEBHOOK_URL:-}" ] || exit 0
+            BUILD_URL="https://codemagic.io/app/${CM_PROJECT_ID}/build/${CM_BUILD_ID}"
+            LABEL="${CM_TAG:-${CM_BRANCH:-manual}}"
+            if [ -f "$HOME/.cef_host_publish_succeeded" ]; then
+              MSG="✅ flutter_cef cef_host ${LABEL} published → ${BUILD_URL}"
+            else
+              MSG="🚨 flutter_cef cef_host ${LABEL} FAILED → ${BUILD_URL}"
+            fi
+            curl -fsS -X POST -H 'Content-type: application/json' \
+              --data "{\"text\":\"${MSG}\"}" "${SLACK_WEBHOOK_URL}" || true
