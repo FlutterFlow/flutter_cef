@@ -1,5 +1,27 @@
 # Prebuilt, auto-bundled cef_host — make flutter_cef "just a Flutter package"
 
+## Status — content-hash + GCS + Codemagic (supersedes the manifest/GitHub-release model)
+
+The prebuilt is now **keyed by a content hash of the build inputs** (`native/cef_host/` +
+`build_cef_host.sh`) and served from **public GCS** — not by a committed manifest + ad-hoc
+GitHub release. Why: the artifact decouples from how flutter_cef versions itself (any
+SHA/branch/tag pin that checks out the same native sources resolves to the same object), a
+Dart-only change rebuilds nothing, and the signing material never touches this public repo.
+The published variant is the **sandboxed, Developer-ID** host (`CEF_HOST_ADHOC=OFF`) — the
+ad-hoc variant fails to render `agent_ui` in a consumer, which is why the earlier
+manifest/ad-hoc approach was not adopted downstream.
+
+- `tool/cef_host_hash.sh` — the deterministic hash, sourced by both sides so they can't drift.
+- `tool/fetch_cef_host.sh` — consumer fetch: hash → `https://storage.googleapis.com/flutterflow-downloads/campus_prebuilt_cef_host/<hash>/cef_host-macos-arm64.tar.gz`, sha256-verify, extract. Fail-open on network, fail-closed on mismatch.
+- `tool/publish-cef-host.sh` — build sandboxed+signed → hash → idempotent GCS upload. CI-agnostic.
+- `make publish-cef-host` — the current publisher: run it locally when `cef_host` changes
+  (auto-resolves the Developer-ID identity; needs `gsutil` write). Since the host changes
+  rarely, this is enough; `publish-cef-host.sh` is CI-ready if automation is wanted later
+  (e.g. a step in a repo you control that already holds signing + GCS creds).
+
+The design detail below (embedding, signing, incremental rollout) still stands; only the
+publish/fetch transport changed from "committed manifest + `gh release`" to "content-hash + GCS".
+
 ## Problem
 The Dart/Swift half of flutter_cef is already a normal pod. The native `cef_host.app`
 (a nested SIGNED app: ~200MB Chromium + 5 helper apps) is NOT — every consumer must
