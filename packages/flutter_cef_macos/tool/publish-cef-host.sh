@@ -44,9 +44,17 @@ CEF_HOST_ADHOC=OFF CODESIGN_ID="$CODESIGN_ID" bash "$NATIVE/build_cef_host.sh" "
 APP="$OUT/cef_host.app"
 [ -d "$APP" ] || { echo "::error:: cef_host.app not produced by build" >&2; exit 1; }
 
-# Fail-fast: it must be Developer-ID signed and NOT ad-hoc.
-codesign -dvv "$APP" 2>&1 | grep -q "Authority=Developer ID Application" \
-  || { echo "::error:: cef_host.app is not Developer-ID signed (ad-hoc?)" >&2; exit 1; }
+# Fail-fast: it must be Developer-ID signed and NOT ad-hoc. Capture the output
+# (|| true) and string-match rather than piping into grep under `set -o pipefail`
+# — codesign -dvv can exit non-zero on a perfectly valid signature, which would
+# false-fail a `codesign … | grep` pipeline.
+sig="$(codesign -dvv "$APP" 2>&1 || true)"
+case "$sig" in
+  *"Developer ID Application"*) : ;;
+  *) echo "::error:: cef_host.app is not Developer-ID signed (ad-hoc?):" >&2
+     printf '%s\n' "$sig" | head -3 >&2
+     exit 1 ;;
+esac
 
 # --- Provenance stamps beside the app (informational; the URL is the hash) ---
 SRC_SHA="$(git -C "$REPO" rev-parse HEAD)"
