@@ -26,8 +26,42 @@ rendering when off-screen. macOS only.
   s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES' }
   s.swift_version = '5.0'
   s.resource_bundles = {'flutter_cef_privacy' => ['Resources/PrivacyInfo.xcprivacy']}
-  # cef_host.app is bundled into the host .app by the app target, not the pod
-  # (a pod script-phase runs before the app bundle exists). For dev, point the
-  # app at it via $FLUTTER_CEF_HOST; for a distributable build, add a Run Script
-  # phase calling tool/bundle_cef_host.sh — see the README.
+
+  # Fetch the prebuilt, version-matched cef_host.app at `pod install` (downloads + SHA256-verifies
+  # the artifact named in cef_host_prebuilt.json into native/cef_host/prebuilt/). Fail-open + cached;
+  # FLUTTER_CEF_FROM_SOURCE=1 skips it for co-dev. The :after_compile phase below embeds whatever
+  # lands there, so `flutter pub get` + `flutter build macos` is turnkey with no make/host steps.
+  s.prepare_command = 'bash ../tool/fetch_cef_host.sh'
+
+  # Auto-embed cef_host.app into the consuming app's Contents/Frameworks. cef_host.app is a
+  # nested SIGNED app (Chromium + 5 helper apps) — CocoaPods can't auto-embed a nested .app the
+  # way it does a .framework (resource_bundles would nest it inside this pod's framework and break
+  # its seal; vendored_frameworks only embeds .framework). So we copy it ourselves in an
+  # :after_compile script phase, which runs DURING `flutter build macos` AFTER the app bundle +
+  # `[CP] Embed Pods Frameworks` exist and BEFORE Xcode's codesign — the moment the destination
+  # Contents/Frameworks is real (the old "a pod script-phase runs before the app bundle exists"
+  # was only true for :before_compile). ditto (never cp -R) preserves the prebuilt's inside-out
+  # signatures. The prebuilt is fetched at `pod install` by prepare_command (see fetch_cef_host.sh)
+  # into native/cef_host/prebuilt/. When absent (co-dev from-source, or FLUTTER_CEF_HOST set) this
+  # is a clean no-op — the runtime resolver falls back to FLUTTER_CEF_HOST / a make-built host.
+  s.script_phase = {
+    :name => 'Embed cef_host.app',
+    :execution_position => :after_compile,
+    :script => <<-SCRIPT
+set -e
+PREBUILT="${PODS_TARGET_SRCROOT}/../native/cef_host/prebuilt/cef_host.app"
+DEST_DIR="${BUILT_PRODUCTS_DIR}/${FRAMEWORKS_FOLDER_PATH}"
+echo "[flutter_cef] embed: PODS_TARGET_SRCROOT=${PODS_TARGET_SRCROOT}"
+echo "[flutter_cef] embed: prebuilt=${PREBUILT}"
+echo "[flutter_cef] embed: dest=${DEST_DIR}/cef_host.app"
+if [ -d "${PREBUILT}" ]; then
+  mkdir -p "${DEST_DIR}"
+  rm -rf "${DEST_DIR}/cef_host.app"
+  ditto "${PREBUILT}" "${DEST_DIR}/cef_host.app"
+  echo "[flutter_cef] embedded cef_host.app into Contents/Frameworks"
+else
+  echo "[flutter_cef] no prebuilt cef_host.app; skipping (co-dev from-source / FLUTTER_CEF_HOST path)"
+fi
+SCRIPT
+  }
 end

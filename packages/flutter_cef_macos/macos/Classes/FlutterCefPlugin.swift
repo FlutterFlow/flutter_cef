@@ -737,7 +737,16 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       return env
     }
     let inner = "/cef_host.app/Contents/MacOS/cef_host"
+    // The plugin podspec's :after_compile script phase embeds cef_host.app into THIS framework's
+    // Versions/A/Frameworks (a pod build phase can't reach the app's top-level Contents/Frameworks —
+    // it runs before the app bundle exists). The framework exposes no top-level `Frameworks` symlink,
+    // so reach it through `Versions/Current/Frameworks`. This makes a prebuilt-bundled host resolve
+    // with zero consumer wiring. The Contents/Frameworks + Contents/Helpers probes remain for a
+    // consumer that copies the host to the app's top level itself.
+    let fwFrameworks = Bundle(for: FlutterCefPlugin.self).bundleURL
+      .appendingPathComponent("Versions/Current/Frameworks").path
     for base in [
+      fwFrameworks,
       Bundle(for: FlutterCefPlugin.self).resourceURL?.path,
       Bundle.main.bundlePath + "/Contents/Frameworks",
       Bundle.main.bundlePath + "/Contents/Helpers",
