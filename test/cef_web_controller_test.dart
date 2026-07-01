@@ -41,6 +41,49 @@ void main() {
     expect(args['width'], 100);
   });
 
+  test('create re-asserts last-known visibility only when explicitly set',
+      () async {
+    // Explicit setVisible(false) before create: the browser binds, then the
+    // controller replays the recorded visibility so a create-burst race can't
+    // leave the slot latched in the wrong state. Carries the explicit value.
+    final hidden = CefWebController(sessionId: 'vis-false');
+    await hidden.setVisible(false);
+    log.clear();
+    await hidden.create(url: 'about:blank', width: 1, height: 1);
+    final reHidden = log.where((m) =>
+        m.method == 'setVisible' &&
+        (m.arguments as Map)['sessionId'] == 'vis-false');
+    expect(reHidden, isNotEmpty,
+        reason: 'an explicitly-set visibility must be re-asserted after bind');
+    expect((reHidden.last.arguments as Map)['visible'], false);
+
+    // Explicit setVisible(true) before create: replays true — the on-screen wedge
+    // heal (a visible edge that raced the bind is re-applied so the tile paints).
+    final shown = CefWebController(sessionId: 'vis-true');
+    await shown.setVisible(true);
+    log.clear();
+    await shown.create(url: 'about:blank', width: 1, height: 1);
+    final reShown = log.where((m) =>
+        m.method == 'setVisible' &&
+        (m.arguments as Map)['sessionId'] == 'vis-true');
+    expect(reShown, isNotEmpty);
+    expect((reShown.last.arguments as Map)['visible'], true);
+
+    // Never set: NO re-assert. A fresh/recovered slot that was never told a
+    // visibility keeps CEF's default-shown rather than being force-repainted, so
+    // an off-screen tile isn't briefly pumped at 60fps on create/recover.
+    final never = CefWebController(sessionId: 'vis-never');
+    log.clear();
+    await never.create(url: 'about:blank', width: 1, height: 1);
+    expect(
+      log.where((m) =>
+          m.method == 'setVisible' &&
+          (m.arguments as Map)['sessionId'] == 'vis-never'),
+      isEmpty,
+      reason: 'a never-set visibility must not be re-asserted (off-screen guard)',
+    );
+  });
+
   test('create forwards allowedSchemes as a lowercased CSV', () async {
     final c = CefWebController(sessionId: 's-allow');
     await c.create(
