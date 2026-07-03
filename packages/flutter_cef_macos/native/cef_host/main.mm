@@ -96,6 +96,17 @@
 
 namespace {
 
+// ---- Wire protocol version ----
+// Announced in kOpReady's payload (byte 1; byte 0 stays the ready-flags byte) so the
+// Swift plugin can REFUSE a host speaking a different protocol instead of silently
+// mis-parsing frames (frozen/blank tiles with no breadcrumb). The content-hash
+// distribution keeps host + plugin matched on the normal path; this catches the skew
+// vectors that bypass it (FLUTTER_CEF_HOST env override, a stale from-source build, a
+// stale embedded copy). BUMP THIS on any semantic change to the kOp wire protocol
+// below, together with CefProfileHost.protocolVersion (Swift side) — the two must
+// stay equal. Hosts predating the handshake send a 1-byte payload and read as v0.
+constexpr uint8_t kCefHostProtocolVersion = 1;
+
 // ---- Opcodes ----
 constexpr uint8_t kOpPresent = 0x01;
 constexpr uint8_t kOpReady = 0x02;
@@ -1447,7 +1458,9 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
   // this profile). Nothing loads — and nothing is written to the profile cache —
   // until the first kOpCreateBrowser, which is the safety window the host uses to
   // refuse a persistent profile under a mock-keychain (ad-hoc) build (F.5). The
-  // readyFlags byte tells the host whether this is an ad-hoc build (bit0).
+  // payload is [readyFlags (bit0 = ad-hoc build), protocolVersion] — the version
+  // byte lets the host refuse a protocol-skewed binary at the handshake instead of
+  // silently mis-parsing every later frame.
   void OnContextInitialized() override {
     CEF_REQUIRE_UI_THREAD();
     if (std::getenv("FLUTTER_CEF_DEBUG"))
@@ -1456,7 +1469,8 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
 #ifdef CEF_HOST_ADHOC
     ready_flags |= 0x01;  // bit0 = ad-hoc / mock-keychain build
 #endif
-    SendFrame(/*browser_id=*/0, kOpReady, &ready_flags, 1);
+    const uint8_t ready_payload[2] = {ready_flags, kCefHostProtocolVersion};
+    SendFrame(/*browser_id=*/0, kOpReady, ready_payload, sizeof(ready_payload));
   }
   IMPLEMENT_REFCOUNTING(HostApp);
 };
@@ -2320,8 +2334,22 @@ void IpcReadLoop() {
                                            ch));
         break;
       }
-      default:
+      default: {
+        // An opcode this build doesn't know = protocol skew (a newer plugin driving an
+        // older host — the kOpReady version handshake should have refused it, but an
+        // in-between version or a bypassed handshake still lands here). Log ONCE per
+        // opcode (this reader is a single thread, so plain statics are safe) instead of
+        // silently dropping — a silent drop is a frozen tile with no breadcrumb.
+        static bool logged_unknown[256] = {false};
+        if (!logged_unknown[opcode]) {
+          logged_unknown[opcode] = true;
+          SendLog(/*browser_id=*/0,
+                  "unknown opcode " + std::to_string(opcode) +
+                      " (protocol skew? plugin newer than host) — dropping this "
+                      "and further frames of this opcode");
+        }
         break;
+      }
     }
   }
   // Parent died / socket closed: quit.
