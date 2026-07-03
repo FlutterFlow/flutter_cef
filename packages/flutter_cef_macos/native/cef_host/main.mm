@@ -105,7 +105,7 @@ namespace {
 // stale embedded copy). BUMP THIS on any semantic change to the kOp wire protocol
 // below, together with CefProfileHost.protocolVersion (Swift side) — the two must
 // stay equal. Hosts predating the handshake send a 1-byte payload and read as v0.
-constexpr uint8_t kCefHostProtocolVersion = 1;
+constexpr uint8_t kCefHostProtocolVersion = 2;
 
 // ---- Opcodes ----
 constexpr uint8_t kOpPresent = 0x01;
@@ -161,6 +161,7 @@ constexpr uint8_t kOpLoadTrusted = 0x34;    // {utf8 url} host content-load, exe
 constexpr uint8_t kOpSetVisible = 0x35;     // {u8 visible} -> CefBrowserHost::WasHidden(!visible)
 constexpr uint8_t kOpResolveTargetId = 0x36;  // {} resolve this browser's CDP targetId (CEF-2b) -> kOpTargetId
 constexpr uint8_t kOpInvalidate = 0x37;       // {} C1: force a repaint (Invalidate PET_VIEW) to re-kick a stalled first frame
+constexpr uint8_t kOpEditCommand = 0x38;      // {u8 cmd} run a focused-frame edit command (0=copy 1=cut 2=paste 3=selectAll 4=undo 5=redo)
 
 // ---- Shared runtime state ----
 // Atomic: the reader thread reads it (ReadAll), SendFrame on any thread reads it,
@@ -1715,6 +1716,25 @@ void DoExecuteJs(const std::shared_ptr<Slot>& slot, const std::string& code) {
 void DoSetZoom(const std::shared_ptr<Slot>& slot, double level) {
   if (slot->browser) slot->browser->GetHost()->SetZoomLevel(level);
 }
+// Run a browser edit command on the FOCUSED frame. OSR has no AppKit responder
+// chain, so a raw ⌘C/⌘V key event never becomes an editor action — the host
+// invokes these explicitly (CefWebView wires the shortcuts). CefFrame's methods
+// are no-ops when nothing is focused/selected. UI-thread only.
+void DoEditCommand(const std::shared_ptr<Slot>& slot, int command) {
+  CEF_REQUIRE_UI_THREAD();
+  if (!slot->browser) return;
+  CefRefPtr<CefFrame> frame = slot->browser->GetFocusedFrame();
+  if (!frame) return;
+  switch (command) {
+    case 0: frame->Copy(); break;
+    case 1: frame->Cut(); break;
+    case 2: frame->Paste(); break;
+    case 3: frame->SelectAll(); break;
+    case 4: frame->Undo(); break;
+    case 5: frame->Redo(); break;
+    default: break;
+  }
+}
 // Off-screen render gating. WasHidden(true) makes CEF stop producing frames
 // (no OnPaint, the compositor idles) until WasHidden(false); the browser stays
 // alive, so this is a cheap pause/resume — not a teardown. The host pauses a
@@ -2195,6 +2215,12 @@ void IpcReadLoop() {
         if (!slot) break;
         if (plen < 8) break;
         CefPostTask(TID_UI, base::BindOnce(&DoSetZoom, slot, ReadF64BE(p)));
+        break;
+      }
+      case kOpEditCommand: {
+        if (!slot) break;
+        if (plen < 1) break;
+        CefPostTask(TID_UI, base::BindOnce(&DoEditCommand, slot, int{p[0]}));
         break;
       }
       case kOpSetVisible: {

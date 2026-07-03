@@ -40,6 +40,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   private static let opPointer: UInt8 = 0x10
   private static let opResize: UInt8 = 0x11
   private static let opInvalidate: UInt8 = 0x37  // us -> cef_host: force a repaint (re-kick a stuck resize)
+  private static let opEditCommand: UInt8 = 0x38 // us -> cef_host: {u8 cmd} run a focused-frame edit command (copy/cut/paste/selectAll/undo/redo)
   private static let opKey: UInt8 = 0x12
   private static let opFindResult: UInt8 = 0x0e
   private static let opJsDialog: UInt8 = 0x0f
@@ -365,6 +366,12 @@ final class CefWebSession: NSObject, FlutterTexture {
     var p = [UInt8]()
     appendF64(&p, level)
     sendFrame(Self.opSetZoom, p)
+  }
+
+  /// Run a browser edit command (0=copy 1=cut 2=paste 3=selectAll 4=undo
+  /// 5=redo) on the focused frame in the cef_host subprocess.
+  func editCommand(_ command: Int) {
+    sendFrame(Self.opEditCommand, [UInt8(truncatingIfNeeded: command)])
   }
 
   /// Pause/resume frame production in the cef_host subprocess. `false` calls
