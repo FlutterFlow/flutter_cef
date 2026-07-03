@@ -105,7 +105,7 @@ namespace {
 // stale embedded copy). BUMP THIS on any semantic change to the kOp wire protocol
 // below, together with CefProfileHost.protocolVersion (Swift side) — the two must
 // stay equal. Hosts predating the handshake send a 1-byte payload and read as v0.
-constexpr uint8_t kCefHostProtocolVersion = 2;
+constexpr uint8_t kCefHostProtocolVersion = 3;
 
 // ---- Opcodes ----
 constexpr uint8_t kOpPresent = 0x01;
@@ -1552,6 +1552,19 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr,
       (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0)) {
     slot->pending_nav_url = url;
     create_url = "about:blank";
+  }
+  // create-with-html/file: a data:/file: create URL is host-trusted content
+  // injection (the same schemes loadHtmlString/loadFile use via kOpLoadTrusted),
+  // and can NEVER arise from an untrusted page navigation — the scheme allowlist
+  // refuses data:/file: in OnBeforeBrowse. So arm the trusted-load exemption for
+  // the INITIAL load here, exactly as DoNavigateTrusted does, letting a consumer
+  // create the browser directly on its authored document in ONE step (no
+  // about:blank + later loadHtmlString, which raced blank). Identical trust model
+  // to a post-create loadTrusted; only the timing (at create) differs.
+  if (!g_allowed_schemes.empty() &&
+      (create_url.rfind("data:", 0) == 0 ||
+       create_url.rfind("file:", 0) == 0)) {
+    slot->trusted_pending.insert(create_url);
   }
   CefRefPtr<HostClient> client = new HostClient(slot);
   // H3: ASYNC create. CreateBrowserSync BLOCKS this (the single CEF UI) thread until

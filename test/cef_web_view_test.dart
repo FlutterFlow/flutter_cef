@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -61,6 +63,25 @@ void main() {
     expect(args['url'], 'https://a.test');
     expect(args['width'], 320);
     expect(args['height'], 240);
+  });
+
+  testWidgets('create(html:) creates directly on the authored doc as a '
+      'trusted data: URL (one step, no about:blank)', (tester) async {
+    await tester.pumpWidget(boxed(const CefWebView(
+      url: 'about:blank',
+      html: '<h1>hello</h1>',
+    )));
+    await tester.pumpAndSettle();
+    final creates = callsTo('create');
+    expect(creates, hasLength(1));
+    final url = (creates.single.arguments as Map)['url'] as String;
+    expect(url, startsWith('data:text/html;charset=utf-8;base64,'),
+        reason: 'the browser is born on the authored doc, not about:blank');
+    // Round-trips to the original html.
+    final b64 = url.substring('data:text/html;charset=utf-8;base64,'.length);
+    expect(utf8.decode(base64Decode(b64)), '<h1>hello</h1>');
+    // No separate loadTrusted — the doc rode the create.
+    expect(callsTo('loadTrusted'), isEmpty);
   });
 
   testWidgets('resizes the session when the layout changes', (tester) async {

@@ -440,6 +440,12 @@ class CefWebController {
   /// Spawn the renderer for [url] at [width]×[height] logical px. Returns the
   /// [Texture] id to display, or null on failure.
   ///
+  /// Pass [html] instead of a real [url] to create the browser DIRECTLY on an
+  /// authored document (host-trusted, allowlist-exempt — the same content
+  /// [loadHtmlString] loads, but in ONE step at create, so there is no
+  /// about:blank → later loadHtmlString race). [html] wins when both are given;
+  /// [url] should be `about:blank` in that case.
+  ///
   /// Idempotent under concurrency: if a session already exists ([isCreated]) the
   /// existing [textureId] is returned, and if a create() is already in flight
   /// this call adopts it (same future, no second spawn) — [url]/[width]/[height]
@@ -452,6 +458,7 @@ class CefWebController {
     Set<String>? allowedSchemes,
     bool enableCdp = false,
     bool agentControl = false,
+    String? html,
   }) {
     // The TCP enableCdp+named-profile combination is rejected because CDP-over-TCP
     // is an unauthenticated localhost port that could read the shared cookie jar.
@@ -463,8 +470,12 @@ class CefWebController {
         'unauthenticated localhost port that could read the shared cookie jar). '
         'Use agentControl for a private CDP-over-pipe channel instead.');
     if (textureId != null) return Future<int?>.value(textureId);
+    // create-with-html: a base64 data: URL (as loadHtmlString builds). cef_host
+    // arms the trusted-load exemption for a data:/file: create URL, so this
+    // renders the authored doc as the browser's first (and only) page.
+    final createUrl = html != null ? _htmlDataUrl(html) : url;
     return _createInFlight ??= _createSession(
-      url: url,
+      url: createUrl,
       width: width,
       height: height,
       dpr: dpr,
@@ -779,13 +790,18 @@ class CefWebController {
   Future<void> imeCancelComposition() =>
       _channel.invokeMethod('imeCancelComposition', {'sessionId': sessionId});
 
+  /// The `data:` URL an HTML string loads as (base64, utf-8). Shared by
+  /// [loadHtmlString] and create-with-html so the two produce identical content.
+  static String _htmlDataUrl(String html) =>
+      'data:text/html;charset=utf-8;base64,'
+      '${base64Encode(const Utf8Encoder().convert(html))}';
+
   /// Load an HTML string. (`baseUrl` is accepted for API familiarity but not yet
   /// honoured — relative URLs resolve against the `data:` document.)
   ///
   /// Host-trusted content: rendered regardless of the view's `allowedSchemes`.
   Future<void> loadHtmlString(String html, {String? baseUrl}) {
-    final encoded = base64Encode(const Utf8Encoder().convert(html));
-    return _loadTrusted('data:text/html;charset=utf-8;base64,$encoded');
+    return _loadTrusted(_htmlDataUrl(html));
   }
 
   /// Load a local file by absolute path.
