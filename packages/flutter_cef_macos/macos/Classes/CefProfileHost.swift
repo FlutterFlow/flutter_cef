@@ -32,6 +32,15 @@ final class CefProfileHost {
   static let opInvalidate: UInt8 = 0x37       // us -> cef_host: force a repaint to re-kick a stalled first frame (C1)
   static let opSetVisible: UInt8 = 0x35       // us -> cef_host: WasHidden(!visible); peeked to make the C1 watchdog visibility-aware
 
+  // Expected kOp wire-protocol version, announced by the host in opReady's payload
+  // (byte 1; a 1-byte payload = a host predating the handshake = v0). Must equal
+  // kCefHostProtocolVersion in native/cef_host/main.mm — bump BOTH on any semantic
+  // wire change. A mismatched host is refused at the handshake (onProtocolMismatch →
+  // processGone) instead of silently mis-parsing frames into frozen/blank tiles; the
+  // skew vectors are FLUTTER_CEF_HOST overrides, stale from-source builds, and stale
+  // embedded copies (the content-hash fetch can't drift on the normal path).
+  static let protocolVersion: UInt8 = 1
+
   // Profile identity / config.
   let profileId: String
   let profileDir: String
@@ -182,6 +191,14 @@ final class CefProfileHost {
   // profile (no creds were written — see F.5). The plugin tears this host down
   // and respawns an ephemeral one for the same session.
   var onInsecureProfileRefused: (() -> Void)?
+
+  // Invoked (off the reader thread) when the host announces a kOp wire-protocol
+  // version other than [protocolVersion] in its opReady payload. The host is
+  // refused before ANY create flushes (nothing was mis-parsed); the plugin emits
+  // processGone("protocolMismatch") for every attached session and tears the host
+  // down. Deliberately NO auto-respawn: respawning would re-resolve the same
+  // mismatched binary and loop.
+  var onProtocolMismatch: ((UInt8) -> Void)?
 
   // C1: invoked ON THE MAIN THREAD when the reader loop exits UNEXPECTEDLY
   // (cef_host died: EOF/ECONNRESET while running, or a writeAll to a dead pipe)
@@ -1317,6 +1334,23 @@ final class CefProfileHost {
   private func handleProcessFrame(_ op: UInt8, _ payload: [UInt8]) {
     switch op {
     case Self.opReady:
+      // Protocol handshake FIRST: refuse a version-skewed host before anything is
+      // flushed to it. Byte 1 is the host's wire-protocol version; a legacy 1-byte
+      // payload (pre-handshake host) reads as v0 and is refused the same way —
+      // same-framing semantic drift would otherwise mis-parse or silently drop
+      // frames (frozen/blank tiles with no breadcrumb).
+      let hostVersion: UInt8 = payload.count >= 2 ? payload[1] : 0
+      if hostVersion != Self.protocolVersion {
+        NSLog("[cef] REFUSING cef_host for profile '\(profileId)': wire-protocol " +
+              "version \(hostVersion) != expected \(Self.protocolVersion). The " +
+              "resolved cef_host binary does not match this plugin build " +
+              "(FLUTTER_CEF_HOST override / stale from-source build / stale embed?).")
+        writeLock.lock()
+        pendingCreates.removeAll()  // never flushed — the plugin fails the sessions via processGone
+        writeLock.unlock()
+        onProtocolMismatch?(hostVersion)
+        return
+      }
       let flags = payload.first ?? 0
       let adhoc = (flags & 0x01) != 0
       // F.5 dev safety-rail: an ad-hoc (mock-keychain) host must NOT load a named

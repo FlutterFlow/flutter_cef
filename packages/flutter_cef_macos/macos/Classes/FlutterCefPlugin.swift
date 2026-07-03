@@ -474,6 +474,39 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   /// guard unblocks (hasLiveBrowser also goes false via the host's crashed flag),
   /// and reap the process. `onHostDied` is dispatched on the main thread by the
   /// host, so the unlocked dictionaries are touched only here on main (H3).
+  /// Fail every session attached to `host` (emit processGone with `reason` + dispose),
+  /// drop the host from the profile registry, and reap it. Main-thread only (the maps
+  /// are main-thread confined — H3). Shared by the host-death and protocol-mismatch
+  /// paths, which differ only in the reason string.
+  private func failHost(_ host: CefProfileHost, reason: String) {
+    dispatchPrecondition(condition: .onQueue(.main))
+    // Every session still routed to this host loses its browser. Snapshot first
+    // (we mutate the maps in the loop).
+    let goneSessions = sessionHost.compactMap { $0.value === host ? $0.key : nil }
+    for sid in goneSessions {
+      emit("processGone", ["sessionId": sid, "reason": reason])
+      // F-5: dispose the session BEFORE niling the maps. dispose() is the only caller of
+      // registry.unregisterTexture (+ frees the CVPixelBuffer / IOSurface / any pending
+      // buffer). If we just nil sessions[sid], the later Dart controller.dispose ->
+      // disposeSession early-returns on the now-missing session, so the texture + surfaces
+      // leak for the engine's lifetime — on EVERY host crash, exactly when recovery (a
+      // fresh create) happens most. (onBrowserFailed / respawn-failure already dispose;
+      // this path was the asymmetric leak.)
+      sessions[sid]?.dispose()
+      sessions[sid] = nil
+      sessionHost[sid] = nil
+      sessionKey[sid] = nil
+      sessionCreateArgs[sid] = nil
+    }
+    // Drop the host from the profile registry so a re-create spawns a fresh
+    // one. Snapshot the matching keys first — never mutate a Dictionary while
+    // iterating it.
+    let goneKeys = profiles.compactMap { $0.value === host ? $0.key : nil }
+    for k in goneKeys { profiles[k] = nil }
+    // Reap: idempotent SIGTERM(+SIGKILL escalation), a no-op if already exited.
+    host.shutdown()
+  }
+
   private func wireHostDied(_ host: CefProfileHost) {
     host.onHostDied = { [weak self, weak host] status in
       dispatchPrecondition(condition: .onQueue(.main))
@@ -482,32 +515,18 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       // when it loses the cache singleton lock to another process. Surface that as
       // a distinct reason so the widget can say "already open elsewhere" instead of
       // a generic crash.
-      let reason = (status == 2) ? "locked" : "crashed"
-      // Every session still routed to this host loses its browser. Snapshot first
-      // (we mutate the maps in the loop).
-      let goneSessions = self.sessionHost.compactMap { $0.value === host ? $0.key : nil }
-      for sid in goneSessions {
-        self.emit("processGone", ["sessionId": sid, "reason": reason])
-        // F-5: dispose the session BEFORE niling the maps. dispose() is the only caller of
-        // registry.unregisterTexture (+ frees the CVPixelBuffer / IOSurface / any pending
-        // buffer). If we just nil sessions[sid], the later Dart controller.dispose ->
-        // disposeSession early-returns on the now-missing session, so the texture + surfaces
-        // leak for the engine's lifetime — on EVERY host crash, exactly when recovery (a
-        // fresh create) happens most. (onBrowserFailed / respawn-failure already dispose;
-        // this path was the asymmetric leak.)
-        self.sessions[sid]?.dispose()
-        self.sessions[sid] = nil
-        self.sessionHost[sid] = nil
-        self.sessionKey[sid] = nil
-        self.sessionCreateArgs[sid] = nil
+      self.failHost(host, reason: (status == 2) ? "locked" : "crashed")
+    }
+    // Protocol handshake refusal: the host announced a wire-protocol version this
+    // plugin doesn't speak (see CefProfileHost.protocolVersion). Nothing was flushed
+    // to it, so nothing mis-parsed — fail its sessions with a distinct reason and
+    // tear it down. Deliberately NO auto-respawn (a respawn would re-resolve the
+    // same mismatched binary and loop); the consumer's bounded recovery surfaces it.
+    host.onProtocolMismatch = { [weak self, weak host] hostVersion in
+      DispatchQueue.main.async {
+        guard let self = self, let host = host else { return }
+        self.failHost(host, reason: "protocolMismatch(host=v\(hostVersion))")
       }
-      // Drop the host from the profile registry so a re-create spawns a fresh
-      // one. Snapshot the matching keys first — never mutate a Dictionary while
-      // iterating it.
-      let goneKeys = self.profiles.compactMap { $0.value === host ? $0.key : nil }
-      for k in goneKeys { self.profiles[k] = nil }
-      // Reap: idempotent SIGTERM(+SIGKILL escalation), a no-op if already exited.
-      host.shutdown()
     }
     // H7: a SINGLE browser's create failed (host otherwise healthy) — drop just that
     // session + emit processGone for it, so Dart stops waiting on a browser that will
