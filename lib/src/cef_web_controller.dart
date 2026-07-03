@@ -800,6 +800,23 @@ class CefWebController {
   Future<void> setZoomLevel(double level) => _channel
       .invokeMethod('setZoomLevel', {'sessionId': sessionId, 'level': level});
 
+  /// Run a browser edit command on the FOCUSED frame. In off-screen-rendering
+  /// mode a raw ⌘C/⌘V key event does NOT trigger these (there is no AppKit
+  /// responder chain to translate the shortcut into an editor action), so the
+  /// host must invoke them explicitly — [CefWebView] wires the standard
+  /// shortcuts to these. All are no-ops when nothing is focused/selected.
+  /// [copy]/[cut] write the current selection to the system clipboard; [paste]
+  /// inserts from it into the focused editable element.
+  Future<void> copy() => _editCommand(0);
+  Future<void> cut() => _editCommand(1);
+  Future<void> paste() => _editCommand(2);
+  Future<void> selectAll() => _editCommand(3);
+  Future<void> undo() => _editCommand(4);
+  Future<void> redo() => _editCommand(5);
+
+  Future<void> _editCommand(int command) => _channel.invokeMethod(
+      'editCommand', {'sessionId': sessionId, 'command': command});
+
   /// Pause or resume frame production. `setVisible(false)` calls CEF's
   /// `WasHidden(true)` so the page stops painting (no `OnPaint`, the compositor
   /// idles) — the browser stays alive, so it's a cheap pause/resume, not a

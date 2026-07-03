@@ -1,4 +1,6 @@
 
+import 'dart:async';
+
 import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
@@ -11,6 +13,12 @@ import 'cef_web_controller.dart';
 /// page as a scroll. OSR gets no OS scroll momentum, so a flat gain brings the
 /// swipe distance closer to a native browser. Tunable.
 const double _kTrackpadScrollGain = 3.0;
+
+// Content-zoom keyboard stepping (⌘+/-/0). CEF's zoom *factor* is 1.2^level, so a
+// 0.5 step ≈ 9.5% per press; the range clamps to ~48%..207%.
+const double _kZoomStep = 0.5;
+const double _kZoomMin = -4.0;
+const double _kZoomMax = 4.0;
 
 /// A live Chromium (CEF) browser rendered into a Flutter [Texture].
 ///
@@ -317,6 +325,14 @@ class _CefWebViewState extends State<CefWebView>
 
   // ── input forwarding ──────────────────────────────────────────────
   int _lastButton = 0;
+  // Current content-zoom level (CEF factor = 1.2^level), driven by ⌘+/-/0. View-
+  // local: a fresh session (recovery) starts at 100%, matching this reset to 0.
+  double _zoomLevel = 0;
+
+  void _applyZoom(double level) {
+    _zoomLevel = level;
+    unawaited(_controller.setZoomLevel(level));
+  }
   // Multi-click tracking — the page keys word/line selection off clickCount,
   // which Flutter's Listener doesn't surface.
   Duration _lastDownAt = Duration.zero;
@@ -456,6 +472,61 @@ class _CefWebViewState extends State<CefWebView>
         keys.isControlPressed &&
         keys.isMetaPressed) {
       return KeyEventResult.skipRemainingHandlers;
+    }
+
+    // Standard browser shortcuts. In OSR there's no AppKit responder chain, so a
+    // raw ⌘-key event never becomes an editor action or a zoom — route the common
+    // ones to explicit controller calls so a focused webview behaves like a real
+    // browser (⌘C/X/V/A/Z, ⌘+/-/0). Handled on key-down; zoom also on repeat
+    // (hold to keep zooming). Returning `handled` keeps the raw combo off the page
+    // AND off Flutter's own shortcuts.
+    final isMetaOnly = keys.isMetaPressed &&
+        !keys.isControlPressed &&
+        !keys.isAltPressed;
+    if (isMetaOnly && (event is KeyDownEvent || event is KeyRepeatEvent)) {
+      final k = event.logicalKey;
+      // Editing commands: key-down only (repeat would re-cut/re-paste).
+      if (event is KeyDownEvent && !keys.isShiftPressed) {
+        if (k == LogicalKeyboardKey.keyC) {
+          unawaited(_controller.copy());
+          return KeyEventResult.handled;
+        }
+        if (k == LogicalKeyboardKey.keyX) {
+          unawaited(_controller.cut());
+          return KeyEventResult.handled;
+        }
+        if (k == LogicalKeyboardKey.keyV) {
+          unawaited(_controller.paste());
+          return KeyEventResult.handled;
+        }
+        if (k == LogicalKeyboardKey.keyA) {
+          unawaited(_controller.selectAll());
+          return KeyEventResult.handled;
+        }
+        if (k == LogicalKeyboardKey.keyZ) {
+          unawaited(_controller.undo());
+          return KeyEventResult.handled;
+        }
+      }
+      if (event is KeyDownEvent &&
+          keys.isShiftPressed &&
+          k == LogicalKeyboardKey.keyZ) {
+        unawaited(_controller.redo());
+        return KeyEventResult.handled;
+      }
+      // Content zoom (⌘+/-/0). `=`/`+` in, `-` in, `0` reset. Repeat-friendly.
+      if (k == LogicalKeyboardKey.equal || k == LogicalKeyboardKey.add) {
+        _applyZoom((_zoomLevel + _kZoomStep).clamp(_kZoomMin, _kZoomMax));
+        return KeyEventResult.handled;
+      }
+      if (k == LogicalKeyboardKey.minus || k == LogicalKeyboardKey.numpadSubtract) {
+        _applyZoom((_zoomLevel - _kZoomStep).clamp(_kZoomMin, _kZoomMax));
+        return KeyEventResult.handled;
+      }
+      if (k == LogicalKeyboardKey.digit0 || k == LogicalKeyboardKey.numpad0) {
+        _applyZoom(0);
+        return KeyEventResult.handled;
+      }
     }
 
     final mods = _cefModifiers();

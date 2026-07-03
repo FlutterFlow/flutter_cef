@@ -471,4 +471,53 @@ void main() {
       expect(callsTo('imeCommitText'), isEmpty);
     });
   }
+
+  // Browser editing shortcuts (⌘C/X/V/A/Z) route to explicit edit commands —
+  // OSR has no responder chain, so a raw ⌘-key never becomes an editor action.
+  int? editCommandOf(MethodCall c) =>
+      (c.arguments as Map)['command'] as int?;
+
+  for (final (name, key, shift, cmd) in <(String, LogicalKeyboardKey, bool, int)>[
+    ('⌘C copies', LogicalKeyboardKey.keyC, false, 0),
+    ('⌘X cuts', LogicalKeyboardKey.keyX, false, 1),
+    ('⌘V pastes', LogicalKeyboardKey.keyV, false, 2),
+    ('⌘A selects all', LogicalKeyboardKey.keyA, false, 3),
+    ('⌘Z undoes', LogicalKeyboardKey.keyZ, false, 4),
+    ('⌘⇧Z redoes', LogicalKeyboardKey.keyZ, true, 5),
+  ]) {
+    testWidgets('$name via an editCommand (not a raw key)', (tester) async {
+      await focusedView(tester);
+      log.clear();
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.meta);
+      if (shift) await tester.sendKeyDownEvent(LogicalKeyboardKey.shift);
+      await tester.sendKeyEvent(key);
+      if (shift) await tester.sendKeyUpEvent(LogicalKeyboardKey.shift);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.meta);
+      await tester.pump();
+      final edits = callsTo('editCommand');
+      expect(edits, hasLength(1), reason: 'exactly one edit command');
+      expect(editCommandOf(edits.single), cmd);
+      // The shortcut LETTER isn't also forwarded to the page as a text char
+      // (the ⌘/⇧ modifier keydowns themselves do forward, like a real browser).
+      expect(callsTo('imeCommitText'), isEmpty);
+    });
+  }
+
+  for (final (name, key, expectLevel) in <(String, LogicalKeyboardKey, double)>[
+    ('⌘= zooms in', LogicalKeyboardKey.equal, 0.5),
+    ('⌘- zooms out', LogicalKeyboardKey.minus, -0.5),
+    ('⌘0 resets zoom', LogicalKeyboardKey.digit0, 0.0),
+  ]) {
+    testWidgets('$name via setZoomLevel', (tester) async {
+      await focusedView(tester);
+      log.clear();
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.meta);
+      await tester.sendKeyEvent(key);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.meta);
+      await tester.pump();
+      final zooms = callsTo('setZoomLevel');
+      expect(zooms, hasLength(1));
+      expect((zooms.single.arguments as Map)['level'], expectLevel);
+    });
+  }
 }

@@ -131,6 +131,9 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     case "setZoomLevel":
       withSession(args) { $0.setZoomLevel(args["level"] as? Double ?? 0) }
       result(nil)
+    case "editCommand":
+      withSession(args) { $0.editCommand(args["command"] as? Int ?? -1) }
+      result(nil)
     case "setVisible":
       withSession(args) { $0.setVisible(args["visible"] as? Bool ?? true) }
       result(nil)
