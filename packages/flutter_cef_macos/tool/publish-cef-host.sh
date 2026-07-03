@@ -31,10 +31,28 @@ echo "[publish] cef_host input hash: $HASH"
 
 DST="gs://$GCS_BUCKET/$GCS_PREFIX/$HASH/$FILE"
 
-# Idempotency: this exact tree was already built + uploaded -> nothing to do.
+# Idempotency: this exact tree was already built + uploaded -> nothing to do — but VERIFY the
+# remote object first. The keys are content hashes of PUBLIC sources, so anyone with bucket write
+# could pre-plant a malicious object for a future commit and this skip would then permanently
+# suppress the legitimate upload. Verifying the remote's Developer-ID signature (same gate the
+# fetch applies) makes a planted object loud instead of load-bearing.
 if gsutil -q stat "$DST" 2>/dev/null; then
-  echo "[publish] $DST already exists — nothing to do."
-  exit 0
+  echo "[publish] $DST already exists — verifying the remote artifact's signature…"
+  CHECK="$(mktemp -d)"
+  gsutil -q cp "$DST" "$CHECK/$FILE"
+  tar -xzf "$CHECK/$FILE" -C "$CHECK"
+  TEAM="${FLUTTER_CEF_TEAM_ID:-KLAJ5X6PJP}"
+  if codesign --verify --deep --strict \
+      -R="anchor apple generic and certificate leaf[subject.OU] = \"$TEAM\"" \
+      "$CHECK/cef_host.app" 2>/dev/null; then
+    echo "[publish] remote artifact signature ok (team $TEAM) — nothing to do."
+    rm -rf "$CHECK"
+    exit 0
+  fi
+  echo "::error:: remote $DST FAILED signature verification (team $TEAM) — possible planted/corrupt object." >&2
+  echo "::error:: refusing to skip; investigate + delete the object, then re-run to publish a clean build." >&2
+  rm -rf "$CHECK"
+  exit 1
 fi
 
 # --- Build the sandboxed, Developer-ID-signed variant ---

@@ -9,7 +9,16 @@
 # no committed manifest, no per-commit bookkeeping, release-model-agnostic (any
 # SHA/branch/tag pin that checks out the same native sources resolves to the same
 # object). Fail-OPEN on network/missing (co-dev + offline builds fall back to
-# build-from-source / FLUTTER_CEF_HOST); fail-CLOSED on checksum mismatch.
+# build-from-source / FLUTTER_CEF_HOST); fail-CLOSED on checksum mismatch and on
+# a bad/foreign code signature.
+#
+# AUTHENTICITY: the .sha256 sidecar lives in the same public bucket as the tarball,
+# so it is transport-integrity only — anyone who could tamper with the tarball could
+# tamper with the sidecar. The real root of trust is the Developer-ID signature
+# sealed inside the app (tar round-trips it), so after extraction we REQUIRE a
+# valid, untampered signature chained to Apple AND pinned to the publishing team
+# (FLUTTER_CEF_TEAM_ID, default FlutterFlow's KLAJ5X6PJP) before the binary is
+# placed where a build (or posix_spawn, which bypasses Gatekeeper) can use it.
 set -euo pipefail
 
 # Escape hatch: co-dev / build-from-source (native/build_cef_host.sh + a make host).
@@ -81,11 +90,35 @@ if [ ! -f "$tarball" ] || [ "$(sha256_file "$tarball")" != "$expected" ]; then
   mv "$tarball.part" "$tarball"
 fi
 
-echo "[flutter_cef] extracting prebuilt cef_host -> $DEST"
+# Extract to a private staging dir, verify the signature there, and only then move
+# into place — a consumer can never observe a half-extracted or unverified host.
+STAGE="$(mktemp -d "${TMPDIR:-/tmp}/flutter_cef_fetch.XXXXXX")"
+trap 'rm -rf "$STAGE"' EXIT
+echo "[flutter_cef] extracting prebuilt cef_host…"
+# tar preserves the inside-out Developer-ID signature; the .app + provenance
+# stamps (source_sha / version / input_hash) land beside it.
+tar -xzf "$tarball" -C "$STAGE"
+APP="$STAGE/cef_host.app"
+[ -d "$APP" ] || { echo "[flutter_cef] tarball did not contain cef_host.app — refusing." >&2; exit 1; }
+
+# fail-CLOSED authenticity gate: a valid, strict, deep signature (Chromium framework +
+# all nested helpers) whose leaf certificate belongs to the publishing team.
+TEAM="${FLUTTER_CEF_TEAM_ID:-KLAJ5X6PJP}"
+REQ="anchor apple generic and certificate leaf[subject.OU] = \"$TEAM\""
+if ! err="$(codesign --verify --deep --strict -R="$REQ" "$APP" 2>&1)"; then
+  echo "[flutter_cef] SIGNATURE VERIFICATION FAILED for the fetched cef_host — refusing." >&2
+  echo "[flutter_cef]   expected a valid Developer-ID signature from team $TEAM" >&2
+  printf '%s\n' "$err" | head -4 | sed 's/^/[flutter_cef]   /' >&2
+  rm -f "$tarball"   # poisoned/corrupt — don't trust the cached copy again
+  exit 1
+fi
+echo "[flutter_cef] signature ok (Developer ID, team $TEAM)."
+
 mkdir -p "$DEST"
 rm -rf "$DEST/cef_host.app"
-# tar preserves the inside-out Developer-ID signature; the .app + provenance
-# stamps (source_sha / version / input_hash) land in prebuilt/.
-tar -xzf "$tarball" -C "$DEST"
+mv "$APP" "$DEST/cef_host.app"
+for f in cef_host_source_sha.txt cef_version.txt cef_host_input_hash.txt; do
+  [ -f "$STAGE/$f" ] && mv "$STAGE/$f" "$DEST/$f"
+done
 printf '%s\n' "$HASH" > "$STAMP"    # stamp even if the tarball predates the field
 echo "[flutter_cef] prebuilt cef_host ready ($HASH)."
