@@ -520,4 +520,41 @@ void main() {
       expect((zooms.single.arguments as Map)['level'], expectLevel);
     });
   }
+
+  testWidgets('⌘F invokes onFind (host opens its own find bar)', (tester) async {
+    var finds = 0;
+    final focus = FocusNode();
+    addTearDown(focus.dispose);
+    await tester.pumpWidget(boxed(CefWebView(
+      url: 'about:blank',
+      focusNode: focus,
+      onFind: () => finds++,
+    )));
+    await tester.pumpAndSettle();
+    focus.requestFocus();
+    await tester.pump();
+    log.clear();
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.meta);
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyF);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.meta);
+    await tester.pump();
+    expect(finds, 1);
+    // ⌘F is consumed — the letter isn't forwarded to the page as text.
+    expect(callsTo('imeCommitText'), isEmpty);
+  });
+
+  testWidgets('⌘F with no onFind falls through to the page', (tester) async {
+    await focusedView(tester); // no onFind wired
+    log.clear();
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.meta);
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyF);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.meta);
+    await tester.pump();
+    // The ⌘F key reaches the page (a 'key' call for F), not swallowed.
+    final fKeys = callsTo('key').where((c) {
+      final wkc = (c.arguments as Map)['windowsKeyCode'] as int?;
+      return wkc == 0x46; // 'F'
+    });
+    expect(fKeys, isNotEmpty);
+  });
 }

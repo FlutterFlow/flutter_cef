@@ -64,6 +64,7 @@ class CefWebView extends StatefulWidget {
     this.agentControl = false,
     this.profile,
     this.renderScale,
+    this.onFind,
   }) : assert(!(enableCdp && !agentControl && profile != null && profile != ''),
             'enableCdp cannot be combined with a named profile: CDP-over-TCP '
             'exposes an unauthenticated localhost port that could read the '
@@ -88,6 +89,13 @@ class CefWebView extends StatefulWidget {
 
   /// Shown until the first frame arrives. Defaults to a dark blank box.
   final Widget? placeholder;
+
+  /// Invoked when the user presses ⌘F in the focused view. The view has no
+  /// find-bar UI of its own — a host that wants find-in-page provides this to
+  /// open its own bar (which then drives [CefWebController.find] / `stopFind`
+  /// and reads `onFindResult`). When null, ⌘F falls through to the page as an
+  /// ordinary key (a page can implement its own find).
+  final VoidCallback? onFind;
 
   /// If non-null, the page may only navigate to URLs whose scheme is in this
   /// set (case-insensitive) — every other navigation, including the initial
@@ -525,6 +533,15 @@ class _CefWebViewState extends State<CefWebView>
       }
       if (k == LogicalKeyboardKey.digit0 || k == LogicalKeyboardKey.numpad0) {
         _applyZoom(0);
+        return KeyEventResult.handled;
+      }
+      // ⌘F opens the host's find bar (if it wired one); else fall through to the
+      // page. Key-down only.
+      if (event is KeyDownEvent &&
+          !keys.isShiftPressed &&
+          k == LogicalKeyboardKey.keyF &&
+          widget.onFind != null) {
+        widget.onFind!();
         return KeyEventResult.handled;
       }
     }
