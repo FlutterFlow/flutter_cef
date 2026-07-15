@@ -501,6 +501,31 @@ double ReadF64BE(const uint8_t* p) {
 // ---- CEF NSApplication (CefAppProtocol) ----
 }  // namespace
 
+// NSWindowDelegate for the native OAuth popup window (see PopupClient below).
+// ObjC declarations must be at global scope — not inside the anonymous
+// namespace that wraps PopupClient — so it lives here alongside the app class.
+@interface FCPopupWindowDelegate : NSObject <NSWindowDelegate> {
+ @public
+  // Raw CefBrowser*, only safe to deref while `alive` is YES — i.e. between
+  // OnAfterCreated and DoClose. Once a close is underway (JS window.close() or a
+  // user click) CEF may synthesize a close-button press and fire this delegate
+  // AFTER it has begun destroying the browser, leaving `browser` dangling; the
+  // `alive` gate keeps us from touching it then (EXC_BAD_ACCESS otherwise).
+  CefBrowser* browser;
+  BOOL alive;
+}
+@end
+
+@implementation FCPopupWindowDelegate
+- (BOOL)windowShouldClose:(NSWindow*)sender {
+  if (alive && browser) {
+    browser->GetHost()->CloseBrowser(false);  // -> DoClose -> OnBeforeClose closes the window
+    return NO;  // don't close yet; CEF drives teardown, then we close the window
+  }
+  return YES;  // a close is already underway (browser gone/going) — let it close
+}
+@end
+
 @interface CefHostApplication : NSApplication <CefAppProtocol> {
   BOOL handlingSendEvent_;
 }
@@ -1019,6 +1044,133 @@ class HostPermissionHandler : public CefPermissionHandler {
   IMPLEMENT_REFCOUNTING(HostPermissionHandler);
 };
 
+// ───── Native windowed popup for OAuth (window.open with features) ──────────
+//
+// The main tile is OSR (windowless) and cancels ordinary popups, loading their
+// URL in-place. That works for target=_blank links but BREAKS popup-based sign-in
+// (Google / Firebase signInWithPopup): those open a real popup, authenticate,
+// then postMessage the credential back to window.opener and close. An in-place
+// navigation has no opener and destroys the page waiting for the message, so the
+// flow hangs (e.g. stuck at accounts.google.com/gsi/transform).
+//
+// For a SIZED popup (WOD_NEW_POPUP) we instead let CEF create a REAL popup
+// browser hosted in a native NSWindow (SetAsChild). window.opener / postMessage /
+// window.close all work natively — exactly like a normal browser's sign-in popup.
+// The popup is windowed (no OSR render handler), fixed-size, and owns its window's
+// lifecycle. It uses the parent's request context (shared cookie jar), so an
+// already-signed-in Google session is recognized.
+// FCPopupWindowDelegate (the NSWindowDelegate) is declared at global scope
+// between the two anonymous namespaces (ObjC decls can't live in a C++
+// namespace) — see near CefHostApplication above.
+static void OpenNativeAuthPopup(const CefString& url, const CefPopupFeatures& f,
+                                CefWindowInfo& window_info,
+                                CefRefPtr<CefClient>& client);
+
+class PopupClient : public CefClient,
+                    public CefLifeSpanHandler,
+                    public CefDisplayHandler {
+ public:
+  PopupClient(NSWindow* window, FCPopupWindowDelegate* delegate)
+      : window_([window retain]), delegate_([delegate retain]) {}
+
+  CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
+  CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
+
+  // Nested windows opened from within the auth popup (consent screens, IdP hops)
+  // are part of the same flow — give sized popups their own native window too so
+  // opener/postMessage keeps working all the way down. Other dispositions fall
+  // through to CEF's default (rare in a sign-in flow).
+  bool OnBeforePopup(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, int,
+                     const CefString& target_url, const CefString&,
+                     WindowOpenDisposition disposition, bool,
+                     const CefPopupFeatures& features, CefWindowInfo& window_info,
+                     CefRefPtr<CefClient>& client, CefBrowserSettings&,
+                     CefRefPtr<CefDictionaryValue>&, bool*) override {
+    if (disposition == CEF_WOD_NEW_POPUP)
+      OpenNativeAuthPopup(target_url, features, window_info, client);
+    return false;
+  }
+
+  void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
+    if (delegate_) {
+      delegate_->browser = browser.get();
+      delegate_->alive = YES;
+    }
+  }
+
+  bool DoClose(CefRefPtr<CefBrowser>) override {
+    // Close underway (JS window.close() or a user click). Flip the gate BEFORE
+    // CEF destroys the browser so any close-button press CEF synthesizes can't
+    // deref a dangling browser in windowShouldClose:.
+    if (delegate_) delegate_->alive = NO;
+    return false;  // allow the default close; OnBeforeClose then tears down the window
+  }
+
+  void OnBeforeClose(CefRefPtr<CefBrowser>) override {
+    // Runs inside CEF's teardown of the child NSView. Closing/releasing the
+    // window synchronously here re-enters -[NSWindow __close] and can fire the
+    // delegate against a half-destroyed browser (EXC_BAD_ACCESS). So: sever the
+    // browser pointer NOW (any stray windowShouldClose: then sees nil and no-ops),
+    // detach the delegate, and defer the window close + releases to the next
+    // main-loop turn, out of the teardown stack.
+    NSWindow* win = window_;
+    FCPopupWindowDelegate* del = delegate_;
+    window_ = nil;
+    delegate_ = nil;
+    if (del) del->browser = nullptr;
+    if (win) [win setDelegate:nil];
+    dispatch_async(dispatch_get_main_queue(), ^{
+      if (win) {
+        [win orderOut:nil];
+        [win close];
+        [win release];
+      }
+      if (del) [del release];
+    });
+  }
+
+  void OnTitleChange(CefRefPtr<CefBrowser>, const CefString& title) override {
+    if (window_)
+      [window_ setTitle:[NSString stringWithUTF8String:title.ToString().c_str()]];
+  }
+
+ private:
+  NSWindow* window_;                 // MRC: retained in ctor, released in OnBeforeClose
+  FCPopupWindowDelegate* delegate_;  // MRC: retained in ctor, released in OnBeforeClose
+  IMPLEMENT_REFCOUNTING(PopupClient);
+};
+
+static void OpenNativeAuthPopup(const CefString& url, const CefPopupFeatures& f,
+                                CefWindowInfo& window_info,
+                                CefRefPtr<CefClient>& client) {
+  // Runs on the CEF UI thread, which on macOS (CefRunMessageLoop) is the main
+  // thread — safe to build AppKit objects here.
+  int w = (f.widthSet && f.width > 0) ? f.width : 480;
+  int h = (f.heightSet && f.height > 0) ? f.height : 640;
+  if (w < 320) w = 320;
+  if (w > 1200) w = 1200;
+  if (h < 400) h = 400;
+  if (h > 1000) h = 1000;
+  NSRect frame = NSMakeRect(0, 0, w, h);
+  NSWindow* win = [[NSWindow alloc]
+      initWithContentRect:frame
+                styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable)
+                  backing:NSBackingStoreBuffered
+                    defer:NO];
+  [win setReleasedWhenClosed:NO];  // MRC: PopupClient releases it explicitly
+  [win setTitle:@"Sign in"];
+  [win center];
+  FCPopupWindowDelegate* del = [[[FCPopupWindowDelegate alloc] init] autorelease];
+  [win setDelegate:del];
+  // Host the popup browser windowed inside our content view: CEF renders + routes
+  // native input for it, and keeps the window.opener relationship intact.
+  window_info.SetAsChild((CefWindowHandle)[win contentView], CefRect(0, 0, w, h));
+  client = new PopupClient(win, del);  // retains win + del
+  [win makeKeyAndOrderFront:nil];
+  [NSApp activateIgnoringOtherApps:YES];
+  [win release];  // drop our alloc +1; PopupClient's retain keeps it alive
+}
+
 class HostClient : public CefClient,
                    public CefLoadHandler,
                    public CefDisplayHandler,
@@ -1236,9 +1388,20 @@ class HostClient : public CefClient,
   // navigation delegate rather than a separate window.
   bool OnBeforePopup(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, int,
                      const CefString& target_url, const CefString&,
-                     WindowOpenDisposition, bool, const CefPopupFeatures&,
-                     CefWindowInfo&, CefRefPtr<CefClient>&, CefBrowserSettings&,
+                     WindowOpenDisposition disposition, bool,
+                     const CefPopupFeatures& features, CefWindowInfo& window_info,
+                     CefRefPtr<CefClient>& client, CefBrowserSettings&,
                      CefRefPtr<CefDictionaryValue>&, bool*) override {
+    // A SIZED popup (window.open with width/height) is the shape OAuth /
+    // "Sign in with Google" uses: it needs a real popup with window.opener so it
+    // can postMessage the credential back to us. Give it a native window — the
+    // in-tab diversion below can never complete that handshake (it would strand
+    // the flow at e.g. accounts.google.com/gsi/transform with no opener).
+    if (disposition == CEF_WOD_NEW_POPUP) {
+      OpenNativeAuthPopup(target_url, features, window_info, client);
+      return false;  // allow CEF to create the popup browser in our native window
+    }
+    // target=_blank / plain new tab: keep loading it in this single-view tile.
     if (!target_url.empty())
       SendUtf8(slot_->browser_id, kOpNewWindow, target_url.ToString());
     return true;
