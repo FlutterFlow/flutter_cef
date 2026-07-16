@@ -893,6 +893,14 @@ class _CefWebViewState extends State<CefWebView>
   @override
   void showToolbar() {}
 
+  // Newer Flutter text-input protocol addition: the framework grew
+  // TextInputClient.onFocusReceived (platform re-focus for browser
+  // autofill). CEF owns its own focus lifecycle; decline, matching the
+  // framework default. Deliberately omit @override for pre-3.41 SDKs, where
+  // the member does not exist; on newer SDKs this is the intended override.
+  // ignore: annotate_overrides
+  bool onFocusReceived() => false;
+
   @override
   void connectionClosed() {
     _textInput = null;
