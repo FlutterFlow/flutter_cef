@@ -583,13 +583,57 @@ class HostRenderHandler : public CefRenderHandler {
     rect = CefRect(0, 0, slot_->width, slot_->height);
   }
 
+  // The REAL display the app sits on (DIP). Reporting screen == the tile's own
+  // viewport (the old behavior) is a textbook headless/OSR fingerprint — bot
+  // detectors flag `window.screen.width == innerWidth`, `screen.colorDepth == 0`.
+  // This is not spoofing: it's the actual monitor the browser is on. GetViewRect
+  // (the render size) stays tile-sized, exactly like a real browser window is
+  // smaller than its screen. Falls back to a plausible frame with no display
+  // (headless CI). Returns rect(top-left DIP) + work-area (menu-bar/Dock excluded).
+  static void RealScreenDip(CefRect& full, CefRect& work) {
+    NSScreen* s = NSScreen.mainScreen;
+    if (!s) {  // headless: a common 14" default so the value is never the tell
+      full = CefRect(0, 0, 1512, 982);
+      work = CefRect(0, 38, 1512, 982 - 38);
+      return;
+    }
+    NSRect f = s.frame;          // points == DIP on macOS; primary screen at (0,0)
+    NSRect v = s.visibleFrame;   // minus menu bar (top) + Dock; Cocoa bottom-left
+    const int H = static_cast<int>(f.size.height);
+    full = CefRect(0, 0, static_cast<int>(f.size.width), H);
+    // Flip Cocoa bottom-left visibleFrame to CEF top-left work area.
+    work = CefRect(static_cast<int>(v.origin.x),
+                   H - static_cast<int>(v.origin.y + v.size.height),
+                   static_cast<int>(v.size.width),
+                   static_cast<int>(v.size.height));
+  }
+
   // Report the device scale so CEF renders the OSR buffer at logical*dpr
-  // (Retina-native) instead of 1x upscaled — fixes the blur on HiDPI displays.
+  // (Retina-native) instead of 1x upscaled — fixes the blur on HiDPI displays —
+  // AND the real screen bounds + color depth (see RealScreenDip).
   bool GetScreenInfo(CefRefPtr<CefBrowser>, CefScreenInfo& info) override {
     std::lock_guard<std::mutex> lock(slot_->surface_mutex);
     info.device_scale_factor = static_cast<float>(slot_->dpr);
-    info.rect = CefRect(0, 0, slot_->width, slot_->height);
-    info.available_rect = info.rect;
+    info.depth = 24;             // screen.colorDepth — 0 was a headless tell
+    info.depth_per_component = 8;
+    info.is_monochrome = 0;
+    CefRect full, work;
+    RealScreenDip(full, work);
+    info.rect = full;
+    info.available_rect = work;
+    return true;
+  }
+
+  // The browser's root-window rect on screen (DIP). Without this CEF falls back
+  // to GetViewRect → window.outerWidth/Height == innerWidth/Height and
+  // screenX/screenY == 0, another OSR tell. Report a plausible window frame at a
+  // non-zero offset, taller than the view by typical browser chrome, so
+  // outerHeight > innerHeight like a real window. Popups/IME are composited into
+  // our own surface from view-relative coords, so this offset doesn't move them.
+  bool GetRootScreenRect(CefRefPtr<CefBrowser>, CefRect& rect) override {
+    std::lock_guard<std::mutex> lock(slot_->surface_mutex);
+    constexpr int kChromeH = 87;  // tab strip + toolbar, ~ real Chrome on macOS
+    rect = CefRect(100, 80, slot_->width, slot_->height + kChromeH);
     return true;
   }
 
