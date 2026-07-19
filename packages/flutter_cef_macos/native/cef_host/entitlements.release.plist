@@ -23,5 +23,16 @@
   <!-- Bluetooth is load-bearing: caBLE / hybrid passkeys (WebAuthn cross-device)
        reach Web Bluetooth, so this stays even in the minimal release set. -->
   <key>com.apple.security.device.bluetooth</key><true/>
+  <!-- On-device passkeys (WebAuthn platform authenticator, Touch ID / Secure
+       Enclave). Chromiums macOS FIDO backend (device/fido/mac/touch_id_context.mm)
+       stores the credential in the Keychain and refuses Touch ID unless the binary
+       is entitled for the group TEAMID.org.chromium.Chromium.webauthn. Self-serve
+       (no Apple approval); only works on a real-keychain signed build (ad-hoc uses
+       use-mock-keychain). KLAJ5X6PJP is our Team ID. Keep ASCII only: the AMFI
+       entitlement parser rejects non-ASCII (em dash / smart quotes) in comments. -->
+  <key>keychain-access-groups</key>
+  <array>
+    <string>KLAJ5X6PJP.org.chromium.Chromium.webauthn</string>
+  </array>
 </dict>
 </plist>

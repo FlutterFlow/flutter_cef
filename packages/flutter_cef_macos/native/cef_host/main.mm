@@ -1184,6 +1184,29 @@ class PopupClient : public CefClient,
   IMPLEMENT_REFCOUNTING(PopupClient);
 };
 
+// SPIKE (passkeys): a bare client for a windowed, CHROME-runtime browser. The
+// Chrome runtime manages its own native window, toolbar, and — crucially — the
+// full WebAuthn stack (Touch ID sheet, account picker, hybrid QR), none of which
+// exist in the Alloy/OSR runtime the tiles are forced into. So this needs no
+// handlers; it exists to prove a Campus-spawned window can complete a passkey
+// ceremony the OSR tile cannot.
+class AuthWindowClient : public CefClient {
+  IMPLEMENT_REFCOUNTING(AuthWindowClient);
+};
+
+// SPIKE: open a real windowed Chrome-runtime browser at |url|, sharing THIS
+// process's cookie jar (global request context == the tile's named profile, since
+// profiles are per-cef_host-process via root_cache_path). Windowed + Chrome style
+// = the WebAuthn UI can actually draw. Env-triggered one-shot from OnAfterCreated.
+void OpenChromeAuthWindow(const std::string& url) {
+  CefWindowInfo wi;                             // default → windowed, CEF owns the NSWindow
+  wi.runtime_style = CEF_RUNTIME_STYLE_CHROME;  // full Chrome UI + WebAuthn stack
+  wi.bounds = CefRect(120, 100, 520, 760);      // a plausible sign-in window
+  CefBrowserSettings settings;
+  CefBrowserHost::CreateBrowser(wi, new AuthWindowClient(), url, settings,
+                                nullptr, nullptr);  // nullptr ctx = shared cookies
+}
+
 static void OpenNativeAuthPopup(const CefString& url, const CefPopupFeatures& f,
                                 CefWindowInfo& window_info,
                                 CefRefPtr<CefClient>& client) {
@@ -1422,6 +1445,16 @@ class HostClient : public CefClient,
     if (!slot_->begin_frame_pump_started) {
       slot_->begin_frame_pump_started = true;
       PumpBeginFrame(slot_->browser_id);
+    }
+    // SPIKE (passkeys): one-shot — open a windowed Chrome-runtime auth window on
+    // the first tile, so we can test whether a passkey ceremony completes there
+    // (it hangs in the OSR/Alloy tile). Off unless FLUTTER_CEF_SPIKE_AUTH_URL set.
+    static std::atomic<bool> s_auth_opened{false};
+    if (const char* au = std::getenv("FLUTTER_CEF_SPIKE_AUTH_URL")) {
+      bool expected = false;
+      if (s_auth_opened.compare_exchange_strong(expected, true)) {
+        OpenChromeAuthWindow(au);
+      }
     }
   }
 
