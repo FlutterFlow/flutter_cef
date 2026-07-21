@@ -128,6 +128,11 @@ survived. Three PLAN.md claims are corrected below (one refuted outright).**
 - v1 action: plumb the runner's top-level HWND into `SetAsWindowless` for
   dialog placement (small refinement, not a blocker). Re-confirm the
   biometric sub-UI on a Hello-enrolled box (this box has no NGC container).
+- **Caveat closed 2026-07-20**: during live P4-slice testing the maintainer
+  completed a real passkey **login** end-to-end in the example app on this
+  machine (OSR browser → webauthn.dll → CredentialUIBroker → authenticator →
+  assertion accepted by the page). WebAuthn on Windows OSR is confirmed at
+  the full-ceremony level, not just dialog-appearance.
 
 ## S6 — toolchain: smaller delta than budgeted
 

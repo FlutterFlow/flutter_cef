@@ -1,3 +1,5 @@
+import 'dart:io' show Platform;
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_cef/flutter_cef.dart';
@@ -248,11 +250,15 @@ and committed text — including emoji — should appear intact.</p>
                     tooltip: 'openDevTools()',
                     onPressed: _controller.openDevTools,
                   ),
-                  IconButton(
-                    icon: const Icon(Icons.emoji_emotions_outlined),
-                    tooltip: 'showEmojiPicker() (focus a field first)',
-                    onPressed: _emojiPicker,
-                  ),
+                  // macOS-only: showEmojiPicker drives the AppKit Character
+                  // Palette; there is no supported Win32 equivalent (PLAN §6),
+                  // so the button is hidden per-platform.
+                  if (Platform.isMacOS)
+                    IconButton(
+                      icon: const Icon(Icons.emoji_emotions_outlined),
+                      tooltip: 'showEmojiPicker() (focus a field first)',
+                      onPressed: _emojiPicker,
+                    ),
                   IconButton(
                     icon: const Icon(Icons.keyboard),
                     tooltip: 'Load the IME / text-input test page',

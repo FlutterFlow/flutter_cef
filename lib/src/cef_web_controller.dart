@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart' show defaultTargetPlatform;
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:meta/meta.dart';
@@ -808,8 +809,13 @@ class CefWebController {
   ///
   /// Host-trusted content: rendered regardless of the view's `allowedSchemes`
   /// (so `file:` need not be in the allowlist to use this).
-  Future<void> loadFile(String absolutePath) =>
-      _loadTrusted('file://$absolutePath');
+  Future<void> loadFile(String absolutePath) => _loadTrusted(
+      // A Windows path (drive letter + backslashes, e.g. `C:\a\b.html`) needs
+      // Uri.file to become a valid `file:///C:/a/b.html`; the POSIX branch keeps
+      // the historical byte-identical `file://<path>` form macOS ships today.
+      defaultTargetPlatform == TargetPlatform.windows
+          ? Uri.file(absolutePath, windows: true).toString()
+          : 'file://$absolutePath');
 
   /// Set the page content zoom. `level` is a Chromium zoom *level*; the zoom
   /// *factor* is `1.2^level` (0 = 100%, 1 ≈ 120%, -1 ≈ 83%).

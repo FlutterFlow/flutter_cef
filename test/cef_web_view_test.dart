@@ -578,4 +578,100 @@ void main() {
     });
     expect(fKeys, isNotEmpty);
   });
+
+  // ── Windows: Ctrl is the accelerator, key events carry Windows codes ──
+  group('on Windows', () {
+    const onWindows = TargetPlatformVariant(<TargetPlatform>{
+      TargetPlatform.windows,
+    });
+
+    for (final (name, key, shift, cmd) in <(String, LogicalKeyboardKey, bool, int)>[
+      ('Ctrl+C copies', LogicalKeyboardKey.keyC, false, 0),
+      ('Ctrl+X cuts', LogicalKeyboardKey.keyX, false, 1),
+      ('Ctrl+V pastes', LogicalKeyboardKey.keyV, false, 2),
+      ('Ctrl+A selects all', LogicalKeyboardKey.keyA, false, 3),
+      ('Ctrl+Z undoes', LogicalKeyboardKey.keyZ, false, 4),
+      ('Ctrl+Shift+Z redoes', LogicalKeyboardKey.keyZ, true, 5),
+      ('Ctrl+Y redoes', LogicalKeyboardKey.keyY, false, 5),
+    ]) {
+      testWidgets('$name via an editCommand', (tester) async {
+        await focusedView(tester);
+        log.clear();
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.control);
+        if (shift) await tester.sendKeyDownEvent(LogicalKeyboardKey.shift);
+        await tester.sendKeyEvent(key);
+        if (shift) await tester.sendKeyUpEvent(LogicalKeyboardKey.shift);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.control);
+        await tester.pump();
+        final edits = callsTo('editCommand');
+        expect(edits, hasLength(1));
+        expect(editCommandOf(edits.single), cmd);
+        expect(callsTo('imeCommitText'), isEmpty);
+      }, variant: onWindows);
+    }
+
+    testWidgets('Ctrl+= zooms via setZoomLevel', (tester) async {
+      await focusedView(tester);
+      log.clear();
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.control);
+      await tester.sendKeyEvent(LogicalKeyboardKey.equal);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.control);
+      await tester.pump();
+      final zooms = callsTo('setZoomLevel');
+      expect(zooms, hasLength(1));
+      expect((zooms.single.arguments as Map)['level'], 0.5);
+    }, variant: onWindows);
+
+    testWidgets('Ctrl+F invokes onFind', (tester) async {
+      var finds = 0;
+      final focus = FocusNode();
+      addTearDown(focus.dispose);
+      await tester.pumpWidget(boxed(CefWebView(
+        url: 'about:blank',
+        focusNode: focus,
+        onFind: () => finds++,
+      )));
+      await tester.pumpAndSettle();
+      focus.requestFocus();
+      await tester.pump();
+      log.clear();
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.control);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyF);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.control);
+      await tester.pump();
+      expect(finds, 1);
+      expect(callsTo('imeCommitText'), isEmpty);
+    }, variant: onWindows);
+
+    testWidgets(
+        'key events carry the Windows VK as nativeKeyCode and no macOS '
+        'NSEvent character', (tester) async {
+      await focusedView(tester);
+      log.clear();
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.backspace);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.backspace);
+      await tester.pump();
+      final keyCalls = callsTo('key');
+      expect(keyCalls, isNotEmpty);
+      for (final c in keyCalls) {
+        final a = (c.arguments as Map).cast<String, dynamic>();
+        expect(a['windowsKeyCode'], 0x08); // VK_BACK
+        expect(a['nativeKeyCode'], 0x08,
+            reason: 'Windows uses the VK, not a macOS keycode (51)');
+        expect(a['character'], 0,
+            reason: 'NSDeleteCharacter (0x7F) is macOS-only');
+      }
+    }, variant: onWindows);
+
+    testWidgets('meta (Win key) combos are NOT treated as accelerators',
+        (tester) async {
+      await focusedView(tester);
+      log.clear();
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.meta);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyC);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.meta);
+      await tester.pump();
+      expect(callsTo('editCommand'), isEmpty);
+    }, variant: onWindows);
+  });
 }

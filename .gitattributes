@@ -6,3 +6,7 @@
 packages/**/native/** text eol=lf
 packages/**/tool/*.sh text eol=lf
 *.sh text eol=lf
+# Windows batch files MUST be CRLF (cmd.exe misparses LF-only .bat, dropping
+# characters). This overrides the native/** LF pin above for *.bat only — the
+# hash key stays deterministic because CRLF is pinned on BOTH platforms.
+*.bat text eol=crlf

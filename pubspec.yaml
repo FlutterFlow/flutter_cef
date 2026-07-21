@@ -31,6 +31,9 @@ dependencies:
   # on directly so a plain dependency on `flutter_cef` provides macOS support.
   flutter_cef_macos:
     path: packages/flutter_cef_macos
+  # Endorsed default Windows implementation (see `default_package` below).
+  flutter_cef_windows:
+    path: packages/flutter_cef_windows
 
 dev_dependencies:
   flutter_test:
@@ -58,6 +61,10 @@ flutter:
         # Federated: the macOS implementation lives in the endorsed
         # flutter_cef_macos package (see packages/flutter_cef_macos).
         default_package: flutter_cef_macos
+      windows:
+        # Federated: the Windows implementation lives in the endorsed
+        # flutter_cef_windows package (see packages/flutter_cef_windows).
+        default_package: flutter_cef_windows
 
   # To add assets to your plugin package, add an assets section, like this:
   # assets:
