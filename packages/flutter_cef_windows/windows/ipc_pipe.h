@@ -3,11 +3,16 @@
 // Framing/opcodes: ../native/cef_host/PROTOCOL.md §1/§2 and the shared
 // constants header ../native/cef_host/cef_host_protocol.h.
 //
-//  - Name: \\.\pipe\flutter_cef_<pid>_<counter> (NextPipeName()).
-//  - Server: CreateNamedPipeW(PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-//    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_REJECT_REMOTE_CLIENTS,
-//    1 instance), created BEFORE spawning cef_host so the child's
-//    CreateFileW connects first try.
+//  - Name: \\.\pipe\flutter_cef_<128-bit CSPRNG hex> (NextPipeName()). The
+//    unguessable name + FILE_FLAG_FIRST_PIPE_INSTANCE close the squat race
+//    (PLAN §4.2/§7.6): a predictable pid_counter name let a same-user process
+//    pre-create the pipe before cef_host connected.
+//  - Server: CreateNamedPipeW(PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED |
+//    FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE |
+//    PIPE_REJECT_REMOTE_CLIENTS, 1 instance) with a PROTECTED DACL granting
+//    only the current-user SID, created BEFORE spawning cef_host so the child's
+//    CreateFileW connects first try. Creation aborts on ERROR_ACCESS_DENIED /
+//    ERROR_PIPE_BUSY (the name already exists — squat/collision).
 //  - OVERLAPPED I/O is REQUIRED, not an optimization (found empirically by
 //    the harness): on a synchronous handle the I/O manager serializes ALL
 //    operations on the file object, so a reader thread parked in a blocking

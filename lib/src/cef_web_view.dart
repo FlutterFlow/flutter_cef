@@ -580,7 +580,14 @@ class _CefWebViewState extends State<CefWebView>
     }
 
     final mods = _cefModifiers();
-    final wkc = cefWindowsKeyCode(event.logicalKey);
+    // On Windows CEF resolves the key entirely from windows_key_code, so the VK
+    // must cover the full keyboard — the function row, Insert, numpad, and OEM
+    // punctuation included (else those send 0 and the page sees dead keys). The
+    // macOS path keeps the leaner [cefWindowsKeyCode] so its wire bytes are
+    // unchanged.
+    final wkc = _isWindows
+        ? cefWindowsKeyCodeForEvent(event.logicalKey, event.physicalKey)
+        : cefWindowsKeyCode(event.logicalKey);
     // native_key_code MUST be the macOS keycode for the physical key — CEF on
     // macOS keys editing/navigation off it. Deriving it from the Windows VK
     // collides (e.g. 0 -> VK 0x30 == macOS keycode 48 == Tab, moving focus).

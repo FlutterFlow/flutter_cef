@@ -17,30 +17,50 @@
 cmake_minimum_required(VERSION 3.21)
 project(cef_host_win LANGUAGES CXX)
 
-# CEF_ROOT: -DCEF_ROOT=... > env CEF_ROOT > the dev-box spike extraction.
+# CEF_DIST_NAME: the pinned distribution (keep in lockstep with fetch_cef.ps1,
+# ../../windows/CMakeLists.txt, build_cef_host.sh:17 and SPIKES.md).
+set(CEF_DIST_NAME
+    "cef_binary_144.0.27+g3fae261+chromium-144.0.7559.254_windows64_minimal")
+
+# CEF_ROOT resolution — ONE shared order, mirrored in ../../windows/CMakeLists.txt
+# and fetch_cef.ps1:
+#   -DCEF_ROOT=... > env CEF_ROOT > %LOCALAPPDATA%/flutter_cef/<dist>. If none
+#   exists, ask fetch_cef.ps1 to resolve/print it; still unresolved -> fail.
 if(NOT DEFINED CEF_ROOT)
   if(DEFINED ENV{CEF_ROOT})
     set(CEF_ROOT "$ENV{CEF_ROOT}")
+  elseif(EXISTS "$ENV{LOCALAPPDATA}/flutter_cef/${CEF_DIST_NAME}/cmake")
+    set(CEF_ROOT "$ENV{LOCALAPPDATA}/flutter_cef/${CEF_DIST_NAME}")
   else()
-    set(CEF_ROOT "C:/dev/flutter_cef_spikes/cef/cef_binary_144.0.27+g3fae261+chromium-144.0.7559.254_windows64_minimal")
+    execute_process(
+      COMMAND powershell -NoProfile -ExecutionPolicy Bypass -File
+              "${CMAKE_CURRENT_SOURCE_DIR}/fetch_cef.ps1"
+      OUTPUT_VARIABLE CEF_ROOT
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      RESULT_VARIABLE _fetch_cef_result)
+    if(NOT _fetch_cef_result EQUAL 0)
+      set(CEF_ROOT "")
+    endif()
   endif()
 endif()
+# Normalize to forward slashes: %LOCALAPPDATA% (and env CEF_ROOT) come back with
+# backslashes, which CMake reads as escape sequences in later string references.
+file(TO_CMAKE_PATH "${CEF_ROOT}" CEF_ROOT)
 if(NOT EXISTS "${CEF_ROOT}/cmake")
   message(FATAL_ERROR
-    "CEF_ROOT not found at '${CEF_ROOT}'. Run fetch_cef.ps1 or set CEF_ROOT "
-    "(env or -DCEF_ROOT=) to the extracted cef_binary_144.0.27 windows64_minimal dir.")
+    "CEF_ROOT not found (resolved '${CEF_ROOT}'). Run fetch_cef.ps1 to stage "
+    "'${CEF_DIST_NAME}' under %LOCALAPPDATA%/flutter_cef/, or set CEF_ROOT "
+    "(env or -DCEF_ROOT=) to an extracted copy.")
 endif()
+message(STATUS "cef_host: resolved CEF_ROOT = ${CEF_ROOT}")
 list(APPEND CMAKE_MODULE_PATH "${CEF_ROOT}/cmake")
 find_package(CEF REQUIRED)
 
 # libcef_dll_wrapper: reuse a prebuilt (/MT, matching CEF's default flags)
-# when provided, else build it in-tree. -DCEF_WRAPPER_LIB=<path/to/.lib>.
-if(NOT DEFINED CEF_WRAPPER_LIB)
-  set(_default_prebuilt
-      "C:/dev/flutter_cef_spikes/cefbuild/libcef_dll_wrapper/libcef_dll_wrapper.lib")
-  if(EXISTS "${_default_prebuilt}")
-    set(CEF_WRAPPER_LIB "${_default_prebuilt}")
-  endif()
+# when provided, else build it in-tree. Resolution mirrors the CEF_ROOT
+# env-first chain: -DCEF_WRAPPER_LIB=<path/to/.lib> > env CEF_WRAPPER_LIB.
+if(NOT DEFINED CEF_WRAPPER_LIB AND DEFINED ENV{CEF_WRAPPER_LIB})
+  set(CEF_WRAPPER_LIB "$ENV{CEF_WRAPPER_LIB}")
 endif()
 if(DEFINED CEF_WRAPPER_LIB AND EXISTS "${CEF_WRAPPER_LIB}")
   set(WRAPPER_LIB "${CEF_WRAPPER_LIB}")

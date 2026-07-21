@@ -135,9 +135,19 @@ bool TextureBridge::Present(int64_t texture_id, uint64_t bridge_handle,
         reinterpret_cast<HANDLE>(static_cast<uintptr_t>(bridge_handle)),
         IID_PPV_ARGS(opened.GetAddressOf()));
     if (FAILED(hr)) {
-      // Host re-minted and freed this handle racing us (or a bad handle) —
-      // keep serving the previous texture; the next present retries.
-      BridgeLog("OpenSharedResource failed — keeping previous frame", hr);
+      // #9: on device loss (removed/reset) the cached device is dead and every
+      // OpenSharedResource on it keeps failing — drop it (+ this slot's opened
+      // keepalive) so the next present re-creates the device via EnsureDevice
+      // and reopens the host-re-minted handle fresh. A plain bad-handle miss
+      // (host re-minted/freed racing us) just keeps the previous frame serving.
+      if (FAILED(device_->GetDeviceRemovedReason())) {
+        BridgeLog("device lost on OpenSharedResource — resetting device", hr);
+        device_.Reset();
+        std::lock_guard<std::mutex> lock(entry->mutex);
+        entry->keepalive.Reset();
+      } else {
+        BridgeLog("OpenSharedResource failed — keeping previous frame", hr);
+      }
       return false;
     }
     std::lock_guard<std::mutex> lock(entry->mutex);

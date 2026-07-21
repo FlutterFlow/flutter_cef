@@ -251,14 +251,22 @@ ComPtr<ID3D11Device> g_d3d_device;
 ComPtr<ID3D11Device1> g_d3d_device1;
 ComPtr<ID3D11DeviceContext> g_d3d_ctx;
 std::mutex g_d3d_mutex;
+// EnsureD3D's "already tried and failed" latch. A file-global (not a function
+// static) so device-loss recovery can clear it; touched only on the CEF UI
+// thread (the sole OnAcceleratedPaint thread).
+bool g_d3d_tried = false;
+// Bumped on every device (re)create / loss so a Slot can tell its bridge was
+// minted on a now-dead device and re-mint (see EnsureBridgeForPaintLocked).
+// Atomic because Slots read it while only the UI thread writes it.
+std::atomic<uint64_t> g_d3d_epoch{0};
 
-// Returns false (once, then cached) if D3D11 is unavailable — the pixel path
-// then degrades to the logged software OnPaint fallback.
+// Returns false (once, then cached until a device-loss reset) if D3D11 is
+// unavailable — the pixel path then degrades to the logged software OnPaint
+// fallback.
 bool EnsureD3D() {
-  static bool tried = false;
   if (g_d3d_device1) return true;
-  if (tried) return false;
-  tried = true;
+  if (g_d3d_tried) return false;
+  g_d3d_tried = true;
   UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
   D3D_FEATURE_LEVEL fl;
   HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
@@ -275,7 +283,25 @@ bool EnsureD3D() {
     g_d3d_ctx.Reset();
     return false;
   }
+  g_d3d_epoch.fetch_add(1);  // a fresh device — all bridges must re-mint on it
   return true;
+}
+
+// True if the cached device has been removed/reset (any GetDeviceRemovedReason
+// failure). Caller holds g_d3d_mutex.
+bool D3DDeviceLostLocked() {
+  return g_d3d_device && FAILED(g_d3d_device->GetDeviceRemovedReason());
+}
+
+// Drop the cached device/context so the NEXT EnsureD3D re-creates from scratch,
+// and bump the epoch so every Slot re-mints its bridge on the new device (their
+// old bridge textures died with the removed device). Caller holds g_d3d_mutex.
+void ResetD3DDeviceLocked() {
+  g_d3d_device1.Reset();
+  g_d3d_device.Reset();
+  g_d3d_ctx.Reset();
+  g_d3d_tried = false;
+  g_d3d_epoch.fetch_add(1);
 }
 
 // Per-browser state: one cef_host process multiplexes N browsers, one Slot
@@ -302,6 +328,9 @@ struct Slot {
   uint64_t bridge_handle = 0;  // IDXGIResource::GetSharedHandle of `bridge`
   int bridge_w = 0;
   int bridge_h = 0;
+  // g_d3d_epoch the current `bridge` was minted at. A mismatch means the device
+  // it lives on was lost/reset, so the bridge must be re-minted (#9).
+  uint64_t bridge_epoch = 0;
   // Belt-1 friendliness: the OLD bridge is kept alive here across a re-mint
   // until the kOpPresent announcing its replacement has been written to the
   // pipe (the plugin also holds its own opened D3D reference — LAW 6 — this
@@ -426,8 +455,9 @@ class HostRenderHandler : public CefRenderHandler {
   bool EnsureBridgeForPaintLocked(int sw, int sh) {
     if (sw < 1 || sh < 1) return false;
     if (slot_->closing) return false;  // paint racing teardown: no re-mint
-    if (slot_->bridge && slot_->bridge_w == sw && slot_->bridge_h == sh)
-      return true;  // steady state: zero allocation
+    if (slot_->bridge && slot_->bridge_w == sw && slot_->bridge_h == sh &&
+        slot_->bridge_epoch == g_d3d_epoch.load())
+      return true;  // steady state: zero allocation (same device + same size)
     D3D11_TEXTURE2D_DESC d = {};
     d.Width = static_cast<UINT>(sw);
     d.Height = static_cast<UINT>(sh);
@@ -462,6 +492,7 @@ class HostRenderHandler : public CefRenderHandler {
         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(legacy));
     slot_->bridge_w = sw;
     slot_->bridge_h = sh;
+    slot_->bridge_epoch = g_d3d_epoch.load();
     return true;
   }
 
@@ -529,9 +560,20 @@ class HostRenderHandler : public CefRenderHandler {
       HRESULT hr = g_d3d_device1->OpenSharedResource1(
           nt, __uuidof(ID3D11Texture2D), &src);
       if (FAILED(hr)) {
-        SendLog(slot_->browser_id,
-                "OnAcceleratedPaint: OpenSharedResource1 failed hr=" +
-                    std::to_string(static_cast<long>(hr)));
+        // #9: distinguish a transient bad-handle miss from real device loss. On
+        // loss, drop the cached device (+ bump the epoch) so the next paint
+        // re-creates the device and every bridge — otherwise the dead device is
+        // cached forever and the tile never repaints.
+        if (D3DDeviceLostLocked()) {
+          SendLog(slot_->browser_id,
+                  "OnAcceleratedPaint: D3D device lost (open) — resetting; next "
+                  "paint re-creates");
+          ResetD3DDeviceLocked();
+        } else {
+          SendLog(slot_->browser_id,
+                  "OnAcceleratedPaint: OpenSharedResource1 failed hr=" +
+                      std::to_string(static_cast<long>(hr)));
+        }
         return;
       }
       // The opened texture's own desc is the truth about the frame's physical
@@ -543,6 +585,16 @@ class HostRenderHandler : public CefRenderHandler {
       if (!EnsureBridgeForPaintLocked(srcW, srcH)) return;
       g_d3d_ctx->CopyResource(slot_->bridge.Get(), src.Get());
       g_d3d_ctx->Flush();
+      // CopyResource/Flush return void; device loss surfaces via
+      // GetDeviceRemovedReason. If it went down mid-blit, reset and skip this
+      // frame — never present pixels from a dead device (#9).
+      if (D3DDeviceLostLocked()) {
+        SendLog(slot_->browser_id,
+                "OnAcceleratedPaint: D3D device lost (blit) — resetting; next "
+                "paint re-creates");
+        ResetD3DDeviceLocked();
+        return;
+      }
     }
     if (std::getenv("FLUTTER_CEF_DEBUG") &&
         (slot_->diag_paint_count <= 3 || slot_->diag_paint_count % 120 == 0)) {
@@ -769,16 +821,31 @@ class HostClient : public CefClient,
     }
   }
 
-  // Popups (window.open / target=_blank) -> kOpNewWindow, loaded in-place by
-  // the plugin (main.mm:1433-1452). The macOS native OAuth-popup window path
-  // (CEF_WOD_NEW_POPUP -> real NSWindow) is post-slice on Windows: sized
-  // popups also divert to kOpNewWindow for now.
+  // Popups. macOS (main.mm:1444-1451) splits by disposition: a SIZED popup
+  // (CEF_WOD_NEW_POPUP — the window.open-with-features shape OAuth/"Sign in with
+  // Google" uses) gets a REAL native window so window.opener/postMessage/
+  // window.close work; everything else (target=_blank / plain new tab) diverts
+  // to kOpNewWindow and loads in-place. The native-window port is post-slice on
+  // Windows, so sized popups still divert in-tab — but that CANNOT complete the
+  // opener/postMessage handshake (it strands sign-in). Emit a distinct log per
+  // CEF_WOD_NEW_POPUP so the regression is visible, not silent.
   bool OnBeforePopup(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, int,
                      const CefString& target_url, const CefString&,
-                     CefLifeSpanHandler::WindowOpenDisposition, bool,
+                     CefLifeSpanHandler::WindowOpenDisposition disposition, bool,
                      const CefPopupFeatures&,
                      CefWindowInfo&, CefRefPtr<CefClient>&, CefBrowserSettings&,
                      CefRefPtr<CefDictionaryValue>&, bool*) override {
+    if (disposition == CEF_WOD_NEW_POPUP) {
+      static std::atomic<bool> logged{false};
+      if (!logged.exchange(true))
+        SendLog(slot_->browser_id,
+                "OnBeforePopup: sized popup (CEF_WOD_NEW_POPUP) diverted in-tab "
+                "— native OAuth-popup window is post-slice on Windows; "
+                "window.open sign-in (opener/postMessage) will not complete "
+                "(macOS OpenNativeAuthPopup, main.mm:1444)");
+    }
+    // Non-native case (matches macOS's non-popup branch, main.mm:1449-1451):
+    // load the target in this tile.
     if (!target_url.empty())
       SendUtf8(slot_->browser_id, kOpNewWindow, target_url.ToString());
     return true;  // cancel the native popup
@@ -1558,12 +1625,36 @@ void IpcReadLoop() {
                     base::BindOnce(&DoKey, slot, type, mods, wkc, nkc, ch));
         break;
       }
+      case kOpEvalReturning: {
+        // #14: runJavaScriptReturningResult AWAITS the evalResult event, so a
+        // silent drop hangs the Dart Future forever. The renderer-side
+        // CefMessageRouter half that would produce a real result is post-slice —
+        // until it lands, synthesize an ERROR evalResult so the Future completes
+        // (with an error) instead of hanging. Wire shape per PROTOCOL.md
+        // kOpEvalResult: {utf8 "id:json"}, json = {ok,v} (cef_web_controller
+        // .dart:295-313). {u32 id}{utf8 code} inbound.
+        if (plen < 4) break;
+        uint32_t id = ReadU32BE(p);
+        std::string reply =
+            std::to_string(id) +
+            ":{\"ok\":false,\"v\":\"evalReturning not implemented on Windows "
+            "yet\"}";
+        SendUtf8(wire_id, kOpEvalResult, reply);
+        static bool logged_eval = false;
+        if (!logged_eval) {
+          logged_eval = true;
+          SendLog(0, "cef_host: evalReturning not implemented in the Windows "
+                     "slice — replying error evalResult (Future completes)");
+        }
+        break;
+      }
       case kOpAddChannel:
-      case kOpEvalReturning:
       case kOpResolveTargetId: {
         // Post-slice: these need the renderer-side CefMessageRouter half /
-        // the DevTools observer (macOS process_helper.mm counterpart). Log
-        // ONCE per opcode; never kill the stream.
+        // the DevTools observer (macOS process_helper.mm counterpart). Neither
+        // can hang a Dart Future (addJavaScriptChannel resolves via the method-
+        // channel reply; resolveTargetId is fire-and-forget), so a logged drop
+        // is safe. Log ONCE per opcode; never kill the stream.
         static bool logged_stub[256] = {false};
         if (!logged_stub[opcode]) {
           logged_stub[opcode] = true;
@@ -1628,7 +1719,11 @@ extern "C" CEF_BOOTSTRAP_EXPORT int RunConsoleMain(
   std::string profile_dir = GetSwitch(argc, argv, "--profile-dir=");
   std::string allowed = GetSwitch(argc, argv, "--allowed-schemes=");
   bool ephemeral = HasFlag(argc, argv, "--ephemeral");
-  // TODO(post-slice): delete-on-exit for --ephemeral profile dirs.
+  // NB: the PLUGIN owns ephemeral profile-dir deletion — its reaper deletes the
+  // dir once this host is confirmed dead, and a startup sweep reclaims dirs
+  // orphaned by a crash (FlutterCefPlugin.cpp TeardownSession reaper +
+  // SweepStaleEphemeralProfiles; macOS CefProfileHost.swift:1004-1006). The
+  // host need not delete its own dir (it can't reliably, holding it open).
 
   // Navigation scheme allowlist (lowercased csv; main.mm:2727-2737). Empty =
   // allow all.

@@ -37,9 +37,13 @@ class HostProcess {
   HostProcess& operator=(const HostProcess&) = delete;
 
   // Spawns cef_host.exe bound to the (already created) pipe `pipe_name`.
-  // Returns false on spawn failure.
+  // `allowed_schemes` is an optional csv navigation-scheme allowlist passed as
+  // --allowed-schemes=<csv> (empty = omitted = allow all; mirrors
+  // CefProfileHost.spawn, CefProfileHost.swift:289-291). Returns false on
+  // spawn failure.
   bool Spawn(const std::wstring& cef_host_exe, const std::wstring& pipe_name,
-             const std::wstring& profile_dir, bool ephemeral);
+             const std::wstring& profile_dir, bool ephemeral,
+             const std::string& allowed_schemes = std::string());
 
   // Waits up to `timeout_ms` for exit; returns the exit code, or
   // kStillRunning on timeout / if never spawned.

@@ -663,6 +663,50 @@ void main() {
       }
     }, variant: onWindows);
 
+    // Regression: the Windows key path used to resolve VKs from the partial
+    // cefWindowsKeyCode table only, so the function row, numpad, and OEM
+    // punctuation all sent windows_key_code 0 → the page saw dead keys. They
+    // must now carry their real VK in BOTH windowsKeyCode and nativeKeyCode
+    // (Windows keys everything off the VK, so native == the VK).
+    for (final (name, key, physical, vk) in <(
+      String,
+      LogicalKeyboardKey,
+      PhysicalKeyboardKey,
+      int
+    )>[
+      ('F5', LogicalKeyboardKey.f5, PhysicalKeyboardKey.f5, 0x74),
+      ('F1', LogicalKeyboardKey.f1, PhysicalKeyboardKey.f1, 0x70),
+      ('numpad3', LogicalKeyboardKey.numpad3, PhysicalKeyboardKey.numpad3, 0x63),
+      ('numpad*', LogicalKeyboardKey.numpadMultiply,
+          PhysicalKeyboardKey.numpadMultiply, 0x6A),
+      ('Insert', LogicalKeyboardKey.insert, PhysicalKeyboardKey.insert, 0x2D),
+      // OEM punctuation resolves from the PHYSICAL key (layout-independent).
+      ('semicolon', LogicalKeyboardKey.semicolon,
+          PhysicalKeyboardKey.semicolon, 0xBA),
+      ('slash', LogicalKeyboardKey.slash, PhysicalKeyboardKey.slash, 0xBF),
+      // Arrows were already mapped — assert they stay real, not 0.
+      ('arrowLeft', LogicalKeyboardKey.arrowLeft, PhysicalKeyboardKey.arrowLeft,
+          0x25),
+    ]) {
+      testWidgets('$name carries its real VK in windowsKeyCode/nativeKeyCode',
+          (tester) async {
+        await focusedView(tester);
+        log.clear();
+        await tester.sendKeyDownEvent(key, physicalKey: physical);
+        await tester.sendKeyUpEvent(key, physicalKey: physical);
+        await tester.pump();
+        final keyCalls = callsTo('key');
+        expect(keyCalls, isNotEmpty);
+        for (final c in keyCalls) {
+          final a = (c.arguments as Map).cast<String, dynamic>();
+          expect(a['windowsKeyCode'], vk,
+              reason: '$name must send VK 0x${vk.toRadixString(16)}, not 0');
+          expect(a['nativeKeyCode'], vk,
+              reason: 'Windows uses the VK as the native code');
+        }
+      }, variant: onWindows);
+    }
+
     testWidgets('meta (Win key) combos are NOT treated as accelerators',
         (tester) async {
       await focusedView(tester);

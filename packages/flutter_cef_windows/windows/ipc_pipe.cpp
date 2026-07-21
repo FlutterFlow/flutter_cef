@@ -1,9 +1,22 @@
 #include "ipc_pipe.h"
 
+#include <bcrypt.h>
+#include <sddl.h>
+
 #include <atomic>
+#include <cstring>
+#include <iomanip>
 #include <sstream>
+#include <vector>
 
 #include "cef_host_protocol.h"
+
+// PLAN §4.2/§7.6 pipe hardening needs a CSPRNG (BCryptGenRandom) and the token/
+// SID/SDDL APIs. Neither bcrypt.lib nor advapi32.lib is on this plugin's CMake
+// link line and that file is owned elsewhere — pull them in from the TU so the
+// build stays self-contained.
+#pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "advapi32.lib")
 
 namespace flutter_cef {
 
@@ -16,6 +29,37 @@ void PipeLog(const char* msg) {
   s += msg;
   s += "\n";
   OutputDebugStringA(s.c_str());
+}
+
+// Builds a self-relative security descriptor whose DACL is PROTECTED and grants
+// GENERIC_ALL to ONLY the current user's SID (PLAN §7.6). PROTECTED (SDDL "P")
+// blocks inherited ACEs, so nothing a squatter controls can widen access. On
+// success *out_sd is a LocalAlloc'd descriptor the caller must LocalFree.
+bool BuildCurrentUserOnlySD(PSECURITY_DESCRIPTOR* out_sd) {
+  *out_sd = nullptr;
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+  DWORD len = 0;
+  GetTokenInformation(token, TokenUser, nullptr, 0, &len);  // size probe
+  if (len == 0) {
+    CloseHandle(token);
+    return false;
+  }
+  std::vector<uint8_t> buf(len);
+  const bool got =
+      GetTokenInformation(token, TokenUser, buf.data(), len, &len) != FALSE;
+  CloseHandle(token);
+  if (!got) return false;
+  auto* tu = reinterpret_cast<TOKEN_USER*>(buf.data());
+  LPWSTR sid_str = nullptr;
+  if (!ConvertSidToStringSidW(tu->User.Sid, &sid_str)) return false;
+  // D:  DACL present
+  // P   PROTECTED — no ACEs inherited from any parent object
+  // (A;;GA;;;<SID>)  ALLOW GENERIC_ALL to the current user's SID only
+  std::wstring sddl = std::wstring(L"D:P(A;;GA;;;") + sid_str + L")";
+  LocalFree(sid_str);
+  return ConvertStringSecurityDescriptorToSecurityDescriptorW(
+             sddl.c_str(), SDDL_REVISION_1, out_sd, nullptr) != FALSE;
 }
 
 }  // namespace
@@ -33,26 +77,66 @@ IpcPipe::~IpcPipe() {
 
 // static
 std::wstring IpcPipe::NextPipeName() {
+  // 128-bit CSPRNG name (PLAN §4.2/§7.6): a predictable pid_counter name lets a
+  // same-user process pre-create (squat) the pipe before cef_host connects. An
+  // unguessable name closes the race window entirely.
+  uint8_t rnd[16] = {};
+  if (BCryptGenRandom(nullptr, rnd, sizeof(rnd),
+                      BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+    // BCryptGenRandom effectively never fails, but never emit a predictable
+    // name: mix pid + high-res tick + a monotonic counter + a stack address as
+    // a defensive backstop rather than fall back to a guessable pattern.
+    const uint64_t a = (static_cast<uint64_t>(GetCurrentProcessId()) << 32) ^
+                       GetTickCount64();
+    const uint64_t b =
+        (static_cast<uint64_t>(g_pipe_counter.fetch_add(1)) << 32) ^
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&rnd));
+    std::memcpy(rnd, &a, sizeof(a));
+    std::memcpy(rnd + 8, &b, sizeof(b));
+  }
   std::wostringstream name;
-  name << L"\\\\.\\pipe\\flutter_cef_" << GetCurrentProcessId() << L"_"
-       << g_pipe_counter.fetch_add(1);
+  name << L"\\\\.\\pipe\\flutter_cef_" << std::hex << std::setfill(L'0');
+  for (uint8_t byte : rnd) name << std::setw(2) << static_cast<unsigned>(byte);
   return name.str();
 }
 
 bool IpcPipe::Create(const std::wstring& pipe_name) {
   pipe_name_ = pipe_name;
+  // Explicit protected DACL granting ONLY the current user (PLAN §7.6): the
+  // default named-pipe DACL is broader than we want, and an anonymous descriptor
+  // gives no guarantee. Refuse to create an unsecured pipe.
+  PSECURITY_DESCRIPTOR sd = nullptr;
+  if (!BuildCurrentUserOnlySD(&sd)) {
+    PipeLog("failed to build current-user DACL — refusing to create pipe");
+    return false;
+  }
+  SECURITY_ATTRIBUTES sa = {};
+  sa.nLength = sizeof(sa);
+  sa.lpSecurityDescriptor = sd;
+  sa.bInheritHandle = FALSE;
   // FILE_FLAG_OVERLAPPED is load-bearing: without it a reader parked in a
   // blocking ReadFile serializes (and thus blocks) every WriteFile on the
   // same handle — see the header comment.
+  // FILE_FLAG_FIRST_PIPE_INSTANCE: creation FAILS (never silently attaches) if
+  // any instance of this exact name already exists — the anti-squat guarantee.
   pipe_ = CreateNamedPipeW(
-      pipe_name.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+      pipe_name.c_str(),
+      PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED |
+          FILE_FLAG_FIRST_PIPE_INSTANCE,
       PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT |
           PIPE_REJECT_REMOTE_CLIENTS,
       /*nMaxInstances=*/1, /*nOutBufferSize=*/64 * 1024,
       /*nInBufferSize=*/64 * 1024, /*nDefaultTimeOut=*/0,
-      /*lpSecurityAttributes=*/nullptr);
+      /*lpSecurityAttributes=*/&sa);
+  const DWORD gle = GetLastError();  // capture before LocalFree resets it
+  LocalFree(sd);
   if (pipe_ == INVALID_HANDLE_VALUE) {
-    PipeLog("CreateNamedPipeW failed");
+    // ERROR_ACCESS_DENIED / ERROR_PIPE_BUSY here mean the name already exists
+    // (squatter or collision) — abort, never adopt someone else's pipe.
+    if (gle == ERROR_ACCESS_DENIED || gle == ERROR_PIPE_BUSY)
+      PipeLog("pipe name already in use (squat/collision) — aborting");
+    else
+      PipeLog("CreateNamedPipeW failed");
     return false;
   }
   stop_event_ = CreateEventW(nullptr, /*bManualReset=*/TRUE, FALSE, nullptr);

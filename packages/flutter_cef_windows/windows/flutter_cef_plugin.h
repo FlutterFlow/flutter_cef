@@ -61,6 +61,13 @@ class FlutterCefPlugin : public flutter::Plugin {
   // confined (the reader/watcher threads only post events).
   struct Session {
     std::string id;
+    // Monotonic per-create identity (C1 host-object-identity analogue of
+    // macOS failHost, FlutterCefPlugin.swift:484-511). The reader/exit-watcher
+    // lambdas capture THIS value and stamp it into every HostEvent; a stale
+    // OLD-host event (posted during the reaper grace after a dispose+recreate
+    // of the SAME id) then carries a generation that no longer matches the
+    // live session and is dropped instead of killing the new one.
+    uint64_t generation = 0;
     uint32_t browser_id = 1;  // wire id (>= 1); single browser per host
     int64_t texture_id = -1;
     int width = 800;
@@ -73,6 +80,20 @@ class FlutterCefPlugin : public flutter::Plugin {
     bool closing = false;  // teardown started — ignore further host events
     uint64_t current_handle = 0;  // last promoted bridge handle
     uint32_t gate_misses = 0;     // diagnostics
+    // C1 first-present watchdog (mirror CefProfileHost.swift:641-765). A
+    // per-session WM_TIMER (id == generation) armed at create: on the first
+    // grace with no kOpPresent we re-kick via kOpInvalidate; on the next grace
+    // still blank we emit the 'paintStalled' event (repeating). Suspended while
+    // hidden (a WasHidden browser produces no frames by design), re-armed on
+    // show. Cancelled the instant any present arrives / on teardown.
+    bool painted = false;           // first kOpPresent seen — watchdog retired
+    bool visible = true;            // last setVisible state
+    UINT_PTR watchdog_timer = 0;    // active WM_TIMER id (0 = none); == generation
+    int watchdog_phase = 0;         // 0 = armed (pre re-kick), 1 = kicked
+    // The ephemeral %TEMP%\flutter_cef_ephem_* profile dir this host owns;
+    // recursively deleted by the reaper once the host is confirmed dead
+    // (macOS: CefProfileHost.swift:1004-1006).
+    std::wstring profile_dir;
     // Frames queued before kOpReady: (opcode, payload).
     std::vector<std::pair<uint8_t, std::vector<uint8_t>>> pending_frames;
     std::unique_ptr<IpcPipe> pipe;
@@ -86,6 +107,10 @@ class FlutterCefPlugin : public flutter::Plugin {
     enum class Kind { kFrame, kDisconnect, kExited };
     Kind kind = Kind::kFrame;
     std::string session_id;
+    // The generation of the Session that owned the poster (reader/watcher).
+    // Dropped on drain if it no longer matches the live session's generation
+    // (C1: a stale OLD-host event must not touch a re-created same-id session).
+    uint64_t generation = 0;
     uint32_t browser_id = 0;
     uint8_t opcode = 0;
     std::vector<uint8_t> payload;
@@ -121,11 +146,17 @@ class FlutterCefPlugin : public flutter::Plugin {
   // Cross-thread marshal.
   void PostEvent(HostEvent event);
   void DrainEvents();
-  void HandleHostFrame(const std::string& session_id, uint32_t browser_id,
-                       uint8_t opcode, const std::vector<uint8_t>& payload);
-  void HandleHostGone(const std::string& session_id, bool exit_code_known,
-                      unsigned long exit_code);
+  void HandleHostFrame(const std::string& session_id, uint64_t generation,
+                       uint32_t browser_id, uint8_t opcode,
+                       const std::vector<uint8_t>& payload);
+  void HandleHostGone(const std::string& session_id, uint64_t generation,
+                      bool exit_code_known, unsigned long exit_code);
   void HandlePresent(Session* session, const std::vector<uint8_t>& payload);
+
+  // C1 first-present watchdog (WM_TIMER on message_window_, id == generation).
+  void ArmWatchdog(Session* session);
+  void CancelWatchdog(Session* session);
+  void OnWatchdogTimer(UINT_PTR timer_id);
 
   // Emit an event to Dart (platform thread only). `args` need not contain
   // sessionId — it is added here.
@@ -135,6 +166,14 @@ class FlutterCefPlugin : public flutter::Plugin {
   // FLUTTER_CEF_HOST env override -> cef_host.exe beside the app exe -> L"".
   static std::wstring ResolveCefHostPath();
   static std::wstring MakeEphemeralProfileDir();
+  // Recursively delete a directory tree (best-effort). Used by the reaper to
+  // reclaim an ephemeral profile dir once its host is dead, and by the startup
+  // sweep. Safe on a missing path.
+  static void DeleteDirRecursive(const std::wstring& dir);
+  // Reclaim ephemeral profile dirs left behind by a previous crash/kill: any
+  // %TEMP%\flutter_cef_ephem_<pid>_* whose owning pid is no longer alive
+  // (macOS: FlutterCefPlugin.swift:97-109 sweepStaleEphemeralProfiles).
+  static void SweepStaleEphemeralProfiles();
 
   flutter::PluginRegistrarWindows* registrar_;  // owned by the engine
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> channel_;
@@ -145,9 +184,16 @@ class FlutterCefPlugin : public flutter::Plugin {
   std::deque<HostEvent> queue_;
 
   std::map<std::string, std::unique_ptr<Session>> sessions_;
-  // Per-session teardown threads (bounded: wait <=3s then kill). Joined in
-  // the destructor so no thread outlives the plugin.
-  std::vector<std::thread> reapers_;
+  // Monotonic source for Session::generation (never 0 — 0 means "no session").
+  uint64_t next_generation_ = 1;
+  // Per-session teardown threads (bounded: wait <=3s then kill). Each carries a
+  // `done` flag so finished reapers can be pruned/joined on the next teardown
+  // (H17), and all are joined in the destructor so no thread outlives `this`.
+  struct Reaper {
+    std::thread thread;
+    std::shared_ptr<std::atomic<bool>> done;
+  };
+  std::vector<Reaper> reapers_;
   // Inbound opcodes we've already warned about (log once per opcode).
   std::vector<uint8_t> warned_opcodes_;
 };

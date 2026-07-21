@@ -4,8 +4,7 @@
 //  - Each session gets a flutter::GpuSurfaceTexture
 //    (kFlutterDesktopGpuSurfaceTypeDxgiSharedHandle) whose descriptor callback
 //    serves the CURRENT host-minted bridge handle under a mutex
-//    (spike recipe: C:\dev\flutter_cef_spikes\s1\s1_flutter\windows\runner\
-//    spike_textures.cpp).
+//    (validated by the P0 S1 spike — see specs/windows-port/SPIKES.md).
 //  - Descriptor: struct_size SET, width/height AND visible_width/height,
 //    format = kFlutterDesktopPixelFormatNone (LAW 5). Returns nullptr before
 //    the first present — the engine skips the frame (PopulateTexture checks

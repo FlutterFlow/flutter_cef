@@ -25,7 +25,8 @@ HostProcess::~HostProcess() { Shutdown(); }
 
 bool HostProcess::Spawn(const std::wstring& cef_host_exe,
                         const std::wstring& pipe_name,
-                        const std::wstring& profile_dir, bool ephemeral) {
+                        const std::wstring& profile_dir, bool ephemeral,
+                        const std::string& allowed_schemes) {
   if (process_) return false;  // one-shot
 
   // CommandLineToArgvW-correct quoting: quote the exe and the --profile-dir
@@ -34,6 +35,13 @@ bool HostProcess::Spawn(const std::wstring& cef_host_exe,
   std::wstring cmd = L"\"" + cef_host_exe + L"\" --ipc=" + pipe_name +
                      L" \"--profile-dir=" + profile_dir + L"\"";
   if (ephemeral) cmd += L" --ephemeral";
+  // Navigation scheme allowlist (csv; enforced host-side in OnBeforeBrowse).
+  // Schemes are [a-z0-9.+-] tokens, never contain spaces — no quoting needed
+  // (mirror CefProfileHost.swift:289-291 --allowed-schemes).
+  if (!allowed_schemes.empty()) {
+    std::wstring w(allowed_schemes.begin(), allowed_schemes.end());
+    cmd += L" --allowed-schemes=" + w;
+  }
 
   // Kill-on-close Job Object, assigned while the child is suspended, so the
   // guarantee covers the child's entire lifetime (its own subprocesses run

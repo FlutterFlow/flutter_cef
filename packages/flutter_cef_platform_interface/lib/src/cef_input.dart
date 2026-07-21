@@ -177,6 +177,10 @@ int cefMacCharForKey(LogicalKeyboardKey key) => kCefMacKeyChars[key] ?? 0;
 
 /// The Windows virtual-key code for [key]: the special-key table first, then
 /// a→VK_A..z→VK_Z, A–Z, and 0–9. 0 if unmapped (a printable that rides CHAR).
+///
+/// Shared with the macOS wire path (which sends this as `windows_key_code`), so
+/// its output must stay stable — the fuller Windows-only set that covers the
+/// function row, numpad, and OEM punctuation lives in [cefWindowsKeyCodeForEvent].
 int cefWindowsKeyCode(LogicalKeyboardKey key) {
   final special = kCefSpecialWindowsKeyCodes[key];
   if (special != null) return special;
@@ -185,6 +189,75 @@ int cefWindowsKeyCode(LogicalKeyboardKey key) {
   if (id >= 0x41 && id <= 0x5A) return id; // A-Z
   if (id >= 0x30 && id <= 0x39) return id; // 0-9
   return 0;
+}
+
+/// Windows virtual-key codes for keys that carry a fixed VK by **logical**
+/// identity but ride the CHAR path (so [cefWindowsKeyCode] leaves them 0): the
+/// function row, Insert, and the numpad. CEF on Windows resolves these by
+/// `windows_key_code`, so without a real VK the page sees dead keys (F1-F12,
+/// Insert, numpad digits/operators all send 0). Layered on Windows only — see
+/// [cefWindowsKeyCodeForEvent] — so the shared [cefWindowsKeyCode] (and the
+/// macOS wire path that reads it) stays byte-identical.
+final Map<LogicalKeyboardKey, int> kCefWindowsExtraKeyCodes =
+    <LogicalKeyboardKey, int>{
+  // Function row (VK_F1..VK_F12).
+  LogicalKeyboardKey.f1: 0x70, LogicalKeyboardKey.f2: 0x71,
+  LogicalKeyboardKey.f3: 0x72, LogicalKeyboardKey.f4: 0x73,
+  LogicalKeyboardKey.f5: 0x74, LogicalKeyboardKey.f6: 0x75,
+  LogicalKeyboardKey.f7: 0x76, LogicalKeyboardKey.f8: 0x77,
+  LogicalKeyboardKey.f9: 0x78, LogicalKeyboardKey.f10: 0x79,
+  LogicalKeyboardKey.f11: 0x7A, LogicalKeyboardKey.f12: 0x7B,
+  // Insert (Delete is in kCefSpecialWindowsKeyCodes).
+  LogicalKeyboardKey.insert: 0x2D,
+  // Numpad digits (VK_NUMPAD0..VK_NUMPAD9).
+  LogicalKeyboardKey.numpad0: 0x60, LogicalKeyboardKey.numpad1: 0x61,
+  LogicalKeyboardKey.numpad2: 0x62, LogicalKeyboardKey.numpad3: 0x63,
+  LogicalKeyboardKey.numpad4: 0x64, LogicalKeyboardKey.numpad5: 0x65,
+  LogicalKeyboardKey.numpad6: 0x66, LogicalKeyboardKey.numpad7: 0x67,
+  LogicalKeyboardKey.numpad8: 0x68, LogicalKeyboardKey.numpad9: 0x69,
+  // Numpad operators.
+  LogicalKeyboardKey.numpadMultiply: 0x6A, // VK_MULTIPLY
+  LogicalKeyboardKey.numpadAdd: 0x6B, // VK_ADD
+  LogicalKeyboardKey.numpadSubtract: 0x6D, // VK_SUBTRACT
+  LogicalKeyboardKey.numpadDecimal: 0x6E, // VK_DECIMAL
+  LogicalKeyboardKey.numpadDivide: 0x6F, // VK_DIVIDE
+};
+
+/// Windows virtual-key codes for the OEM **punctuation** keys, keyed by the
+/// **physical** key so the VK is layout-independent (mirroring
+/// [kCefMacKeyCodesByPhysical]): the physical `;` key reports VK_OEM_1 on any
+/// layout even when it produces a different character — the produced text rides
+/// the CHAR / IME path, while the raw key event needs the position's VK. Keying
+/// off the logical character instead would miss these on non-US layouts. Windows
+/// only — see [cefWindowsKeyCodeForEvent].
+final Map<PhysicalKeyboardKey, int> kCefWindowsKeyCodesByPhysical =
+    <PhysicalKeyboardKey, int>{
+  PhysicalKeyboardKey.semicolon: 0xBA, // VK_OEM_1   ;:
+  PhysicalKeyboardKey.equal: 0xBB, // VK_OEM_PLUS  =+
+  PhysicalKeyboardKey.comma: 0xBC, // VK_OEM_COMMA ,<
+  PhysicalKeyboardKey.minus: 0xBD, // VK_OEM_MINUS -_
+  PhysicalKeyboardKey.period: 0xBE, // VK_OEM_PERIOD .>
+  PhysicalKeyboardKey.slash: 0xBF, // VK_OEM_2   /?
+  PhysicalKeyboardKey.backquote: 0xC0, // VK_OEM_3   `~
+  PhysicalKeyboardKey.bracketLeft: 0xDB, // VK_OEM_4   [{
+  PhysicalKeyboardKey.backslash: 0xDC, // VK_OEM_5   \|
+  PhysicalKeyboardKey.bracketRight: 0xDD, // VK_OEM_6   ]}
+  PhysicalKeyboardKey.quote: 0xDE, // VK_OEM_7   '"
+};
+
+/// The Windows virtual-key code for a key event on the **Windows** key path.
+/// Layers the fuller Windows-only set — function row, Insert, numpad, and the
+/// OEM punctuation (resolved by physical key, layout-independent) — on top of
+/// the shared [cefWindowsKeyCode]. CEF on Windows keys everything off
+/// `windows_key_code`, so a 0 here makes the page see a dead key. The macOS path
+/// keeps calling [cefWindowsKeyCode] directly, so its wire bytes don't move.
+int cefWindowsKeyCodeForEvent(
+    LogicalKeyboardKey logical, PhysicalKeyboardKey physical) {
+  final base = cefWindowsKeyCode(logical);
+  if (base != 0) return base;
+  final extra = kCefWindowsExtraKeyCodes[logical];
+  if (extra != null) return extra;
+  return kCefWindowsKeyCodesByPhysical[physical] ?? 0;
 }
 
 // ── Cursor ───────────────────────────────────────────────────────────────
