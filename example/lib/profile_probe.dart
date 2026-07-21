@@ -33,7 +33,10 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_cef/flutter_cef.dart';
 
-const _evidenceDir = r'C:\dev\flutter_cef_spikes\profile_evidence';
+// A dev probe artifact — write evidence under the OS temp dir, not a
+// maintainer-specific absolute path (PLAN P1: probe outputs -> systemTemp).
+final _evidenceDir =
+    '${Directory.systemTemp.path}${Platform.pathSeparator}flutter_cef_profile_evidence';
 const _sharedProfile = 'evi_shared';
 const _otherProfile = 'evi_other';
 const _persistProfile = 'evi_persist';

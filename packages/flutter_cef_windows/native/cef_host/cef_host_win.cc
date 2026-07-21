@@ -778,8 +778,20 @@ class HostClient : public CefClient,
     SendUtf8(slot_->browser_id, kOpDownload, suggested_name.ToString());
     const std::wstring dir = GetDownloadsDir();
     if (!dir.empty()) {
+      // SECURITY: suggested_name is page-controlled (Content-Disposition), so
+      // reduce it to a bare leaf before joining it to Downloads — a name like
+      // "..\..\Startup\x.exe" or an absolute path would otherwise escape the
+      // folder. Take the component after the last / or \, reject . / .. /
+      // empty, and drop any residual separators.
+      std::wstring leaf = suggested_name.ToWString();
+      const size_t slash = leaf.find_last_of(L"/\\");
+      if (slash != std::wstring::npos) leaf = leaf.substr(slash + 1);
+      leaf.erase(std::remove_if(leaf.begin(), leaf.end(),
+                                [](wchar_t c) { return c == L'/' || c == L'\\'; }),
+                 leaf.end());
+      if (leaf.empty() || leaf == L"." || leaf == L"..") leaf = L"download";
       CefString full;
-      full.FromWString(dir + L"\\" + suggested_name.ToWString());
+      full.FromWString(dir + L"\\" + leaf);
       callback->Continue(full, /*show_dialog=*/false);
     } else {
       callback->Continue(CefString(), /*show_dialog=*/true);
@@ -1032,8 +1044,12 @@ class HostClient : public CefClient,
   // Navigation scheme allowlist (main.mm:1528-1565). Empty allowlist = allow
   // all. Main-frame only; kOpLoadTrusted's exact-URL exemptions are consumed
   // here.
-  bool OnBeforeBrowse(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
+  bool OnBeforeBrowse(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame,
                       CefRefPtr<CefRequest> request, bool, bool) override {
+    // Clean up any pending message-router queries for the frame about to
+    // navigate (main.mm:1563) — otherwise a channel query in flight across a
+    // navigation can misfire or leak its callback.
+    if (router_) router_->OnBeforeBrowse(browser, frame);
     if (g_allowed_schemes.empty()) return false;  // allow
     const std::string url = request->GetURL().ToString();
     const bool main_frame = !frame || frame->IsMain();
@@ -2069,9 +2085,24 @@ extern "C" CEF_BOOTSTRAP_EXPORT int RunConsoleMain(
   // per-spawn and can never contend.
   if (!ephemeral) {
     const std::wstring lock_path = Widen(profile_dir + "\\.flutter_cef.lock");
-    HANDLE lock = CreateFileW(lock_path.c_str(), GENERIC_READ | GENERIC_WRITE,
-                              /*dwShareMode=*/0, nullptr, OPEN_ALWAYS,
-                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    // Retry with bounded backoff before declaring the profile locked. A rapid
+    // dispose+recreate of the SAME profile (route change / hot reload) races
+    // the OUTGOING host, which still holds this exclusive handle until it exits
+    // — it defers its quit up to ~2s to flush cookies, and the plugin's reaper
+    // waits up to 3s before Terminate. Without the retry the fresh host loses
+    // the lock instantly and surfaces a spurious processGone("locked") with no
+    // other app open. ~5s of 50ms tries covers the outgoing host's release;
+    // a GENUINE cross-app conflict still reports "locked" after the window.
+    HANDLE lock = INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < 100; ++attempt) {
+      lock = CreateFileW(lock_path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                         /*dwShareMode=*/0, nullptr, OPEN_ALWAYS,
+                         FILE_ATTRIBUTE_NORMAL, nullptr);
+      if (lock != INVALID_HANDLE_VALUE) break;
+      const DWORD gle = GetLastError();
+      if (gle != ERROR_SHARING_VIOLATION && gle != ERROR_ACCESS_DENIED) break;
+      Sleep(50);
+    }
     if (lock == INVALID_HANDLE_VALUE) {
       SendLog(0, "profile-locked");
       LogErr("[cef_host] profile already in use (%s, gle=%lu)",

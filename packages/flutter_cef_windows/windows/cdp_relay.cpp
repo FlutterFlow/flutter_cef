@@ -88,14 +88,15 @@ std::string Base64(const uint8_t* p, size_t n) {
 }
 
 // CSPRNG token: 24 random bytes hex-encoded (48 chars), matching
-// CdpRelay.swift randomToken(). Fails closed to an unguessable-but-unusable
-// value if CNG somehow fails (Start() success is the gate; a bad token just
-// means no client can connect).
+// CdpRelay.swift randomToken(). Returns EMPTY on CNG failure so Start() can
+// abort — an all-zeros token is NOT fail-closed, it is a guessable CONSTANT
+// (an attacker who knows CNG failed connects with 48 zeros), so we must refuse
+// to start rather than emit a usable weak token.
 std::string RandomToken() {
   uint8_t bytes[24] = {};
   if (BCryptGenRandom(nullptr, bytes, sizeof(bytes),
                       BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
-    // Never expected; keep the buffer zeroed (still 48 hex chars, unusable).
+    return std::string();  // Start() treats an empty token as fatal.
   }
   static const char* hex = "0123456789abcdef";
   std::string s;
@@ -143,6 +144,10 @@ CdpRelay::~CdpRelay() {
 // MARK: Lifecycle
 
 bool CdpRelay::Start() {
+  if (token_.empty()) {
+    DLog("refusing to start: token RNG failed (would be a guessable constant)");
+    return false;
+  }
   WSADATA wsa = {};
   if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
     DLog("WSAStartup failed");
@@ -155,8 +160,12 @@ bool CdpRelay::Start() {
     DLog("socket() failed");
     return false;
   }
+  // SO_EXCLUSIVEADDRUSE, NOT SO_REUSEADDR (PLAN §4.5): on Windows SO_REUSEADDR
+  // is a port-HIJACK primitive — it lets another same-user socket bind our
+  // already-bound loopback port and intercept the client's next connection
+  // (stealing the bearer token off the upgrade). Exclusive-use forbids that.
   BOOL on = TRUE;
-  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<char*>(&on),
+  setsockopt(fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<char*>(&on),
              sizeof(on));
 
   sockaddr_in addr = {};

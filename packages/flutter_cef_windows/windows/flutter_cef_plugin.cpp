@@ -150,6 +150,23 @@ std::wstring SanitizeProfileLeaf(const std::string& profile) {
     if (c != '.') all_dots = false;
   }
   if (out.empty() || all_dots) return L"_";
+  // Windows silently drops trailing dots/spaces from a path component, which
+  // would let "work." and "work" resolve to the SAME dir (jar confusion) and
+  // fight over the profile lock. Spaces already map to '_' via the allowlist;
+  // strip trailing dots here so the on-disk leaf is exactly what we keyed on.
+  while (!out.empty() && out.back() == L'.') out.pop_back();
+  if (out.empty()) return L"_";
+  // Reserved DOS device basenames (CON/PRN/AUX/NUL/COM1-9/LPT1-9) are illegal
+  // directory names even with an extension — neutralize by prefixing '_'.
+  std::wstring base = out.substr(0, out.find(L'.'));
+  for (wchar_t& ch : base)
+    if (ch >= L'a' && ch <= L'z') ch = static_cast<wchar_t>(ch - 32);
+  static const wchar_t* kReserved[] = {
+      L"CON",  L"PRN",  L"AUX",  L"NUL",  L"COM1", L"COM2", L"COM3", L"COM4",
+      L"COM5", L"COM6", L"COM7", L"COM8", L"COM9", L"LPT1", L"LPT2", L"LPT3",
+      L"LPT4", L"LPT5", L"LPT6", L"LPT7", L"LPT8", L"LPT9"};
+  for (const wchar_t* r : kReserved)
+    if (base == r) return L"_" + out;
   return out;
 }
 
@@ -674,6 +691,29 @@ void FlutterCefPlugin::HandleCreate(
     return;
   }
 
+  // SECURITY (P9 single-tile invariant): the CDP relay is a BROWSER-LEVEL
+  // passthrough (the per-tile CEF-2b Target filter is deferred — PROTOCOL.md
+  // §8.4). So an active agent-control grant must own a host with exactly ONE
+  // tile; otherwise the agent driving this host could Target.getTargets/attach
+  // the new sibling tile. Refuse a second tile joining a host whose grant is
+  // live. (The complementary guard is in EnableAgentControl: no grant on a
+  // multi-tile host.) Co-locate an agent-controlled view on its OWN profile.
+  if (host->agent_control && !host->browsers.empty() && host->cdp) {
+    bool grant_active;
+    {
+      std::lock_guard<std::mutex> lk(host->cdp->relay_mutex);
+      grant_active = host->cdp->relay != nullptr;
+    }
+    if (grant_active) {
+      result->Error(
+          "agent_control_active",
+          "cannot add a tile to a profile whose agent-control grant is active "
+          "(per-tile CDP scoping is not yet implemented on Windows — give the "
+          "agent-controlled view its own profile)");
+      return;
+    }
+  }
+
   const int64_t texture_id = texture_bridge_->RegisterSessionTexture();
   if (texture_id < 0) {
     // Roll back a host we just spawned solely for this session (no other
@@ -987,6 +1027,11 @@ void FlutterCefPlugin::TeardownHost(const std::string& host_key,
         if (cdp && cdp->read) CancelIoEx(cdp->read, nullptr);
         if (cdp_reader.joinable()) cdp_reader.join();
         if (cdp) {
+          // Close under write_mutex: send_to_pipe (the relay's client->pipe
+          // writer) takes the same mutex and checks cdp->write, so serializing
+          // the close+null against it prevents a WriteFile on a freed handle
+          // even if a relay bridge thread outlived relay->Stop() above.
+          std::lock_guard<std::mutex> lk(cdp->write_mutex);
           if (cdp->read) CloseHandle(cdp->read);
           if (cdp->write) CloseHandle(cdp->write);
           cdp->read = cdp->write = nullptr;
@@ -1083,6 +1128,17 @@ void FlutterCefPlugin::EnableAgentControl(
     result->Error("no_agent_control",
                   "enableAgentControl requires a session created with "
                   "agentControl: true");
+    return;
+  }
+  // SECURITY (P9 single-tile invariant, see HandleCreate): the browser-level
+  // relay would expose every sibling tile on this host to the agent. Until the
+  // per-tile Target filter lands, refuse a grant while the host serves >1 tile.
+  if (h->browsers.size() > 1) {
+    result->Error(
+        "agent_control_shared",
+        "enableAgentControl needs a single-tile host: this profile has other "
+        "tiles that a browser-level grant would expose. Give the "
+        "agent-controlled view its own profile.");
     return;
   }
 

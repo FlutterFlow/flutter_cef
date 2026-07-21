@@ -27,6 +27,7 @@ jobs:
           flutter analyze
           (cd packages/flutter_cef_platform_interface && flutter pub get && flutter analyze)
           (cd packages/flutter_cef_macos && flutter pub get && flutter analyze)
+          (cd packages/flutter_cef_windows && flutter pub get && flutter analyze)
           (cd example && flutter pub get && flutter analyze)
       - name: Test
         run: flutter test
@@ -35,3 +36,33 @@ jobs:
         # swiftc suite runs without Xcode/CocoaPods. (A regression here previously went
         # unnoticed precisely because CI did not run it.)
         run: ./packages/flutter_cef_macos/test/run_filter_tests.sh
+
+  # Windows: analyze the endorsed windows implementation + build the example so
+  # the ~5.5k lines of native plugin/cef_host/CDP-relay code (profiles, cookies,
+  # JS bridge, agent control) are actually compiled by CI, not merged blind.
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.38.8
+          channel: stable
+      - run: flutter --version
+      - name: Analyze (windows implementation package)
+        shell: bash
+        run: |
+          flutter pub get
+          flutter analyze
+          (cd packages/flutter_cef_windows && flutter pub get && flutter analyze)
+      - name: Dart tests (includes the Windows key/accelerator + verb twins)
+        run: flutter test
+      - name: Build example for Windows (compiles the plugin + cef_host)
+        shell: bash
+        # CEF (~200 MB) is fetched by the plugin CMake from the pinned dist; if
+        # the fetch/build is unavailable on the runner this step surfaces it
+        # rather than letting native regressions merge unbuilt.
+        run: |
+          cd example
+          flutter pub get
+          flutter build windows --debug
