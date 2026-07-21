@@ -1,3 +1,8 @@
+// cdp_relay.h pulls in <winsock2.h> BEFORE <windows.h>; it must lead so the
+// winsock2/windows.h ordering holds for the whole TU (windows.h's default
+// winsock.h would otherwise conflict — the classic WSA redefinition).
+#include "cdp_relay.h"
+
 #include "flutter_cef_plugin.h"
 
 #include <windows.h>
@@ -578,6 +583,14 @@ void FlutterCefPlugin::HandleMethodCall(
     result->Success();
     return;
   }
+  if (method == "enableAgentControl") {
+    EnableAgentControl(args, result);
+    return;
+  }
+  if (method == "disableAgentControl") {
+    DisableAgentControl(args, result);
+    return;
+  }
   if (method == "getFrameSurface") {
     if (s) {
       result->Success(flutter::EncodableValue(flutter::EncodableMap{
@@ -618,6 +631,10 @@ void FlutterCefPlugin::HandleCreate(
   const std::string allowed_schemes = GetString(args, "allowedSchemes");
   const bool named_profile = HasNamedProfile(args);
   const std::string profile = GetString(args, "profile");
+  // Agent control (P9): CDP-over-pipe launch. Off by default; when set, the host
+  // is spawned with the two inherited CDP pipes (the S3 recipe). Independent of
+  // enableCdp (TCP) — the pipe path never opens a listening port.
+  const bool agent_control = GetBool(args, "agentControl", false);
 
   // Re-creating the same id is idempotent (Swift:293-295) — route teardown
   // through its host first.
@@ -650,8 +667,8 @@ void FlutterCefPlugin::HandleCreate(
     key = "~ephemeral~" + session_id;
   }
 
-  Host* host =
-      ResolveOrSpawnHost(key, profile_dir, ephemeral, host_exe, allowed_schemes);
+  Host* host = ResolveOrSpawnHost(key, profile_dir, ephemeral, host_exe,
+                                  allowed_schemes, agent_control);
   if (!host) {
     result->Error("spawn_failed", "failed to spawn cef_host");
     return;
@@ -764,8 +781,11 @@ FlutterCefPlugin::Host* FlutterCefPlugin::HostForSession(
 
 FlutterCefPlugin::Host* FlutterCefPlugin::ResolveOrSpawnHost(
     const std::string& key, const std::wstring& profile_dir, bool ephemeral,
-    const std::wstring& host_exe, const std::string& allowed_schemes) {
+    const std::wstring& host_exe, const std::string& allowed_schemes,
+    bool agent_control) {
   // Reuse a live host for this key (a shared persistent profile's 2nd+ tile).
+  // agent_control (like allowed_schemes) is a process arg fixed at the host's
+  // spawn — a reuse ignores it (macOS parity, CefProfileHost.swift:456-471).
   auto existing = hosts_.find(key);
   if (existing != hosts_.end() && !existing->second->closing) {
     return existing->second.get();
@@ -778,8 +798,11 @@ FlutterCefPlugin::Host* FlutterCefPlugin::ResolveOrSpawnHost(
     return nullptr;
   }
   auto process = std::make_unique<HostProcess>();
+  HANDLE cdp_read = nullptr, cdp_write = nullptr;
   if (!process->Spawn(host_exe, pipe->pipe_name(), profile_dir, ephemeral,
-                      allowed_schemes)) {
+                      allowed_schemes, agent_control,
+                      agent_control ? &cdp_read : nullptr,
+                      agent_control ? &cdp_write : nullptr)) {
     if (ephemeral) DeleteDirRecursive(profile_dir);  // no host will own it
     return nullptr;
   }
@@ -791,6 +814,15 @@ FlutterCefPlugin::Host* FlutterCefPlugin::ResolveOrSpawnHost(
   host->profile_dir = profile_dir;
   host->pipe = std::move(pipe);
   host->process = std::move(process);
+  host->agent_control = agent_control;
+  // Agent control: own the parent-side CDP pipe ends and start the always-on
+  // reader that fans NUL-framed CDP messages to the (later-created) relay.
+  if (agent_control) {
+    host->cdp = std::make_shared<CdpTransport>();
+    host->cdp->read = cdp_read;
+    host->cdp->write = cdp_write;
+    host->cdp_reader = std::thread(&FlutterCefPlugin::CdpReadLoop, host->cdp);
+  }
 
   const std::string host_key = key;
   const uint64_t gen = host->generation;
@@ -925,7 +957,19 @@ void FlutterCefPlugin::TeardownHost(const std::string& host_key,
   reapers_.push_back(Reaper{
       std::thread([pipe = std::move(h->pipe), process = std::move(h->process),
                    watcher = std::move(h->exit_watcher),
+                   cdp = std::move(h->cdp),
+                   cdp_reader = std::move(h->cdp_reader),
                    profile_dir = std::move(profile_dir), done]() mutable {
+        // Agent control: stop the relay FIRST (closes its WS sockets, so no more
+        // client IO or sendToPipe) before we kill the host.
+        if (cdp) {
+          std::shared_ptr<CdpRelay> relay;
+          {
+            std::lock_guard<std::mutex> lk(cdp->relay_mutex);
+            relay = std::move(cdp->relay);
+          }
+          if (relay) relay->Stop();
+        }
         if (process) {
           if (process->WaitForExit(3000) == HostProcess::kStillRunning) {
             process->Terminate();
@@ -936,6 +980,17 @@ void FlutterCefPlugin::TeardownHost(const std::string& host_key,
           pipe.release();  // wedged reader: leak by contract
         }
         if (watcher.joinable()) watcher.join();
+        // CDP reader: the host is dead now, so the child's CDP write end closed
+        // -> the reader's ReadFile hits EOF and exits. CancelIoEx unblocks it
+        // defensively; then join and close the parent-side handles (only after
+        // the join, so the reader never touches a closed handle).
+        if (cdp && cdp->read) CancelIoEx(cdp->read, nullptr);
+        if (cdp_reader.joinable()) cdp_reader.join();
+        if (cdp) {
+          if (cdp->read) CloseHandle(cdp->read);
+          if (cdp->write) CloseHandle(cdp->write);
+          cdp->read = cdp->write = nullptr;
+        }
         if (!profile_dir.empty()) DeleteDirRecursive(profile_dir);
         done->store(true);
       }),
@@ -979,6 +1034,123 @@ void FlutterCefPlugin::SendOrQueue(Session* session, uint8_t opcode,
   }
   host->pipe->SendFrame(session->browser_id, opcode, payload.data(),
                         static_cast<uint32_t>(payload.size()));
+}
+
+// ---- agent control (P9) ----
+
+// static
+void FlutterCefPlugin::CdpReadLoop(std::shared_ptr<CdpTransport> transport) {
+  HANDLE read = transport->read;
+  if (!read) return;
+  std::string acc;
+  std::vector<char> buf(64 * 1024);
+  for (;;) {
+    DWORD got = 0;
+    if (!ReadFile(read, buf.data(), static_cast<DWORD>(buf.size()), &got,
+                  nullptr) ||
+        got == 0) {
+      break;  // EOF / error / CancelIoEx: host gone or teardown
+    }
+    acc.append(buf.data(), got);
+    // Split the NUL-delimited JSON stream into complete messages (a message can
+    // span reads; one read can carry several / straddle a boundary — mirror
+    // macOS readCdpLoop).
+    size_t nul;
+    while ((nul = acc.find('\0')) != std::string::npos) {
+      std::string msg = acc.substr(0, nul);
+      acc.erase(0, nul + 1);
+      std::shared_ptr<CdpRelay> relay;
+      {
+        std::lock_guard<std::mutex> lk(transport->relay_mutex);
+        relay = transport->relay;  // snapshot; deliver OUTSIDE the lock
+      }
+      if (relay) relay->DeliverToClient(msg);
+    }
+    // Bound the accumulator (mirror the IPC reader cap): a malformed never-NUL
+    // stream must not grow unbounded. The peer is our own cef_host (Chromium
+    // always NUL-frames), so this is defensive.
+    if (acc.size() > (64u << 20)) break;
+  }
+}
+
+void FlutterCefPlugin::EnableAgentControl(
+    const flutter::EncodableMap& args,
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>& result) {
+  Session* s = FindSession(args);
+  Host* h = HostForSession(s);
+  if (!h || !h->agent_control || !h->cdp) {
+    // macOS throws a PlatformException when the tile isn't agent-control mode.
+    result->Error("no_agent_control",
+                  "enableAgentControl requires a session created with "
+                  "agentControl: true");
+    return;
+  }
+
+  std::shared_ptr<CdpTransport> cdp = h->cdp;
+  std::shared_ptr<CdpRelay> relay;
+  {
+    std::lock_guard<std::mutex> lk(cdp->relay_mutex);
+    relay = cdp->relay;  // idempotent fast-path: return the live relay
+  }
+  if (!relay) {
+    // sendToPipe: NUL-frame the client's CDP command onto the host's command
+    // pipe. A WEAK transport ref avoids a relay<->transport cycle, and a dead
+    // transport (post-teardown) just drops the write.
+    std::weak_ptr<CdpTransport> weak = cdp;
+    auto send_to_pipe = [weak](const std::string& json) {
+      auto t = weak.lock();
+      if (!t) return;
+      std::lock_guard<std::mutex> lk(t->write_mutex);
+      if (!t->write) return;
+      std::string framed = json;
+      framed.push_back('\0');
+      DWORD wrote = 0;
+      WriteFile(t->write, framed.data(), static_cast<DWORD>(framed.size()),
+                &wrote, nullptr);
+    };
+    auto fresh = std::make_shared<CdpRelay>(send_to_pipe);
+    if (!fresh->Start()) {
+      result->Error("relay_failed", "failed to start the CDP relay");
+      return;
+    }
+    std::lock_guard<std::mutex> lk(cdp->relay_mutex);
+    if (cdp->relay) {
+      // A concurrent enable raced us: keep the existing relay, drop ours.
+      fresh->Stop();
+      relay = cdp->relay;
+    } else {
+      cdp->relay = fresh;
+      relay = fresh;
+    }
+  }
+
+  // Match the Swift return shape EXACTLY (CefProfileHost.endpoint):
+  //   ws://127.0.0.1:<port>/devtools/browser?token=<token>
+  const int port = relay->port();
+  const std::string token = relay->token();
+  std::ostringstream ws;
+  ws << "ws://127.0.0.1:" << port << "/devtools/browser?token=" << token;
+  result->Success(flutter::EncodableValue(flutter::EncodableMap{
+      {Ev("wsUrl"), flutter::EncodableValue(ws.str())},
+      {Ev("token"), flutter::EncodableValue(token)},
+      {Ev("port"), flutter::EncodableValue(port)},
+  }));
+}
+
+void FlutterCefPlugin::DisableAgentControl(
+    const flutter::EncodableMap& args,
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>& result) {
+  Session* s = FindSession(args);
+  Host* h = HostForSession(s);
+  if (h && h->cdp) {
+    std::shared_ptr<CdpRelay> relay;
+    {
+      std::lock_guard<std::mutex> lk(h->cdp->relay_mutex);
+      relay = std::move(h->cdp->relay);
+    }
+    if (relay) relay->Stop();  // outside the lock (Stop closes sockets)
+  }
+  result->Success();  // idempotent — no-op if that tile has no relay
 }
 
 // ---- inbound host events (platform thread) ----

@@ -114,6 +114,15 @@ HWND g_hidden_hwnd = nullptr;
 // HostClient::OnBeforeBrowse exactly like main.mm:335-342/1528-1565.
 std::set<std::string> g_allowed_schemes;
 
+// Agent-control CDP-over-pipe (P9). "<read>,<write>" decimal inherited-HANDLE
+// values from the plugin's --cdp-io-pipes= switch (the S3 recipe): the browser
+// READS CDP commands from <read> and WRITES responses/events to <write>. Set in
+// RunConsoleMain (browser process only) BEFORE CefInitialize; OnBeforeCommand-
+// LineProcessing then injects Chromium's --remote-debugging-pipe +
+// --remote-debugging-io-pipes. Empty = agent control off (byte-identical to the
+// pre-P9 launch). Mirrors macOS main.mm's --cdp-pipe translation.
+std::string g_cdp_io_pipes;
+
 // Registered JS channel names (UI-thread-only; mirrors main.mm:352-356). On
 // each MAIN-frame load OnLoadStart injects a window.<name>.postMessage shim
 // that routes to the browser process over window.cefQuery (the
@@ -1123,8 +1132,17 @@ class HostApp : public CefApp,
           "log-file", std::string(tmp) + "cef_host_chromium.log");
       command_line->AppendSwitchWithValue("v", "1");
     }
-    // CDP pipe translation (S3) + disable-blink-features=AutomationControlled
-    // land here post-slice (main.mm:1640-1662).
+    // Agent-control CDP-over-pipe translation (S3, P9): the plugin passed the
+    // two inherited pipe HANDLE values as --cdp-io-pipes=<read>,<write>; turn
+    // them into Chromium's real switches. Browser process only (process_type
+    // empty) — the renderer/GPU children never get the debugging pipe (and never
+    // inherited the handles). Mirrors macOS main.mm's --cdp-pipe injection.
+    // (disable-blink-features=AutomationControlled is post-slice.)
+    if (process_type.empty() && !g_cdp_io_pipes.empty()) {
+      command_line->AppendSwitch("remote-debugging-pipe");
+      command_line->AppendSwitchWithValue("remote-debugging-io-pipes",
+                                           g_cdp_io_pipes);
+    }
   }
 
   // Announce readiness. Payload = {readyFlags, protocolVersion}
@@ -1984,6 +2002,10 @@ extern "C" CEF_BOOTSTRAP_EXPORT int RunConsoleMain(
   std::string profile_dir = GetSwitch(argc, argv, "--profile-dir=");
   std::string allowed = GetSwitch(argc, argv, "--allowed-schemes=");
   bool ephemeral = HasFlag(argc, argv, "--ephemeral");
+  // Agent control (P9): "<read>,<write>" inherited-HANDLE values. Stored in the
+  // file-global so OnBeforeCommandLineProcessing (called from CefInitialize
+  // below) can inject the Chromium CDP-pipe switches. Empty when off.
+  g_cdp_io_pipes = GetSwitch(argc, argv, "--cdp-io-pipes=");
   // NB: the PLUGIN owns ephemeral profile-dir deletion — its reaper deletes the
   // dir once this host is confirmed dead, and a startup sweep reclaims dirs
   // orphaned by a crash (FlutterCefPlugin.cpp TeardownSession reaper +

@@ -33,6 +33,8 @@ list(APPEND PLUGIN_SOURCES
   "host_process.h"
   "ipc_pipe.cpp"
   "ipc_pipe.h"
+  "cdp_relay.cpp"
+  "cdp_relay.h"
 )
 
 add_library(${PLUGIN_NAME} SHARED
@@ -58,6 +60,10 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
   flutter_wrapper_plugin
   d3d11
   dxgi
+  # Agent-control CDP relay (P9): winsock (loopback HTTP+WS server) + bcrypt
+  # (SHA-1 Sec-WebSocket-Accept + BCryptGenRandom token). cdp_relay.cpp.
+  ws2_32
+  bcrypt
 )
 
 # ---- cef_host: build + stage (LAW 8 ship pair: cef_host.dll + renamed

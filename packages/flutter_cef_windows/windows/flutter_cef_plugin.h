@@ -62,6 +62,26 @@
 
 namespace flutter_cef {
 
+class CdpRelay;  // windows/cdp_relay.h — winsock, pulled in only by the .cpp
+
+// Agent-control (P9) CDP-over-pipe transport for one host. Held via a
+// shared_ptr so the always-on CDP reader thread (which delivers pipe messages
+// to the current relay) can safely outlive a Host erase during teardown — the
+// reader captures its own shared_ptr, so the transport (and its handles) stay
+// alive until the reader is joined in the reaper. `read`/`write` are the
+// PARENT-side ends of the two inherited anonymous pipes (we read CDP
+// responses/events on `read`, write CDP commands on `write`). `relay` is the
+// token-gated WS relay, created lazily by enableAgentControl and swapped in/out
+// under `relay_mutex` (mirrors macOS CefProfileHost.cdpRelays + onCdpMessage).
+// SINGLE-TILE: one relay slot per host; the N-relay fan-out is deferred.
+struct CdpTransport {
+  HANDLE read = nullptr;
+  HANDLE write = nullptr;
+  std::mutex write_mutex;            // serializes WriteFile to `write`
+  std::mutex relay_mutex;           // guards `relay`
+  std::shared_ptr<CdpRelay> relay;  // null until enableAgentControl
+};
+
 class FlutterCefPlugin : public flutter::Plugin {
  public:
   static void RegisterWithRegistrar(flutter::PluginRegistrarWindows* registrar);
@@ -108,6 +128,14 @@ class FlutterCefPlugin : public flutter::Plugin {
     std::unique_ptr<IpcPipe> pipe;
     std::unique_ptr<HostProcess> process;
     std::thread exit_watcher;  // waits on a dup'd process handle
+    // Agent control (P9): set when this host was spawned with the CDP-over-pipe
+    // transport (create arg agentControl:true). `cdp` owns the parent-side pipe
+    // ends + the lazily-created relay; `cdp_reader` continuously drains the CDP
+    // read pipe and delivers to cdp->relay. Both are moved into the reaper on
+    // teardown. Null / not-joinable for a non-agent-control host.
+    bool agent_control = false;
+    std::shared_ptr<CdpTransport> cdp;
+    std::thread cdp_reader;
   };
 
   // One browser/view. Platform-thread confined.
@@ -178,8 +206,26 @@ class FlutterCefPlugin : public flutter::Plugin {
   Host* ResolveOrSpawnHost(const std::string& key,
                            const std::wstring& profile_dir, bool ephemeral,
                            const std::wstring& host_exe,
-                           const std::string& allowed_schemes);
+                           const std::string& allowed_schemes,
+                           bool agent_control);
   void DisposeSession(const std::string& session_id);
+
+  // Agent control (P9). enableAgentControl starts (idempotently) the token-gated
+  // loopback CDP relay for the session's host and replies
+  // `{wsUrl, token, port}` (the macOS return shape exactly); it errors if the
+  // host was not created with agentControl:true. disableAgentControl tears the
+  // relay down (the tile keeps running). Both platform-thread only.
+  void EnableAgentControl(
+      const flutter::EncodableMap& args,
+      std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>& result);
+  void DisableAgentControl(
+      const flutter::EncodableMap& args,
+      std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>& result);
+  // The always-on CDP reader: drains a host's CDP read pipe (NUL-framed JSON)
+  // and delivers each complete message to the current relay. Runs on its own
+  // thread; touches no MethodChannel state. Static + shared_ptr-scoped so it can
+  // outlive a Host erase (joined in the reaper).
+  static void CdpReadLoop(std::shared_ptr<CdpTransport> transport);
   // Tear down a whole Host: mark closing, optionally send kOpShutdown, sweep
   // any lingering sessions, and hand pipe/process/watcher to a reaper thread
   // (bounded wait -> kill -> close; deletes an EPHEMERAL profile dir).

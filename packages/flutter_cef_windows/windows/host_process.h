@@ -41,9 +41,27 @@ class HostProcess {
   // --allowed-schemes=<csv> (empty = omitted = allow all; mirrors
   // CefProfileHost.spawn, CefProfileHost.swift:289-291). Returns false on
   // spawn failure.
+  //
+  // AGENT CONTROL (P9): when `agent_control` is true, the spawn additionally
+  // sets up the CDP-over-pipe transport (the S3 recipe, mirroring macOS
+  // launchViaPosixSpawn's fds 3/4): it CreatePipe()s two anonymous pipes, marks
+  // ONLY the child-side ends inheritable, spawns cef_host with a
+  // STARTUPINFOEX PROC_THREAD_ATTRIBUTE_HANDLE_LIST containing exactly those two
+  // ends (so nothing else leaks — this composes with the existing spawn, which
+  // inherits NO handles: the IPC pipe is connected by NAME and the Job Object is
+  // assigned post-spawn), and passes `--cdp-io-pipes=<childRead>,<childWrite>`
+  // (decimal HANDLE values) which cef_host's OnBeforeCommandLineProcessing
+  // translates into Chromium's --remote-debugging-pipe +
+  // --remote-debugging-io-pipes. The PARENT-side ends are returned via
+  // `out_cdp_read` (we read CDP responses/events here; child writes) and
+  // `out_cdp_write` (we write CDP commands here; child reads). The caller owns +
+  // closes them. When `agent_control` is false the spawn is byte-identical to
+  // the pre-P9 path (no handle inheritance, no extra pipes).
   bool Spawn(const std::wstring& cef_host_exe, const std::wstring& pipe_name,
              const std::wstring& profile_dir, bool ephemeral,
-             const std::string& allowed_schemes = std::string());
+             const std::string& allowed_schemes = std::string(),
+             bool agent_control = false, HANDLE* out_cdp_read = nullptr,
+             HANDLE* out_cdp_write = nullptr);
 
   // Waits up to `timeout_ms` for exit; returns the exit code, or
   // kStillRunning on timeout / if never spawned.

@@ -180,8 +180,8 @@ reply success/null + `OutputDebugString` warning, never an error.
 | visitCookies | id:int, url:String | null | 0x2e | P6 | Swift:183-188 |
 | deleteCookie | url:String, name:String | null | 0x2f | P6 | Swift:189-194 |
 | showDevTools | — | null | 0x33 | IMPL\* | Swift:195-197 |
-| enableAgentControl | — | `{wsUrl, token, port}` or FlutterError | CDP relay (P9) | STUB (null) | Swift:198-217 |
-| disableAgentControl | — | null | CDP relay (P9) | STUB | Swift:218-225 |
+| enableAgentControl | — | `{wsUrl:String, token:String, port:int}` or FlutterError (`no_agent_control` when the session wasn't created with `agentControl:true`) | CDP relay (§8) | P9 | Swift:198-217, controller:595-605 |
+| disableAgentControl | — | null | CDP relay (§8) | P9 | Swift:218-225, controller:609-610 |
 | showEmojiPicker | — | null | macOS-only (Character Palette) | STUB | Swift:226-230 |
 | imeSetComposition | text:String | null | 0x30 | IMPL\* | Swift:231-233 |
 | imeCommitText | text:String | null | 0x31 | IMPL\* | Swift:234-236 |
@@ -237,9 +237,11 @@ thread (marshal from the reader thread).
   `shared_texture_handle` values (SPIKES.md S4).
 - The plugin holds an opened `ID3D11Texture2D` ComPtr on the current bridge
   handle for as long as it feeds it to Flutter (LAW 6 / S1 belt-1).
-- cef_host args (slice): `--ipc=<pipe name>` `--profile-dir=<abs path>`
-  `--ephemeral` (cf. macOS args main.mm:32-38; `--cdp-port`/`--cdp-pipe`/
-  `--allowed-schemes` are post-slice).
+- cef_host args: `--ipc=<pipe name>` `--profile-dir=<abs path>` `--ephemeral`
+  `--allowed-schemes=<csv>` (§6) and — for agent control (§8) — `--cdp-io-pipes=
+  <read>,<write>` (cf. macOS args main.mm:32-38; `--cdp-port` TCP CDP is still
+  post-slice — the Dart-side `enableCdp`+named-profile assert already blocks the
+  unsafe combination, so `cdpPort` stays 0 on Windows).
 
 ## 6. Profile model (P6 foundation + P11 profile slice)
 
@@ -476,3 +478,91 @@ Page → host. The shim is injected NATIVELY (there is no Dart-injected shim):
   suggestedName}` (main.mm:1254). The plugin emits `download {suggestedName}`
   (§4); Dart invokes `onDownload(suggestedName)`
   (cef_web_controller.dart:255-257). Informational only (no reply verb).
+
+## 8. Agent control — CDP-over-pipe + the token-gated loopback relay (P9)
+
+An external CDP client (Playwright via `connectOverCDP`, agent-browser) drives a
+live, logged-in tile **without** an open debug port: Chromium speaks CDP over an
+inherited pipe (`--remote-debugging-pipe` + `--remote-debugging-io-pipes`,
+NUL-framed JSON), and a small token-gated LOOPBACK HTTP+WebSocket relay bridges a
+standard CDP client to that pipe. Transcribed from the macOS reference
+`CdpRelay.swift` (the canonical relay) + `CefProfileHost.swift`
+(launchViaPosixSpawn / readCdpLoop / enableAgentControl); the Windows spawn is
+the S3 recipe (`flutter_cef_spikes/s3`). **SINGLE-TILE scope:** one relay per
+host (raw browser-level passthrough — the pipe carries exactly one page target);
+the per-tile Target-domain filter + N-relay CDP-id multiplex (CEF-2b,
+`CdpRelay.swift:560-884`) is a documented follow-up (the `scope_target_id` seam
+in `windows/cdp_relay.h`).
+
+### 8.1 Launch — the CDP pipe (S3 recipe)
+
+The `create` arg `agentControl:true` (§3) switches the host launch mechanism.
+`HostProcess::Spawn(agent_control=true)` (windows/host_process.cpp):
+
+- `CreatePipe` × 2 (anonymous). `cmd_pipe`: parent writes CDP → child reads.
+  `out_pipe`: child writes CDP → parent reads.
+- `SetHandleInformation(HANDLE_FLAG_INHERIT)` on **only the two child-side ends**;
+  a `STARTUPINFOEX` `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` naming exactly those two
+  (so nothing else leaks). This **composes** with the existing spawn, which
+  inherits nothing: the IPC pipe is connected by NAME (`CreateFileW`) and the Job
+  Object is assigned post-spawn — neither is an inherited handle. `bInheritHandles
+  = TRUE` + `EXTENDED_STARTUPINFO_PRESENT` are added only on this path; the
+  non-agent spawn stays byte-identical (S2/S3 confirm bootstrap preserves the
+  handle list).
+- The child gets `--cdp-io-pipes=<childRead>,<childWrite>` (decimal HANDLE
+  values). cef_host's `OnBeforeCommandLineProcessing` (browser process only)
+  translates it into Chromium's `--remote-debugging-pipe` +
+  `--remote-debugging-io-pipes=<childRead>,<childWrite>`. Mirrors macOS main.mm's
+  `--cdp-pipe` → `remote-debugging-pipe` injection (fds 3/4 there; explicit HANDLE
+  values here).
+- The plugin keeps the two PARENT-side ends (`CdpTransport::read`/`write`) and
+  runs an always-on `CdpReadLoop` that splits the NUL-framed CDP stream and fans
+  each message to the current relay (mirrors `CefProfileHost.readCdpLoop` +
+  `deliverCdpToRelays`). `cdpPort` stays 0 — there is no listening socket.
+
+### 8.2 The relay (`windows/cdp_relay.{h,cpp}`, winsock + bcrypt)
+
+A loopback HTTP+WS server (`socket`/`bind` `127.0.0.1:0` → OS-assigned ephemeral
+port, accept thread, detached per-connection handlers), a direct winsock port of
+`CdpRelay.swift`:
+
+- **Discovery (token-free):** `GET /json/version` · `/json` · `/json/list`
+  advertise `webSocketDebuggerUrl = ws://127.0.0.1:<port>/devtools/browser` (the
+  token is NOT in the discovery response).
+- **Upgrade (token-REQUIRED):** RFC-6455 handshake; `Sec-WebSocket-Accept =
+  base64(SHA-1(key + GUID))` via BCrypt. The upgrade is rejected **401** without a
+  valid `Authorization: Bearer <token>` header (a `?token=` query is an accepted
+  fallback); constant-time compared. A second concurrent client is **503**'d
+  (single active client).
+- **Bridge:** masked client text frames → `send_to_pipe` (NUL-framed CDP command
+  onto `cmd_pipe`); pipe messages → `DeliverToClient` (unmasked text frame to the
+  client). Frame/message cap 64 MiB; ping→pong; close handled.
+- **Token:** 24 CSPRNG bytes (`BCryptGenRandom`) hex-encoded (48 chars).
+
+Security posture (matches macOS): loopback only, ephemeral unadvertised port,
+mandatory token, single client, and the relay exists **only while the grant is
+active** (created by `enableAgentControl`, torn down by `disableAgentControl` /
+dispose / host-death). Strictly better than raw Chrome's fixed, always-open,
+multi-client `--remote-debugging-port`.
+
+### 8.3 Verbs
+
+- `enableAgentControl` → starts (idempotently) the relay for the session's host
+  and returns `{wsUrl, token, port}` — the macOS return shape **exactly**:
+  `wsUrl = ws://127.0.0.1:<port>/devtools/browser?token=<token>`
+  (`CefProfileHost.endpoint`). Errors `no_agent_control` if the session was not
+  created with `agentControl:true`.
+- `disableAgentControl` → stops the relay (closes the listener + any client,
+  invalidates the token); the tile keeps running. Idempotent. Also torn down on
+  `dispose` / host death (the reaper stops the relay, joins the CDP reader, and
+  closes the pipe ends).
+
+### 8.4 Deferred (N-tile Target multiplex)
+
+Not implemented in the slice (single-tile is passthrough): `Target.getTargetInfo`
+targetId resolution (`kOpResolveTargetId 0x36` → `kOpTargetId 0x1b`, still a
+logged drop host-side), the deny-by-default / fail-closed / flatten-only
+Target-domain filter, and the per-relay CDP-id rewrite/demux that lets N relays
+share one browser-wide pipe. See `CdpRelay.swift:560-884` +
+`CefProfileHost.swift:1460-1596` and the filter test vectors
+`packages/flutter_cef_macos/macos/Classes/test/CdpRelayFilterTests.swift`.
