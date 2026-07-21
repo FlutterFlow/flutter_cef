@@ -1,0 +1,8 @@
+# Native sources are hashed by tool/cef_host_hash.sh to key the prebuilt
+# cef_host artifact in GCS. The hash is over RAW BYTES, so a Windows checkout
+# with core.autocrlf=true would compute a different digest than the macOS
+# publisher for the same commit — forever missing the prebuilt. Pin LF for
+# everything the hash covers (and shell scripts, which break under CRLF).
+packages/**/native/** text eol=lf
+packages/**/tool/*.sh text eol=lf
+*.sh text eol=lf
