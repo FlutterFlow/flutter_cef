@@ -56,7 +56,7 @@ final cookies = await c.getCookies(); // read/enumerate; pass url: to scope
 c.deleteCookie(url: 'https://example.com/', name: 'sid'); c.clearCookies();
 c.scrollTo(0, 200); c.scrollBy(0, -50); await c.getScrollPosition();
 c.clearLocalStorage(); await c.getTitle(); await c.getUserAgent();
-c.onDownload = (suggestedName) {}; // downloads land in ~/Downloads
+c.onDownload = (suggestedName) {}; // a download started (a native Save panel is shown)
 
 // open the Chrome DevTools inspector for this view in its own window
 c.openDevTools();
@@ -456,7 +456,13 @@ Next:
   `flutter_cef_platform_interface` + `flutter_cef_macos`); a new platform is a
   sibling `flutter_cef_<os>` package. The CEF logic + IPC protocol are portable;
   each OS supplies its own host plugin + shared-texture / transport / sandbox
-  glue. See [`PORTING.md`](PORTING.md) for the full contract and seam map.
+  glue. See [`PORTING.md`](PORTING.md) for the full contract and seam map. A
+  Windows port (`flutter_cef_windows`) is in progress: the Dart controller /
+  widget surface is already cross-platform (the JS bridge, JS dialogs,
+  find-in-page, content zoom, and downloads all speak the same
+  method-channel/wire protocol on both OSes — see
+  `packages/flutter_cef_windows/native/cef_host/PROTOCOL.md`), with the Windows
+  host's sandbox + code-signing story still pending.
 
 ## Credits
 

@@ -146,8 +146,11 @@ stage-1; the slice instead reuses `kOpPresent 0x01` with the Windows payload
 
 Verb names + arg keys verbatim from FlutterCefPlugin.swift:113-241 and
 cef_web_controller.dart (invokeMethod sites). Every arg map carries
-`sessionId` (String). SLICE = must be functional for the vertical slice;
-STUB = reply success/null + `OutputDebugString` warning, never an error.
+`sessionId` (String). SLICE = functional since the P1–P4 vertical slice;
+P6 = functional since the profiles/cookies slice; P7 = functional since the
+JS-bridge/dialogs/find/zoom/downloads slice (see §7); IMPL\* = native
+implementation present but not yet verified on Windows OSR; STUB = still a
+reply success/null + `OutputDebugString` warning, never an error.
 
 | Verb | Args (beyond sessionId) | Returns | Maps to | Slice? | Source |
 |---|---|---|---|---|---|
@@ -164,25 +167,25 @@ STUB = reply success/null + `OutputDebugString` warning, never an error.
 | goBack | — | null | 0x23 | SLICE | Swift:124 |
 | goForward | — | null | 0x24 | SLICE | Swift:125 |
 | executeJavaScript | code:String | null | 0x25 | SLICE | Swift:126-130 |
-| setZoomLevel | level:double | null | 0x26 | STUB | Swift:131-133 |
-| editCommand | command:int | null | 0x38 | STUB | Swift:134-136 |
+| setZoomLevel | level:double | null | 0x26 | P7 | Swift:131-133 |
+| editCommand | command:int | null | 0x38 | SLICE | Swift:134-136 |
 | setVisible | visible:bool | null | 0x35 | SLICE | Swift:137-139 |
-| find | text:String, forward:bool, matchCase:bool, findNext:bool | null | 0x27 | STUB | Swift:140-148 |
-| stopFind | clearSelection:bool | null | 0x28 | STUB | Swift:149-151 |
-| respondJsDialog | id:int, ok:bool, text:String | null | 0x29 | STUB | Swift:152-158 |
-| evalReturning | id:int, code:String | null | 0x2a | STUB | Swift:159-165 |
-| addJavaScriptChannel | name:String | null | 0x2b | STUB | Swift:166-170 |
-| setCookie | url, name, value, domain, path : String | null | 0x2c | STUB | Swift:171-179 |
-| clearCookies | — | null | 0x2d | STUB | Swift:180-182 |
-| visitCookies | id:int, url:String | null | 0x2e | STUB | Swift:183-188 |
-| deleteCookie | url:String, name:String | null | 0x2f | STUB | Swift:189-194 |
-| showDevTools | — | null | 0x33 | STUB | Swift:195-197 |
+| find | text:String, forward:bool, matchCase:bool, findNext:bool | null | 0x27 | P7 | Swift:140-148 |
+| stopFind | clearSelection:bool | null | 0x28 | P7 | Swift:149-151 |
+| respondJsDialog | id:int, ok:bool, text:String | null | 0x29 | P7 | Swift:152-158 |
+| evalReturning | id:int, code:String | null | 0x2a | P7 | Swift:159-165 |
+| addJavaScriptChannel | name:String | null | 0x2b | P7 | Swift:166-170 |
+| setCookie | url, name, value, domain, path : String | null | 0x2c | P6 | Swift:171-179 |
+| clearCookies | — | null | 0x2d | P6 | Swift:180-182 |
+| visitCookies | id:int, url:String | null | 0x2e | P6 | Swift:183-188 |
+| deleteCookie | url:String, name:String | null | 0x2f | P6 | Swift:189-194 |
+| showDevTools | — | null | 0x33 | IMPL\* | Swift:195-197 |
 | enableAgentControl | — | `{wsUrl, token, port}` or FlutterError | CDP relay (P9) | STUB (null) | Swift:198-217 |
 | disableAgentControl | — | null | CDP relay (P9) | STUB | Swift:218-225 |
 | showEmojiPicker | — | null | macOS-only (Character Palette) | STUB | Swift:226-230 |
-| imeSetComposition | text:String | null | 0x30 | STUB | Swift:231-233 |
-| imeCommitText | text:String | null | 0x31 | STUB | Swift:234-236 |
-| imeCancelComposition | — | null | 0x32 | STUB | Swift:237-239 |
+| imeSetComposition | text:String | null | 0x30 | IMPL\* | Swift:231-233 |
+| imeCommitText | text:String | null | 0x31 | IMPL\* | Swift:234-236 |
+| imeCancelComposition | — | null | 0x32 | IMPL\* | Swift:237-239 |
 
 macOS replies `FlutterMethodNotImplemented` for unknown verbs
 (Swift:240); the WINDOWS SLICE deviates deliberately: unknown/unimplemented
@@ -333,3 +336,143 @@ arrives carrying the same `id` and a JSON array (`CefCookie.fromJson` per elemen
 cef_web_controller.dart:741-767). The JSON array shape MUST match macOS
 byte-for-byte (main.mm's `DoVisitCookies` serializer) so a page cannot detect a
 Windows-vs-macOS divergence.
+
+## 7. JS bridge, JS dialogs, find, zoom, downloads (P7 verb parity)
+
+All opcode numbers and byte layouts are in §2; this section documents the
+**string packings** and the **per-session message-router routing** that the P7
+verbs depend on, transcribed from main.mm with line cites. The Dart side
+(cef_web_controller.dart, cross-platform, unchanged for Windows) parses exactly
+these shapes; the Windows host MUST reproduce them byte-for-byte so a page cannot
+detect a Windows-vs-macOS divergence.
+
+### 7.1 The message router (CefMessageRouter) — renderer + browser halves
+
+The JS bridge (channels + `runJavaScriptReturningResult`) rides one
+`CefMessageRouter` created with the **DEFAULT** `CefMessageRouterConfig`
+(`window.cefQuery` / `window.cefQueryCancel`). Browser-side and renderer-side
+MUST use the SAME config or queries never route.
+
+- **macOS reference:** browser-side router lives in the `Handler` (main.mm —
+  `router_->OnProcessMessageReceived`, main.mm:1495-1501; `OnQuery`,
+  main.mm:1472-1494). The renderer half is a SEPARATE process
+  (`process_helper.mm`): `CefMessageRouterRendererSide` with the default config,
+  wired in `OnContextCreated` / `OnContextReleased` / `OnProcessMessageReceived`.
+- **Windows:** there is no separate helper exe — the SAME `cef_host.exe` is
+  re-executed as the render subprocess via `CefExecuteProcess`, so the
+  renderer-side router lives in cef_host's `CefApp::GetRenderProcessHandler`
+  (cef_host_win.cc), branched by process type. Both halves still use the DEFAULT
+  config (contract, not Dart-visible).
+
+### 7.2 JS channels — `addJavaScriptChannel` / `removeJavaScriptChannel`
+
+Page → host. The shim is injected NATIVELY (there is no Dart-injected shim):
+
+- `addJavaScriptChannel(name)` → verb `addJavaScriptChannel` → **0x2b
+  kOpAddChannel** `{utf8 name}` (§2). The host validates `name` is a JS
+  identifier (`IsValidChannelName`, main.mm:362-375; ≤64 chars,
+  `[A-Za-z_$][A-Za-z0-9_$]*`) and registers it process-globally in `g_channels`
+  (`DoAddChannel`, main.mm:2019-2035). Invalid names are dropped + logged, never
+  fatal. Dart pre-validates with the same regex (cef_web_controller.dart:165,
+  669-671) and re-registers every channel on `create()`
+  (cef_web_controller.dart:541-544) so add-before-mount works.
+- **Shim injection** (`InjectChannelShim`, main.mm:377-384) — injected into the
+  **MAIN frame ONLY** on every `OnLoadStart` (main.mm:1337-1343) and into the
+  current frame at registration time (main.mm:2034). The injected source is
+  exactly:
+  ```js
+  window['<name>']={postMessage:function(m){window.cefQuery({request:'ch:<name>:'+String(m),
+    persistent:false,onSuccess:function(){},onFailure:function(){}});}};
+  ```
+- **Page → host delivery.** `window.<name>.postMessage(m)` calls
+  `window.cefQuery` with `request = "ch:<name>:<m>"`. `OnQuery`
+  (main.mm:1487-1492) refuses subframe queries (privileged bridge; 403), strips
+  the `"ch:"` prefix (3 bytes), and sends **0x17 kOpChannelMsg** `{utf8
+  "name:message"}` (main.mm:1489). The plugin emits `channelMessage
+  {payload:"name:message"}` (§4); Dart splits at the FIRST `:` and dispatches to
+  the registered handler (`_handleChannelMessage`, cef_web_controller.dart:336-340)
+  — colons in the message body are preserved.
+- **Per-session routing (mandatory — channel_probe_shared).** `OnQuery` stamps
+  `slot_->browser_id` (the originating browser) on kOpChannelMsg
+  (main.mm:1489), and the plugin fans the event to only that session's Dart
+  channel handler. A message from tile A's page reaches A's handler, never B's,
+  even on a shared host. This is an information-sharing boundary (the channel
+  NAME is process-global), not a message-spoofing one.
+- `removeJavaScriptChannel(name)` is **Dart-local** (cef_web_controller.dart:683-685):
+  it stops delivery to the handler but does NOT tear down the page-side shim
+  (which is process-global on a shared profile), so the page may still post — those
+  messages are dropped. No opcode.
+
+### 7.3 `runJavaScriptReturningResult` — the eval round-trip
+
+- `runJavaScriptReturningResult(code)` assigns an `id` and sends verb
+  `evalReturning` → **0x2a kOpEvalReturning** `{u32 id}{utf8 code}` (§2,
+  cef_web_controller.dart:655-662). The host (`DoEvalReturning`,
+  main.mm:2001-2018) SPLICES `code` into a `window.cefQuery` call (not `eval()`,
+  so it survives a strict page CSP) that JSON-stringifies
+  `{ok:true,v:(<code>)}` on success or `{ok:false,v:String(e)}` on throw, with
+  `request = "eval:<id>:<json>"`.
+- `OnQuery` (main.mm:1481-1486) refuses subframe queries (403), strips the
+  `"eval:"` prefix (5 bytes), and sends **0x16 kOpEvalResult** `{utf8
+  "id:json"}` (main.mm:1483). The plugin emits `evalResult
+  {payload:"id:json"}` (§4); Dart splits at the FIRST `:`, matches the pending
+  completer by `id`, and JSON-decodes the tail: `ok:true` completes with `v`,
+  `ok:false` completes with an `Exception('<v>')` (`_handleEvalResult`,
+  cef_web_controller.dart:297-313).
+- In-flight evals are failed (never leaked) on `pageStarted`
+  (cef_web_controller.dart:224-228), `processGone`, and `dispose`
+  (cef_web_controller.dart:317-324).
+- `executeJavaScript(code)` is the fire-and-forget sibling → **0x25
+  kOpExecuteJs** `{utf8 code}` (§2), no result event.
+
+### 7.4 JS dialogs — alert / confirm / prompt
+
+- Host → page request: `CefJSDialogHandler::OnJSDialog` (main.mm:1279-1303)
+  assigns a per-slot `id`, stashes the `CefJSDialogCallback`, and sends **0x0f
+  kOpJsDialog** `{u32 id}{u32 type}{u32 msgLen}{msg utf8}{defaultText utf8}`
+  (main.mm:1291-1301). `type`: 0=alert, 1=confirm, 2=prompt (main.mm:1286-1288).
+  The plugin emits `jsDialog {id,type,message,defaultText}` (§4).
+- Dart (`_handleJsDialog`, cef_web_controller.dart:345-382) routes by `type` to
+  `onJavaScriptAlertDialog` / `onJavaScriptConfirmDialog` /
+  `onJavaScriptTextInputDialog`, then replies verb `respondJsDialog
+  {id, ok, text}` → **0x29 kOpJsDialogResp** `{u32 id}{u8 ok}{utf8 text}` (§2).
+  Unset handlers fall closed to sensible defaults (alert dismissed, confirm→OK,
+  prompt→defaultText). A throwing handler fails closed (`ok=false`) but is
+  reported via `FlutterError.reportError` (not silently swallowed).
+- Host applies the answer: `DoJsDialogResp` (main.mm:1994-2000) looks up the
+  stashed callback by `id` and calls `Continue(ok, text)`, which returns the
+  page's `alert`/`confirm`/`prompt`. `OnBeforeUnloadDialog` always allows
+  navigation (main.mm:1304-1309).
+
+### 7.5 Find-in-page
+
+- `find(text, forward, matchCase, findNext)` → verb `find` → **0x27 kOpFind**
+  `{u8 fwd}{u8 matchCase}{u8 findNext}{utf8 text}` (§2,
+  cef_web_controller.dart:858-868; host read main.mm:2452-2459 → `DoFind`).
+- `stopFind(clearSelection)` → verb `stopFind` → **0x28 kOpStopFind** `{u8
+  clearSelection}` (absent = 1) (§2, cef_web_controller.dart:871-872; host
+  main.mm:2460-2465 → `DoStopFind`, main.mm:1991-1993).
+- Result event: `CefFindHandler::OnFindResult` (main.mm:1260-1275) sends **0x0e
+  kOpFindResult** `{u32 count}{u32 activeOrdinal}{u8 final}` = 9 bytes
+  (main.mm:1265-1274). The plugin emits `findResult
+  {count, activeMatchOrdinal, isFinal}` (§4); Dart delivers a `CefFindResult`
+  to `onFindResult` (cef_web_controller.dart:239-245). ⌘F/Ctrl+F is surfaced to
+  the host via `CefWebView.onFind` (cef_web_view.dart:571-579) — the widget has
+  no find bar of its own.
+
+### 7.6 Content zoom
+
+- `setZoomLevel(level)` → verb `setZoomLevel` → **0x26 kOpSetZoom** `{f64
+  level}` (§2, cef_web_controller.dart:822-823; host read main.mm:2434-2438 →
+  `DoSetZoom`). `level` is a Chromium zoom LEVEL; the factor is `1.2^level`
+  (0 = 100%). The view wires Ctrl/⌘ +/-/0 to step it (cef_web_view.dart:559-570).
+  No result event.
+
+### 7.7 Downloads
+
+- `CefDownloadHandler::OnBeforeDownload` (main.mm:1251-1257) allows the download
+  (CEF blocks downloads without a handler), continues with an empty path +
+  `show_dialog=true` (native Save panel), and sends **0x18 kOpDownload** `{utf8
+  suggestedName}` (main.mm:1254). The plugin emits `download {suggestedName}`
+  (§4); Dart invokes `onDownload(suggestedName)`
+  (cef_web_controller.dart:255-257). Informational only (no reply verb).

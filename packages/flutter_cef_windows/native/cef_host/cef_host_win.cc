@@ -46,6 +46,7 @@
 
 #include <d3d11.h>
 #include <d3d11_1.h>
+#include <shlobj.h>  // SHGetKnownFolderPath / FOLDERID_Downloads (downloads)
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -75,13 +76,21 @@
 #include "include/cef_life_span_handler.h"
 #include "include/cef_permission_handler.h"
 #include "include/cef_render_handler.h"
+#include "include/cef_render_process_handler.h"
 #include "include/cef_request_handler.h"
 #include "include/cef_sandbox_win.h"
 #include "include/cef_task.h"
+#include "include/cef_v8.h"
 #include "include/wrapper/cef_closure_task.h"
 #include "include/wrapper/cef_helpers.h"
+#include "include/wrapper/cef_message_router.h"
 
 #include "cef_host_protocol.h"
+
+// SHGetKnownFolderPath (downloads dir) + CoTaskMemFree live in shell32/ole32.
+// These pragmas keep the TU self-linking without touching CMake.
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
 
 namespace {
 
@@ -104,6 +113,61 @@ HWND g_hidden_hwnd = nullptr;
 // Empty = allow all. `about` is always allowed. Enforced in
 // HostClient::OnBeforeBrowse exactly like main.mm:335-342/1528-1565.
 std::set<std::string> g_allowed_schemes;
+
+// Registered JS channel names (UI-thread-only; mirrors main.mm:352-356). On
+// each MAIN-frame load OnLoadStart injects a window.<name>.postMessage shim
+// that routes to the browser process over window.cefQuery (the
+// CefMessageRouter channel; the renderer half lives in HostApp below).
+std::set<std::string> g_channels;
+
+// A channel name is spliced into the injected shim's source, so it MUST be a
+// plain JS identifier — else a crafted name could break out of the string
+// literal and run arbitrary script on every page load (main.mm:362-375,
+// verbatim). DoAddChannel drops invalid names.
+bool IsValidChannelName(const std::string& n) {
+  if (n.empty() || n.size() > 64) return false;
+  auto isFirst = [](unsigned char c) {
+    return std::isalpha(c) || c == '_' || c == '$';
+  };
+  auto isRest = [](unsigned char c) {
+    return std::isalnum(c) || c == '_' || c == '$';
+  };
+  if (!isFirst(static_cast<unsigned char>(n[0]))) return false;
+  for (size_t i = 1; i < n.size(); ++i) {
+    if (!isRest(static_cast<unsigned char>(n[i]))) return false;
+  }
+  return true;
+}
+
+// Inject the per-channel page-side shim (window.<name>.postMessage ->
+// window.cefQuery 'ch:<name>:<msg>'). BYTE-for-byte identical to main.mm:
+// 377-384 so a page cannot detect a Windows-vs-macOS divergence.
+void InjectChannelShim(CefRefPtr<CefFrame> frame, const std::string& name) {
+  if (!frame) return;
+  std::string js = "window['" + name +
+                   "']={postMessage:function(m){window.cefQuery({request:'ch:" +
+                   name + ":'+String(m),persistent:false,"
+                   "onSuccess:function(){},onFailure:function(){}});}};";
+  frame->ExecuteJavaScript(js, "", 0);
+}
+
+// The user's Downloads folder (Windows analogue of macOS's native save panel).
+// Empty on failure — OnBeforeDownload then falls back to a Save-As dialog.
+std::wstring GetDownloadsDir() {
+  PWSTR path = nullptr;
+  if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Downloads, 0, nullptr, &path)) &&
+      path) {
+    std::wstring dir(path);
+    CoTaskMemFree(path);
+    return dir;
+  }
+  if (path) CoTaskMemFree(path);
+  // Fallback: %USERPROFILE%\Downloads.
+  wchar_t up[MAX_PATH] = {};
+  const DWORD n = GetEnvironmentVariableW(L"USERPROFILE", up, MAX_PATH);
+  if (n > 0 && n < MAX_PATH) return std::wstring(up) + L"\\Downloads";
+  return std::wstring();
+}
 
 void LogErr(const char* fmt, ...) {
   va_list ap;
@@ -663,12 +727,22 @@ class HostClient : public CefClient,
                    public CefFindHandler,
                    public CefJSDialogHandler,
                    public CefDownloadHandler,
-                   public CefRequestHandler {
+                   public CefRequestHandler,
+                   public CefMessageRouterBrowserSide::Handler {
  public:
   explicit HostClient(std::shared_ptr<Slot> slot) : slot_(std::move(slot)) {
+    // Browser-side message router (default config: window.cefQuery /
+    // cefQueryCancel) — the SAME config the renderer half uses (main.mm:
+    // 1228-1234). One router per HostClient, i.e. per browser: OnQuery below
+    // stamps slot_->browser_id so a page message is delivered ONLY to the
+    // originating session (per-session routing, channel_probe_shared).
+    CefMessageRouterConfig config;
+    router_ = CefMessageRouterBrowserSide::Create(config);
+    router_->AddHandler(this, false);
     rh_ = new HostRenderHandler(slot_);
     ph_ = new HostPermissionHandler();
   }
+  CefRefPtr<CefMessageRouterBrowserSide> router_;
   CefRefPtr<CefRenderHandler> rh_;
   CefRefPtr<CefPermissionHandler> ph_;
   CefRefPtr<CefRenderHandler> GetRenderHandler() override { return rh_; }
@@ -683,12 +757,24 @@ class HostClient : public CefClient,
   CefRefPtr<CefDownloadHandler> GetDownloadHandler() override { return this; }
   CefRefPtr<CefRequestHandler> GetRequestHandler() override { return this; }
 
-  // CefDownloadHandler (main.mm:1251-1257): allow downloads + notify.
+  // CefDownloadHandler (main.mm:1251-1257): allow downloads + notify the
+  // plugin. macOS Continues with an empty path + show_dialog so AppKit's
+  // native save panel picks the location; a hidden-window OSR host on Windows
+  // has no good save panel, so default to the user's Downloads folder
+  // (SHGetKnownFolderPath FOLDERID_Downloads) with the suggested name, and
+  // fall back to the Save-As dialog only if the folder can't be resolved.
   bool OnBeforeDownload(CefRefPtr<CefBrowser>, CefRefPtr<CefDownloadItem>,
                         const CefString& suggested_name,
                         CefRefPtr<CefBeforeDownloadCallback> callback) override {
     SendUtf8(slot_->browser_id, kOpDownload, suggested_name.ToString());
-    callback->Continue(CefString(), true);
+    const std::wstring dir = GetDownloadsDir();
+    if (!dir.empty()) {
+      CefString full;
+      full.FromWString(dir + L"\\" + suggested_name.ToWString());
+      callback->Continue(full, /*show_dialog=*/false);
+    } else {
+      callback->Continue(CefString(), /*show_dialog=*/true);
+    }
     return true;
   }
 
@@ -741,7 +827,55 @@ class HostClient : public CefClient,
                                  const CefString&) override {
     SendLog(slot_->browser_id, "renderer terminated (status " +
                                    std::to_string(status) + ") — reloading");
+    if (router_) router_->OnRenderProcessTerminated(browser);
     if (browser) browser->ReloadIgnoreCache();
+  }
+
+  // CefMessageRouter wiring (main.mm:1468-1501). The renderer half (HostApp
+  // below) injects window.cefQuery; queries land here. Forward the request to
+  // the plugin: "eval:<id>:<json>" -> kOpEvalResult (a
+  // runJavaScriptReturningResult result); "ch:<name>:<message>" ->
+  // kOpChannelMsg (a JS-channel post). Both are stamped with slot_->browser_id
+  // (this HostClient owns exactly one browser), so the message reaches ONLY the
+  // originating session's Dart channel — the per-session routing boundary
+  // (channel_probe_shared). 'eval:'/'ch:' are privileged (they hit the trusted
+  // host eval path / the channel bridge) and the shim is injected per-frame, so
+  // honor them ONLY from the MAIN frame; refuse a forged subframe query.
+  bool OnQuery(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame, int64_t,
+               const CefString& request, bool,
+               CefRefPtr<Callback> callback) override {
+    std::string r = request.ToString();
+    const bool main_frame = !frame || frame->IsMain();
+    if (r.rfind("eval:", 0) == 0) {
+      if (!main_frame) {
+        callback->Failure(403, "subframe");
+        return true;
+      }
+      SendUtf8(slot_->browser_id, kOpEvalResult, r.substr(5));
+      callback->Success(CefString());
+      return true;
+    }
+    if (r.rfind("ch:", 0) == 0) {
+      if (!main_frame) {
+        callback->Failure(403, "subframe");
+        return true;
+      }
+      SendUtf8(slot_->browser_id, kOpChannelMsg, r.substr(3));
+      callback->Success(CefString());
+      return true;
+    }
+    return false;
+  }
+
+  // Route renderer->browser process messages through the message router
+  // (main.mm:1495-1501). This carries the cefQuery payloads that surface in
+  // OnQuery above.
+  bool OnProcessMessageReceived(CefRefPtr<CefBrowser> browser,
+                                CefRefPtr<CefFrame> frame,
+                                CefProcessId source_process,
+                                CefRefPtr<CefProcessMessage> message) override {
+    return router_->OnProcessMessageReceived(browser, frame, source_process,
+                                             message);
   }
 
   // CefLoadHandler: spinner + back/forward enablement.
@@ -751,8 +885,13 @@ class HostClient : public CefClient,
   }
   void OnLoadStart(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
                    TransitionType) override {
-    if (frame && frame->IsMain())
+    if (frame && frame->IsMain()) {
       SendUtf8(slot_->browser_id, kOpPageStart, frame->GetURL().ToString());
+      // SECURITY (main.mm:1339-1343): install the JS-channel shims ONLY into
+      // the MAIN frame — injecting the privileged window.<name> bridge into a
+      // cross-origin subframe would hand an untrusted iframe that bridge.
+      for (const auto& name : g_channels) InjectChannelShim(frame, name);
+    }
   }
   void OnLoadEnd(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame,
                  int) override {
@@ -863,7 +1002,8 @@ class HostClient : public CefClient,
   // Centralized per-browser teardown (main.mm:1510-1527): drop the routing
   // entry, release the bridge under the slot lock (closing set FIRST so a
   // racing paint can't re-mint), break the retain cycle.
-  void OnBeforeClose(CefRefPtr<CefBrowser>) override {
+  void OnBeforeClose(CefRefPtr<CefBrowser> browser) override {
+    if (router_) router_->OnBeforeClose(browser);
     {
       std::lock_guard<std::mutex> lock(g_slots_mutex);
       g_slots_by_wire_id.erase(slot_->browser_id);
@@ -916,10 +1056,51 @@ class HostClient : public CefClient,
 
 // ---- CEF app ----
 
-class HostApp : public CefApp, public CefBrowserProcessHandler {
+// The one CefApp, used for BOTH the browser process (CefInitialize) and every
+// re-exec'd sub-process (CefExecuteProcess). CEF calls GetBrowserProcessHandler
+// in the browser process and GetRenderProcessHandler in the render process, so
+// the SAME binary hosts both halves of CefMessageRouter (main.mm's split across
+// main.mm + process_helper.mm collapses here — Windows re-runs cef_host.exe as
+// the render subprocess, LAW 8). The renderer half owns a
+// CefMessageRouterRendererSide with the DEFAULT config (must match the
+// browser-side HostClient config); it injects window.cefQuery into every frame
+// and relays cefQuery calls to the browser process.
+class HostApp : public CefApp,
+                public CefBrowserProcessHandler,
+                public CefRenderProcessHandler {
  public:
   CefRefPtr<CefBrowserProcessHandler> GetBrowserProcessHandler() override {
     return this;
+  }
+  CefRefPtr<CefRenderProcessHandler> GetRenderProcessHandler() override {
+    return this;
+  }
+
+  // ---- Render-process half (process_helper.mm:24-57 counterpart) ----
+  // Render-process-only callback; create the renderer-side router here with the
+  // default config (window.cefQuery / cefQueryCancel).
+  void OnWebKitInitialized() override {
+    CefMessageRouterConfig config;
+    render_router_ = CefMessageRouterRendererSide::Create(config);
+  }
+  void OnContextCreated(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame,
+                        CefRefPtr<CefV8Context> context) override {
+    if (render_router_) render_router_->OnContextCreated(browser, frame,
+                                                         context);
+  }
+  void OnContextReleased(CefRefPtr<CefBrowser> browser,
+                         CefRefPtr<CefFrame> frame,
+                         CefRefPtr<CefV8Context> context) override {
+    if (render_router_)
+      render_router_->OnContextReleased(browser, frame, context);
+  }
+  bool OnProcessMessageReceived(CefRefPtr<CefBrowser> browser,
+                                CefRefPtr<CefFrame> frame,
+                                CefProcessId source_process,
+                                CefRefPtr<CefProcessMessage> message) override {
+    return render_router_ &&
+           render_router_->OnProcessMessageReceived(browser, frame,
+                                                    source_process, message);
   }
 
   void OnBeforeCommandLineProcessing(
@@ -958,6 +1139,11 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
     SendFrame(/*browser_id=*/0, kOpReady, ready_payload,
               sizeof(ready_payload));
   }
+
+ private:
+  // Renderer-side message router (render process only; created in
+  // OnWebKitInitialized). Null in the browser process.
+  CefRefPtr<CefMessageRouterRendererSide> render_router_;
 
   IMPLEMENT_REFCOUNTING(HostApp);
 };
@@ -1181,8 +1367,54 @@ void DoJsDialogResp(const std::shared_ptr<Slot>& slot, uint32_t id, bool ok,
                     const std::string& text) {
   auto it = slot->dialogs.find(id);
   if (it == slot->dialogs.end()) return;
-  it->second->Continue(ok, text);
+  // On Windows, CefJSDialogCallback::Continue() synchronously re-enters
+  // OnResetDialogState(), which clears slot->dialogs — so a Continue()-then-
+  // erase(it) (as macOS does, where the reset is async) would erase() through an
+  // invalidated iterator and crash the host. Take the ref and drop our map entry
+  // BEFORE Continue(); the callback stays alive in `cb`. No wire-observable
+  // difference from macOS — this only fixes the iterator lifetime on Windows.
+  CefRefPtr<CefJSDialogCallback> cb = it->second;
   slot->dialogs.erase(it);
+  cb->Continue(ok, text);
+}
+
+// runJavaScriptReturningResult (main.mm DoEvalReturning:2001-2018, verbatim).
+// Evaluate the user expression and post its JSON result back through
+// window.cefQuery (-> HostClient::OnQuery -> kOpEvalResult "id:json",
+// correlated to the Dart Future). `code` is the trusted host's JS (same trust
+// level as executeJavaScript) and must be a single expression. It is spliced
+// (not eval()'d) so it works under a strict page CSP; the Dart side fails any
+// pending result on navigation so a wedged callback can't leak a completer.
+void DoEvalReturning(const std::shared_ptr<Slot>& slot, uint32_t id,
+                     const std::string& code) {
+  if (!slot->browser) return;
+  CefRefPtr<CefFrame> frame = slot->browser->GetMainFrame();
+  if (!frame) return;
+  std::string js =
+      "window.cefQuery({request:'eval:" + std::to_string(id) +
+      ":'+(function(){try{return JSON.stringify({ok:true,v:(" + code +
+      "\n)});}catch(e){return JSON.stringify({ok:false,v:String(e)});}})(),"
+      "persistent:false,onSuccess:function(){},onFailure:function(){}});";
+  frame->ExecuteJavaScript(js, "", 0);
+}
+
+// Register a JS channel (main.mm DoAddChannel:2019-2035, verbatim). Registers
+// process-globally: OnLoadStart injects every g_channels entry into each
+// freshly-loaded MAIN frame, so the shim lands on the next load. Null-safe on
+// `slot` (a shared host may still be queuing this session's create). Also
+// injects into the registering session's CURRENT frame, covering registration
+// after the page already loaded.
+void DoAddChannel(const std::shared_ptr<Slot>& slot, const std::string& name) {
+  if (!IsValidChannelName(name)) {
+    if (slot)
+      SendLog(slot->browser_id,
+              "addJavaScriptChannel: rejected invalid name '" + name +
+                  "' (must be a JS identifier)");
+    return;
+  }
+  g_channels.insert(name);
+  if (slot && slot->browser)
+    InjectChannelShim(slot->browser->GetMainFrame(), name);
 }
 
 // ---- Cookies (global manager = the shared profile jar; main.mm:2040-2140) ----
@@ -1663,35 +1895,31 @@ void IpcReadLoop() {
         break;
       }
       case kOpEvalReturning: {
-        // #14: runJavaScriptReturningResult AWAITS the evalResult event, so a
-        // silent drop hangs the Dart Future forever. The renderer-side
-        // CefMessageRouter half that would produce a real result is post-slice —
-        // until it lands, synthesize an ERROR evalResult so the Future completes
-        // (with an error) instead of hanging. Wire shape per PROTOCOL.md
-        // kOpEvalResult: {utf8 "id:json"}, json = {ok,v} (cef_web_controller
-        // .dart:295-313). {u32 id}{utf8 code} inbound.
+        // runJavaScriptReturningResult (main.mm:2475-2482). {u32 id}{utf8 code}
+        // inbound; DoEvalReturning posts the value back via the message router
+        // as kOpEvalResult "id:json", correlated to the Dart Future.
+        if (!slot) break;
         if (plen < 4) break;
         uint32_t id = ReadU32BE(p);
-        std::string reply =
-            std::to_string(id) +
-            ":{\"ok\":false,\"v\":\"evalReturning not implemented on Windows "
-            "yet\"}";
-        SendUtf8(wire_id, kOpEvalResult, reply);
-        static bool logged_eval = false;
-        if (!logged_eval) {
-          logged_eval = true;
-          SendLog(0, "cef_host: evalReturning not implemented in the Windows "
-                     "slice — replying error evalResult (Future completes)");
-        }
+        std::string code(reinterpret_cast<const char*>(p + 4), plen - 4);
+        CefPostTask(TID_UI, base::BindOnce(&DoEvalReturning, slot, id, code));
         break;
       }
-      case kOpAddChannel:
+      case kOpAddChannel: {
+        // Do NOT require `slot` (main.mm:2483-2494): on a shared host a
+        // session's create may still be queued when this arrives; dropping it
+        // is exactly why a peer session's window.<name> shim was never
+        // injected. DoAddChannel registers the name process-globally
+        // (OnLoadStart injects it on the next load) and, if the browser already
+        // exists, into its current frame.
+        std::string name(reinterpret_cast<const char*>(p), plen);
+        CefPostTask(TID_UI, base::BindOnce(&DoAddChannel, slot, name));
+        break;
+      }
       case kOpResolveTargetId: {
-        // Post-slice: these need the renderer-side CefMessageRouter half /
-        // the DevTools observer (macOS process_helper.mm counterpart). Neither
-        // can hang a Dart Future (addJavaScriptChannel resolves via the method-
-        // channel reply; resolveTargetId is fire-and-forget), so a logged drop
-        // is safe. Log ONCE per opcode; never kill the stream.
+        // Post-slice: needs the DevTools observer (macOS CEF-2b path). It can't
+        // hang a Dart Future (fire-and-forget), so a logged drop is safe. Log
+        // ONCE per opcode; never kill the stream.
         static bool logged_stub[256] = {false};
         if (!logged_stub[opcode]) {
           logged_stub[opcode] = true;
