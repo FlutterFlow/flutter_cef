@@ -1384,9 +1384,38 @@ void DoInvalidate(const std::shared_ptr<Slot>& slot) {
     slot->browser->GetHost()->Invalidate(PET_VIEW);
 }
 
+// Quit the message loop exactly once (the FlushStore completion and the
+// bounded fallback both route here; whichever wins quits, the other is a no-op).
+std::atomic<bool> g_quit_posted{false};
+void FinishShutdownQuit() {
+  CEF_REQUIRE_UI_THREAD();
+  if (g_quit_posted.exchange(true)) return;
+  CefQuitMessageLoop();
+}
+
+// Cookie-store flush completion: once the on-disk jar is written, quit.
+class ShutdownFlushCallback : public CefCompletionCallback {
+ public:
+  void OnComplete() override { FinishShutdownQuit(); }
+
+ private:
+  IMPLEMENT_REFCOUNTING(ShutdownFlushCallback);
+};
+
 // Tear down the WHOLE process (kOpShutdown / pipe EOF): close every browser,
-// then quit the message loop. Per-slot cleanup runs in OnBeforeClose
-// (main.mm DoShutdown:2324-2335).
+// flush the cookie jar to disk, then quit the message loop. Per-slot cleanup
+// runs in OnBeforeClose (main.mm DoShutdown:2324-2335).
+//
+// WINDOWS COOKIE DURABILITY (no macOS analogue): unlike macOS — where the
+// implicit CefShutdown flush reliably persists the jar — a fast Windows teardown
+// exits cleanly (code 0) yet leaves the on-disk cookie store EMPTY (verified:
+// a plugin-driven dispose+kOpShutdown flushed nothing, while the SAME host binary
+// under a slow standalone driver did). Session cookies (has_expires=false, kept
+// by persist_session_cookies) are only guaranteed durable once explicitly
+// flushed, so we FlushStore here and defer the quit into its completion — that is
+// what makes "stay signed in" survive relaunch. A bounded fallback quits anyway
+// if the callback never fires, so teardown can't wedge inside the plugin reaper's
+// grace. macOS main.mm is unchanged (it does not need this).
 void DoShutdown() {
   CEF_REQUIRE_UI_THREAD();
   std::vector<std::shared_ptr<Slot>> slots;
@@ -1398,7 +1427,15 @@ void DoShutdown() {
   for (auto& slot : slots) {
     if (slot->browser) slot->browser->GetHost()->CloseBrowser(true);
   }
-  CefQuitMessageLoop();
+  CefRefPtr<CefCookieManager> mgr = CefCookieManager::GetGlobalManager(nullptr);
+  if (mgr) {
+    mgr->FlushStore(new ShutdownFlushCallback());
+    // Fallback well inside the plugin reaper's 3s grace: never let a missing
+    // flush callback wedge the quit.
+    CefPostDelayedTask(TID_UI, base::BindOnce(&FinishShutdownQuit), 2000);
+  } else {
+    FinishShutdownQuit();
+  }
 }
 
 // Reader thread: decode frames, marshal onto the CEF UI thread (mirrors
@@ -1800,6 +1837,20 @@ extern "C" CEF_BOOTSTRAP_EXPORT int RunConsoleMain(
   settings.windowless_rendering_enabled = 1;
   settings.no_sandbox = 1;  // SLICE: sandbox is P11. Do not enable here.
   settings.multi_threaded_message_loop = 0;
+  // Per-profile cache: one root_cache_path shared by every browser in this
+  // process is what makes login shared across the tiles on a profile
+  // (CefCookieManager::GetGlobalManager -> this jar). persist_session_cookies
+  // keeps session cookies across relaunch — set UNCONDITIONALLY, mirroring
+  // main.mm:2869 (harmless for an ephemeral host, whose dir the plugin's reaper
+  // deletes on teardown; required for a named profile's "stay signed in").
+  //
+  // AT-REST (SPIKES.md S2 / §7): Windows OSCrypt encrypts the cookie/login
+  // stores with DPAPI, which is ALWAYS available and signing-INDEPENDENT — so a
+  // named profile persists directly here, with NO analogue of the macOS ad-hoc
+  // "mock-keychain -> downgrade named profile to ephemeral" rule (there is no
+  // readyFlags bit0 gate on Windows; OnContextInitialized sends 0). DPAPI is
+  // same-user-readable (weaker than the macOS Keychain), so the plugin's
+  // current-user protected DACL on the profile dir is defense-in-depth.
   CefString(&settings.root_cache_path) = profile_dir;
   CefString(&settings.cache_path) = profile_dir;
   settings.persist_session_cookies = 1;

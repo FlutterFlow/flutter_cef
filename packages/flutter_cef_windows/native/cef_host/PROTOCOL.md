@@ -237,3 +237,99 @@ thread (marshal from the reader thread).
 - cef_host args (slice): `--ipc=<pipe name>` `--profile-dir=<abs path>`
   `--ephemeral` (cf. macOS args main.mm:32-38; `--cdp-port`/`--cdp-pipe`/
   `--allowed-schemes` are post-slice).
+
+## 6. Profile model (P6 foundation + P11 profile slice)
+
+The plugin owns ONE `cef_host` process per **profile key** and multiplexes N
+browsers over it (one wire browserId each) — the macOS
+`CefProfileHost`/`FlutterCefPlugin` model transcribed to Windows. Key =
+the sanitized `profile` name for a named profile, or `"~ephemeral~"+sessionId`
+for the default (throwaway) case, so every ephemeral session gets its own host
+and every view with the same non-null `profile` shares one host → one cookie
+jar → one login (macOS: FlutterCefPlugin.swift:326-327, CefProfileHost.swift:1-12).
+
+### 6.1 Profile-dir resolution (plugin side)
+
+The `create` verb's `profile` arg (String, omit-when-empty — §3) selects the
+mode. The plugin resolves an on-disk cache dir and always passes it as
+`--profile-dir=<abs path>` (macOS `resolveProfileDir`,
+FlutterCefPlugin.swift:697-728):
+
+- **Ephemeral** (`profile` absent/empty): a unique throwaway dir
+  `%TEMP%\flutter_cef_ephem_<uuid>`, created + removed on host shutdown, and the
+  host is launched WITH `--ephemeral` (macOS uses `flutter_cef_ephem_<uuid>` +
+  `--ephemeral=1`, FlutterCefPlugin.swift:704-708 / CefProfileHost.swift:286-288).
+- **Named / persistent** (`profile` non-empty): a stable dir
+  `%LOCALAPPDATA%\flutter_cef\profiles\<sanitized-name>`, launched WITHOUT
+  `--ephemeral`. Sanitize the name to `[A-Za-z0-9._-]` (every other char → `_`),
+  and neutralize an all-dots leaf (`.`/`..`/`...`) to `_` so it can't escape the
+  `profiles\` container (macOS FlutterCefPlugin.swift:710-717 — mirror this
+  exactly, including the all-dots guard).
+
+  NOTE — Windows path root differs from macOS DELIBERATELY: macOS uses
+  `<Application Support>/<bundleId>/flutter_cef/profiles/<name>`; Windows uses
+  `%LOCALAPPDATA%\flutter_cef\profiles\<name>` (no per-app bundleId segment).
+  **Multi-app shared-profiles-root caveat**: every flutter_cef app for a given
+  Windows user therefore shares this one `profiles\` root, so a `profile: 'work'`
+  in app A and app B resolve to the SAME dir (analogous to the macOS
+  shared-"Chromium Safe Storage"-keychain caveat). Co-locate only
+  mutually-trusting apps on a shared profile name.
+
+- **DACL**: create the named-profile dir (and its `profiles\` ancestor) with a
+  current-user-SID-protected DACL — the same pattern `ipc_pipe.cpp` uses for the
+  pipe (audit fix #3). This is the Windows analogue of macOS's `0700`
+  owner-only chmod (FlutterCefPlugin.swift:706/722/726). Re-apply on an existing
+  leaf from a prior run (macOS re-chmods at :726).
+
+### 6.2 Host side (`--profile-dir` → `root_cache_path`)
+
+`cef_host` maps `--profile-dir` to `CefSettings.root_cache_path` and sets
+`settings.persist_session_cookies = true` (macOS main.mm:2854-2869). One
+`root_cache_path` is shared by every browser in the process — that is what makes
+the login shared. `persist_session_cookies` keeps session cookies across relaunch
+(harmless for ephemeral, required for "stay signed in" on a named profile). The
+`--ephemeral` flag (main.mm:2726, `is_ephemeral`) marks the throwaway case so the
+host's guards (CDP-on-named-profile refusal, and on macOS the mock-keychain
+downgrade) fire only for a REAL persistent profile — `--profile-dir` is set for
+both.
+
+### 6.3 At-rest encryption — Windows DPAPI (NO macOS-style downgrade)
+
+**KEY Windows security fact (SPIKES.md S2):** OSCrypt on Windows encrypts the
+cookie store with **DPAPI**, which is **always available and
+signing-independent**. So the macOS rule "ad-hoc build → mock keychain → downgrade
+a named profile to ephemeral (unless `FLUTTER_CEF_ALLOW_INSECURE_PROFILE=1`)"
+has **NO Windows analogue** — there is no mock-keystore state and no downgrade.
+A named profile on Windows simply persists, encrypted at rest, regardless of code
+signing. Concretely: `kOpReady`'s `readyFlags` bit0 (ad-hoc/mock-keychain build)
+is **macOS-only; the Windows host always sends 0** (§2, main.mm:1664-1682), and
+there is no `onInsecureProfileRefused` / re-home-to-ephemeral path on Windows.
+
+**Caveat (state it, do not hide it):** DPAPI's user-tier protection is
+**same-user-readable** — any process running as the same Windows user can call
+`CryptUnprotectData` and decrypt the store. This is **weaker than the macOS
+Keychain**, which can prompt / ACL-scope access. So on Windows the at-rest
+guarantee is "protected against other users / offline disk theft, NOT against
+other same-user processes." `localStorage`/IndexedDB are plaintext on both
+platforms (FileVault/BitLocker is the backstop).
+
+### 6.4 Cookies API (the four verbs + the result event)
+
+Cookies act on the profile's ONE process-wide `CefCookieManager` (the shared
+jar §6.1), so a write/clear is visible to every browser in the host. The four
+command opcodes and the one result event are fully specified in §2 (byte layouts,
+with main.mm cites) and reached from Dart via the verbs in §3/§4 — summarized here:
+
+| Dart (controller) | Verb (§3) | Opcode (§2) | main.mm |
+|---|---|---|---|
+| `setCookie(url,name,value,domain,path)` | `setCookie` | 0x2c `{utf8 url\0name\0value\0domain\0path}` (pad to 5) | 2495-2510 |
+| `clearCookies()` | `clearCookies` | 0x2d `{}` | 2511-2514 |
+| `getCookies({url})` → `List<CefCookie>` | `visitCookies` | 0x2e `{u32 id}{utf8 url}` (empty = all) → **0x1a** `{u32 id}{utf8 json-array}` event | 2515-2522 |
+| `deleteCookie(url,name)` | `deleteCookie` | 0x2f `{utf8 url\0name}` | 2523-2531 |
+
+`getCookies` is the only round-trip: the plugin assigns `id`, sends `visitCookies`,
+and resolves the Dart `Future` when the `cookies` event (from opcode 0x1a — §4)
+arrives carrying the same `id` and a JSON array (`CefCookie.fromJson` per element,
+cef_web_controller.dart:741-767). The JSON array shape MUST match macOS
+byte-for-byte (main.mm's `DoVisitCookies` serializer) so a page cannot detect a
+Windows-vs-macOS divergence.
