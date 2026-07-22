@@ -113,6 +113,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     switch call.method {
     case "create": create(args, result)
     case "navigate": navigate(args, result)
+    case "openAuthWindow": openAuthWindow(args, result)
     case "loadTrusted": loadTrusted(args, result)
     case "resize": resize(args, result)
     case "getFrameSurface": getFrameSurface(args, result)
@@ -617,6 +618,16 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   private func navigate(_ a: [String: Any], _ result: @escaping FlutterResult) {
     if let id = a["sessionId"] as? String, let url = a["url"] as? String {
       sessions[id]?.navigate(url)
+    }
+    result(nil)
+  }
+
+  /// Open a windowed Chrome-runtime browser at |url| for a WebAuthn / Touch ID
+  /// ceremony the OSR tile cannot host. Shares the session's cookie jar so the
+  /// sign-in propagates back to the tile.
+  private func openAuthWindow(_ a: [String: Any], _ result: @escaping FlutterResult) {
+    if let id = a["sessionId"] as? String, let url = a["url"] as? String {
+      sessions[id]?.openAuthWindow(url)
     }
     result(nil)
   }

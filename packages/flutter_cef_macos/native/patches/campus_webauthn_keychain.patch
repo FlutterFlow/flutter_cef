@@ -1,0 +1,13 @@
+diff --git a/chrome/browser/webauthn/chrome_web_authentication_delegate.cc b/chrome/browser/webauthn/chrome_web_authentication_delegate.cc
+index 743cee559e61e..bba4356b78f26 100644
+--- a/chrome/browser/webauthn/chrome_web_authentication_delegate.cc
++++ b/chrome/browser/webauthn/chrome_web_authentication_delegate.cc
+@@ -538,7 +538,7 @@ ChromeWebAuthenticationDelegate::TouchIdAuthenticatorConfig
+ ChromeWebAuthenticationDelegate::TouchIdAuthenticatorConfigForProfile(
+     Profile* profile) {
+   constexpr char kKeychainAccessGroup[] =
+-      MAC_TEAM_IDENTIFIER_STRING "." MAC_BUNDLE_IDENTIFIER_STRING ".webauthn";
++      "KLAJ5X6PJP." MAC_BUNDLE_IDENTIFIER_STRING ".webauthn";
+ 
+   std::string metadata_secret = profile->GetPrefs()->GetString(
+       webauthn::pref_names::kWebAuthnTouchIdMetadataSecretPrefName);
