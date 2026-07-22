@@ -23,6 +23,23 @@ _cefhost_sha256() {
 
 cef_host_input_hash() {
   local native_dir="$1"
+  # Campus CEF framework variant. 'stock' = the Spotify prebuilt CEF framework;
+  # anything else (e.g. 'campus-webauthn-h264') = a PATCHED from-source framework
+  # built by native/build-cef-from-source.sh (WebAuthn keychain group and/or
+  # proprietary codecs). The framework BYTES are NOT hashed here (only CEF_VERSION
+  # is, transitively via build_cef_host.sh) -- so WITHOUT this, a patched framework
+  # shipped under the same CEF_VERSION would collide with the stock content hash:
+  # publish-cef-host would idempotent-skip, cef-doctor would pass on the OLD stock
+  # object, and every consumer would silently fetch the UNPATCHED framework. Folding
+  # the variant into the digest gives a patched build a DISTINCT GCS key. Read from
+  # a version-controlled marker file so publish (CI) and fetch (pod install) agree.
+  # Emitted ONLY when non-stock, so the stock digest is byte-identical to before
+  # (no republish of the existing stock host required).
+  local variant="stock"
+  if [ -f "$native_dir/cef_host/CEF_FRAMEWORK_VARIANT" ]; then
+    variant="$(tr -d '[:space:]' < "$native_dir/cef_host/CEF_FRAMEWORK_VARIANT")"
+    [ -z "$variant" ] && variant="stock"
+  fi
   # Sorted, path-relative list of build-input files. LC_ALL=C makes the sort
   # byte-stable across machines. We emit "<relpath>\n<filesha>\n" per file so
   # BOTH content changes and path/renames move the final digest.
@@ -33,10 +50,16 @@ cef_host_input_hash() {
       printf '%s\n' "build_cef_host.sh"
       find cef_host -type f \
         -not -path 'cef_host/prebuilt/*' \
-        -not -path 'cef_host/build/*'
+        -not -path 'cef_host/build/*' \
+        -not -path 'cef_host/CEF_FRAMEWORK_VARIANT'
     } | LC_ALL=C sort -u | while IFS= read -r f; do
         printf '%s\n' "$f"
         _cefhost_sha256 "$f" | awk '{print $1}'
       done
+    # Non-stock framework variant participates in the digest (see above). Appended
+    # AFTER the sorted file stream; stock => nothing emitted => identical digest.
+    if [ "$variant" != "stock" ]; then
+      printf 'CEF_FRAMEWORK_VARIANT\n%s\n' "$variant"
+    fi
   ) | _cefhost_sha256 | awk '{print $1}'
 }

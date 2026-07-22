@@ -50,6 +50,38 @@ if [ ! -f "$CEF_ROOT/cmake/FindCEF.cmake" ]; then
   tar -xjf "$tarball" -C "$CACHE"
 fi
 
+# Campus framework-variant guard. If the pinned variant (native/cef_host/
+# CEF_FRAMEWORK_VARIANT) is not 'stock', the CEF framework at CEF_ROOT MUST be the
+# PATCHED from-source build (provided by pointing FLUTTER_CEF_CACHE at the output
+# of native/build-cef-from-source.sh). Fail loudly rather than silently linking
+# the stock Spotify framework under a patched content hash -- the exact silent
+# drift cef_host_hash.sh's variant fold-in guards against.
+CEF_VARIANT="stock"
+[ -f "$HERE/cef_host/CEF_FRAMEWORK_VARIANT" ] && \
+  CEF_VARIANT="$(tr -d '[:space:]' < "$HERE/cef_host/CEF_FRAMEWORK_VARIANT")"
+[ -z "$CEF_VARIANT" ] && CEF_VARIANT="stock"
+if [ "$CEF_VARIANT" != "stock" ]; then
+  echo "[flutter_cef] CEF framework variant: $CEF_VARIANT (expecting a PATCHED from-source framework)"
+  case "$CEF_VARIANT" in
+    *webauthn*)
+      _fw="$(find "$CEF_ROOT/Release" -name 'Chromium Embedded Framework' -type f 2>/dev/null | head -1)"
+      # grep -c (not -q): -q exits early and SIGPIPEs strings, which under
+      # `set -o pipefail` makes the pipeline fail even on a MATCH (false negative).
+      _fw_hits=0
+      [ -n "$_fw" ] && _fw_hits="$(LC_ALL=C strings -a "$_fw" 2>/dev/null \
+          | grep -c 'KLAJ5X6PJP\.org\.chromium\.Chromium\.webauthn')"
+      if [ -z "$_fw" ] || [ "${_fw_hits:-0}" -eq 0 ]; then
+        echo "[flutter_cef] FATAL: variant '$CEF_VARIANT' expects the WebAuthn keychain patch, but the" >&2
+        echo "  framework at $CEF_ROOT does not contain it." >&2
+        echo "  Build the patched framework with native/build-cef-from-source.sh and point" >&2
+        echo "  FLUTTER_CEF_CACHE at its binary_distrib output before running this script." >&2
+        exit 1
+      fi
+      echo "[flutter_cef] verified: WebAuthn keychain patch present in framework"
+      ;;
+  esac
+fi
+
 echo "[flutter_cef] building cef_host.app ..."
 MP_FLAG="-DCEF_MULTI_PROCESS=ON"   # default: renders heavy SPAs + crash-isolated
 if [ "${CEF_MULTI_PROCESS:-}" = "0" ] || [ "${CEF_MULTI_PROCESS:-}" = "OFF" ]; then

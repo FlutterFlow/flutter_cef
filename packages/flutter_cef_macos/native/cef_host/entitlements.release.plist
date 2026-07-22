@@ -23,5 +23,10 @@
   <!-- Bluetooth is load-bearing: caBLE / hybrid passkeys (WebAuthn cross-device)
        reach Web Bluetooth, so this stays even in the minimal release set. -->
   <key>com.apple.security.device.bluetooth</key><true/>
+  <!-- NOTE (auth spike): the on-device-passkey keychain-access-group lives in the
+       SEPARATE entitlements.browser.plist and is applied ONLY to the top-level
+       cef_host (browser) process at re-sign time. Helpers (renderer/GPU/utility)
+       do NOT do keychain work, so keeping the group out of this shared file means
+       they need no provisioning profile and won't be AMFI-killed. -->
 </dict>
 </plist>

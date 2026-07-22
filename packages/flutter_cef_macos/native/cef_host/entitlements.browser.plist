@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- AUTH SPIKE ONLY (not shippable): entitlements for the TOP-LEVEL cef_host
+       (browser) process. Applied by hand at re-sign time, not by the build.
+       Superset of entitlements.release.plist + the passkey keychain group + the
+       identity entitlements that let a Developer-ID provisioning profile bless
+       that group. Helpers keep the minimal entitlements.release.plist. -->
+  <key>com.apple.security.cs.allow-jit</key><true/>
+  <key>com.apple.security.device.bluetooth</key><true/>
+  <!-- On-device passkeys (Touch ID / Secure Enclave). Chromium's macOS FIDO
+       backend refuses Touch ID unless the browser process is entitled for
+       TEAMID.org.chromium.Chromium.webauthn. KLAJ5X6PJP is our Team ID. -->
+  <key>keychain-access-groups</key>
+  <array>
+    <string>KLAJ5X6PJP.org.chromium.Chromium.webauthn</string>
+  </array>
+  <!-- Identity entitlements. These must match the embedded provisioning profile
+       (reuse path = Campus_Dev_Direct_Distribution.provisionprofile, whose
+       application-identifier is KLAJ5X6PJP.io.flutterflow.campus.dev.mac and whose
+       keychain-access-groups wildcard KLAJ5X6PJP.* covers the group above).
+       application-identifier also supplies the runtime keychain PREFIX Chromium
+       reads (its absence was the "empty prefix" failure in the first spike). -->
+  <key>com.apple.application-identifier</key>
+  <string>KLAJ5X6PJP.io.flutterflow.campus.dev.mac</string>
+  <key>com.apple.developer.team-identifier</key>
+  <string>KLAJ5X6PJP</string>
+</dict>
+</plist>

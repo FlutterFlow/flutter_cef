@@ -71,6 +71,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   private static let opShowDevTools: UInt8 = 0x33
   private static let opLoadTrusted: UInt8 = 0x34
   private static let opSetVisible: UInt8 = 0x35
+  private static let opOpenAuthWindow: UInt8 = 0x39
 
   // Event callbacks (fired off the main thread). The registrar relays each to a
   // Dart channel message.
@@ -346,6 +347,12 @@ final class CefWebSession: NSObject, FlutterTexture {
 
   func navigate(_ url: String) {
     sendFrame(Self.opNavigate, Array(url.utf8))
+  }
+
+  /// Open a windowed Chrome-runtime browser at |url| for a WebAuthn / Touch ID
+  /// ceremony the OSR tile cannot host. Shares this session's cookie jar.
+  func openAuthWindow(_ url: String) {
+    sendFrame(Self.opOpenAuthWindow, Array(url.utf8))
   }
 
   /// A host content-injection load (loadHtmlString -> data:, loadFile -> file:):
