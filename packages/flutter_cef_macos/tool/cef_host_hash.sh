@@ -60,6 +60,20 @@ cef_host_input_hash() {
     # AFTER the sorted file stream; stock => nothing emitted => identical digest.
     if [ "$variant" != "stock" ]; then
       printf 'CEF_FRAMEWORK_VARIANT\n%s\n' "$variant"
+      # The files that actually DEFINE a patched framework -- the patch set and the
+      # from-source build recipe -- live at native/ level (siblings of cef_host/),
+      # so the `find cef_host` stream above misses them. Fold their content in HERE,
+      # non-stock ONLY (so the stock digest stays byte-identical, no republish).
+      # Without this, editing a patch hunk or a gn-arg WITHOUT hand-bumping the
+      # variant string yields an identical hash -> publish idempotent-skips ->
+      # consumers silently fetch the STALE patched framework (WebAuthn code).
+      {
+        [ -f build-cef-from-source.sh ] && printf '%s\n' "build-cef-from-source.sh"
+        [ -d patches ] && find patches -type f
+      } | LC_ALL=C sort -u | while IFS= read -r pf; do
+          printf '%s\n' "$pf"
+          _cefhost_sha256 "$pf" | awk '{print $1}'
+        done
     fi
   ) | _cefhost_sha256 | awk '{print $1}'
 }

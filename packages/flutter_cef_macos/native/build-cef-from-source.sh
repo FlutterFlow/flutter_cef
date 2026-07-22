@@ -61,8 +61,10 @@ python3 "$AUTOMATE" \
   --arm64-build --no-build --no-distrib
 
 # 2. Apply the Campus keychain patch to the Chromium tree (idempotent).
-#    (Also registered condition-gated in cef/patch/patch.cfg for CEF-native
-#    full-patch-cycle builds; here we apply directly for reliability.)
+#    Applied directly via `git apply` -- it is NOT registered in CEF's patch.cfg,
+#    so a stock/unpatched build is unaffected purely via the content-hash + variant
+#    marker machinery (tool/cef_host_hash.sh + CEF_FRAMEWORK_VARIANT), not via any
+#    patch-cycle condition.
 if git -C "$SRC" apply --check --reverse "$PATCH" 2>/dev/null; then
   echo "[cef-src] keychain patch already applied"
 else

@@ -351,7 +351,17 @@ final class CefWebSession: NSObject, FlutterTexture {
 
   /// Open a windowed Chrome-runtime browser at |url| for a WebAuthn / Touch ID
   /// ceremony the OSR tile cannot host. Shares this session's cookie jar.
+  ///
+  /// Defense-in-depth: this pops a cookie-bearing, user-navigable top-level window
+  /// outside OSR containment, so only ever launch it at a real web origin. Reject
+  /// anything that isn't http(s) (javascript:/data:/file:/about: ...) -- the tile's
+  /// own `navigate` is scheme-gated in cef_host; keep this entry point in step.
   func openAuthWindow(_ url: String) {
+    guard let scheme = URL(string: url)?.scheme?.lowercased(),
+          scheme == "https" || scheme == "http" else {
+      NSLog("[flutter_cef] openAuthWindow refused non-http(s) URL")
+      return
+    }
     sendFrame(Self.opOpenAuthWindow, Array(url.utf8))
   }
 

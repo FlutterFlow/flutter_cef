@@ -573,8 +573,15 @@ class CefWebController {
   /// a real Chrome-runtime window that CAN, sharing this tile's cookie jar so the
   /// sign-in propagates back to the tile once the window is closed. Typically
   /// called with the tile's current address ([url]'s live value).
-  Future<void> openAuthWindow(String url) =>
-      _channel.invokeMethod('openAuthWindow', {'sessionId': sessionId, 'url': url});
+  Future<void> openAuthWindow(String url) {
+    // Defense-in-depth (mirrored authoritatively in the Swift session): only ever
+    // open the cookie-bearing auth window at a real web origin. Refuse non-http(s)
+    // schemes (javascript:/data:/file:/about: ...) rather than round-tripping them.
+    final scheme = Uri.tryParse(url)?.scheme.toLowerCase();
+    if (scheme != 'https' && scheme != 'http') return Future<void>.value();
+    return _channel
+        .invokeMethod('openAuthWindow', {'sessionId': sessionId, 'url': url});
+  }
 
   /// CEF-2a — enable agent control for this tile and return a brokered, token-gated
   /// CDP endpoint a standard CDP client (e.g. `agent-browser`) can connect to.
