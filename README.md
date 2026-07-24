@@ -56,7 +56,7 @@ final cookies = await c.getCookies(); // read/enumerate; pass url: to scope
 c.deleteCookie(url: 'https://example.com/', name: 'sid'); c.clearCookies();
 c.scrollTo(0, 200); c.scrollBy(0, -50); await c.getScrollPosition();
 c.clearLocalStorage(); await c.getTitle(); await c.getUserAgent();
-c.onDownload = (suggestedName) {}; // downloads land in ~/Downloads
+c.onDownload = (suggestedName) {}; // a download started (a native Save panel is shown)
 
 // open the Chrome DevTools inspector for this view in its own window
 c.openDevTools();
@@ -223,11 +223,15 @@ final c = CefWebController(profile: 'work');
 CefWebView(url: startUrl, controller: c);
 ```
 
-- **Persistent.** A named profile is stored on disk at
-  `<Application Support>/<bundleId>/flutter_cef/profiles/<name>` (the directory
-  is created `0700`, owner-only, and the profile name is sanitized to
-  `[A-Za-z0-9._-]`). CEF is started with `persist_session_cookies` on, so a
-  login survives `cef_host` and host-app relaunch.
+- **Persistent.** A named profile is stored on disk — on macOS at
+  `<Application Support>/<bundleId>/flutter_cef/profiles/<name>`, on Windows at
+  `%LOCALAPPDATA%\flutter_cef\profiles\<name>`. The directory is created
+  owner-only (`0700` on macOS; a current-user-SID-protected DACL on Windows) and
+  the profile name is sanitized to `[A-Za-z0-9._-]`. CEF is started with
+  `persist_session_cookies` on, so a login survives `cef_host` and host-app
+  relaunch. On Windows the `profiles\` root is **not** namespaced by app, so every
+  flutter_cef app for a user shares it — a `profile: 'work'` in two apps resolves
+  to the same directory (co-locate only mutually-trusting apps on a shared name).
 - **Shared.** Every view constructed with the same non-null `profile` is served
   by **one `cef_host` process with one cookie jar** — they share one login.
   Cookie writes are therefore process-wide: `clearCookies()` /
@@ -272,6 +276,17 @@ to ephemeral** (and logs a warning) rather than persisting it. Set
 persist under the mock keychain anyway (dev convenience only — do not ship it).
 The downgrade leaks nothing: the refusal happens before any browser is created,
 so nothing is ever written to the persistent directory.
+
+**Windows is different — no downgrade, and no signing requirement.** On Windows,
+OSCrypt encrypts the cookie store with **DPAPI**, which is **always available and
+independent of code signing**. There is no mock-keychain state, so the
+ad-hoc-downgrade rule above has no Windows analogue: a named `profile:` on Windows
+simply persists, encrypted at rest, in every build. The trade-off is that DPAPI's
+user-tier protection is **same-user-readable** — any process running as the same
+Windows user can decrypt the store (`CryptUnprotectData`). This is **weaker than
+the macOS Keychain**: at-rest protection covers other users and offline disk theft
+(with BitLocker as the full-disk backstop), but **not** other same-user processes.
+As on macOS, `localStorage` / IndexedDB are stored unencrypted regardless.
 
 Two further caveats even under a signed build: `localStorage` and IndexedDB are
 **not** encrypted by OSCrypt (they sit in the profile directory as plaintext —
@@ -366,12 +381,15 @@ SIGABRT'd the instant the hardware is touched. Declare
 
 ### A named `profile:` silently behaves as ephemeral (login doesn't persist)
 
-The default ad-hoc dev build (`CEF_HOST_ADHOC=ON`) has only a mock keychain and
-can't encrypt cookies at rest, so it **downgrades a named profile to ephemeral**
-rather than persisting a login to a plaintext store (it logs a warning). For real
-persistence ship a signed release build (`CEF_HOST_ADHOC=OFF`, real
-Keychain/OSCrypt). For dev only, set `FLUTTER_CEF_ALLOW_INSECURE_PROFILE=1` —
-**never ship that override.**
+**macOS only.** The default ad-hoc dev build (`CEF_HOST_ADHOC=ON`) has only a mock
+keychain and can't encrypt cookies at rest, so it **downgrades a named profile to
+ephemeral** rather than persisting a login to a plaintext store (it logs a
+warning). For real persistence ship a signed release build (`CEF_HOST_ADHOC=OFF`,
+real Keychain/OSCrypt). For dev only, set `FLUTTER_CEF_ALLOW_INSECURE_PROFILE=1` —
+**never ship that override.** On **Windows** this never happens: OSCrypt uses
+DPAPI, which is always available and signing-independent, so a named profile
+persists in every build (see [Secrets at rest](#secrets-at-rest) for the
+same-user-readable caveat).
 
 ### `onProcessGone` fires with reason `'locked'`
 
@@ -438,7 +456,13 @@ Next:
   `flutter_cef_platform_interface` + `flutter_cef_macos`); a new platform is a
   sibling `flutter_cef_<os>` package. The CEF logic + IPC protocol are portable;
   each OS supplies its own host plugin + shared-texture / transport / sandbox
-  glue. See [`PORTING.md`](PORTING.md) for the full contract and seam map.
+  glue. See [`PORTING.md`](PORTING.md) for the full contract and seam map. A
+  Windows port (`flutter_cef_windows`) is in progress: the Dart controller /
+  widget surface is already cross-platform (the JS bridge, JS dialogs,
+  find-in-page, content zoom, and downloads all speak the same
+  method-channel/wire protocol on both OSes — see
+  `packages/flutter_cef_windows/native/cef_host/PROTOCOL.md`), with the Windows
+  host's sandbox + code-signing story still pending.
 
 ## Credits
 

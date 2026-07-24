@@ -1,6 +1,7 @@
 
 import 'dart:async';
 
+import 'package:flutter/foundation.dart' show defaultTargetPlatform;
 import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
@@ -25,7 +26,7 @@ const double _kZoomMax = 4.0;
 /// The page renders off-screen in a `cef_host` subprocess and is shown here as
 /// a texture (so it composites, transforms, and clips like any widget — unlike
 /// a platform view). Pointer + keyboard input is forwarded by coordinate, and
-/// the page's cursor drives a [MouseRegion]. macOS only.
+/// the page's cursor drives a [MouseRegion]. macOS and Windows.
 ///
 /// Keyboard input reaches the page as real `keydown → keypress → keyup` events,
 /// so a focused control activates from the keyboard (Enter submits / clicks,
@@ -97,7 +98,8 @@ class CefWebView extends StatefulWidget {
   /// Shown until the first frame arrives. Defaults to a dark blank box.
   final Widget? placeholder;
 
-  /// Invoked when the user presses ⌘F in the focused view. The view has no
+  /// Invoked when the user presses ⌘F (Ctrl+F on Windows) in the focused view.
+  /// The view has no
   /// find-bar UI of its own — a host that wants find-in-page provides this to
   /// open its own bar (which then drives [CefWebController.find] / `stopFind`
   /// and reads `onFindResult`). When null, ⌘F falls through to the page as an
@@ -164,6 +166,13 @@ class CefWebView extends StatefulWidget {
 
 class _CefWebViewState extends State<CefWebView>
     implements DeltaTextInputClient {
+  /// Windows uses Ctrl for the browser accelerators (Ctrl+C/V/X/A/Z, Ctrl+/-/0,
+  /// Ctrl+F) where macOS uses ⌘, and its key events carry Windows codes rather
+  /// than macOS NSEvent codes. Everything else in this file is cross-platform.
+  /// (In `flutter test` [defaultTargetPlatform] is android, which takes the
+  /// non-Windows — i.e. existing macOS — branches.)
+  static bool get _isWindows =>
+      defaultTargetPlatform == TargetPlatform.windows;
   late final CefWebController _controller =
       widget.controller ?? CefWebController(profile: widget.profile);
   bool _ownsController = false;
@@ -483,8 +492,11 @@ class _CefWebViewState extends State<CefWebView>
     // the picker never opens. Flutter's own plugin documents this exact case.
     // skipRemainingHandlers stops Flutter ancestors from eating it but still
     // hands it to the platform; don't forward it to the page either.
+    // macOS-specific: on Windows Ctrl+Win+Space is not an emoji-picker chord
+    // (the Win key is an OS-level modifier), so it takes the ordinary key path.
     final keys = HardwareKeyboard.instance;
-    if (event.logicalKey == LogicalKeyboardKey.space &&
+    if (!_isWindows &&
+        event.logicalKey == LogicalKeyboardKey.space &&
         keys.isControlPressed &&
         keys.isMetaPressed) {
       return KeyEventResult.skipRemainingHandlers;
@@ -495,11 +507,16 @@ class _CefWebViewState extends State<CefWebView>
     // ones to explicit controller calls so a focused webview behaves like a real
     // browser (⌘C/X/V/A/Z, ⌘+/-/0). Handled on key-down; zoom also on repeat
     // (hold to keep zooming). Returning `handled` keeps the raw combo off the page
-    // AND off Flutter's own shortcuts.
-    final isMetaOnly = keys.isMetaPressed &&
-        !keys.isControlPressed &&
-        !keys.isAltPressed;
-    if (isMetaOnly && (event is KeyDownEvent || event is KeyRepeatEvent)) {
+    // AND off Flutter's own shortcuts. The accelerator modifier is ⌘ on macOS
+    // and Ctrl on Windows (Ctrl+C/V/X/A/Z, Ctrl+/-/0, Ctrl+F).
+    final isAccelOnly = _isWindows
+        ? (keys.isControlPressed &&
+            !keys.isMetaPressed &&
+            !keys.isAltPressed)
+        : (keys.isMetaPressed &&
+            !keys.isControlPressed &&
+            !keys.isAltPressed);
+    if (isAccelOnly && (event is KeyDownEvent || event is KeyRepeatEvent)) {
       final k = event.logicalKey;
       // Editing commands: key-down only (repeat would re-cut/re-paste).
       if (event is KeyDownEvent && !keys.isShiftPressed) {
@@ -530,6 +547,14 @@ class _CefWebViewState extends State<CefWebView>
         unawaited(_controller.redo());
         return KeyEventResult.handled;
       }
+      // Windows convention: Ctrl+Y is redo (alongside Ctrl+Shift+Z above).
+      if (_isWindows &&
+          event is KeyDownEvent &&
+          !keys.isShiftPressed &&
+          k == LogicalKeyboardKey.keyY) {
+        unawaited(_controller.redo());
+        return KeyEventResult.handled;
+      }
       // Content zoom (⌘+/-/0). `=`/`+` in, `-` in, `0` reset. Repeat-friendly.
       if (k == LogicalKeyboardKey.equal || k == LogicalKeyboardKey.add) {
         _applyZoom((_zoomLevel + _kZoomStep).clamp(_kZoomMin, _kZoomMax));
@@ -555,16 +580,29 @@ class _CefWebViewState extends State<CefWebView>
     }
 
     final mods = _cefModifiers();
-    final wkc = cefWindowsKeyCode(event.logicalKey);
+    // On Windows CEF resolves the key entirely from windows_key_code, so the VK
+    // must cover the full keyboard — the function row, Insert, numpad, and OEM
+    // punctuation included (else those send 0 and the page sees dead keys). The
+    // macOS path keeps the leaner [cefWindowsKeyCode] so its wire bytes are
+    // unchanged.
+    final wkc = _isWindows
+        ? cefWindowsKeyCodeForEvent(event.logicalKey, event.physicalKey)
+        : cefWindowsKeyCode(event.logicalKey);
     // native_key_code MUST be the macOS keycode for the physical key — CEF on
     // macOS keys editing/navigation off it. Deriving it from the Windows VK
     // collides (e.g. 0 -> VK 0x30 == macOS keycode 48 == Tab, moving focus).
-    final nkc = cefMacNativeKeyCode(event.physicalKey) ?? wkc;
+    // On Windows CEF keys everything off windows_key_code, so the VK is the
+    // right native code there (and the macOS table would be wrong).
+    final nkc =
+        _isWindows ? wkc : (cefMacNativeKeyCode(event.physicalKey) ?? wkc);
     final ch = event.character;
     final isText = ch != null && _isPrintable(ch);
     // Editing / navigation keys MUST carry the macOS NSEvent character or CEF
     // OSR double-applies them (one Backspace deletes two, one arrow moves two).
-    final keyChar = cefMacCharForKey(event.logicalKey);
+    // macOS-only: the table holds NSEvent codepoints (incl. private-use
+    // 0xF7xx function-key values) that would corrupt a Windows key event —
+    // Windows CEF derives the character from the VK itself, so send 0 there.
+    final keyChar = _isWindows ? 0 : cefMacCharForKey(event.logicalKey);
     // The page should see keydown→keypress→keyup for every character, like a
     // browser. We always send RAWKEYDOWN/KEYUP; the keypress (CHAR) is
     // synthesized by [_commitText] when the IME's insertText delivers a typed

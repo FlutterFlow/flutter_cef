@@ -1,3 +1,5 @@
+import 'dart:io' show Platform;
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_cef/flutter_cef.dart';
@@ -43,6 +45,14 @@ class _BrowserDemoState extends State<BrowserDemo> {
   final TextEditingController _urlBar = TextEditingController(text: _startUrl);
   double _zoom = 0;
 
+  // Find-in-page bar, opened by ⌘F / Ctrl+F via [CefWebView.onFind]. The view
+  // has no find UI of its own; the host owns it and drives controller.find /
+  // stopFind, reading results back on onFindResult.
+  final TextEditingController _findBar = TextEditingController();
+  final FocusNode _findFocus = FocusNode(debugLabel: 'find');
+  bool _findVisible = false;
+  CefFindResult? _findResult;
+
   CefWebController _newController() => CefWebController(profile: _profile);
 
   @override
@@ -66,6 +76,17 @@ class _BrowserDemoState extends State<BrowserDemo> {
     _controller.onCreateWindow = (url) {
       _urlBar.text = url;
       _controller.navigate(url);
+    };
+    // A page->host JS channel: the page calls window.flutterCef.postMessage(...)
+    // (see the "channel" toolbar button, which pokes the page to do exactly
+    // that) and the message surfaces here. Registered per-controller, so it is
+    // re-wired when a profile toggle swaps the controller.
+    _controller.addJavaScriptChannel('flutterCef',
+        onMessageReceived: (m) => _snack('JS channel -> $m'));
+    // Find-in-page result updates, driven by the find bar (opened with ⌘F /
+    // Ctrl+F). Guarded on mounted since the callback can outlive a rebuild.
+    _controller.onFindResult = (r) {
+      if (mounted) setState(() => _findResult = r);
     };
   }
 
@@ -91,6 +112,39 @@ class _BrowserDemoState extends State<BrowserDemo> {
   void _setZoom(double z) {
     setState(() => _zoom = z.clamp(-3.0, 3.0));
     _controller.setZoomLevel(_zoom);
+  }
+
+  /// Poke the page to post a message back through the `flutterCef` JS channel
+  /// registered in [_wireController] — exercises the page->host bridge.
+  void _pingChannel() => _controller.executeJavaScript(
+      "window.flutterCef && window.flutterCef.postMessage("
+      "'hello from ' + location.host)");
+
+  void _openFindBar() {
+    setState(() => _findVisible = true);
+    _findFocus.requestFocus();
+  }
+
+  /// (Re)issue the current find query. An empty query stops the search.
+  /// [findNext] advances to the next/previous match of the same query.
+  void _runFind({bool findNext = false, bool forward = true}) {
+    final q = _findBar.text;
+    if (q.isEmpty) {
+      _controller.stopFind();
+      setState(() => _findResult = null);
+      return;
+    }
+    _controller.find(q, forward: forward, findNext: findNext);
+  }
+
+  void _closeFindBar() {
+    _controller.stopFind();
+    _findBar.clear();
+    setState(() {
+      _findVisible = false;
+      _findResult = null;
+    });
+    _webFocus.requestFocus();
   }
 
   Future<void> _runJs() async {
@@ -197,6 +251,8 @@ and committed text — including emoji — should appear intact.</p>
   void dispose() {
     _webFocus.dispose();
     _urlBar.dispose();
+    _findBar.dispose();
+    _findFocus.dispose();
     _controller.dispose();
     super.dispose();
   }
@@ -244,15 +300,29 @@ and committed text — including emoji — should appear intact.</p>
                     onPressed: _dumpCookies,
                   ),
                   IconButton(
+                    icon: const Icon(Icons.forum_outlined),
+                    tooltip: 'Post a message from the page over a JS channel',
+                    onPressed: _pingChannel,
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.search),
+                    tooltip: 'Find in page (also ⌘F / Ctrl+F)',
+                    onPressed: _openFindBar,
+                  ),
+                  IconButton(
                     icon: const Icon(Icons.bug_report_outlined),
                     tooltip: 'openDevTools()',
                     onPressed: _controller.openDevTools,
                   ),
-                  IconButton(
-                    icon: const Icon(Icons.emoji_emotions_outlined),
-                    tooltip: 'showEmojiPicker() (focus a field first)',
-                    onPressed: _emojiPicker,
-                  ),
+                  // macOS-only: showEmojiPicker drives the AppKit Character
+                  // Palette; there is no supported Win32 equivalent (PLAN §6),
+                  // so the button is hidden per-platform.
+                  if (Platform.isMacOS)
+                    IconButton(
+                      icon: const Icon(Icons.emoji_emotions_outlined),
+                      tooltip: 'showEmojiPicker() (focus a field first)',
+                      onPressed: _emojiPicker,
+                    ),
                   IconButton(
                     icon: const Icon(Icons.keyboard),
                     tooltip: 'Load the IME / text-input test page',
@@ -294,6 +364,7 @@ and committed text — including emoji — should appear intact.</p>
                   ? const LinearProgressIndicator(minHeight: 2)
                   : const SizedBox(height: 2),
             ),
+            if (_findVisible) _buildFindBar(),
             ValueListenableBuilder<String>(
               valueListenable: _controller.title,
               builder: (_, title, _) => Align(
@@ -320,6 +391,9 @@ and committed text — including emoji — should appear intact.</p>
                 url: _startUrl,
                 controller: _controller,
                 focusNode: _webFocus,
+                // ⌘F / Ctrl+F opens the host's find bar (the view has none of
+                // its own); it drives controller.find / stopFind.
+                onFind: _openFindBar,
                 allowedSchemes: _allowedSchemes,
                 // Persistent, shared profile: login survives relaunch and is
                 // shared by every view with the same name. Null (default) is an
@@ -334,6 +408,52 @@ and committed text — including emoji — should appear intact.</p>
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  /// The host-owned find bar (⌘F / Ctrl+F). Drives [CefWebController.find] /
+  /// `stopFind` and shows the `active/total` match count from `onFindResult`.
+  Widget _buildFindBar() {
+    final r = _findResult;
+    final label = (r == null || _findBar.text.isEmpty)
+        ? ''
+        : '${r.activeMatchOrdinal}/${r.numberOfMatches}';
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      child: Row(
+        children: [
+          Expanded(
+            child: TextField(
+              controller: _findBar,
+              focusNode: _findFocus,
+              autofocus: true,
+              decoration: InputDecoration(
+                isDense: true,
+                border: const OutlineInputBorder(),
+                hintText: 'Find in page',
+                suffixText: label,
+              ),
+              onChanged: (_) => _runFind(),
+              onSubmitted: (_) => _runFind(findNext: true),
+            ),
+          ),
+          IconButton(
+            icon: const Icon(Icons.keyboard_arrow_up),
+            tooltip: 'Previous match',
+            onPressed: () => _runFind(findNext: true, forward: false),
+          ),
+          IconButton(
+            icon: const Icon(Icons.keyboard_arrow_down),
+            tooltip: 'Next match',
+            onPressed: () => _runFind(findNext: true),
+          ),
+          IconButton(
+            icon: const Icon(Icons.close),
+            tooltip: 'Close find bar',
+            onPressed: _closeFindBar,
+          ),
+        ],
       ),
     );
   }

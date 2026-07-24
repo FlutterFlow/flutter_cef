@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, debugDefaultTargetPlatformOverride;
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_cef/flutter_cef.dart';
@@ -417,6 +419,18 @@ void main() {
     expect(loads, contains('file:///tmp/x.html'));
     // ...and specifically NOT through the gated navigate path.
     expect(log.any((m) => m.method == 'navigate'), false);
+  });
+
+  test('loadFile on Windows turns a drive-letter path into a file:/// URL',
+      () async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    final c = CefWebController(sessionId: 'winfile');
+    await c.loadFile(r'C:\pages\Hello World.html');
+    final loads = log
+        .where((m) => m.method == 'loadTrusted')
+        .map((m) => (m.arguments as Map)['url'] as String);
+    expect(loads, contains('file:///C:/pages/Hello%20World.html'));
   });
 
   test('findResult event invokes onFindResult', () async {

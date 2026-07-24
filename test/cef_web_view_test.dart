@@ -578,4 +578,144 @@ void main() {
     });
     expect(fKeys, isNotEmpty);
   });
+
+  // ── Windows: Ctrl is the accelerator, key events carry Windows codes ──
+  group('on Windows', () {
+    const onWindows = TargetPlatformVariant(<TargetPlatform>{
+      TargetPlatform.windows,
+    });
+
+    for (final (name, key, shift, cmd) in <(String, LogicalKeyboardKey, bool, int)>[
+      ('Ctrl+C copies', LogicalKeyboardKey.keyC, false, 0),
+      ('Ctrl+X cuts', LogicalKeyboardKey.keyX, false, 1),
+      ('Ctrl+V pastes', LogicalKeyboardKey.keyV, false, 2),
+      ('Ctrl+A selects all', LogicalKeyboardKey.keyA, false, 3),
+      ('Ctrl+Z undoes', LogicalKeyboardKey.keyZ, false, 4),
+      ('Ctrl+Shift+Z redoes', LogicalKeyboardKey.keyZ, true, 5),
+      ('Ctrl+Y redoes', LogicalKeyboardKey.keyY, false, 5),
+    ]) {
+      testWidgets('$name via an editCommand', (tester) async {
+        await focusedView(tester);
+        log.clear();
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.control);
+        if (shift) await tester.sendKeyDownEvent(LogicalKeyboardKey.shift);
+        await tester.sendKeyEvent(key);
+        if (shift) await tester.sendKeyUpEvent(LogicalKeyboardKey.shift);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.control);
+        await tester.pump();
+        final edits = callsTo('editCommand');
+        expect(edits, hasLength(1));
+        expect(editCommandOf(edits.single), cmd);
+        expect(callsTo('imeCommitText'), isEmpty);
+      }, variant: onWindows);
+    }
+
+    testWidgets('Ctrl+= zooms via setZoomLevel', (tester) async {
+      await focusedView(tester);
+      log.clear();
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.control);
+      await tester.sendKeyEvent(LogicalKeyboardKey.equal);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.control);
+      await tester.pump();
+      final zooms = callsTo('setZoomLevel');
+      expect(zooms, hasLength(1));
+      expect((zooms.single.arguments as Map)['level'], 0.5);
+    }, variant: onWindows);
+
+    testWidgets('Ctrl+F invokes onFind', (tester) async {
+      var finds = 0;
+      final focus = FocusNode();
+      addTearDown(focus.dispose);
+      await tester.pumpWidget(boxed(CefWebView(
+        url: 'about:blank',
+        focusNode: focus,
+        onFind: () => finds++,
+      )));
+      await tester.pumpAndSettle();
+      focus.requestFocus();
+      await tester.pump();
+      log.clear();
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.control);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyF);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.control);
+      await tester.pump();
+      expect(finds, 1);
+      expect(callsTo('imeCommitText'), isEmpty);
+    }, variant: onWindows);
+
+    testWidgets(
+        'key events carry the Windows VK as nativeKeyCode and no macOS '
+        'NSEvent character', (tester) async {
+      await focusedView(tester);
+      log.clear();
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.backspace);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.backspace);
+      await tester.pump();
+      final keyCalls = callsTo('key');
+      expect(keyCalls, isNotEmpty);
+      for (final c in keyCalls) {
+        final a = (c.arguments as Map).cast<String, dynamic>();
+        expect(a['windowsKeyCode'], 0x08); // VK_BACK
+        expect(a['nativeKeyCode'], 0x08,
+            reason: 'Windows uses the VK, not a macOS keycode (51)');
+        expect(a['character'], 0,
+            reason: 'NSDeleteCharacter (0x7F) is macOS-only');
+      }
+    }, variant: onWindows);
+
+    // Regression: the Windows key path used to resolve VKs from the partial
+    // cefWindowsKeyCode table only, so the function row, numpad, and OEM
+    // punctuation all sent windows_key_code 0 → the page saw dead keys. They
+    // must now carry their real VK in BOTH windowsKeyCode and nativeKeyCode
+    // (Windows keys everything off the VK, so native == the VK).
+    for (final (name, key, physical, vk) in <(
+      String,
+      LogicalKeyboardKey,
+      PhysicalKeyboardKey,
+      int
+    )>[
+      ('F5', LogicalKeyboardKey.f5, PhysicalKeyboardKey.f5, 0x74),
+      ('F1', LogicalKeyboardKey.f1, PhysicalKeyboardKey.f1, 0x70),
+      ('numpad3', LogicalKeyboardKey.numpad3, PhysicalKeyboardKey.numpad3, 0x63),
+      ('numpad*', LogicalKeyboardKey.numpadMultiply,
+          PhysicalKeyboardKey.numpadMultiply, 0x6A),
+      ('Insert', LogicalKeyboardKey.insert, PhysicalKeyboardKey.insert, 0x2D),
+      // OEM punctuation resolves from the PHYSICAL key (layout-independent).
+      ('semicolon', LogicalKeyboardKey.semicolon,
+          PhysicalKeyboardKey.semicolon, 0xBA),
+      ('slash', LogicalKeyboardKey.slash, PhysicalKeyboardKey.slash, 0xBF),
+      // Arrows were already mapped — assert they stay real, not 0.
+      ('arrowLeft', LogicalKeyboardKey.arrowLeft, PhysicalKeyboardKey.arrowLeft,
+          0x25),
+    ]) {
+      testWidgets('$name carries its real VK in windowsKeyCode/nativeKeyCode',
+          (tester) async {
+        await focusedView(tester);
+        log.clear();
+        await tester.sendKeyDownEvent(key, physicalKey: physical);
+        await tester.sendKeyUpEvent(key, physicalKey: physical);
+        await tester.pump();
+        final keyCalls = callsTo('key');
+        expect(keyCalls, isNotEmpty);
+        for (final c in keyCalls) {
+          final a = (c.arguments as Map).cast<String, dynamic>();
+          expect(a['windowsKeyCode'], vk,
+              reason: '$name must send VK 0x${vk.toRadixString(16)}, not 0');
+          expect(a['nativeKeyCode'], vk,
+              reason: 'Windows uses the VK as the native code');
+        }
+      }, variant: onWindows);
+    }
+
+    testWidgets('meta (Win key) combos are NOT treated as accelerators',
+        (tester) async {
+      await focusedView(tester);
+      log.clear();
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.meta);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyC);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.meta);
+      await tester.pump();
+      expect(callsTo('editCommand'), isEmpty);
+    }, variant: onWindows);
+  });
 }

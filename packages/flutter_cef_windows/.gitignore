@@ -1,0 +1,3 @@
+# Standalone cef_host build output (build_cef_host.bat's default BUILD_DIR;
+# the flutter-driven build uses the example's binary dir instead).
+native/cef_host/build/
