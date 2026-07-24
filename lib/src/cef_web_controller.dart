@@ -911,14 +911,16 @@ class CefWebController {
   /// Recreate the native browser for a [freeze]-d session on the SAME texture.
   /// The frozen frame keeps showing until the new browser's first paint lands
   /// (no flash). [url] overrides the original create URL — pass the page's
-  /// current address (or a regenerated authored document) for fidelity;
-  /// omitted, the browser reloads what [create] was originally given.
-  /// Returns false when the session wasn't frozen.
-  Future<bool> thaw({String? url}) async {
+  /// current address for fidelity; [html] (winning over [url], mirroring
+  /// [create]) re-authors the document directly, for consumers whose content
+  /// state lives host-side. Omitted, the browser reloads what [create] was
+  /// originally given. Returns false when the session wasn't frozen.
+  Future<bool> thaw({String? url, String? html}) async {
     if (_disposed || !_frozen) return false;
+    final thawUrl = html != null ? _htmlDataUrl(html) : url;
     final res = await _channel.invokeMapMethod<String, dynamic>(
         'thawSession',
-        {'sessionId': sessionId, if (url != null) 'url': url});
+        {'sessionId': sessionId, if (thawUrl != null) 'url': thawUrl});
     if (res == null) return false;
     _frozen = false;
     // Same post-bind re-assert as _createSession: the thawed browser's fresh
