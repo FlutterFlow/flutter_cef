@@ -864,6 +864,74 @@ class CefWebController {
         'setVisible', {'sessionId': sessionId, 'visible': visible});
   }
 
+  /// Mute or unmute the page's audio output. Besides silencing it, a hidden
+  /// AND muted page regains Chromium's intensive wake-up throttling (audible
+  /// pages are exempt), so muting on hide keeps a background tile's timers
+  /// cheap. Policy is the caller's — muting is user-visible for media tiles.
+  Future<void> setAudioMuted(bool muted) => _channel
+      .invokeMethod('setAudioMuted', {'sessionId': sessionId, 'muted': muted});
+
+  /// Set the visible frame cadence: milliseconds between begin-frames (the OSR
+  /// frame clock). 16 ≈ 60fps (the default), 33 ≈ 30fps for a
+  /// visible-but-unengaged tile. Clamped natively to [8, 250]. Hidden views
+  /// produce no frames regardless (see [setVisible]).
+  Future<void> setFrameInterval(int milliseconds) => _channel.invokeMethod(
+      'setFrameInterval', {'sessionId': sessionId, 'ms': milliseconds});
+
+  bool _frozen = false;
+
+  /// Whether the native browser is currently frozen — torn down by [freeze]
+  /// while the texture keeps serving the last painted frame.
+  bool get isFrozen => _frozen;
+
+  /// Tear down the native browser — and, when it was the last live browser on
+  /// its profile, the entire cef_host process tree — while KEEPING the
+  /// texture, which continues to show the last painted frame. Reclaims
+  /// essentially the view's whole native cost (renderer process, compositor,
+  /// surfaces); use it for tiles culled long enough that a stale still image
+  /// is acceptable.
+  ///
+  /// Page state (DOM, scroll, JS heap) is lost. Cookies/localStorage survive
+  /// for a named [profile] (disk-backed jar) but not for an ephemeral session.
+  /// [thaw] recreates the browser on the same texture. Returns false when
+  /// there was nothing to freeze (not created, already frozen, or the native
+  /// process was already gone).
+  Future<bool> freeze() async {
+    if (_disposed || textureId == null || _frozen) return false;
+    final ok = await _channel
+        .invokeMethod<bool>('freezeSession', {'sessionId': sessionId});
+    if (ok != true) return false;
+    _frozen = true;
+    // No host is left to answer in-flight round-trips.
+    _failPendingEvals('the session is frozen');
+    _failPendingCookies('the session is frozen');
+    return true;
+  }
+
+  /// Recreate the native browser for a [freeze]-d session on the SAME texture.
+  /// The frozen frame keeps showing until the new browser's first paint lands
+  /// (no flash). [url] overrides the original create URL — pass the page's
+  /// current address (or a regenerated authored document) for fidelity;
+  /// omitted, the browser reloads what [create] was originally given.
+  /// Returns false when the session wasn't frozen.
+  Future<bool> thaw({String? url}) async {
+    if (_disposed || !_frozen) return false;
+    final res = await _channel.invokeMapMethod<String, dynamic>(
+        'thawSession',
+        {'sessionId': sessionId, if (url != null) 'url': url});
+    if (res == null) return false;
+    _frozen = false;
+    // Same post-bind re-assert as _createSession: the thawed browser's fresh
+    // slot is default-shown, so push the consumer's last explicit visibility
+    // (a culled tile thawed for e.g. room preload must come back hidden). JS
+    // channels re-flush natively in attach().
+    if (_visibilityExplicitlySet) {
+      _channel.invokeMethod(
+          'setVisible', {'sessionId': sessionId, 'visible': _lastVisible});
+    }
+    return true;
+  }
+
   /// Start (or advance) a find-in-page search for [text]. Results arrive on
   /// [onFindResult]. Pass `findNext: true` to move to the next/previous match of
   /// the same query; toggle [forward] for direction.

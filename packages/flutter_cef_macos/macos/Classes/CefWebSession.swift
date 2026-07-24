@@ -72,6 +72,8 @@ final class CefWebSession: NSObject, FlutterTexture {
   private static let opLoadTrusted: UInt8 = 0x34
   private static let opSetVisible: UInt8 = 0x35
   private static let opOpenAuthWindow: UInt8 = 0x39
+  private static let opSetAudioMuted: UInt8 = 0x3a    // {u8 muted} -> CefBrowserHost::SetAudioMuted
+  private static let opSetPumpInterval: UInt8 = 0x3b  // {u16 BE ms} visible begin-frame cadence
 
   // Event callbacks (fired off the main thread). The registrar relays each to a
   // Dart channel message.
@@ -205,6 +207,29 @@ final class CefWebSession: NSObject, FlutterTexture {
     // Flush channels registered before the wire id existed (and re-send them on a
     // re-home to a new host) now that sendFrame can route with a valid browserId.
     for name in channels { sendFrame(Self.opAddChannel, Array(name.utf8)) }
+  }
+
+  /// Freeze support: unbind from the (already-unregistered, about-to-close)
+  /// browser while KEEPING the texture and the adopted pixelBuffer — its
+  /// CVPixelBuffer retains the producer's IOSurface (a kernel object), so the
+  /// tile keeps serving its last painted frame even after the whole cef_host
+  /// process exits. Also resets the establishment counters: the thaw's
+  /// recreated browser must look FRESH to the create pacer and first-present
+  /// watchdog (both gate on the FIRST present, which a stale presentCount
+  /// would never report). Call AFTER CefProfileHost.removeBrowser — once the
+  /// browser is out of the host's map no reader thread touches these fields,
+  /// so the pacer counters are safe to reset unlocked.
+  func detachForFreeze() {
+    bufferLock.lock()
+    hidden = true
+    resizeInFlight = false
+    bufferLock.unlock()
+    host = nil
+    browserId = 0
+    firstPresentSeen = false
+    presentCount = 0
+    lastPresentNs = 0
+    livenessNudgedAt = 0
   }
 
   // MARK: FlutterTexture
@@ -399,6 +424,21 @@ final class CefWebSession: NSObject, FlutterTexture {
     hidden = !visible
     bufferLock.unlock()
     sendFrame(Self.opSetVisible, [visible ? 1 : 0])
+  }
+
+  /// Mute/unmute the page's audio. Besides silencing it, a hidden AND muted
+  /// page regains Chromium's intensive wake-up throttling (audible pages are
+  /// exempt), so muting on hide keeps a background tile's timers cheap.
+  func setAudioMuted(_ muted: Bool) {
+    sendFrame(Self.opSetAudioMuted, [muted ? 1 : 0])
+  }
+
+  /// Set the visible begin-frame pump interval (ms) — the OSR frame clock for
+  /// this browser. 16 ≈ 60fps (default), 33 ≈ 30fps; cef_host clamps to
+  /// [8, 250]. Hidden tiles produce no frames regardless.
+  func setFrameInterval(_ ms: Int) {
+    let clamped = UInt16(clamping: ms)
+    sendFrame(Self.opSetPumpInterval, [UInt8(clamped >> 8), UInt8(clamped & 0xff)])
   }
 
   func find(_ text: String, forward: Bool, matchCase: Bool, findNext: Bool) {

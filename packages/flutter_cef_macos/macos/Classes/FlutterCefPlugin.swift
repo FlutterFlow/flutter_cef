@@ -21,8 +21,16 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   // C2: per-session create args, so when a shared host turns out to be ad-hoc and
   // refuses its named profile we can re-home EVERY session on it onto ephemeral hosts
   // (not just the last one whose closure was installed), preserving each session's
-  // url + schemes + agent-control transport.
-  private var sessionCreateArgs: [String: (url: String, allowedSchemes: String, agentControl: Bool)] = [:]
+  // url + schemes + agent-control transport. Also the freeze/thaw recipe: thaw
+  // respawns a host of the ORIGINAL kind (profile / enableCdp) and recreates the
+  // browser at the original url unless the thaw call overrides it.
+  private var sessionCreateArgs: [String: (url: String, allowedSchemes: String,
+                                           agentControl: Bool, profile: String?,
+                                           enableCdp: Bool)] = [:]
+  // Sessions whose native browser was torn down by freezeSession while the
+  // session + texture live on serving the last painted frame. Not in
+  // sessionHost/sessionKey while frozen (their host may be gone entirely).
+  private var frozenSessions: Set<String> = []
   // C2: named profiles a running ad-hoc host already refused — future creates for them
   // go straight to ephemeral instead of racing onto a doomed shared host.
   private var adhocBlockedProfiles: Set<String> = []
@@ -138,6 +146,14 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     case "setVisible":
       withSession(args) { $0.setVisible(args["visible"] as? Bool ?? true) }
       result(nil)
+    case "setAudioMuted":
+      withSession(args) { $0.setAudioMuted(args["muted"] as? Bool ?? true) }
+      result(nil)
+    case "setFrameInterval":
+      withSession(args) { $0.setFrameInterval(args["ms"] as? Int ?? 16) }
+      result(nil)
+    case "freezeSession": freezeSession(args, result)
+    case "thawSession": thawSession(args, result)
     case "find":
       if let text = args["text"] as? String {
         withSession(args) {
@@ -439,7 +455,8 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     sessions[sessionId] = session
     sessionHost[sessionId] = host
     sessionKey[sessionId] = key
-    sessionCreateArgs[sessionId] = (url, allowedSchemes, agentControl)  // C2 re-home
+    // C2 re-home + freeze/thaw recipe.
+    sessionCreateArgs[sessionId] = (url, allowedSchemes, agentControl, profile, enableCdp)
     result([
       "textureId": session.textureId, "width": width, "height": height,
       "cdpPort": host.cdpPort,
@@ -690,6 +707,8 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     sessionHost[id] = nil
     sessionKey[id] = nil
     sessionCreateArgs[id] = nil
+    // A frozen session has no host on record; the guard below releases it.
+    frozenSessions.remove(id)
     guard let host = host else {
       // No host on record (shouldn't happen) — just release the session.
       session.dispose()
@@ -703,6 +722,93 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     } else {
       session.dispose()
     }
+  }
+
+  /// Freeze one session: close its native browser — and, when that was the
+  /// host's last live browser, the whole cef_host process tree — while KEEPING
+  /// the session + texture. The consumer-held CVPixelBuffer retains the
+  /// producer's IOSurface (a kernel object), so the tile keeps serving its
+  /// last painted frame; thawSession recreates a browser onto the same
+  /// session. Returns false when there is nothing to freeze (unknown session,
+  /// already frozen, or its host already died — processGone handles that path).
+  private func freezeSession(_ a: [String: Any], _ result: @escaping FlutterResult) {
+    dispatchPrecondition(condition: .onQueue(.main))
+    guard let id = a["sessionId"] as? String, let session = sessions[id],
+          !frozenSessions.contains(id), let host = sessionHost[id] else {
+      result(false)
+      return
+    }
+    let key = sessionKey[id]
+    // Same F.3 ordering discipline as disposeSession: removeBrowser unregisters
+    // under lock (reader stops routing to this session), and a last-browser
+    // host is fully shut down (reader joined) BEFORE the session's unlocked
+    // establishment counters are reset in detachForFreeze.
+    let remaining = host.removeBrowser(session.browserId)
+    if remaining == 0 {
+      host.shutdown()
+      if let key = key { profiles[key] = nil }
+    }
+    session.detachForFreeze()
+    frozenSessions.insert(id)
+    sessionHost[id] = nil
+    sessionKey[id] = nil
+    result(true)
+  }
+
+  /// Thaw a frozen session: resolve/spawn a host of the ORIGINAL kind (same
+  /// profile / transport, from sessionCreateArgs) and recreate a browser onto
+  /// the SAME session + texture — attach() re-binds the wire id and re-flushes
+  /// JS channels, and the create pacer / first-present watchdog treat it as a
+  /// fresh establishment. The frozen frame keeps showing until the new
+  /// browser's first paint adopts (no flash). `url` overrides the original
+  /// create URL (pass the page's current address for fidelity). Returns nil
+  /// when there is nothing to thaw.
+  private func thawSession(_ a: [String: Any], _ result: @escaping FlutterResult) {
+    dispatchPrecondition(condition: .onQueue(.main))
+    guard let id = a["sessionId"] as? String, frozenSessions.contains(id),
+          let session = sessions[id], let args = sessionCreateArgs[id] else {
+      result(nil)
+      return
+    }
+    guard let cefHost = resolveCefHostPath() else {
+      result(FlutterError(code: "no_cef_host",
+                          message: "cef_host not found (set FLUTTER_CEF_HOST)",
+                          details: nil))
+      return
+    }
+    let url = (a["url"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? args.url
+    let profile = args.profile
+    let namedProfile = profile != nil && !profile!.isEmpty
+    // Mirrors create(): skip a named profile a running ad-hoc host already refused.
+    let effectiveNamed = namedProfile && !adhocBlockedProfiles.contains(profile ?? "")
+    let (profileDir, isEphemeral) = resolveProfileDir(effectiveNamed ? profile : nil)
+    let key = effectiveNamed ? profile! : "~ephemeral~" + id
+    guard let host = resolveOrSpawnHost(
+      key: key, profileDir: profileDir, isEphemeral: isEphemeral,
+      cefHostPath: cefHost, enableCdp: args.enableCdp,
+      allowedSchemes: args.allowedSchemes, agentControl: args.agentControl)
+    else {
+      result(FlutterError(code: "spawn_failed",
+                          message: "failed to spawn cef_host", details: nil))
+      return
+    }
+    // F.5 wiring, same as create(): an ad-hoc host refusing the named profile
+    // re-homes every session on it onto ephemeral hosts.
+    if effectiveNamed {
+      host.onInsecureProfileRefused = { [weak self, weak host] in
+        DispatchQueue.main.async {
+          guard let self = self, let host = host, let prof = profile else { return }
+          self.respawnHostEphemeral(host, refusedProfile: prof)
+        }
+      }
+    }
+    frozenSessions.remove(id)
+    _ = host.createBrowser(session, url: url, allowedSchemes: args.allowedSchemes)
+    sessionHost[id] = host
+    sessionKey[id] = key
+    // sessionCreateArgs keeps the ORIGINAL url: a later thaw without an
+    // override falls back to it again (the thaw url is transient).
+    result(["textureId": session.textureId])
   }
 
   /// Resolve the on-disk cache dir for a profile. F.4: a null/empty profile gets
