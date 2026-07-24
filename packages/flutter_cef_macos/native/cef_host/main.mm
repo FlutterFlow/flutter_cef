@@ -105,7 +105,7 @@ namespace {
 // stale embedded copy). BUMP THIS on any semantic change to the kOp wire protocol
 // below, together with CefProfileHost.protocolVersion (Swift side) — the two must
 // stay equal. Hosts predating the handshake send a 1-byte payload and read as v0.
-constexpr uint8_t kCefHostProtocolVersion = 4;
+constexpr uint8_t kCefHostProtocolVersion = 5;
 
 // ---- Opcodes ----
 constexpr uint8_t kOpPresent = 0x01;
@@ -163,6 +163,8 @@ constexpr uint8_t kOpResolveTargetId = 0x36;  // {} resolve this browser's CDP t
 constexpr uint8_t kOpInvalidate = 0x37;       // {} C1: force a repaint (Invalidate PET_VIEW) to re-kick a stalled first frame
 constexpr uint8_t kOpEditCommand = 0x38;      // {u8 cmd} run a focused-frame edit command (0=copy 1=cut 2=paste 3=selectAll 4=undo 5=redo)
 constexpr uint8_t kOpOpenAuthWindow = 0x39;   // {utf8 url} open a windowed Chrome-runtime browser for a WebAuthn/Touch ID ceremony the OSR tile can't host (shares the tile's cookie jar)
+constexpr uint8_t kOpSetAudioMuted = 0x3a;    // {u8 muted} -> CefBrowserHost::SetAudioMuted; a hidden AND muted page regains intensive wake-up throttling (audible pages are exempt)
+constexpr uint8_t kOpSetPumpInterval = 0x3b;  // {u16 BE ms} visible begin-frame cadence for this slot, clamped to [8, 250]; hidden slots stay on the 100ms no-op poll
 
 // ---- Shared runtime state ----
 // Atomic: the reader thread reads it (ReadAll), SendFrame on any thread reads it,
@@ -256,6 +258,11 @@ struct Slot {
   // DoSetVisible); `begin_frame_pump_started` guards a double-start. UI-thread only.
   bool visible = true;
   bool begin_frame_pump_started = false;
+  // Visible begin-frame cadence (ms) for this slot — the OSR frame clock.
+  // 16 ≈ 60fps (default); the host clamps kOpSetPumpInterval to [8, 250] so a
+  // consumer can drop an unengaged tile to ~30fps without touching hidden
+  // gating. UI-thread only, like `visible`.
+  int pump_interval_ms = 16;
   // F-1/F-2: a dpr/screen-info change that lands while the slot is HIDDEN is deferred —
   // the begin-frame pump is gated off while hidden, so notifying + painting now would
   // composite into a surface nothing displays and mislead the Swift resize watchdog into
@@ -313,7 +320,7 @@ void PumpBeginFrame(uint32_t wire_id) {
                          " paints=" + std::to_string(slot->diag_paint_count) +
                          " visible=" + std::to_string(slot->visible ? 1 : 0));
   CefPostDelayedTask(TID_UI, base::BindOnce(&PumpBeginFrame, wire_id),
-                     slot->visible ? 16 : 100);
+                     slot->visible ? slot->pump_interval_ms : 100);
 }
 
 // Process-wide Metal context for the GPU-blit present path (CompositeMetalLocked). One device +
@@ -2017,6 +2024,14 @@ void DoSetVisible(const std::shared_ptr<Slot>& slot, bool visible) {
     slot->browser->GetHost()->SendExternalBeginFrame();
   }
 }
+void DoSetAudioMuted(const std::shared_ptr<Slot>& slot, bool muted) {
+  if (slot->browser) slot->browser->GetHost()->SetAudioMuted(muted);
+}
+void DoSetPumpInterval(const std::shared_ptr<Slot>& slot, int ms) {
+  // Clamp: <8ms buys nothing over 60fps begin-frames + risks pump starvation;
+  // >250ms visible would read as a frozen tile.
+  slot->pump_interval_ms = ms < 8 ? 8 : (ms > 250 ? 250 : ms);
+}
 void DoFind(const std::shared_ptr<Slot>& slot, const std::string& text,
             bool forward, bool match_case, bool find_next) {
   if (slot->browser)
@@ -2492,6 +2507,19 @@ void IpcReadLoop() {
         if (!slot) break;
         bool vis = plen >= 1 ? p[0] != 0 : true;
         CefPostTask(TID_UI, base::BindOnce(&DoSetVisible, slot, vis));
+        break;
+      }
+      case kOpSetAudioMuted: {
+        if (!slot) break;
+        bool muted = plen >= 1 ? p[0] != 0 : true;
+        CefPostTask(TID_UI, base::BindOnce(&DoSetAudioMuted, slot, muted));
+        break;
+      }
+      case kOpSetPumpInterval: {
+        if (!slot) break;
+        if (plen < 2) break;
+        int ms = (int{p[0]} << 8) | int{p[1]};
+        CefPostTask(TID_UI, base::BindOnce(&DoSetPumpInterval, slot, ms));
         break;
       }
       case kOpFind: {
