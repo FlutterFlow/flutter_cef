@@ -6,16 +6,26 @@
 # Idempotent: re-running with an unchanged tree is a no-op.
 #
 # ---------------------------------------------------------------------------
-# SIGNING (STUBBED-BUT-REAL)
+# SIGNING (three modes, priority order)
 # ---------------------------------------------------------------------------
-# If FLUTTER_CEF_SIGN_THUMBPRINT is set, signtool signs cef_host.exe +
-# cef_host.dll (SHA-256 file digest + RFC3161 timestamp) before packaging, then
-# verifies them. Otherwise it prints "signing skipped (no cert; unsigned
-# artifact)" and publishes UNSIGNED -- expected today, since the certificate is
-# not procured yet. The consumer (fetch_cef_host.ps1) only accepts an unsigned
-# host when FLUTTER_CEF_ALLOW_UNSIGNED_HOST=1.
-#   FLIP WHEN SIGNING SHIPS: make signing mandatory (fail if
-#   FLUTTER_CEF_SIGN_THUMBPRINT is unset) and drop the consumer's unsigned opt-in.
+# 1. GOOGLECLOUD (jsign) -- the FlutterFlow production identity. Set
+#    FLUTTER_CEF_SIGN_GCLOUD_KEYSTORE (the KMS keyring path) +
+#    FLUTTER_CEF_SIGN_CERTFILE (the public cert chain .crt). Reuses the SAME
+#    EV cert + Google Cloud KMS key the FlutterFlow desktop app signs with
+#    (flutterflow/windows/Makefile) -- so cef_host is signed by "FlutterFlow,
+#    Inc." No key material on this machine: the private key stays in KMS, auth
+#    is `gcloud auth print-access-token`. Needs `jsign` + `gcloud` (authed with
+#    roles/cloudkms.signerVerifier on the key).
+#      FLUTTER_CEF_SIGN_GCLOUD_KEYSTORE  e.g. projects/flutterflow-cicd/locations/
+#                                        us-central1/keyRings/windows-code-sign
+#      FLUTTER_CEF_SIGN_GCLOUD_ALIAS     default windows-code-sign-key/cryptoKeyVersions/1
+#      FLUTTER_CEF_SIGN_CERTFILE         path to the public cert chain (.crt)
+# 2. signtool -- set FLUTTER_CEF_SIGN_THUMBPRINT for a cert in the machine store.
+# 3. unsigned -- neither set (pre-cert dev posture); the consumer then requires
+#    FLUTTER_CEF_ALLOW_UNSIGNED_HOST=1.
+#   FLIP WHEN SIGNING IS WIRED IN CI: make signing mandatory (fail if no mode is
+#   set) and drop the consumer's unsigned opt-in.
+# Common: FLUTTER_CEF_SIGN_TIMESTAMP_URL (default http://timestamp.digicert.com).
 # ---------------------------------------------------------------------------
 #
 # Requires: gsutil (Google Cloud SDK) authed with object-create on the bucket.
@@ -104,22 +114,59 @@ try {
     Fail "[publish] build did not produce cef_host.exe + cef_host.dll."
   }
 
-  # --- Sign (STUBBED-BUT-REAL). ---
-  if ($env:FLUTTER_CEF_SIGN_THUMBPRINT) {
+  # --- Sign. Three modes, in priority order:
+  #   1. GOOGLECLOUD (jsign, the FlutterFlow production identity): set
+  #      FLUTTER_CEF_SIGN_GCLOUD_KEYSTORE. Reuses the SAME EV cert + Google
+  #      Cloud KMS key the FlutterFlow desktop app signs with (see
+  #      flutterflow/windows/Makefile), so cef_host is signed by "FlutterFlow,
+  #      Inc." No key material touches this machine or repo -- the private key
+  #      stays in KMS; auth is `gcloud auth print-access-token`. Needs `jsign`
+  #      (choco install jsign), `gcloud` authed with roles/cloudkms.signerVerifier
+  #      on the key, and the public cert chain (FLUTTER_CEF_SIGN_CERTFILE).
+  #   2. signtool + a local cert (FLUTTER_CEF_SIGN_THUMBPRINT) -- for a cert
+  #      installed in the machine store.
+  #   3. unsigned (neither set) -- the pre-cert dev posture; the consumer then
+  #      requires FLUTTER_CEF_ALLOW_UNSIGNED_HOST=1.
+  $tsUrl = if ($env:FLUTTER_CEF_SIGN_TIMESTAMP_URL) { $env:FLUTTER_CEF_SIGN_TIMESTAMP_URL }
+           else { 'http://timestamp.digicert.com' }
+  if ($env:FLUTTER_CEF_SIGN_GCLOUD_KEYSTORE) {
+    if (-not (Get-Command jsign -ErrorAction SilentlyContinue)) {
+      Fail "[publish] FLUTTER_CEF_SIGN_GCLOUD_KEYSTORE set but 'jsign' not found (choco install jsign)."
+    }
+    if (-not (Get-Command gcloud -ErrorAction SilentlyContinue)) {
+      Fail "[publish] jsign GOOGLECLOUD signing needs 'gcloud' on PATH (authed with KMS sign access)."
+    }
+    $certfile = $env:FLUTTER_CEF_SIGN_CERTFILE
+    if (-not $certfile -or -not (Test-Path -LiteralPath $certfile)) {
+      Fail "[publish] set FLUTTER_CEF_SIGN_CERTFILE to the public cert chain (.crt) for the KMS key."
+    }
+    $alias = if ($env:FLUTTER_CEF_SIGN_GCLOUD_ALIAS) { $env:FLUTTER_CEF_SIGN_GCLOUD_ALIAS }
+             else { 'windows-code-sign-key/cryptoKeyVersions/1' }
+    $token = (& gcloud auth print-access-token).Trim()
+    if (-not $token) { Fail "[publish] 'gcloud auth print-access-token' returned nothing (run gcloud auth login)." }
+    foreach ($f in @($exe, $dll)) {
+      Info "[publish] jsign GOOGLECLOUD signing $([IO.Path]::GetFileName($f)) ..."
+      & jsign --storetype GOOGLECLOUD --keystore $env:FLUTTER_CEF_SIGN_GCLOUD_KEYSTORE `
+              --alias $alias --certfile $certfile --tsaurl $tsUrl --storepass $token $f
+      if ($LASTEXITCODE -ne 0) { Fail "[publish] jsign failed on $f (exit $LASTEXITCODE)." }
+      $sig = Get-AuthenticodeSignature -LiteralPath $f
+      if ($sig.Status -ne 'Valid') { Fail "[publish] signature not Valid after jsign on $f ($($sig.Status))." }
+    }
+    Info "[publish] signed + verified (GOOGLECLOUD KMS, cert $([IO.Path]::GetFileName($certfile)))."
+  }
+  elseif ($env:FLUTTER_CEF_SIGN_THUMBPRINT) {
     $signtool = Resolve-Signtool
     if (-not $signtool) {
       Fail "[publish] FLUTTER_CEF_SIGN_THUMBPRINT set but signtool.exe not found (install the Windows SDK)."
     }
-    $tsUrl = if ($env:FLUTTER_CEF_SIGN_TIMESTAMP_URL) { $env:FLUTTER_CEF_SIGN_TIMESTAMP_URL }
-             else { 'http://timestamp.digicert.com' }
-    Info "[publish] signing cef_host.exe + cef_host.dll (thumbprint $($env:FLUTTER_CEF_SIGN_THUMBPRINT)) ..."
+    Info "[publish] signtool signing cef_host.exe + cef_host.dll (thumbprint $($env:FLUTTER_CEF_SIGN_THUMBPRINT)) ..."
     & $signtool sign /sha1 $env:FLUTTER_CEF_SIGN_THUMBPRINT /fd SHA256 /tr $tsUrl /td SHA256 $exe $dll
     if ($LASTEXITCODE -ne 0) { Fail "[publish] signtool sign failed (exit $LASTEXITCODE)." }
     & $signtool verify /pa $exe $dll
     if ($LASTEXITCODE -ne 0) { Fail "[publish] signtool verify failed after signing." }
   }
   else {
-    Info "[publish] signing skipped (no cert; unsigned artifact). Set FLUTTER_CEF_SIGN_THUMBPRINT to sign."
+    Info "[publish] signing skipped (no cert; unsigned artifact). Set FLUTTER_CEF_SIGN_GCLOUD_KEYSTORE (jsign+KMS) or FLUTTER_CEF_SIGN_THUMBPRINT (signtool) to sign."
   }
 
   # --- Provenance stamps beside the binaries (informational; the URL is the hash). ---
