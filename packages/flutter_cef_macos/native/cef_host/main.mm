@@ -1618,6 +1618,19 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
   }
   void OnBeforeCommandLineProcessing(
       const CefString&, CefRefPtr<CefCommandLine> command_line) override {
+    // Chromium parses --disable-features ONCE: a second occurrence of the
+    // switch REPLACES the first rather than unioning with it, so appending our
+    // own would silently re-enable whatever an earlier block turned off (most
+    // dangerously the ad-hoc MachPortRendezvous bypass below, whose loss
+    // -67030s the multi-process GPU→browser handoff and blanks every tile).
+    // Every disable therefore accumulates here and is emitted as ONE
+    // comma-joined value at the bottom of this hook. Do not call
+    // AppendSwitchWithValue("disable-features", …) anywhere else.
+    std::vector<std::string> disabled_features;
+    // Effective memory-lever configuration, captured for the one-line startup
+    // log at the bottom (see there for why it is unconditional).
+    bool no_spare_renderer = false;
+
     // OSR establishment-latency: OSR views have no real OS window, so Chromium's scheduler
     // treats every renderer as backgrounded/occluded and LOWERS its process priority during
     // the critical first load — delaying the first frame of a tile that's actually visible
@@ -1631,6 +1644,67 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
       command_line->AppendSwitch("disable-renderer-backgrounding");
       command_line->AppendSwitch("disable-backgrounding-occluded-windows");
     }
+
+    // ---- Memory levers (both opt-in; unset == today's behaviour) -----------
+    // Measured shape of this process tree on macOS (phys_footprint, not summed
+    // RSS — the 307 MB Chromium framework is mapped into every process, so
+    // summed RSS overstates by ~3.4x): 158 MB fixed + 33-42 MB per live
+    // webview, r²=0.9997, with processes = N+5 and renderers = N+1 for N views.
+    // The renderers are the whole per-view slope: at N=16 that is 17 x ~28 MB
+    // = ~476 MB of a 689 MB total. Each lever below trades a specific,
+    // user-visible property for part of that slope, so each is env-gated and
+    // OFF by default — they can be A/B'd on one binary without a rebuild.
+
+    // NOT A LEVER: --renderer-process-limit. Recorded because it is the obvious
+    // next idea and it does NOT work here, so the next person should not spend
+    // the day we spent. The intent would be that above the cap Chromium reuses
+    // renderers instead of spawning, trading isolation for memory. MEASURED on
+    // this build (CEF 144 / chromium-144.0.7559.254): Chromium treats it as a
+    // SOFT limit and still gives every CEF windowless browser a DEDICATED
+    // renderer. At N=8 browsers the renderer count was 8 for caps of 1, 2, 4
+    // and 8 alike — never the cap; at N=16 under a cap of 8 there were 16.
+    // The value does reach Chromium — cap=99 kept the spare (9 renderers),
+    // cap<=8 dropped it (8) — so its ONLY enforced effect is declining to warm
+    // the spare, which is a strictly weaker version of the lever below. It
+    // recovers none of the per-view slope, so there is nothing here to ship.
+
+    // THE LEVER — drop Chromium's SPARE renderer. The browser process keeps one
+    // extra pre-warmed renderer per profile so the next navigation can skip
+    // process startup; it is why renderers measure N+1 at EVERY N, including
+    // N=1, and it costs ~23-24 MB permanently and PER PROFILE (so it compounds
+    // with profile count, and we spawn one cef_host per profile). THE COST IS
+    // FIRST-PAINT LATENCY on the NEXT tile created: that navigation now pays a
+    // cold renderer launch instead of adopting a warm one. Nothing already
+    // rendering is affected.
+    //
+    // Feature name verified against THIS build's vendored Chromium
+    // (CEF 144.0.27 / chromium-144.0.7559.254, see native/build_cef_host.sh):
+    // "SpareRendererForSitePerProcess" appears verbatim in the shipped
+    // "Chromium Embedded Framework" binary, next to the source path
+    // content/browser/renderer_host/spare_render_process_host_manager_impl.cc
+    // that gates on it — i.e. it is this framework's own feature string, not a
+    // name carried over from an older branch.
+    // DEFAULT ON. Measured on the always-live bench (phys_footprint, shared
+    // profile, N in {1,2,4,8,16}): renderer count drops from N+1 to exactly N at
+    // every N, and the fitted fixed term falls 149.5 -> 126.2 MB — ~23 MB back
+    // per CEF PROFILE, so it compounds with however many profiles a host app
+    // declares. The cost is one cold renderer launch for the NEXT browser
+    // created: first paint 38 -> 69 ms (~+31 ms). Nothing already rendering is
+    // touched, and no browser shares a process with another, so there is no
+    // neighbour-jank trade here.
+    //
+    // Opt BACK IN with FLUTTER_CEF_SPARE_RENDERER=1 when first-paint latency of
+    // a newly created browser matters more than ~23 MB.
+    const char* spare_env = std::getenv("FLUTTER_CEF_SPARE_RENDERER");
+    const bool keep_spare =
+        spare_env != nullptr && spare_env[0] != '\0' &&
+        std::strcmp(spare_env, "0") != 0;
+    if (!keep_spare) {
+      no_spare_renderer = true;
+      disabled_features.push_back("SpareRendererForSitePerProcess");
+    }
+    // ------------------------------------------------------------------------
+
 #ifdef CEF_HOST_ADHOC
     // Dev / ad-hoc-only (CEF_HOST_ADHOC is ON by default; a signed release sets
     // -DCEF_HOST_ADHOC=OFF). Mock keychain + basic password store so a launch
@@ -1657,11 +1731,11 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
     // shared-texture GPU OSR path this lets the accelerated path run
     // multi-process (crash-isolated) WITHOUT Developer-ID signing. A signed
     // release omits this and enforces validation, which then requires correct
-    // inside-out Developer-ID signing of the cef_host tree.
-    command_line->AppendSwitchWithValue(
-        "disable-features",
-        "MachPortRendezvousValidatePeerRequirements,"
-        "MachPortRendezvousEnforcePeerRequirements");
+    // inside-out Developer-ID signing of the cef_host tree. Accumulated (not
+    // appended) so a later --disable-features can't clobber it — see the
+    // disabled_features declaration at the top of this hook.
+    disabled_features.push_back("MachPortRendezvousValidatePeerRequirements");
+    disabled_features.push_back("MachPortRendezvousEnforcePeerRequirements");
 #endif
     // Verbose Chromium logging to /tmp only when explicitly debugging; off by
     // default so a shipped build doesn't write logs behind the user's back.
@@ -1701,6 +1775,33 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
       command_line->AppendSwitchWithValue("disable-blink-features",
                                           "AutomationControlled");
     }
+
+    // The ONE --disable-features emission (see the top of this hook: a second
+    // occurrence would replace, not extend, this one).
+    std::string disabled_features_value;
+    for (const std::string& feature : disabled_features) {
+      if (!disabled_features_value.empty()) disabled_features_value += ',';
+      disabled_features_value += feature;
+    }
+    if (!disabled_features_value.empty()) {
+      command_line->AppendSwitchWithValue("disable-features",
+                                          disabled_features_value);
+    }
+
+    // Unconditional, one line, once per browser process (CEF calls this hook
+    // only for process_type == "", see the CDP note above). Deliberately NOT
+    // behind FLUTTER_CEF_DEBUG: an A/B memory sweep needs positive in-band
+    // proof of which configuration the process ACTUALLY started with —
+    // including the control arm, where "no levers" is itself the claim being
+    // measured. Silently measuring the wrong build is the recurring failure
+    // mode, and one stderr write per process launch is the cheapest cure.
+    // Unlike --enable-logging this writes no file and leaks nothing about the
+    // user's browsing — it names only our own switch configuration.
+    fprintf(stderr,
+            "[cef_host] mem-levers spare-renderer=%s disable-features=%s\n",
+            no_spare_renderer ? "disabled" : "kept",
+            disabled_features_value.empty() ? "(none)"
+                                            : disabled_features_value.c_str());
   }
   // No browser is created here. We only announce readiness; the host then drives
   // browser creation on demand via kOpCreateBrowser (one per CefWebView sharing
