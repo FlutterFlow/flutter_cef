@@ -15,11 +15,19 @@
            library validation satisfied without it, so it's dev-only.
          - allow-unsigned-executable-memory: strictly broader than allow-jit and
            deprecated on macOS 14+; V8/MAP_JIT works with just allow-jit (Mozilla
-           ships V8 the same way), so it's dev-only.
-         - device.camera / device.audio-input: camera/mic are now gated by the
-           deny-default CefPermissionHandler, so untrusted page content can't reach
-           them and the OS-level entitlement buys nothing here. -->
+           ships V8 the same way), so it's dev-only. -->
   <key>com.apple.security.cs.allow-jit</key><true/>
+  <!-- Camera / microphone. The permission gate is deny-DEFAULT: HostPermissionHandler
+       never grants getUserMedia on its own — it prompts the user (kOpMediaRequest)
+       and remembers the answer per-origin (and grants only DEVICE capture, never
+       screen), the way a browser does. These OS-level
+       entitlements are what let macOS actually hand the sandboxed cef_host the
+       camera/mic once that in-app gate has allowed it — without them a signed build
+       is denied by the sandbox even after the handler grants (e.g. joining a Google
+       Meet from a webview tile). Paired with the NSCamera/NSMicrophoneUsageDescription
+       strings in cef_host's Info.plist. -->
+  <key>com.apple.security.device.camera</key><true/>
+  <key>com.apple.security.device.audio-input</key><true/>
   <!-- Bluetooth is load-bearing: caBLE / hybrid passkeys (WebAuthn cross-device)
        reach Web Bluetooth, so this stays even in the minimal release set. -->
   <key>com.apple.security.device.bluetooth</key><true/>

@@ -77,7 +77,28 @@ the `case` labels in `FlutterCefPlugin.handle` (host→native verbs: `create`,
 `navigate`, `loadTrusted`, `resize`, `dispose`, `pointer`, `key`, `reload`,
 `executeJavaScript`, cookies, IME, …) and the `emit(...)` calls (native→Dart
 events: `cursor`, `loadingState`, `title`, `url`, `consoleMessage`, `jsDialog`,
-`cookies`, `imeCompositionBounds`, …).
+`cookies`, `imeCompositionBounds`, `mediaRequest`, `mediaState`, …).
+
+Camera/microphone follows the browser permission model and is one round-trip
+plus one status event. A page's `getUserMedia` raises `mediaRequest`
+(`{id, permissions, origin}`) **only** when the site has no remembered
+decision; the host answers with the `respondMediaRequest` verb
+(`{id, allow}`), and `cef_host` remembers that answer as a per-origin content
+setting so the site is asked once. `mediaState`
+(`{videoActive, audioActive, setting}`) reports what is capturing right now
+plus the site's stored decision, and `setMediaSetting` (`{value}`: 0 ask /
+1 allow) rewrites it. A platform that does not implement these degrades to
+deny — the host grants nothing without an explicit answer.
+
+Only an ALLOW is ever persisted as a content setting. A *refusal* is kept by
+the host, out of Chromium: a stored `BLOCK` is readable by the page through
+`navigator.permissions.query()`, and sites check it before asking — so
+persisting one makes their own "use camera" button inert, with no request left
+for the embedder to prompt on and no in-page way back. (Under Alloy style a
+stored BLOCK enforces nothing anyway: `CheckMediaAccessPermission` always
+returns true and the request path consults no content settings, so
+`OnRequestMediaAccessPermission` is the only real gate.) cef_host clears any
+`BLOCK` it finds at page load, for profiles written by older builds.
 
 ## 3. The `cef_host` subprocess — the platform seams
 

@@ -41,6 +41,7 @@ class CefWebController {
   bool _lastVisible = true;
   bool _visibilityExplicitlySet = false;
 
+
   /// Stable id for this session, echoed in every host message.
   final String sessionId;
 
@@ -159,6 +160,31 @@ class CefWebController {
   Future<String?> Function(CefJsDialogRequest request)?
       onJavaScriptTextInputDialog;
 
+  /// Handle a page's request for the camera/microphone (`getUserMedia`). Show
+  /// your permission UI and return the user's answer:
+  ///
+  /// * `true` — allow, and REMEMBER it for the requesting origin.
+  /// * `false` — block, and REMEMBER it.
+  /// * `null` — deny this one request WITHOUT remembering, for when no human
+  ///   actually chose (your UI was dismissed by a navigation, the tile went
+  ///   away, a request arrived while another prompt was open). Returning
+  ///   `false` there would persist a site-wide block the user never asked for,
+  ///   and since a remembered block is applied without asking, that silently
+  ///   kills camera/mic for the site with no prompt left to undo it.
+  ///
+  /// Fires only when the site has no stored decision. **If unset, requests are
+  /// denied** (transiently), so a page can never reach the camera without a
+  /// host that deliberately handles this.
+  Future<bool?> Function(CefMediaPermissionRequest request)?
+      onMediaPermissionRequest;
+
+  /// Live camera/mic status for the current page: what is actually capturing
+  /// right now, plus the site's remembered decision. Drives an "in use" or
+  /// "blocked" indicator; pair with [setMediaSetting] to change the decision.
+  final ValueNotifier<CefMediaState> mediaState =
+      ValueNotifier<CefMediaState>(const CefMediaState());
+
+
   static final Map<String, CefWebController> _bySession =
       <String, CefWebController>{};
   static bool _handlerInstalled = false;
@@ -245,6 +271,20 @@ class CefWebController {
         break;
       case 'jsDialog':
         _handleJsDialog(a);
+        break;
+      case 'mediaRequest':
+        _handleMediaRequest(a);
+        break;
+      case 'mediaState':
+        mediaState.value = CefMediaState(
+          videoActive: a['videoActive'] as bool? ?? false,
+          audioActive: a['audioActive'] as bool? ?? false,
+          setting: switch (a['setting'] as int? ?? 0) {
+            1 => CefMediaSetting.allow,
+            2 => CefMediaSetting.block,
+            _ => CefMediaSetting.ask,
+          },
+        );
         break;
       case 'evalResult':
         _handleEvalResult(a['payload'] as String? ?? '');
@@ -379,6 +419,45 @@ class CefWebController {
     if (_disposed) return; // controller torn down while the callback awaited
     await _channel.invokeMethod('respondJsDialog',
         {'sessionId': sessionId, 'id': id, 'ok': ok, 'text': text});
+  }
+
+  /// A page asked for the camera/mic and the site has no remembered decision.
+  /// Mirrors [_handleJsDialog]: the page's `getUserMedia` is blocked on the
+  /// native callback until this answers, so every path must answer exactly once.
+  Future<void> _handleMediaRequest(Map<String, dynamic> a) async {
+    final id = a['id'] as int? ?? 0;
+    // Bits from cef_media_access_permission_types_t: audio = 1<<0, video = 1<<1.
+    final permissions = a['permissions'] as int? ?? 0;
+    final req = CefMediaPermissionRequest(
+      origin: a['origin'] as String? ?? '',
+      camera: permissions & 0x2 != 0,
+      microphone: permissions & 0x1 != 0,
+    );
+    // Fail closed: no handler means no way to ask a human, so deny — but
+    // TRANSIENTLY (null), never as a remembered site-wide block.
+    bool? decision;
+    try {
+      decision = await onMediaPermissionRequest?.call(req);
+    } catch (e, st) {
+      decision = null;
+      FlutterError.reportError(FlutterErrorDetails(
+        exception: e,
+        stack: st,
+        library: 'flutter_cef',
+        context:
+            ErrorDescription('handling a camera/microphone request from a page'),
+      ));
+    }
+    // Torn down mid-prompt: drop it. cef_host cancels every pending request on
+    // dispose/navigation, and an unanswered callback denies rather than hangs.
+    if (_disposed) return;
+    await _channel.invokeMethod('respondMediaRequest', {
+      'sessionId': sessionId,
+      'id': id,
+      'allow': decision ?? false,
+      // Only a real answer is remembered.
+      'remember': decision != null,
+    });
   }
 
   // ── Spawn throttle ──────────────────────────────────────────────────────
@@ -555,6 +634,10 @@ class CefWebController {
       _channel.invokeMethod(
           'setVisible', {'sessionId': sessionId, 'visible': _lastVisible});
     }
+    // Camera/mic needs no re-assert: the decision lives with the site (a
+    // per-origin content setting in the profile), not with this session, so it
+    // survives create/recover/thaw the way a browser's site permissions survive
+    // reopening a tab.
     return textureId;
   }
 
@@ -870,6 +953,28 @@ class CefWebController {
         'setVisible', {'sessionId': sessionId, 'visible': visible});
   }
 
+  /// Change what this site is remembered as being allowed to do with the camera
+  /// and microphone.
+  ///
+  /// This is the "site settings" path behind an in-use / blocked indicator:
+  /// [CefMediaSetting.ask] forgets the decision (the page will prompt the next
+  /// time it asks), [CefMediaSetting.block] revokes it, [CefMediaSetting.allow]
+  /// grants it without prompting. The page is NOT reloaded — a browser doesn't
+  /// yank the page to change a permission, so the new decision simply applies
+  /// the next time the site calls `getUserMedia`, and a stream already running
+  /// keeps running because it belongs to the page.
+  Future<void> setMediaSetting(CefMediaSetting setting) {
+    return _channel.invokeMethod('setMediaSetting', {
+      'sessionId': sessionId,
+      'value': switch (setting) {
+        CefMediaSetting.ask => 0,
+        CefMediaSetting.allow => 1,
+        CefMediaSetting.block => 2,
+      },
+    });
+  }
+
+
   /// Mute or unmute the page's audio output. Besides silencing it, a hidden
   /// AND muted page regains Chromium's intensive wake-up throttling (audible
   /// pages are exempt), so muting on hide keeps a background tile's timers
@@ -1039,6 +1144,7 @@ class CefWebController {
     canGoForward.dispose();
     title.dispose();
     url.dispose();
+    mediaState.dispose();
     await _channel.invokeMethod('dispose', {'sessionId': sessionId});
   }
 }
