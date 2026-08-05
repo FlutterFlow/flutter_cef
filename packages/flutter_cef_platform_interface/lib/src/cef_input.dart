@@ -169,11 +169,44 @@ final Map<LogicalKeyboardKey, int> kCefMacKeyChars = <LogicalKeyboardKey, int>{
   LogicalKeyboardKey.end: 0xF72B,
   LogicalKeyboardKey.pageUp: 0xF72C,
   LogicalKeyboardKey.pageDown: 0xF72D,
+  LogicalKeyboardKey.f1: 0xF704, // NSF1FunctionKey … NSF12FunctionKey
+  LogicalKeyboardKey.f2: 0xF705,
+  LogicalKeyboardKey.f3: 0xF706,
+  LogicalKeyboardKey.f4: 0xF707,
+  LogicalKeyboardKey.f5: 0xF708,
+  LogicalKeyboardKey.f6: 0xF709,
+  LogicalKeyboardKey.f7: 0xF70A,
+  LogicalKeyboardKey.f8: 0xF70B,
+  LogicalKeyboardKey.f9: 0xF70C,
+  LogicalKeyboardKey.f10: 0xF70D,
+  LogicalKeyboardKey.f11: 0xF70E,
+  LogicalKeyboardKey.f12: 0xF70F,
 };
 
-/// The macOS NSEvent character for an editing/navigation [key], or 0 for keys
-/// whose text rides the IME/CHAR path. See [kCefMacKeyChars].
-int cefMacCharForKey(LogicalKeyboardKey key) => kCefMacKeyChars[key] ?? 0;
+/// The macOS NSEvent character for [key]: the table above, then the key's own
+/// printable codepoint.
+///
+/// A printable key must carry a character too — 0 for *both* `character` and
+/// `unmodified_character` does not mean "no character" to CEF, it means a
+/// different event. `TranslateWebKeyEvent` treats that pair as
+/// `NSEventTypeFlagsChanged`, and Chromium's `DomKeyFromNSEvent` answers a
+/// FlagsChanged event with `DomKeyFromKeyCode()`, which maps only the modifier
+/// keys — so every printable keydown reached the page as
+/// `e.key === 'Unidentified'`, breaking any page-level shortcut. (`e.code`
+/// survived because `DomCodeFromNSEvent` reads `keyCode` whatever the type,
+/// which is why the symptom looked like a partial keyboard rather than none.)
+///
+/// [LogicalKeyboardKey.keyId] is the lowercase Unicode value for a character
+/// key and follows the active layout, so it is exactly the unmodified
+/// character macOS would report.
+int cefMacCharForKey(LogicalKeyboardKey key) {
+  final mapped = kCefMacKeyChars[key];
+  if (mapped != null) return mapped;
+  final id = key.keyId;
+  // Above the Unicode range are Flutter's synthetic plane ids (modifiers, media
+  // keys); those genuinely have no character and stay 0.
+  return (id > 0x20 && id < 0x7F) || (id > 0x7F && id <= 0x10FFFF) ? id : 0;
+}
 
 /// The Windows virtual-key code for [key]: the special-key table first, then
 /// a→VK_A..z→VK_Z, A–Z, and 0–9. 0 if unmapped (a printable that rides CHAR).

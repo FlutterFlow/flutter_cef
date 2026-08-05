@@ -597,12 +597,20 @@ class _CefWebViewState extends State<CefWebView>
         _isWindows ? wkc : (cefMacNativeKeyCode(event.physicalKey) ?? wkc);
     final ch = event.character;
     final isText = ch != null && _isPrintable(ch);
-    // Editing / navigation keys MUST carry the macOS NSEvent character or CEF
-    // OSR double-applies them (one Backspace deletes two, one arrow moves two).
-    // macOS-only: the table holds NSEvent codepoints (incl. private-use
-    // 0xF7xx function-key values) that would corrupt a Windows key event —
-    // Windows CEF derives the character from the VK itself, so send 0 there.
-    final keyChar = _isWindows ? 0 : cefMacCharForKey(event.logicalKey);
+    // Every key MUST carry its macOS NSEvent character. Editing/navigation keys
+    // because CEF OSR otherwise double-applies them (one Backspace deletes two,
+    // one arrow moves two); printable keys because a zero character pair makes
+    // CEF build a FlagsChanged event, which costs the page `e.key` entirely —
+    // see [cefMacCharForKey]. The typed character wins when there is one, so a
+    // shifted key reports `A` like a browser rather than the unshifted `a`.
+    // macOS-only: these are NSEvent codepoints (incl. private-use 0xF7xx
+    // function-key values) that would corrupt a Windows key event — Windows CEF
+    // derives the character from the VK itself, so send 0 there.
+    final keyChar = _isWindows
+        ? 0
+        : (ch != null && isText
+            ? ch.codeUnitAt(0)
+            : cefMacCharForKey(event.logicalKey));
     // The page should see keydown→keypress→keyup for every character, like a
     // browser. We always send RAWKEYDOWN/KEYUP; the keypress (CHAR) is
     // synthesized by [_commitText] when the IME's insertText delivers a typed
