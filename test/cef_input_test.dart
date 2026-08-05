@@ -71,9 +71,33 @@ void main() {
         expect(cefMacCharForKey(key), isNonZero); // the whole point
       });
     });
-    test('printable keys carry no override char (-> 0; they ride the IME)', () {
-      expect(cefMacCharForKey(LogicalKeyboardKey.keyA), 0);
-      expect(cefMacCharForKey(LogicalKeyboardKey.digit5), 0);
+    // A printable key must carry its character too, though it rides the IME for
+    // text. Zero for BOTH character fields is not "no character" to CEF: it is
+    // the FlagsChanged branch of TranslateWebKeyEvent, and Chromium answers a
+    // FlagsChanged event with DomKeyFromKeyCode(), which maps only modifiers —
+    // so the page saw `e.key === 'Unidentified'` for every printable keydown.
+    test('printable keys carry their own codepoint (e.key, not Unidentified)',
+        () {
+      expect(cefMacCharForKey(LogicalKeyboardKey.keyA), 0x61); // 'a'
+      expect(cefMacCharForKey(LogicalKeyboardKey.digit5), 0x35); // '5'
+      expect(cefMacCharForKey(LogicalKeyboardKey.slash), 0x2F); // '/'
+    });
+    test('function keys carry their NSEvent private-use codepoint', () {
+      expect(cefMacCharForKey(LogicalKeyboardKey.f1), 0xF704);
+      expect(cefMacCharForKey(LogicalKeyboardKey.f12), 0xF70F);
+    });
+    // Modifiers are the one case where FlagsChanged is the CORRECT event, and
+    // DomKeyFromKeyCode does map them — so these must stay 0.
+    test('modifier keys stay 0 — FlagsChanged is right for them', () {
+      for (final key in <LogicalKeyboardKey>[
+        LogicalKeyboardKey.shiftLeft,
+        LogicalKeyboardKey.controlLeft,
+        LogicalKeyboardKey.altLeft,
+        LogicalKeyboardKey.metaLeft,
+        LogicalKeyboardKey.capsLock,
+      ]) {
+        expect(cefMacCharForKey(key), 0, reason: key.debugName);
+      }
     });
   });
 
