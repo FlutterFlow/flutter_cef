@@ -145,6 +145,15 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       result(nil)
     case "setVisible":
       withSession(args) { $0.setVisible(args["visible"] as? Bool ?? true) }
+    case "respondMediaRequest":
+      withSession(args) {
+        $0.respondMediaRequest(id: args["id"] as? Int ?? 0,
+                               allow: args["allow"] as? Bool ?? false,
+                               remember: args["remember"] as? Bool ?? false)
+      }
+      result(nil)
+    case "setMediaSetting":
+      withSession(args) { $0.setMediaSetting(args["value"] as? Int ?? 0) }
       result(nil)
     case "setAudioMuted":
       withSession(args) { $0.setAudioMuted(args["muted"] as? Bool ?? true) }
@@ -438,6 +447,18 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     }
     session.onCookies = { [weak self] id, json in
       self?.emit("cookies", ["sessionId": sessionId, "id": id, "json": json])
+    }
+    session.onMediaRequest = { [weak self] id, permissions, origin in
+      self?.emit("mediaRequest", [
+        "sessionId": sessionId, "id": id,
+        "permissions": permissions, "origin": origin,
+      ])
+    }
+    session.onMediaState = { [weak self] video, audio, setting in
+      self?.emit("mediaState", [
+        "sessionId": sessionId, "videoActive": video,
+        "audioActive": audio, "setting": setting,
+      ])
     }
     session.onSurface = { [weak self] surfaceId, width, height in
       self?.emit("onSurface", [

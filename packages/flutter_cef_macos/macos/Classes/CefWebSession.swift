@@ -49,6 +49,11 @@ final class CefWebSession: NSObject, FlutterTexture {
   private static let opDownload: UInt8 = 0x18
   private static let opImeBounds: UInt8 = 0x19
   private static let opCookies: UInt8 = 0x1a
+  // cef_host -> us: a page called getUserMedia and the site has no remembered
+  // decision, so the host must show a permission prompt. {u32 id}{u32 mask}{utf8 origin}
+  private static let opMediaRequest: UInt8 = 0x1e
+  // cef_host -> us: {u8 videoActive}{u8 audioActive}{u8 setting 0=ask 1=allow}
+  private static let opMediaState: UInt8 = 0x1f
   private static let opNavigate: UInt8 = 0x20
   private static let opReload: UInt8 = 0x21
   private static let opStop: UInt8 = 0x22
@@ -71,6 +76,12 @@ final class CefWebSession: NSObject, FlutterTexture {
   private static let opShowDevTools: UInt8 = 0x33
   private static let opLoadTrusted: UInt8 = 0x34
   private static let opSetVisible: UInt8 = 0x35
+  // us -> cef_host: answer a permission prompt {u32 id}{u8 allow}{u8 remember};
+  // remembered per-origin only when a human chose, exactly like a browser.
+  private static let opMediaResponse: UInt8 = 0x3c
+  // us -> cef_host: {u8 0=ask 1=allow 2=block} rewrite this site's remembered
+  // camera/mic decision (the URL-bar "site settings" path). No reload.
+  private static let opSetMediaSetting: UInt8 = 0x3d
   private static let opOpenAuthWindow: UInt8 = 0x39
   private static let opSetAudioMuted: UInt8 = 0x3a    // {u8 muted} -> CefBrowserHost::SetAudioMuted
   private static let opSetPumpInterval: UInt8 = 0x3b  // {u16 BE ms} visible begin-frame cadence
@@ -94,6 +105,8 @@ final class CefWebSession: NSObject, FlutterTexture {
   var onDownload: ((String) -> Void)?  // suggested name
   var onImeBounds: ((Int, Int, Int, Int) -> Void)?  // caret rect x,y,w,h (DIP)
   var onCookies: ((Int, String) -> Void)?  // request id, json array
+  var onMediaRequest: ((Int, Int, String) -> Void)?  // id, permission mask, origin
+  var onMediaState: ((Bool, Bool, Int) -> Void)?  // videoActive, audioActive, setting
   // Fired when the backing IOSurface is (re)allocated — at create and on every
   // resize() (which reallocs). Args are the live global surface id and the
   // PHYSICAL (Retina) pixel dims. A consumer that mirrors the live frame
@@ -426,6 +439,28 @@ final class CefWebSession: NSObject, FlutterTexture {
     sendFrame(Self.opSetVisible, [visible ? 1 : 0])
   }
 
+  /// Owner opt-in for camera/mic (getUserMedia) on this browser. Deny-default in
+  /// cef_host; this flips the per-browser gate. Grants only device capture
+  /// (camera/mic), never screen capture.
+  /// Answer a pending camera/mic prompt. The host remembers the choice for the
+  /// requesting origin, so the page is asked once — the browser contract.
+  /// `remember` only when a human actually chose — a defensive auto-deny must
+  /// not persist as a site-wide block.
+  func respondMediaRequest(id: Int, allow: Bool, remember: Bool) {
+    var p = [UInt8]()
+    appendU32(&p, UInt32(truncatingIfNeeded: id))
+    p.append(allow ? 1 : 0)
+    p.append(remember ? 1 : 0)
+    sendFrame(Self.opMediaResponse, p)
+  }
+
+  /// Rewrite this site's remembered camera/mic decision (0 = ask again, 1 =
+  /// allow, 2 = block). No reload — it applies next time the page asks.
+  func setMediaSetting(_ value: Int) {
+    sendFrame(Self.opSetMediaSetting, [UInt8(clamping: value)])
+  }
+
+
   /// Mute/unmute the page's audio. Besides silencing it, a hidden AND muted
   /// page regains Chromium's intensive wake-up throttling (audible pages are
   /// exempt), so muting on hide keeps a background tile's timers cheap.
@@ -749,6 +784,17 @@ final class CefWebSession: NSObject, FlutterTexture {
       if payload.count >= 4 {
         onCookies?(readU32(payload, 0),
                    String(bytes: payload[4...], encoding: .utf8) ?? "[]")
+      }
+    case Self.opMediaRequest:
+      if payload.count >= 8 {
+        let origin = payload.count > 8
+            ? (String(bytes: payload[8...], encoding: .utf8) ?? "")
+            : ""
+        onMediaRequest?(readU32(payload, 0), readU32(payload, 4), origin)
+      }
+    case Self.opMediaState:
+      if payload.count >= 3 {
+        onMediaState?(payload[0] != 0, payload[1] != 0, Int(payload[2]))
       }
     default:
       break

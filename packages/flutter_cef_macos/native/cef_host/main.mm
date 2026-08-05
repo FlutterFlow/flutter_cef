@@ -87,6 +87,7 @@
 #include "include/cef_life_span_handler.h"
 #include "include/cef_permission_handler.h"
 #include "include/cef_render_handler.h"
+#include "include/cef_request_context.h"
 #include "include/cef_request_handler.h"
 #include "include/cef_task.h"
 #include "include/wrapper/cef_closure_task.h"
@@ -105,7 +106,7 @@ namespace {
 // stale embedded copy). BUMP THIS on any semantic change to the kOp wire protocol
 // below, together with CefProfileHost.protocolVersion (Swift side) — the two must
 // stay equal. Hosts predating the handshake send a 1-byte payload and read as v0.
-constexpr uint8_t kCefHostProtocolVersion = 5;
+constexpr uint8_t kCefHostProtocolVersion = 6;
 
 // ---- Opcodes ----
 constexpr uint8_t kOpPresent = 0x01;
@@ -131,6 +132,8 @@ constexpr uint8_t kOpCookies = 0x1a;    // {u32 id}{utf8 json-array} visitAllCoo
 constexpr uint8_t kOpTargetId = 0x1b;   // {utf8 targetId} -> plugin: this browser's CDP targetId (CEF-2b)
 constexpr uint8_t kOpCreated = 0x1c;    // {} H3: OnAfterCreated — browser is up; host's pacer sends the next create
 constexpr uint8_t kOpCreateFailed = 0x1d; // {} H7: async CreateBrowser dispatch failed; host drops the session
+constexpr uint8_t kOpMediaRequest = 0x1e; // {u32 id}{u32 requested}{utf8 origin} page called getUserMedia and there is NO stored decision -> host prompts
+constexpr uint8_t kOpMediaState = 0x1f;   // {u8 videoActive}{u8 audioActive}{u8 setting 0=ask 1=allow} page media status -> URL-bar "in use" / "allowed" indicator
 constexpr uint8_t kOpPointer = 0x10;
 constexpr uint8_t kOpResize = 0x11;          // {u32 w}{u32 h}{f64 dpr} — producer-allocates: no sid
 constexpr uint8_t kOpKey = 0x12;
@@ -161,6 +164,8 @@ constexpr uint8_t kOpLoadTrusted = 0x34;    // {utf8 url} host content-load, exe
 constexpr uint8_t kOpSetVisible = 0x35;     // {u8 visible} -> CefBrowserHost::WasHidden(!visible)
 constexpr uint8_t kOpResolveTargetId = 0x36;  // {} resolve this browser's CDP targetId (CEF-2b) -> kOpTargetId
 constexpr uint8_t kOpInvalidate = 0x37;       // {} C1: force a repaint (Invalidate PET_VIEW) to re-kick a stalled first frame
+constexpr uint8_t kOpMediaResponse = 0x3c;    // {u32 id}{u8 allow}{u8 remember} answer a kOpMediaRequest prompt; remembered per-origin ONLY when `remember` (a human chose) — never for a defensive auto-deny
+constexpr uint8_t kOpSetMediaSetting = 0x3d;  // {u8 value} rewrite the CURRENT origin's camera+mic content setting (0=ask/default 1=allow 2=block) — the URL-bar "site settings" path; no reload, it applies next time the page asks
 constexpr uint8_t kOpEditCommand = 0x38;      // {u8 cmd} run a focused-frame edit command (0=copy 1=cut 2=paste 3=selectAll 4=undo 5=redo)
 constexpr uint8_t kOpOpenAuthWindow = 0x39;   // {utf8 url} open a windowed Chrome-runtime browser for a WebAuthn/Touch ID ceremony the OSR tile can't host (shares the tile's cookie jar)
 constexpr uint8_t kOpSetAudioMuted = 0x3a;    // {u8 muted} -> CefBrowserHost::SetAudioMuted; a hidden AND muted page regains intensive wake-up throttling (audible pages are exempt)
@@ -192,6 +197,33 @@ struct Slot {
   // until whole-host shutdown. UI-thread-confined (DoDisposeBrowser + OnAfterCreated
   // both run on the CEF UI thread), so no lock.
   bool close_requested = false;
+
+  // Pending getUserMedia permission callbacks, keyed by request id — the browser
+  // permission model: a page asks, the host shows a prompt, the answer comes back
+  // over the IPC (kOpMediaResponse -> DoMediaResponse -> Continue). Held exactly
+  // like `dialogs` below: UI-thread-only (OnRequestMediaAccessPermission and the
+  // response both run on the CEF UI thread), per-slot so one browser's request id
+  // can never Continue() another's. A held callback that is never answered is
+  // dropped (Cancel) in OnBeforeClose / on navigation, matching a page whose
+  // permission prompt is dismissed by leaving it.
+  // The requested mask is held with the callback because CefMediaAccessCallback
+  // requires that, for a getUserMedia request, the allowed permissions MATCH the
+  // requested ones — so a grant is all-or-nothing and the host enforces that
+  // itself rather than trusting whatever mask the response carries.
+  struct PendingMedia {
+    CefRefPtr<CefMediaAccessCallback> callback;
+    uint32_t wanted = 0;
+    // The ORIGIN that asked — the decision is remembered against this, not the
+    // address bar, so a cross-origin iframe's grant can't be recorded for (or
+    // silently inherited from) the top-level page.
+    std::string origin;
+  };
+  std::map<uint32_t, PendingMedia> media_requests;
+  uint32_t media_req_next = 1;
+  // Last capture state reported by OnMediaAccessChange, so the complete media
+  // status can be re-sent (on load, or on demand) without waiting for a change.
+  bool media_video_active = false;
+  bool media_audio_active = false;
 
   // Guards surface / width / height / dpr / popup_* for THIS browser. Per-slot
   // (not a single global) so paints on independent browsers don't contend.
@@ -1073,16 +1105,136 @@ class HostRenderHandler : public CefRenderHandler {
 // CefPermissionHandler permission type (they go through the authenticator /
 // Bluetooth stack, gated by the OS + the bluetooth entitlement), so denying
 // media/geo here leaves the passkey-over-Bluetooth flow untouched.
+// Send the page's COMPLETE media status: what is capturing right now, plus the
+// site's remembered decision. The stored setting has to be reported explicitly
+// because Chromium enforces a remembered BLOCK itself, without ever calling the
+// permission handler — so the UI could otherwise never learn that a site is
+// blocked (there is no request to observe). UI-thread only (GetContentSetting).
+void SendMediaState(const std::shared_ptr<Slot>& slot) {
+  CEF_REQUIRE_UI_THREAD();
+  uint8_t setting = 0;  // 0 = ask (no stored decision)
+  if (slot->browser) {
+    CefRefPtr<CefRequestContext> ctx =
+        slot->browser->GetHost()->GetRequestContext();
+    CefRefPtr<CefFrame> frame = slot->browser->GetMainFrame();
+    const std::string url = frame ? frame->GetURL().ToString() : std::string();
+    if (ctx &&
+        (url.rfind("https://", 0) == 0 || url.rfind("http://", 0) == 0)) {
+      const cef_content_setting_values_t cam = ctx->GetContentSetting(
+          url, CefString(), CEF_CONTENT_SETTING_TYPE_MEDIASTREAM_CAMERA);
+      const cef_content_setting_values_t mic = ctx->GetContentSetting(
+          url, CefString(), CEF_CONTENT_SETTING_TYPE_MEDIASTREAM_MIC);
+      // Heal a stored BLOCK from an older build, at LOAD time. It cannot wait
+      // for the next getUserMedia: the page reads this through
+      // navigator.permissions.query() BEFORE deciding whether to ask at all, so
+      // a site that sees "denied" never calls getUserMedia and the request-time
+      // heal would never run — the page stays permanently dead. Clearing it
+      // here puts the site back to "ask"; a refusal now lives on the Campus
+      // side, invisible to the page.
+      if (cam == CEF_CONTENT_SETTING_VALUE_BLOCK ||
+          mic == CEF_CONTENT_SETTING_VALUE_BLOCK) {
+        ctx->SetContentSetting(url, CefString(),
+                               CEF_CONTENT_SETTING_TYPE_MEDIASTREAM_CAMERA,
+                               CEF_CONTENT_SETTING_VALUE_DEFAULT);
+        ctx->SetContentSetting(url, CefString(),
+                               CEF_CONTENT_SETTING_TYPE_MEDIASTREAM_MIC,
+                               CEF_CONTENT_SETTING_VALUE_DEFAULT);
+        setting = 0;
+      } else if (cam == CEF_CONTENT_SETTING_VALUE_ALLOW ||
+                 mic == CEF_CONTENT_SETTING_VALUE_ALLOW) {
+        setting = 1;
+      }
+    }
+  }
+  const uint8_t p[3] = {static_cast<uint8_t>(slot->media_video_active ? 1 : 0),
+                        static_cast<uint8_t>(slot->media_audio_active ? 1 : 0),
+                        setting};
+  SendFrame(slot->browser_id, kOpMediaState, p, 3);
+}
+
 class HostPermissionHandler : public CefPermissionHandler {
  public:
-  // getUserMedia (camera/mic) and any other media-access request: grant NOTHING.
-  // Returning true means we handled it; Continue(CEF_MEDIA_PERMISSION_NONE)
-  // denies (allowed must be a subset of required, and the empty set is valid).
+  explicit HostPermissionHandler(std::shared_ptr<Slot> slot)
+      : slot_(std::move(slot)) {}
+
+  // getUserMedia (camera/mic): the standard BROWSER model — ask once per origin,
+  // then remember. Never auto-grant: with no stored decision we hold the callback
+  // and ask the host to show a prompt over the tile (kOpMediaRequest), and the
+  // answer is written back as a per-origin content setting so the page is never
+  // asked twice. Only DEVICE capture is ever on the table; DESKTOP capture
+  // (screen-share) is dropped here and stays a separate capability.
   bool OnRequestMediaAccessPermission(
-      CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, const CefString&, uint32_t,
+      CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame>,
+      const CefString& requesting_origin, uint32_t requested_permissions,
       CefRefPtr<CefMediaAccessCallback> callback) override {
-    callback->Continue(CEF_MEDIA_PERMISSION_NONE);
-    return true;
+    CEF_REQUIRE_UI_THREAD();
+    const uint32_t device_only =
+        static_cast<uint32_t>(CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE) |
+        static_cast<uint32_t>(CEF_MEDIA_PERMISSION_DEVICE_VIDEO_CAPTURE);
+    const uint32_t wanted = requested_permissions & device_only;
+    // Nothing grantable (e.g. a pure getDisplayMedia/desktop request) -> deny.
+    if (!slot_ || wanted == 0) {
+      callback->Continue(CEF_MEDIA_PERMISSION_NONE);
+      return true;
+    }
+    const std::string origin = requesting_origin.ToString();
+    // A remembered decision answers immediately — no prompt. Chromium normally
+    // short-circuits a stored setting before ever reaching this handler; we read
+    // it ourselves so the behavior is identical whether or not it does, and so a
+    // partially-stored decision (camera allowed, mic unset) still re-prompts.
+    CefRefPtr<CefRequestContext> ctx =
+        browser ? browser->GetHost()->GetRequestContext() : nullptr;
+    if (ctx && !origin.empty()) {
+      uint32_t remembered = 0;
+      bool stored_block = false;
+      const auto read = [&](uint32_t bit, cef_content_setting_types_t type) {
+        if (!(wanted & bit)) return;
+        const cef_content_setting_values_t v =
+            ctx->GetContentSetting(origin, CefString(), type);
+        if (v == CEF_CONTENT_SETTING_VALUE_ALLOW) {
+          remembered |= bit;
+        } else if (v == CEF_CONTENT_SETTING_VALUE_BLOCK) {
+          stored_block = true;
+        }
+      };
+      read(CEF_MEDIA_PERMISSION_DEVICE_VIDEO_CAPTURE,
+           CEF_CONTENT_SETTING_TYPE_MEDIASTREAM_CAMERA);
+      read(CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE,
+           CEF_CONTENT_SETTING_TYPE_MEDIASTREAM_MIC);
+      // A stored BLOCK is never written any more, but an older profile may
+      // still carry one — heal it. It has to go: the PAGE can read it through
+      // navigator.permissions.query(), and sites branch on that. Meet asks
+      // first and, seeing "denied", never calls getUserMedia at all — so its
+      // own "use camera" button goes dead with no request for the host to
+      // observe, prompt on, or offer a way back from. "Blocked" is remembered
+      // on the Campus side instead, where it can't lie to the page.
+      if (stored_block) {
+        ctx->SetContentSetting(origin, CefString(),
+                               CEF_CONTENT_SETTING_TYPE_MEDIASTREAM_CAMERA,
+                               CEF_CONTENT_SETTING_VALUE_DEFAULT);
+        ctx->SetContentSetting(origin, CefString(),
+                               CEF_CONTENT_SETTING_TYPE_MEDIASTREAM_MIC,
+                               CEF_CONTENT_SETTING_VALUE_DEFAULT);
+      }
+      // All-or-nothing: Continue must MATCH the request for getUserMedia, so a
+      // grant only short-circuits when EVERY requested device is remembered.
+      if (!stored_block && remembered == wanted) {
+        callback->Continue(remembered);
+        return true;
+      }
+    }
+    // Undecided -> hold the callback (exactly like a JS dialog) and prompt.
+    const uint32_t id = slot_->media_req_next++;
+    slot_->media_requests[id] = Slot::PendingMedia{callback, wanted, origin};
+    std::vector<uint8_t> p(8 + origin.size());
+    for (int i = 0; i < 4; ++i) {
+      p[i] = (id >> (24 - 8 * i)) & 0xff;
+      p[4 + i] = (wanted >> (24 - 8 * i)) & 0xff;
+    }
+    memcpy(p.data() + 8, origin.data(), origin.size());
+    SendFrame(slot_->browser_id, kOpMediaRequest, p.data(),
+              static_cast<uint32_t>(p.size()));
+    return true;  // answered asynchronously via DoMediaResponse
   }
   // Geolocation, notifications, clipboard, etc. all arrive as a permission
   // prompt: deny without ever showing UI.
@@ -1094,6 +1246,9 @@ class HostPermissionHandler : public CefPermissionHandler {
   }
 
   IMPLEMENT_REFCOUNTING(HostPermissionHandler);
+
+ private:
+  std::shared_ptr<Slot> slot_;
 };
 
 // ───── Native windowed popup for OAuth (window.open with features) ──────────
@@ -1261,7 +1416,7 @@ class HostClient : public CefClient,
     router_ = CefMessageRouterBrowserSide::Create(config);
     router_->AddHandler(this, false);
     rh_ = new HostRenderHandler(slot_);
-    ph_ = new HostPermissionHandler();  // deny-default permission gate
+    ph_ = new HostPermissionHandler(slot_);  // deny-default; owner opts in per tile
   }
   CefRefPtr<CefMessageRouterBrowserSide> router_;
   CefRefPtr<CefRenderHandler> rh_;
@@ -1345,6 +1500,16 @@ class HostClient : public CefClient,
     slot_->dialogs.clear();
   }
 
+  // CefDisplayHandler: camera/mic capture started or stopped on this page. This
+  // is the ONLY honest source for the URL bar's "in use" indicator — it reflects
+  // what Chromium is actually capturing, not what was merely permitted.
+  void OnMediaAccessChange(CefRefPtr<CefBrowser>, bool has_video_access,
+                           bool has_audio_access) override {
+    slot_->media_video_active = has_video_access;
+    slot_->media_audio_active = has_audio_access;
+    SendMediaState(slot_);
+  }
+
   // Recover from a renderer crash (multi-process only): reload rather than show
   // a dead page. In single-process a renderer CHECK kills the whole process, so
   // this never fires — which is why heavy pages need multi-process.
@@ -1367,6 +1532,18 @@ class HostClient : public CefClient,
     if (!frame) return;
     if (frame->IsMain()) {
       SendUtf8(slot_->browser_id, kOpPageStart, frame->GetURL().ToString());
+      // A navigation abandons any camera/mic prompt the previous page raised —
+      // Cancel the held callbacks so they don't leak (the page that asked is
+      // gone and will never be answered). The host dismisses its prompt UI off
+      // the url change, mirroring how OnResetDialogState drops JS dialogs.
+      for (auto& kv : slot_->media_requests) {
+        if (kv.second.callback) kv.second.callback->Cancel();
+      }
+      slot_->media_requests.clear();
+      // Leaving the page stops its capture; don't strand a stale "in use" dot if
+      // the teardown's OnMediaAccessChange(false,false) doesn't arrive.
+      slot_->media_video_active = false;
+      slot_->media_audio_active = false;
       // SECURITY: install the JS-channel shims ONLY into the MAIN frame. The shims expose the
       // privileged campusHost bridge (window.<name> -> window.cefQuery 'ch:'); injecting them
       // into cross-origin SUBFRAMES would hand an untrusted embedded iframe that bridge. (The
@@ -1378,6 +1555,9 @@ class HostClient : public CefClient,
                  int /*httpStatusCode*/) override {
     if (frame && frame->IsMain()) {
       SendUtf8(slot_->browser_id, kOpPageFinish, frame->GetURL().ToString());
+      // Report the new page's remembered camera/mic decision so the URL bar can
+      // show a "blocked" indicator for a site Chromium will silently refuse.
+      SendMediaState(slot_);
       // C1 + RENDER FLOOR: force a repaint when the main frame finishes. Invalidate(PET_VIEW)
       // ALONE is coalesce-able — the scheduler can drop it, which on a shared GPU/Viz process
       // under a multi-browser establishment burst is exactly when the real-content first frame
@@ -1550,6 +1730,12 @@ class HostClient : public CefClient,
   // paint refs (which copied the shared_ptr) drain.
   void OnBeforeClose(CefRefPtr<CefBrowser> browser) override {
     if (router_) router_->OnBeforeClose(browser);
+    // Answer nothing and release everything: a tile closed with a camera/mic
+    // prompt still up must not leave a held callback behind.
+    for (auto& kv : slot_->media_requests) {
+      if (kv.second.callback) kv.second.callback->Cancel();
+    }
+    slot_->media_requests.clear();
     {
       std::lock_guard<std::mutex> lock(g_slots_mutex);
       g_slots_by_wire_id.erase(slot_->browser_id);
@@ -2128,6 +2314,89 @@ void DoSetVisible(const std::shared_ptr<Slot>& slot, bool visible) {
 void DoSetAudioMuted(const std::shared_ptr<Slot>& slot, bool muted) {
   if (slot->browser) slot->browser->GetHost()->SetAudioMuted(muted);
 }
+// Write a camera+mic content setting for `origin` on this browser's context.
+// This is what makes a decision STICK the way a browser's does — and what
+// un-poisons an origin Chromium has already stored a BLOCK for (with a stored
+// BLOCK it short-circuits getUserMedia and never consults the permission
+// handler, so a site the user once denied would otherwise be permanently dead
+// with no way back). UI-thread only.
+void SetMediaContentSetting(const std::shared_ptr<Slot>& slot,
+                            const std::string& origin,
+                            cef_content_setting_values_t value) {
+  CEF_REQUIRE_UI_THREAD();
+  if (!slot->browser) return;
+  // Content settings are origin-keyed; only http(s) carries one worth writing
+  // (about:blank et al have no meaningful origin to remember).
+  if (origin.rfind("https://", 0) != 0 && origin.rfind("http://", 0) != 0) return;
+  CefRefPtr<CefRequestContext> ctx =
+      slot->browser->GetHost()->GetRequestContext();
+  if (!ctx) return;
+  ctx->SetContentSetting(origin, CefString(),
+                         CEF_CONTENT_SETTING_TYPE_MEDIASTREAM_CAMERA, value);
+  ctx->SetContentSetting(origin, CefString(),
+                         CEF_CONTENT_SETTING_TYPE_MEDIASTREAM_MIC, value);
+}
+
+// Answer a pending prompt (kOpMediaRequest -> the host showed UI -> the user
+// chose). Grants all-or-nothing because Continue must MATCH the getUserMedia
+// request.
+//
+// `remember` MUST be set only when a human actually chose. The host also denies
+// defensively — no permission UI wired up, the prompt handler threw, the tile
+// was torn down or its page replaced mid-prompt — and persisting those as a
+// site-wide BLOCK would permanently, silently kill camera/mic for the site with
+// no request left to re-prompt on. Deny transiently instead: the page simply
+// asks again next time.
+void DoMediaResponse(const std::shared_ptr<Slot>& slot, uint32_t id, bool allow,
+                     bool remember) {
+  CEF_REQUIRE_UI_THREAD();
+  auto it = slot->media_requests.find(id);
+  if (it == slot->media_requests.end()) return;  // already answered/abandoned
+  const uint32_t wanted = it->second.wanted;
+  const std::string origin = it->second.origin;
+  CefRefPtr<CefMediaAccessCallback> cb = it->second.callback;
+  slot->media_requests.erase(it);
+  // Remember BEFORE continuing: the page may re-ask the instant it is answered,
+  // and the stored setting is what keeps that from re-prompting.
+  //
+  // Only an ALLOW is ever written here. A stored BLOCK is visible to the page
+  // via navigator.permissions.query(), and sites check it before asking — so
+  // writing one makes their own "use camera" button do nothing and leaves no
+  // request to prompt on. A refusal is remembered on the Campus side instead.
+  if (remember) {
+    SetMediaContentSetting(slot, origin,
+                           allow ? CEF_CONTENT_SETTING_VALUE_ALLOW
+                                 : CEF_CONTENT_SETTING_VALUE_DEFAULT);
+  }
+  if (cb) cb->Continue(allow ? wanted : CEF_MEDIA_PERMISSION_NONE);
+  SendMediaState(slot);  // refresh the indicator for the new decision
+}
+
+// The URL-bar "site settings" path: rewrite THIS page's camera+mic decision
+// (0 = ask again / forget, 1 = allow, 2 = block).
+//
+// Deliberately does NOT reload. A browser never yanks the page out from under
+// you to change a site permission — the new decision simply applies the next
+// time the page asks. Reloading here also had a surprising side effect: the page
+// re-runs its startup getUserMedia, so the permission prompt appeared by itself
+// right after the reload instead of when the user pressed the site's own
+// "use camera" button. An already-running stream keeps running (it belongs to
+// the page), which is also what a browser does.
+void DoSetMediaSetting(const std::shared_ptr<Slot>& slot, uint8_t value) {
+  CEF_REQUIRE_UI_THREAD();
+  if (!slot->browser) return;
+  CefRefPtr<CefFrame> frame = slot->browser->GetMainFrame();
+  const std::string url = frame ? frame->GetURL().ToString() : std::string();
+  // 1 = allow; anything else clears the stored decision. "Block" deliberately
+  // does NOT write CEF_CONTENT_SETTING_VALUE_BLOCK — see DoMediaResponse: a
+  // stored block is readable by the page and stops it from ever asking.
+  const cef_content_setting_values_t setting =
+      value == 1 ? CEF_CONTENT_SETTING_VALUE_ALLOW
+                 : CEF_CONTENT_SETTING_VALUE_DEFAULT;
+  SetMediaContentSetting(slot, url, setting);
+  SendMediaState(slot);  // the indicator reflects the new decision immediately
+}
+
 void DoSetPumpInterval(const std::shared_ptr<Slot>& slot, int ms) {
   // Clamp: <8ms buys nothing over 60fps begin-frames + risks pump starvation;
   // >250ms visible would read as a frozen tile.
@@ -2608,6 +2877,25 @@ void IpcReadLoop() {
         if (!slot) break;
         bool vis = plen >= 1 ? p[0] != 0 : true;
         CefPostTask(TID_UI, base::BindOnce(&DoSetVisible, slot, vis));
+        break;
+      }
+      case kOpMediaResponse: {
+        // {u32 id}{u8 allow}{u8 remember} — an answer to a camera/mic prompt.
+        if (!slot) break;
+        if (plen < 5) break;
+        uint32_t id = ReadU32BE(p);
+        bool allow = p[4] != 0;
+        // Absent byte = don't remember: only an explicit human choice persists.
+        bool remember = plen >= 6 && p[5] != 0;
+        CefPostTask(TID_UI,
+                    base::BindOnce(&DoMediaResponse, slot, id, allow, remember));
+        break;
+      }
+      case kOpSetMediaSetting: {
+        // {u8 value} — change this site's remembered camera/mic decision.
+        if (!slot) break;
+        if (plen < 1) break;
+        CefPostTask(TID_UI, base::BindOnce(&DoSetMediaSetting, slot, p[0]));
         break;
       }
       case kOpSetAudioMuted: {

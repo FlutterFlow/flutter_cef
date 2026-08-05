@@ -72,6 +72,87 @@ class CefJsDialogRequest {
   String toString() => 'CefJsDialogRequest($message)';
 }
 
+/// A page's request to use the camera and/or microphone (`getUserMedia`),
+/// raised only when the site has no remembered decision. Passed to
+/// [CefWebController.onMediaPermissionRequest]; answer by returning
+/// allow/deny, and the answer is remembered for [origin].
+///
+/// The grant is all-or-nothing: CEF requires the answer to a `getUserMedia`
+/// request to cover exactly what was asked for, so a page wanting camera AND
+/// mic cannot be granted just one.
+class CefMediaPermissionRequest {
+  const CefMediaPermissionRequest({
+    required this.origin,
+    required this.camera,
+    required this.microphone,
+  });
+
+  /// The security origin that asked — the requesting frame's own origin, which
+  /// for a cross-origin iframe is NOT the address-bar URL.
+  final String origin;
+
+  /// Whether camera access was requested.
+  final bool camera;
+
+  /// Whether microphone access was requested.
+  final bool microphone;
+
+  @override
+  String toString() =>
+      'CefMediaPermissionRequest($origin, camera: $camera, mic: $microphone)';
+}
+
+/// What a site is remembered as being allowed to do with camera/mic.
+enum CefMediaSetting {
+  /// No stored decision — the page will raise a permission request.
+  ask,
+
+  /// Remembered allow: `getUserMedia` succeeds without prompting.
+  allow,
+
+  /// Remembered block: `getUserMedia` is refused without prompting.
+  block,
+}
+
+/// Live camera/microphone status for a page: whether capture is actually
+/// happening right now, plus the site's remembered decision. Delivered by
+/// [CefWebController.mediaState]; the capture flags are the honest source for
+/// an "in use" indicator, since they reflect what Chromium is really capturing
+/// rather than what was merely permitted.
+class CefMediaState {
+  const CefMediaState({
+    this.videoActive = false,
+    this.audioActive = false,
+    this.setting = CefMediaSetting.ask,
+  });
+
+  /// The camera is capturing right now.
+  final bool videoActive;
+
+  /// The microphone is capturing right now.
+  final bool audioActive;
+
+  /// The current page's remembered camera/mic decision.
+  final CefMediaSetting setting;
+
+  /// Either device is capturing.
+  bool get isCapturing => videoActive || audioActive;
+
+  @override
+  bool operator ==(Object other) =>
+      other is CefMediaState &&
+      other.videoActive == videoActive &&
+      other.audioActive == audioActive &&
+      other.setting == setting;
+
+  @override
+  int get hashCode => Object.hash(videoActive, audioActive, setting);
+
+  @override
+  String toString() =>
+      'CefMediaState(video: $videoActive, audio: $audioActive, $setting)';
+}
+
 /// The live frame surface backing a session: the global IOSurface id its
 /// off-screen CVPixelBuffer is wrapped over, plus the surface's PHYSICAL
 /// (Retina) pixel dimensions. Delivered by [CefWebController.onSurface] on each

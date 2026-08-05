@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart'
-    show TargetPlatform, debugDefaultTargetPlatformOverride;
+    show FlutterError, TargetPlatform, debugDefaultTargetPlatformOverride;
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_cef/flutter_cef.dart';
@@ -256,6 +256,200 @@ void main() {
       (_) {},
     );
     expect(c.cursor.value, SystemMouseCursors.text);
+  });
+
+  test('a media request reaches the handler and its answer is sent back',
+      () async {
+    final c = CefWebController(sessionId: 'm1');
+    await c.create(url: 'about:blank', width: 10, height: 10);
+    CefMediaPermissionRequest? seen;
+    c.onMediaPermissionRequest = (req) async {
+      seen = req;
+      return true;
+    };
+
+    // permissions bits: audio = 1<<0, video = 1<<1 -> both requested.
+    await messenger.handlePlatformMessage(
+      'flutter_cef',
+      const StandardMethodCodec().encodeMethodCall(
+        const MethodCall('mediaRequest', {
+          'sessionId': 'm1',
+          'id': 42,
+          'permissions': 3,
+          'origin': 'https://meet.google.com',
+        }),
+      ),
+      (_) {},
+    );
+    await Future<void>.delayed(Duration.zero);
+
+    expect(seen?.origin, 'https://meet.google.com');
+    expect(seen?.camera, isTrue);
+    expect(seen?.microphone, isTrue);
+    final args =
+        (log.firstWhere((m) => m.method == 'respondMediaRequest').arguments
+                as Map)
+            .cast<String, dynamic>();
+    expect(args['sessionId'], 'm1');
+    expect(args['id'], 42);
+    expect(args['allow'], isTrue);
+    expect(args['remember'], isTrue);
+  });
+
+  test('an abandoned media prompt denies WITHOUT remembering', () async {
+    // Regression: a defensive deny (nobody chose — the prompt was dismissed by
+    // a navigation / teardown) must not persist as a site-wide block. It did,
+    // which silently killed camera/mic for the site with no prompt left to
+    // undo it, because a remembered block is applied without ever asking.
+    final c = CefWebController(sessionId: 'm6');
+    await c.create(url: 'about:blank', width: 10, height: 10);
+    c.onMediaPermissionRequest = (_) async => null;
+
+    await messenger.handlePlatformMessage(
+      'flutter_cef',
+      const StandardMethodCodec().encodeMethodCall(
+        const MethodCall('mediaRequest', {
+          'sessionId': 'm6',
+          'id': 5,
+          'permissions': 3,
+          'origin': 'https://meet.google.com',
+        }),
+      ),
+      (_) {},
+    );
+    await Future<void>.delayed(Duration.zero);
+
+    final args =
+        (log.firstWhere((m) => m.method == 'respondMediaRequest').arguments
+                as Map)
+            .cast<String, dynamic>();
+    expect(args['allow'], isFalse);
+    expect(args['remember'], isFalse);
+  });
+
+  test('an explicit block IS remembered', () async {
+    final c = CefWebController(sessionId: 'm7');
+    await c.create(url: 'about:blank', width: 10, height: 10);
+    c.onMediaPermissionRequest = (_) async => false;
+
+    await messenger.handlePlatformMessage(
+      'flutter_cef',
+      const StandardMethodCodec().encodeMethodCall(
+        const MethodCall('mediaRequest', {
+          'sessionId': 'm7',
+          'id': 9,
+          'permissions': 3,
+          'origin': 'https://example.com',
+        }),
+      ),
+      (_) {},
+    );
+    await Future<void>.delayed(Duration.zero);
+
+    final args =
+        (log.firstWhere((m) => m.method == 'respondMediaRequest').arguments
+                as Map)
+            .cast<String, dynamic>();
+    expect(args['allow'], isFalse);
+    expect(args['remember'], isTrue);
+  });
+
+  test('a media request with no handler is denied, but not remembered',
+      () async {
+    // Fail closed: a host that never opted into showing permission UI must not
+    // let a page reach the camera — transiently, so wiring the UI up later
+    // still gets to ask.
+    final c = CefWebController(sessionId: 'm2');
+    await c.create(url: 'about:blank', width: 10, height: 10);
+
+    await messenger.handlePlatformMessage(
+      'flutter_cef',
+      const StandardMethodCodec().encodeMethodCall(
+        const MethodCall('mediaRequest', {
+          'sessionId': 'm2',
+          'id': 7,
+          'permissions': 2,
+          'origin': 'https://example.com',
+        }),
+      ),
+      (_) {},
+    );
+    await Future<void>.delayed(Duration.zero);
+
+    final args =
+        (log.firstWhere((m) => m.method == 'respondMediaRequest').arguments
+                as Map)
+            .cast<String, dynamic>();
+    expect(args['allow'], isFalse);
+    expect(args['remember'], isFalse);
+  });
+
+  test('a throwing media handler denies rather than granting', () async {
+    final c = CefWebController(sessionId: 'm3');
+    await c.create(url: 'about:blank', width: 10, height: 10);
+    c.onMediaPermissionRequest = (_) async => throw StateError('boom');
+    final reported = <Object>[];
+    final previousOnError = FlutterError.onError;
+    FlutterError.onError = (details) => reported.add(details.exception);
+    addTearDown(() => FlutterError.onError = previousOnError);
+
+    await messenger.handlePlatformMessage(
+      'flutter_cef',
+      const StandardMethodCodec().encodeMethodCall(
+        const MethodCall('mediaRequest', {
+          'sessionId': 'm3',
+          'id': 1,
+          'permissions': 1,
+          'origin': 'https://example.com',
+        }),
+      ),
+      (_) {},
+    );
+    await Future<void>.delayed(Duration.zero);
+
+    final args =
+        (log.firstWhere((m) => m.method == 'respondMediaRequest').arguments
+                as Map)
+            .cast<String, dynamic>();
+    expect(args['allow'], isFalse);
+    // A handler that blew up is not a human choosing "block".
+    expect(args['remember'], isFalse);
+    // The consumer's bug is reported, not swallowed.
+    expect(reported.single, isA<StateError>());
+  });
+
+  test('a media state event updates the controller status', () async {
+    final c = CefWebController(sessionId: 'm4');
+    await c.create(url: 'about:blank', width: 10, height: 10);
+    expect(c.mediaState.value.isCapturing, isFalse);
+    expect(c.mediaState.value.setting, CefMediaSetting.ask);
+
+    await messenger.handlePlatformMessage(
+      'flutter_cef',
+      const StandardMethodCodec().encodeMethodCall(
+        const MethodCall('mediaState', {
+          'sessionId': 'm4',
+          'videoActive': true,
+          'audioActive': false,
+          'setting': 1,
+        }),
+      ),
+      (_) {},
+    );
+
+    expect(c.mediaState.value.videoActive, isTrue);
+    expect(c.mediaState.value.isCapturing, isTrue);
+    expect(c.mediaState.value.setting, CefMediaSetting.allow);
+  });
+
+  test('setMediaSetting forwards the encoded decision', () async {
+    final c = CefWebController(sessionId: 'm5');
+    await c.setMediaSetting(CefMediaSetting.block);
+    final args =
+        (log.firstWhere((m) => m.method == 'setMediaSetting').arguments as Map)
+            .cast<String, dynamic>();
+    expect(args['sessionId'], 'm5');
+    expect(args['value'], 2);
   });
 
   test('session ids are unique when not supplied', () {
