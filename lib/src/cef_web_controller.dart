@@ -975,6 +975,25 @@ class CefWebController {
   }
 
 
+  /// Read this session's pixel-liveness counters (see [CefSessionStats]).
+  ///
+  /// Returns null when the platform has no such session (never created, or
+  /// already disposed). Cheap — the counters are maintained where present
+  /// frames already arrive, so this adds no IPC to the host.
+  Future<CefSessionStats?> sessionStats() async {
+    final raw = await _channel.invokeMapMethod<String, dynamic>(
+      'sessionStats',
+      {'sessionId': sessionId},
+    );
+    if (raw == null) return null;
+    return CefSessionStats(
+      presentCount: (raw['presentCount'] as num?)?.toInt() ?? 0,
+      lastPresentAgoMs: (raw['lastPresentAgoMs'] as num?)?.toInt(),
+      firstPresentSeen: raw['firstPresentSeen'] as bool? ?? false,
+      frozen: raw['frozen'] as bool? ?? false,
+    );
+  }
+
   /// Mute or unmute the page's audio output. Besides silencing it, a hidden
   /// AND muted page regains Chromium's intensive wake-up throttling (audible
   /// pages are exempt), so muting on hide keeps a background tile's timers

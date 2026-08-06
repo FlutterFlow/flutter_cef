@@ -153,6 +153,46 @@ class CefMediaState {
       'CefMediaState(video: $videoActive, audio: $audioActive, $setting)';
 }
 
+/// Pixel-liveness counters for a session: how many frames have actually
+/// reached the texture, and how long ago the last one did.
+///
+/// The signal that was missing. A JavaScript round-trip proves the renderer
+/// still executes script, which a page can do for minutes after compositing
+/// has died — the "JS alive, pixels dead" wedge. [presentCount] advancing is
+/// the only honest evidence the page is still being drawn.
+class CefSessionStats {
+  const CefSessionStats({
+    required this.presentCount,
+    required this.lastPresentAgoMs,
+    required this.firstPresentSeen,
+    required this.frozen,
+  });
+
+  /// Frames delivered to the texture since this session was created. Compare
+  /// two readings over time: unchanged while the page should be animating
+  /// means the pixels are wedged, whatever a JS probe says.
+  final int presentCount;
+
+  /// Milliseconds since the most recent present, or null if none has arrived.
+  /// High on a genuinely static page too — pair it with [presentCount] deltas
+  /// rather than treating it as a fault on its own.
+  final int? lastPresentAgoMs;
+
+  /// Whether this session has ever painted. False means establishment never
+  /// completed; the first-paint watchdog owns that case.
+  final bool firstPresentSeen;
+
+  /// Whether the native browser is currently discarded (the texture is holding
+  /// the last painted frame on purpose). A frozen session produces no presents
+  /// BY DESIGN, so this distinguishes intended stillness from a wedge.
+  final bool frozen;
+
+  @override
+  String toString() =>
+      'CefSessionStats(presents: $presentCount, lastAgoMs: $lastPresentAgoMs, '
+      'painted: $firstPresentSeen, frozen: $frozen)';
+}
+
 /// The live frame surface backing a session: the global IOSurface id its
 /// off-screen CVPixelBuffer is wrapped over, plus the surface's PHYSICAL
 /// (Retina) pixel dimensions. Delivered by [CefWebController.onSurface] on each

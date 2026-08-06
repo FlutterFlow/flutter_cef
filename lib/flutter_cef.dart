@@ -15,6 +15,7 @@ export 'package:flutter_cef_platform_interface/flutter_cef_platform_interface.da
         CefFindResult,
         CefJsDialogRequest,
         CefLoadError,
+        CefSessionStats,
         CefMediaPermissionRequest,
         CefMediaSetting,
         CefMediaState,
