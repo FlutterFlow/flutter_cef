@@ -125,6 +125,21 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     case "loadTrusted": loadTrusted(args, result)
     case "resize": resize(args, result)
     case "getFrameSurface": getFrameSurface(args, result)
+    case "sessionStats":
+      // Pixel liveness, for a consumer that needs to tell a live page from a
+      // stale texture. A JS round-trip proves only that the renderer executes
+      // script; presentCount/lastPresentAgoMs prove frames are still reaching
+      // the texture, which is what "frozen" actually means to a user.
+      guard let sid = args["sessionId"] as? String, let s = sessions[sid] else {
+        result(nil); return
+      }
+      let st = s.presentStats()
+      result([
+        "presentCount": Int(clamping: st.count),
+        "lastPresentAgoMs": st.lastAgoMs as Any,
+        "firstPresentSeen": st.firstSeen,
+        "frozen": frozenSessions.contains(sid),
+      ])
     case "dispose": destroy(args, result)
     case "pointer": pointer(args, result)
     case "key": key(args, result)

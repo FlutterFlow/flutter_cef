@@ -50,6 +50,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
@@ -177,6 +178,50 @@ constexpr uint8_t kOpSetPumpInterval = 0x3b;  // {u16 BE ms} visible begin-frame
 // the SendFrame `< 0` check against the teardown `= -1` store (UB, and benign
 // only because a closed-fd write is a safe no-op); the atomic makes it defined.
 std::atomic<int> g_ipc_fd{-1};
+
+// ── Renderer crash-loop detector ─────────────────────────────────────────────
+// A renderer that dies is normally recoverable: OnRenderProcessTerminated
+// reloads and the fresh child takes over. But if the child can no longer be
+// SPAWNED at all, that reload re-crashes instantly and loops forever, and the
+// host never notices: the browser process is healthy, so the IPC pipe stays up,
+// no processGone is ever emitted, and the embedder sees a tile stuck on its last
+// frame with no signal and no way back. The observed trigger is the app bundle
+// being replaced under a running host (a rebuild/relaunch): every child then
+// SIGTRAPs at startup resolving the CEF framework it was launched from.
+//
+// So make the unrecoverable case LOOK like the recoverable one. Past a burst
+// threshold, exit deliberately: the pipe EOFs, the plugin reports processGone,
+// and the embedder's existing recreate funnel spawns a fresh host — which
+// re-resolves the binary from disk and therefore picks up the NEW bundle. A
+// silent wedge becomes the recovery path that already works.
+std::mutex g_renderer_crash_mutex;
+int g_renderer_crash_count = 0;
+std::chrono::steady_clock::time_point g_renderer_crash_window_start;
+// Tuned to be unreachable by ordinary flakiness: an isolated renderer crash (or
+// a few across unrelated tabs) reloads normally and never trips this.
+constexpr int kRendererCrashBurstLimit = 4;
+constexpr std::chrono::seconds kRendererCrashWindow{10};
+
+void DoShutdown();  // defined below; the crash-loop exit reuses it
+
+/// Record a renderer death and report whether they are arriving as a burst —
+/// i.e. the reload is re-crashing rather than recovering. UI-thread only (the
+/// single caller is OnRenderProcessTerminated), but locked anyway since the
+/// counter is process-global across every slot: a stale-bundle host fails for
+/// ALL its browsers at once, which is exactly the signal we want to add up.
+bool NoteRendererCrashAndCheckLoop() {
+  const auto now = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lock(g_renderer_crash_mutex);
+  if (g_renderer_crash_count == 0 ||
+      now - g_renderer_crash_window_start > kRendererCrashWindow) {
+    // First death, or the previous burst aged out: start a fresh window so
+    // unrelated one-off crashes over a long session never accumulate.
+    g_renderer_crash_window_start = now;
+    g_renderer_crash_count = 1;
+    return false;
+  }
+  return ++g_renderer_crash_count >= kRendererCrashBurstLimit;
+}
 std::mutex g_ipc_write_mutex;
 
 // Per-browser state. One cef_host process now multiplexes N browsers (one per
@@ -1519,6 +1564,16 @@ class HostClient : public CefClient,
     SendLog(slot_->browser_id, "renderer terminated (status " +
                                    std::to_string(status) + ") — reloading");
     if (router_) router_->OnRenderProcessTerminated(browser);
+    if (NoteRendererCrashAndCheckLoop()) {
+      // Reloading again would just re-crash: the children can't start. Exit so
+      // the embedder's processGone → recreate path takes over (see the detector).
+      SendLog(0,
+              "renderer crash LOOP (" + std::to_string(kRendererCrashBurstLimit) +
+                  " in " + std::to_string(kRendererCrashWindow.count()) +
+                  "s) — children cannot start; exiting so the host is respawned");
+      DoShutdown();
+      return;
+    }
     if (browser) browser->ReloadIgnoreCache();
   }
 

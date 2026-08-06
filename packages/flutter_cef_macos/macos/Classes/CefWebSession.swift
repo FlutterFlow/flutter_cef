@@ -117,6 +117,35 @@ final class CefWebSession: NSObject, FlutterTexture {
   let sessionId: String
   private(set) var textureId: Int64 = 0
 
+  // ── Present liveness counters ────────────────────────────────────────────
+  // Pixel liveness had NO observable signal: a probe could prove the renderer's
+  // JS loop was alive (eval round-trip) while the texture had been frozen for
+  // minutes — the exact "JS alive, pixels dead" wedge. These count what actually
+  // reaches the texture, so a consumer can tell a live page from a stale one
+  // without guessing. Written on the reader thread, read from the main thread
+  // via sessionStats(), so both go through presentStatsLock.
+  private let presentStatsLock = NSLock()
+  private var _presentCount: UInt64 = 0
+  private var _lastPresentUptimeNs: UInt64 = 0
+
+  /// Total presents this session has delivered, the wall-clock age of the most
+  /// recent one (nil if none), and whether it ever painted.
+  func presentStats() -> (count: UInt64, lastAgoMs: Int?, firstSeen: Bool) {
+    presentStatsLock.lock()
+    defer { presentStatsLock.unlock() }
+    let ago: Int? = _lastPresentUptimeNs == 0
+      ? nil
+      : Int((DispatchTime.now().uptimeNanoseconds &- _lastPresentUptimeNs) / 1_000_000)
+    return (_presentCount, ago, _presentCount > 0)
+  }
+
+  private func notePresent() {
+    presentStatsLock.lock()
+    _presentCount &+= 1
+    _lastPresentUptimeNs = DispatchTime.now().uptimeNanoseconds
+    presentStatsLock.unlock()
+  }
+
   // Wire binding to the owning host: the host this session is multiplexed on and
   // the Swift-assigned browserId it routes by. Set once via attach() right after
   // CefProfileHost.createBrowser() allocates the id.
@@ -649,6 +678,9 @@ final class CefWebSession: NSObject, FlutterTexture {
   func handleFrame(_ op: UInt8, _ payload: [UInt8]) {
     switch op {
     case Self.opPresent:
+      // Count FIRST: a present that arrives but fails to adopt is still proof
+      // the producer is painting, which is what liveness asks about.
+      notePresent()
       // Read textureId under bufferLock — dispose() writes it under the same
       // lock on the main thread, so this avoids a data race on the Int64.
       bufferLock.lock()
