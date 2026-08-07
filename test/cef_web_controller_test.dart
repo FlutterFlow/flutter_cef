@@ -1078,4 +1078,174 @@ void main() {
         reason: 'spacing only applies under contention — a single spawn returns '
             'immediately and never waits the gap');
   });
+
+  // ── context menu ────────────────────────────────────────────────────────
+  //
+  // The invariant under test is "answer exactly once". CEF requires the menu
+  // callback be continued or cancelled; a dropped answer wedges the page's menu
+  // handling so later right-clicks are silently ignored. So every path — chosen,
+  // dismissed, no handler, throwing handler — must produce one
+  // chooseContextMenu.
+
+  Future<void> sendContextMenu(String json, {int id = 1}) =>
+      messenger.handlePlatformMessage(
+        'flutter_cef',
+        const StandardMethodCodec().encodeMethodCall(
+          MethodCall('contextMenu', {
+            'sessionId': 'cm',
+            'id': id,
+            'json': json,
+          }),
+        ),
+        (_) {},
+      );
+
+  test('a chosen context-menu command is sent back', () async {
+    final c = CefWebController(sessionId: 'cm');
+    await c.create(url: 'about:blank', width: 10, height: 10);
+    CefContextMenuRequest? seen;
+    c.onContextMenu = (req) async {
+      seen = req;
+      return 101;
+    };
+    log.clear();
+
+    await sendContextMenu(jsonEncode({
+      'x': 12,
+      'y': 34,
+      'editable': true,
+      'linkUrl': 'https://example.com/a',
+      'sourceUrl': '',
+      'selectionText': 'picked text',
+      'misspelledWord': 'teh',
+      'items': [
+        {
+          'type': 'command',
+          'label': 'Back',
+          'commandId': 100,
+          'enabled': false,
+          'checked': false,
+        },
+        {'type': 'separator'},
+        {
+          'type': 'command',
+          'label': 'Copy',
+          'commandId': 101,
+          'enabled': true,
+          'checked': false,
+        },
+        {
+          'type': 'submenu',
+          'label': 'Spelling',
+          'commandId': 0,
+          'enabled': true,
+          'checked': false,
+          'items': [
+            {
+              'type': 'command',
+              'label': 'the',
+              'commandId': 200,
+              'enabled': true,
+              'checked': false,
+            },
+          ],
+        },
+      ],
+    }));
+
+    // Chromium's own state survives the round trip — Back disabled, the
+    // separator kept so grouping is drawable, the submenu nested.
+    expect(seen, isNotNull);
+    expect(seen!.x, 12);
+    expect(seen!.editable, isTrue);
+    expect(seen!.linkUrl, 'https://example.com/a');
+    expect(seen!.selectionText, 'picked text');
+    expect(seen!.misspelledWord, 'teh');
+    expect(seen!.items, hasLength(4));
+    expect(seen!.items[0].enabled, isFalse);
+    expect(seen!.items[1].type, CefContextMenuItemType.separator);
+    expect(seen!.items[3].type, CefContextMenuItemType.submenu);
+    expect(seen!.items[3].items.single.commandId, 200);
+
+    final call = log.singleWhere((m) => m.method == 'chooseContextMenu');
+    final args = (call.arguments as Map).cast<String, dynamic>();
+    expect(args['id'], 1);
+    expect(args['commandId'], 101);
+  });
+
+  test('returning null dismisses rather than dropping the callback', () async {
+    final c = CefWebController(sessionId: 'cm');
+    await c.create(url: 'about:blank', width: 10, height: 10);
+    c.onContextMenu = (_) async => null;
+    log.clear();
+
+    await sendContextMenu('{"items":[]}');
+
+    final args = (log
+            .singleWhere((m) => m.method == 'chooseContextMenu')
+            .arguments as Map)
+        .cast<String, dynamic>();
+    expect(args['commandId'], 0);
+  });
+
+  test('no handler still answers (dismiss), so the menu is not wedged',
+      () async {
+    final c = CefWebController(sessionId: 'cm');
+    await c.create(url: 'about:blank', width: 10, height: 10);
+    log.clear();
+
+    await sendContextMenu('{"items":[]}');
+
+    final args = (log
+            .singleWhere((m) => m.method == 'chooseContextMenu')
+            .arguments as Map)
+        .cast<String, dynamic>();
+    expect(args['commandId'], 0);
+  });
+
+  test('a throwing handler is reported and still answers', () async {
+    final c = CefWebController(sessionId: 'cm');
+    await c.create(url: 'about:blank', width: 10, height: 10);
+    c.onContextMenu = (_) async => throw StateError('boom');
+    log.clear();
+
+    final errors = <Object>[];
+    final prior = FlutterError.onError;
+    FlutterError.onError = (d) => errors.add(d.exception);
+    try {
+      await sendContextMenu('{"items":[]}');
+    } finally {
+      FlutterError.onError = prior;
+    }
+
+    expect(errors.single, isA<StateError>());
+    final args = (log
+            .singleWhere((m) => m.method == 'chooseContextMenu')
+            .arguments as Map)
+        .cast<String, dynamic>();
+    expect(args['commandId'], 0);
+  });
+
+  test('malformed menu json is reported and answered, never silent', () async {
+    final c = CefWebController(sessionId: 'cm');
+    await c.create(url: 'about:blank', width: 10, height: 10);
+    c.onContextMenu = (_) async => 5;
+    log.clear();
+
+    final errors = <Object>[];
+    final prior = FlutterError.onError;
+    FlutterError.onError = (d) => errors.add(d.exception);
+    try {
+      await sendContextMenu('not json at all');
+    } finally {
+      FlutterError.onError = prior;
+    }
+
+    expect(errors, isNotEmpty);
+    final args = (log
+            .singleWhere((m) => m.method == 'chooseContextMenu')
+            .arguments as Map)
+        .cast<String, dynamic>();
+    expect(args['commandId'], 0);
+  });
 }

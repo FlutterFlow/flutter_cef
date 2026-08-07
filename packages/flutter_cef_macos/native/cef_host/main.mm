@@ -107,7 +107,7 @@ namespace {
 // stale embedded copy). BUMP THIS on any semantic change to the kOp wire protocol
 // below, together with CefProfileHost.protocolVersion (Swift side) — the two must
 // stay equal. Hosts predating the handshake send a 1-byte payload and read as v0.
-constexpr uint8_t kCefHostProtocolVersion = 6;
+constexpr uint8_t kCefHostProtocolVersion = 7;
 
 // ---- Opcodes ----
 constexpr uint8_t kOpPresent = 0x01;
@@ -135,6 +135,7 @@ constexpr uint8_t kOpCreated = 0x1c;    // {} H3: OnAfterCreated — browser is 
 constexpr uint8_t kOpCreateFailed = 0x1d; // {} H7: async CreateBrowser dispatch failed; host drops the session
 constexpr uint8_t kOpMediaRequest = 0x1e; // {u32 id}{u32 requested}{utf8 origin} page called getUserMedia and there is NO stored decision -> host prompts
 constexpr uint8_t kOpMediaState = 0x1f;   // {u8 videoActive}{u8 audioActive}{u8 setting 0=ask 1=allow} page media status -> URL-bar "in use" / "allowed" indicator
+constexpr uint8_t kOpContextMenu = 0x20;  // {u32 id}{utf8 json} right-click in the page: Chromium's OWN menu model + params, for the host to draw in Flutter (OSR has no window to put a native menu in)
 constexpr uint8_t kOpPointer = 0x10;
 constexpr uint8_t kOpResize = 0x11;          // {u32 w}{u32 h}{f64 dpr} — producer-allocates: no sid
 constexpr uint8_t kOpKey = 0x12;
@@ -171,6 +172,7 @@ constexpr uint8_t kOpEditCommand = 0x38;      // {u8 cmd} run a focused-frame ed
 constexpr uint8_t kOpOpenAuthWindow = 0x39;   // {utf8 url} open a windowed Chrome-runtime browser for a WebAuthn/Touch ID ceremony the OSR tile can't host (shares the tile's cookie jar)
 constexpr uint8_t kOpSetAudioMuted = 0x3a;    // {u8 muted} -> CefBrowserHost::SetAudioMuted; a hidden AND muted page regains intensive wake-up throttling (audible pages are exempt)
 constexpr uint8_t kOpSetPumpInterval = 0x3b;  // {u16 BE ms} visible begin-frame cadence for this slot, clamped to [8, 250]; hidden slots stay on the 100ms no-op poll
+constexpr uint8_t kOpContextMenuCommand = 0x3e;  // {u32 id}{u32 commandId} run the chosen command from a kOpContextMenu (commandId 0 = dismissed); Chromium executes it, so copy/paste/back/spellcheck behave exactly as in Chrome
 
 // ---- Shared runtime state ----
 // Atomic: the reader thread reads it (ReadAll), SendFrame on any thread reads it,
@@ -264,6 +266,14 @@ struct Slot {
     std::string origin;
   };
   std::map<uint32_t, PendingMedia> media_requests;
+
+  // Right-click menus awaiting a choice from the Flutter side. Same shape as
+  // media_requests and for the same reason: OSR has no window, so the menu is
+  // drawn by the host and the callback has to survive until the user picks.
+  // CEF requires the callback be answered (Continue or Cancel) exactly once, so
+  // a dropped entry would leave the page's menu logic hanging.
+  std::map<uint32_t, CefRefPtr<CefRunContextMenuCallback>> context_menus;
+  uint32_t next_context_menu_id = 1;
   uint32_t media_req_next = 1;
   // Last capture state reported by OnMediaAccessChange, so the complete media
   // status can be re-sent (on load, or on demand) without waiting for a change.
@@ -1446,6 +1456,49 @@ static void OpenNativeAuthPopup(const CefString& url, const CefPopupFeatures& f,
   [win release];  // drop our alloc +1; PopupClient's retain keeps it alive
 }
 
+std::string JsonEscape(const std::string& s);  // defined below
+
+// Flatten Chromium's CefMenuModel into JSON for the Flutter side to draw.
+// Recurses one level for submenus (the spellcheck / "Spelling and Grammar"
+// blocks are submenus). Separators are emitted so the drawn menu keeps
+// Chromium's grouping instead of one undifferentiated list.
+std::string SerializeMenuModel(CefRefPtr<CefMenuModel> model) {
+  std::string out = "[";
+  const size_t n = model->GetCount();
+  for (size_t i = 0; i < n; ++i) {
+    if (i) out += ",";
+    const cef_menu_item_type_t type = model->GetTypeAt(i);
+    const int command = model->GetCommandIdAt(i);
+    out += "{";
+    if (type == MENUITEMTYPE_SEPARATOR) {
+      out += "\"type\":\"separator\"";
+    } else {
+      const char* t = type == MENUITEMTYPE_CHECK      ? "check"
+                      : type == MENUITEMTYPE_RADIO    ? "radio"
+                      : type == MENUITEMTYPE_SUBMENU  ? "submenu"
+                                                      : "command";
+      out += "\"type\":\"" + std::string(t) + "\",";
+      out += "\"label\":\"" + JsonEscape(model->GetLabelAt(i).ToString()) + "\",";
+      out += "\"commandId\":" + std::to_string(command) + ",";
+      // Chromium owns enabled/checked — reporting them keeps the drawn menu
+      // honest (e.g. Paste greyed out with an empty clipboard) without Campus
+      // re-deriving state it cannot see.
+      out += "\"enabled\":" +
+             std::string(model->IsEnabledAt(i) ? "true" : "false") + ",";
+      out += "\"checked\":" +
+             std::string(model->IsCheckedAt(i) ? "true" : "false");
+      if (type == MENUITEMTYPE_SUBMENU) {
+        if (CefRefPtr<CefMenuModel> sub = model->GetSubMenuAt(i)) {
+          out += ",\"items\":" + SerializeMenuModel(sub);
+        }
+      }
+    }
+    out += "}";
+  }
+  out += "]";
+  return out;
+}
+
 class HostClient : public CefClient,
                    public CefLoadHandler,
                    public CefDisplayHandler,
@@ -1454,6 +1507,7 @@ class HostClient : public CefClient,
                    public CefJSDialogHandler,
                    public CefDownloadHandler,
                    public CefRequestHandler,
+                   public CefContextMenuHandler,
                    public CefMessageRouterBrowserSide::Handler {
  public:
   explicit HostClient(std::shared_ptr<Slot> slot) : slot_(std::move(slot)) {
@@ -1475,6 +1529,69 @@ class HostClient : public CefClient,
   CefRefPtr<CefJSDialogHandler> GetJSDialogHandler() override { return this; }
   CefRefPtr<CefDownloadHandler> GetDownloadHandler() override { return this; }
   CefRefPtr<CefRequestHandler> GetRequestHandler() override { return this; }
+  CefRefPtr<CefContextMenuHandler> GetContextMenuHandler() override {
+    return this;
+  }
+
+  // ── CefContextMenuHandler ──────────────────────────────────────────────
+  //
+  // Chromium already builds a complete, correctly-stateful context menu for
+  // every right-click (back/forward/reload, cut/copy/paste with the right items
+  // greyed out, view-source, copy-link-address, the whole spellcheck block with
+  // live dictionary suggestions). Without a handler CEF constructs it and throws
+  // it away, which is why right-click did nothing in a web tile.
+  //
+  // We can't let CEF display it: the default display path is a native menu
+  // parented to a window, and OSR has none. So RunContextMenu takes over
+  // display — serialise the model Chromium built, hand it to Flutter to draw in
+  // the Campus design system, and send the chosen command id back so CHROMIUM
+  // executes it. That keeps every command's behaviour and enabled/checked state
+  // authoritative instead of reimplementing it.
+  bool RunContextMenu(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame>,
+                      CefRefPtr<CefContextMenuParams> params,
+                      CefRefPtr<CefMenuModel> model,
+                      CefRefPtr<CefRunContextMenuCallback> callback) override {
+    CEF_REQUIRE_UI_THREAD();
+    if (!slot_ || !params || !model || !callback) return false;
+    // An empty model means Chromium had nothing to offer; let the default
+    // (no-op) path handle it rather than showing an empty menu.
+    if (model->GetCount() == 0) return false;
+
+    uint32_t id;
+    {
+      std::lock_guard<std::mutex> lock(slot_->surface_mutex);
+      id = slot_->next_context_menu_id++;
+      slot_->context_menus[id] = callback;
+    }
+
+    std::string json = "{";
+    json += "\"x\":" + std::to_string(params->GetXCoord()) + ",";
+    json += "\"y\":" + std::to_string(params->GetYCoord()) + ",";
+    json += "\"editable\":" + std::string(params->IsEditable() ? "true" : "false") + ",";
+    json += "\"linkUrl\":\"" + JsonEscape(params->GetLinkUrl().ToString()) + "\",";
+    json += "\"sourceUrl\":\"" + JsonEscape(params->GetSourceUrl().ToString()) + "\",";
+    json += "\"selectionText\":\"" + JsonEscape(params->GetSelectionText().ToString()) + "\",";
+    json += "\"misspelledWord\":\"" + JsonEscape(params->GetMisspelledWord().ToString()) + "\",";
+    json += "\"items\":" + SerializeMenuModel(model);
+    json += "}";
+
+    std::vector<uint8_t> p(4 + json.size());
+    for (int i = 0; i < 4; ++i) p[i] = (id >> (8 * (3 - i))) & 0xff;
+    std::memcpy(p.data() + 4, json.data(), json.size());
+    SendFrame(slot_->browser_id, kOpContextMenu, p.data(),
+              static_cast<uint32_t>(p.size()));
+    return true;  // we display it
+  }
+
+  // The menu is gone for a reason other than a pick (page navigated, browser
+  // destroyed). Drop our pending entry — CEF has already invalidated the
+  // callback, so answering it later would be a use-after-free.
+  void OnContextMenuDismissed(CefRefPtr<CefBrowser>,
+                              CefRefPtr<CefFrame>) override {
+    if (!slot_) return;
+    std::lock_guard<std::mutex> lock(slot_->surface_mutex);
+    slot_->context_menus.clear();
+  }
 
   // CefDownloadHandler: allow downloads (CEF blocks them without a handler) and
   // notify the host. Continue with an empty path + show_dialog so the user picks
@@ -2402,6 +2519,29 @@ void SetMediaContentSetting(const std::shared_ptr<Slot>& slot,
 // site-wide BLOCK would permanently, silently kill camera/mic for the site with
 // no request left to re-prompt on. Deny transiently instead: the page simply
 // asks again next time.
+// Answer a Flutter-drawn context menu. commandId 0 means dismissed: CEF requires
+// the callback be answered exactly once either way, so a dismissal must Cancel
+// rather than simply drop the entry — otherwise the page's menu logic hangs and
+// the next right-click is ignored.
+void DoContextMenuCommand(const std::shared_ptr<Slot>& slot, uint32_t id,
+                          uint32_t command) {
+  CEF_REQUIRE_UI_THREAD();
+  CefRefPtr<CefRunContextMenuCallback> cb;
+  {
+    std::lock_guard<std::mutex> lock(slot->surface_mutex);
+    auto it = slot->context_menus.find(id);
+    if (it == slot->context_menus.end()) return;  // already answered/dismissed
+    cb = it->second;
+    slot->context_menus.erase(it);
+  }
+  if (!cb) return;
+  if (command == 0) {
+    cb->Cancel();
+  } else {
+    cb->Continue(static_cast<int>(command), EVENTFLAG_NONE);
+  }
+}
+
 void DoMediaResponse(const std::shared_ptr<Slot>& slot, uint32_t id, bool allow,
                      bool remember) {
   CEF_REQUIRE_UI_THREAD();
@@ -2944,6 +3084,18 @@ void IpcReadLoop() {
         bool remember = plen >= 6 && p[5] != 0;
         CefPostTask(TID_UI,
                     base::BindOnce(&DoMediaResponse, slot, id, allow, remember));
+        break;
+      }
+      case kOpContextMenuCommand: {
+        // {u32 id}{u32 commandId} — the user picked an item in the Flutter-drawn
+        // context menu (commandId 0 = dismissed without choosing). Chromium runs
+        // the command, so behaviour matches Chrome exactly.
+        if (!slot) break;
+        if (plen < 8) break;
+        uint32_t id = ReadU32BE(p);
+        uint32_t command = ReadU32BE(p + 4);
+        CefPostTask(TID_UI,
+                    base::BindOnce(&DoContextMenuCommand, slot, id, command));
         break;
       }
       case kOpSetMediaSetting: {

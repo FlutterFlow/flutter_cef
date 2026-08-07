@@ -39,7 +39,7 @@ final class CefProfileHost {
   // processGone) instead of silently mis-parsing frames into frozen/blank tiles; the
   // skew vectors are FLUTTER_CEF_HOST overrides, stale from-source builds, and stale
   // embedded copies (the content-hash fetch can't drift on the normal path).
-  static let protocolVersion: UInt8 = 6
+  static let protocolVersion: UInt8 = 7
 
   // Profile identity / config.
   let profileId: String
