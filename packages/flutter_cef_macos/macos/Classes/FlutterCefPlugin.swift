@@ -240,7 +240,13 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       }
       result(nil)
     case "showDevTools":
-      withSession(args) { $0.showDevTools() }
+      withSession(args) {
+        if let x = args["inspectX"] as? Int, let y = args["inspectY"] as? Int {
+          $0.showDevTools(inspectAt: (x: x, y: y))
+        } else {
+          $0.showDevTools()
+        }
+      }
       result(nil)
     case "enableAgentControl":
       // CEF-2b: broker a token-gated CDP endpoint scoped to THIS tile's CDP target.

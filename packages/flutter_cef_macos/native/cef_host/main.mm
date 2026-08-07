@@ -135,7 +135,7 @@ constexpr uint8_t kOpCreated = 0x1c;    // {} H3: OnAfterCreated — browser is 
 constexpr uint8_t kOpCreateFailed = 0x1d; // {} H7: async CreateBrowser dispatch failed; host drops the session
 constexpr uint8_t kOpMediaRequest = 0x1e; // {u32 id}{u32 requested}{utf8 origin} page called getUserMedia and there is NO stored decision -> host prompts
 constexpr uint8_t kOpMediaState = 0x1f;   // {u8 videoActive}{u8 audioActive}{u8 setting 0=ask 1=allow} page media status -> URL-bar "in use" / "allowed" indicator
-constexpr uint8_t kOpContextMenu = 0x20;  // {u32 id}{utf8 json} right-click in the page: Chromium's OWN menu model + params, for the host to draw in Flutter (OSR has no window to put a native menu in)
+constexpr uint8_t kOpContextMenu = 0x40;  // {u32 id}{utf8 json} right-click in the page: Chromium's OWN menu model + params, for the host to draw in Flutter (OSR has no window to put a native menu in)
 constexpr uint8_t kOpPointer = 0x10;
 constexpr uint8_t kOpResize = 0x11;          // {u32 w}{u32 h}{f64 dpr} — producer-allocates: no sid
 constexpr uint8_t kOpKey = 0x12;
@@ -161,7 +161,7 @@ constexpr uint8_t kOpDeleteCookie = 0x2f;   // {utf8 url\0name} delete one
 constexpr uint8_t kOpImeSetComp = 0x30;     // {utf8 text} IME composition update
 constexpr uint8_t kOpImeCommit = 0x31;      // {utf8 text} commit composed text
 constexpr uint8_t kOpImeCancel = 0x32;      // {} cancel composition
-constexpr uint8_t kOpShowDevTools = 0x33;   // {} open DevTools in a window
+constexpr uint8_t kOpShowDevTools = 0x33;   // {} or {u32 x}{u32 y} open DevTools in a window; with a point, opened INSPECTING the element there (the right-click "Inspect" path)
 constexpr uint8_t kOpLoadTrusted = 0x34;    // {utf8 url} host content-load, exempt from allowlist
 constexpr uint8_t kOpSetVisible = 0x35;     // {u8 visible} -> CefBrowserHost::WasHidden(!visible)
 constexpr uint8_t kOpResolveTargetId = 0x36;  // {} resolve this browser's CDP targetId (CEF-2b) -> kOpTargetId
@@ -1952,9 +1952,30 @@ class HostClient : public CefClient,
             colon == std::string::npos ? std::string() : url.substr(0, colon);
         std::transform(scheme.begin(), scheme.end(), scheme.begin(),
                        [](unsigned char c) { return std::tolower(c); });
-        // `about:` (blank placeholder) is always allowed; anything else must be
-        // in the host allowlist or the navigation is refused.
-        if (scheme != "about" && g_allowed_schemes.count(scheme) == 0) {
+        // `view-source:` is judged by what it wraps: viewing the source of a
+        // page you were already allowed to LOAD grants no new reach (it renders
+        // bytes as text and runs nothing), whereas refusing it silently breaks
+        // Chromium's own View Page Source menu command. `view-source:file:///…`
+        // stays refused, because `file` is not in the allowlist.
+        //
+        // Nesting is not recursive in Chromium (`view-source:view-source:` is
+        // rejected upstream), so one unwrap is the whole story.
+        if (scheme == "view-source") {
+          const std::string inner = url.substr(colon + 1);
+          const size_t inner_colon = inner.find(':');
+          std::string inner_scheme = inner_colon == std::string::npos
+                                         ? std::string()
+                                         : inner.substr(0, inner_colon);
+          std::transform(inner_scheme.begin(), inner_scheme.end(),
+                         inner_scheme.begin(),
+                         [](unsigned char c) { return std::tolower(c); });
+          if (g_allowed_schemes.count(inner_scheme) == 0) {
+            return true;  // cancel — the wrapped scheme is not permitted
+          }
+        } else if (scheme != "about" &&
+                   g_allowed_schemes.count(scheme) == 0) {
+          // `about:` (blank placeholder) is always allowed; anything else must
+          // be in the host allowlist or the navigation is refused.
           return true;  // cancel
         }
       }
@@ -2753,14 +2774,21 @@ void DoDeleteCookie(const std::shared_ptr<Slot>& slot, const std::string& url,
   if (mgr) mgr->DeleteCookies(url, name, nullptr);
 }
 
-void DoShowDevTools(const std::shared_ptr<Slot>& slot) {
+void DoShowDevTools(const std::shared_ptr<Slot>& slot, int inspect_x,
+                    int inspect_y) {
   if (!slot->browser) return;
   // Windowed DevTools (default CefWindowInfo is windowed) — the OSR host can
   // still host a real window. null client lets CEF manage it.
+  //
+  // A non-negative point opens DevTools already inspecting the element there,
+  // which is what "Inspect" from a right-click means. DevTools is a real window
+  // (unlike the page itself), so nothing here depends on OSR having one.
   CefWindowInfo window_info;
   CefBrowserSettings settings;
-  slot->browser->GetHost()->ShowDevTools(window_info, nullptr, settings,
-                                         CefPoint());
+  const CefPoint at = (inspect_x >= 0 && inspect_y >= 0)
+                          ? CefPoint(inspect_x, inspect_y)
+                          : CefPoint();
+  slot->browser->GetHost()->ShowDevTools(window_info, nullptr, settings, at);
 }
 
 // CEF-2b: resolve a browser's CDP targetId so the Swift relay can scope an agent's
@@ -3210,10 +3238,17 @@ void IpcReadLoop() {
         CefPostTask(TID_UI, base::BindOnce(&DoImeCommitText, slot, text));
         break;
       }
-      case kOpShowDevTools:
+      case kOpShowDevTools: {
         if (!slot) break;
-        CefPostTask(TID_UI, base::BindOnce(&DoShowDevTools, slot));
+        // Back-compat: an empty payload still means "just open DevTools".
+        int ix = -1, iy = -1;
+        if (plen >= 8) {
+          ix = static_cast<int>(ReadU32BE(p));
+          iy = static_cast<int>(ReadU32BE(p + 4));
+        }
+        CefPostTask(TID_UI, base::BindOnce(&DoShowDevTools, slot, ix, iy));
         break;
+      }
       case kOpResolveTargetId:
         if (!slot) break;
         CefPostTask(TID_UI, base::BindOnce(&DoResolveTargetId, slot));

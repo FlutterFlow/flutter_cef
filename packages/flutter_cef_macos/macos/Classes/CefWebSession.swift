@@ -52,7 +52,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   // cef_host -> us: a page called getUserMedia and the site has no remembered
   // decision, so the host must show a permission prompt. {u32 id}{u32 mask}{utf8 origin}
   private static let opMediaRequest: UInt8 = 0x1e
-  private static let opContextMenu: UInt8 = 0x20
+  private static let opContextMenu: UInt8 = 0x40
   // cef_host -> us: {u8 videoActive}{u8 audioActive}{u8 setting 0=ask 1=allow}
   private static let opMediaState: UInt8 = 0x1f
   private static let opNavigate: UInt8 = 0x20
@@ -570,7 +570,18 @@ final class CefWebSession: NSObject, FlutterTexture {
     sendFrame(Self.opDeleteCookie, Array((url + "\u{0}" + name).utf8))
   }
 
-  func showDevTools() { sendFrame(Self.opShowDevTools) }
+  /// Open DevTools. With a point (page DIP coords) it opens INSPECTING the
+  /// element there — the right-click "Inspect" path.
+  func showDevTools(inspectAt: (x: Int, y: Int)? = nil) {
+    guard let at = inspectAt else {
+      sendFrame(Self.opShowDevTools)
+      return
+    }
+    var p = [UInt8]()
+    appendU32(&p, UInt32(truncatingIfNeeded: max(0, at.x)))
+    appendU32(&p, UInt32(truncatingIfNeeded: max(0, at.y)))
+    sendFrame(Self.opShowDevTools, p)
+  }
 
   func imeSetComposition(_ text: String) {
     sendFrame(Self.opImeSetComp, Array(text.utf8))

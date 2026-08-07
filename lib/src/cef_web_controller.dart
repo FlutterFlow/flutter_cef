@@ -915,8 +915,18 @@ class CefWebController {
   }
 
   /// Open Chromium's DevTools for this page in a separate window.
-  Future<void> openDevTools() =>
-      _channel.invokeMethod('showDevTools', {'sessionId': sessionId});
+  ///
+  /// [inspectAt] (page DIP coordinates, as reported by
+  /// [CefContextMenuRequest.x]/[CefContextMenuRequest.y]) opens DevTools already
+  /// inspecting the element at that point — what "Inspect" on a right-click
+  /// means. DevTools is a real window even though the page is windowless, so
+  /// this works from an OSR view.
+  Future<void> openDevTools({Offset? inspectAt}) =>
+      _channel.invokeMethod('showDevTools', {
+        'sessionId': sessionId,
+        if (inspectAt != null) 'inspectX': inspectAt.dx.round(),
+        if (inspectAt != null) 'inspectY': inspectAt.dy.round(),
+      });
 
   /// Open the macOS Character Viewer (the emoji & symbols picker — the same
   /// panel as ⌃⌘Space) targeting this view. The view must be focused so the
