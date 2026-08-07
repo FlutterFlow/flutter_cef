@@ -41,6 +41,9 @@ class _BrowserDemoState extends State<BrowserDemo> {
   // with enableCdp, so CDP is only requested in the ephemeral (null) case.
   String? _profile;
   late CefWebController _controller = _newController();
+  /// Anchors the context menu: the page reports click coords relative to the
+  /// view, which must be mapped through this box to global coords.
+  final GlobalKey _viewKey = GlobalKey();
   final FocusNode _webFocus = FocusNode(debugLabel: 'web');
   final TextEditingController _urlBar = TextEditingController(text: _startUrl);
   double _zoom = 0;
@@ -61,6 +64,57 @@ class _BrowserDemoState extends State<BrowserDemo> {
     _wireController();
   }
 
+  /// Draw the page context menu and return the chosen command id (null =
+  /// dismissed). The view is a texture, so the menu is ordinary Flutter UI
+  /// positioned at the click point.
+  Future<int?> _showContextMenu(CefContextMenuRequest req) async {
+    final box = _viewKey.currentContext?.findRenderObject() as RenderBox?;
+    if (box == null || !mounted) return null;
+    final origin = box.localToGlobal(Offset(req.x, req.y));
+    final overlay =
+        Overlay.of(context).context.findRenderObject() as RenderBox?;
+    if (overlay == null) return null;
+    debugPrint('context menu: ${req.items.length} items, link="${req.linkUrl}" '
+        'sel="${req.selectionText}" misspelled="${req.misspelledWord}"');
+    return showMenu<int>(
+      context: context,
+      position: RelativeRect.fromRect(
+        Rect.fromLTWH(origin.dx, origin.dy, 1, 1),
+        Offset.zero & overlay.size,
+      ),
+      items: _menuEntries(req.items),
+    );
+  }
+
+  List<PopupMenuEntry<int>> _menuEntries(List<CefContextMenuItem> items) {
+    final out = <PopupMenuEntry<int>>[];
+    for (final item in items) {
+      switch (item.type) {
+        case CefContextMenuItemType.separator:
+          out.add(const PopupMenuDivider());
+        case CefContextMenuItemType.submenu:
+          // Flattened with a header for the demo; a real host would nest.
+          out.add(PopupMenuItem<int>(
+            enabled: false,
+            child: Text(item.label,
+                style: const TextStyle(fontWeight: FontWeight.w600)),
+          ));
+          out.addAll(_menuEntries(item.items));
+        case CefContextMenuItemType.command:
+        case CefContextMenuItemType.check:
+        case CefContextMenuItemType.radio:
+          out.add(PopupMenuItem<int>(
+            value: item.commandId,
+            // Chromium's own enabled state — Paste greys out with an empty
+            // clipboard without the host deriving anything.
+            enabled: item.enabled,
+            child: Text(item.checked ? '\u2713 ${item.label}' : item.label),
+          ));
+      }
+    }
+    return out;
+  }
+
   /// Attach the demo's listeners/callbacks to the current [_controller]. Called
   /// once at init and again whenever a profile toggle swaps the controller.
   void _wireController() {
@@ -71,6 +125,9 @@ class _BrowserDemoState extends State<BrowserDemo> {
     });
     _controller.onLoadError = (e) =>
         debugPrint('load error ${e.errorCode} ${e.url}: ${e.errorText}');
+    // Right-click: Chromium built the menu, we draw it. A plain Material menu
+    // here on purpose — this demonstrates the seam, not a design.
+    _controller.onContextMenu = _showContextMenu;
     // Links that open a new window (target=_blank / window.open) load in place
     // rather than spawning a separate native window.
     _controller.onCreateWindow = (url) {
@@ -384,7 +441,9 @@ and committed text — including emoji — should appear intact.</p>
               ),
             ),
             Expanded(
-              child: CefWebView(
+              child: KeyedSubtree(
+                key: _viewKey,
+                child: CefWebView(
                 // Key on the profile so toggling it rebuilds the view against
                 // the fresh controller (a profile is fixed at create() time).
                 key: ValueKey(_profile),
@@ -404,6 +463,7 @@ and committed text — including emoji — should appear intact.</p>
                 // exclusive with a named profile, so only request it when none
                 // is active.
                 enableCdp: _profile == null,
+                ),
               ),
             ),
           ],

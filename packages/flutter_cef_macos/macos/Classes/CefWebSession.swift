@@ -52,6 +52,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   // cef_host -> us: a page called getUserMedia and the site has no remembered
   // decision, so the host must show a permission prompt. {u32 id}{u32 mask}{utf8 origin}
   private static let opMediaRequest: UInt8 = 0x1e
+  private static let opContextMenu: UInt8 = 0x40
   // cef_host -> us: {u8 videoActive}{u8 audioActive}{u8 setting 0=ask 1=allow}
   private static let opMediaState: UInt8 = 0x1f
   private static let opNavigate: UInt8 = 0x20
@@ -79,6 +80,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   // us -> cef_host: answer a permission prompt {u32 id}{u8 allow}{u8 remember};
   // remembered per-origin only when a human chose, exactly like a browser.
   private static let opMediaResponse: UInt8 = 0x3c
+  private static let opContextMenuCommand: UInt8 = 0x3e
   // us -> cef_host: {u8 0=ask 1=allow 2=block} rewrite this site's remembered
   // camera/mic decision (the URL-bar "site settings" path). No reload.
   private static let opSetMediaSetting: UInt8 = 0x3d
@@ -106,6 +108,9 @@ final class CefWebSession: NSObject, FlutterTexture {
   var onImeBounds: ((Int, Int, Int, Int) -> Void)?  // caret rect x,y,w,h (DIP)
   var onCookies: ((Int, String) -> Void)?  // request id, json array
   var onMediaRequest: ((Int, Int, String) -> Void)?  // id, permission mask, origin
+  /// Right-click in the page. `json` carries Chromium's own menu model + hit
+  /// context; the Flutter side draws it and answers with `chooseContextMenu`.
+  var onContextMenu: ((Int, String) -> Void)?  // id, json
   var onMediaState: ((Bool, Bool, Int) -> Void)?  // videoActive, audioActive, setting
   // Fired when the backing IOSurface is (re)allocated — at create and on every
   // resize() (which reallocs). Args are the live global surface id and the
@@ -483,6 +488,16 @@ final class CefWebSession: NSObject, FlutterTexture {
     sendFrame(Self.opMediaResponse, p)
   }
 
+  /// Answer a context menu. `commandId` 0 means dismissed without choosing —
+  /// which must still be sent: CEF requires the menu callback be answered
+  /// exactly once, and skipping it wedges the page's menu handling.
+  func chooseContextMenu(id: Int, commandId: Int) {
+    var p = [UInt8]()
+    appendU32(&p, UInt32(truncatingIfNeeded: id))
+    appendU32(&p, UInt32(truncatingIfNeeded: commandId))
+    sendFrame(Self.opContextMenuCommand, p)
+  }
+
   /// Rewrite this site's remembered camera/mic decision (0 = ask again, 1 =
   /// allow, 2 = block). No reload — it applies next time the page asks.
   func setMediaSetting(_ value: Int) {
@@ -555,7 +570,18 @@ final class CefWebSession: NSObject, FlutterTexture {
     sendFrame(Self.opDeleteCookie, Array((url + "\u{0}" + name).utf8))
   }
 
-  func showDevTools() { sendFrame(Self.opShowDevTools) }
+  /// Open DevTools. With a point (page DIP coords) it opens INSPECTING the
+  /// element there — the right-click "Inspect" path.
+  func showDevTools(inspectAt: (x: Int, y: Int)? = nil) {
+    guard let at = inspectAt else {
+      sendFrame(Self.opShowDevTools)
+      return
+    }
+    var p = [UInt8]()
+    appendU32(&p, UInt32(truncatingIfNeeded: max(0, at.x)))
+    appendU32(&p, UInt32(truncatingIfNeeded: max(0, at.y)))
+    sendFrame(Self.opShowDevTools, p)
+  }
 
   func imeSetComposition(_ text: String) {
     sendFrame(Self.opImeSetComp, Array(text.utf8))
@@ -823,6 +849,13 @@ final class CefWebSession: NSObject, FlutterTexture {
             ? (String(bytes: payload[8...], encoding: .utf8) ?? "")
             : ""
         onMediaRequest?(readU32(payload, 0), readU32(payload, 4), origin)
+      }
+    case Self.opContextMenu:
+      if payload.count >= 4 {
+        let json = payload.count > 4
+            ? (String(bytes: payload[4...], encoding: .utf8) ?? "{}")
+            : "{}"
+        onContextMenu?(readU32(payload, 0), json)
       }
     case Self.opMediaState:
       if payload.count >= 3 {

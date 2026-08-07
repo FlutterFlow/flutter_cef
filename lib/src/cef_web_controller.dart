@@ -178,6 +178,18 @@ class CefWebController {
   Future<bool?> Function(CefMediaPermissionRequest request)?
       onMediaPermissionRequest;
 
+  /// A right-click landed in the page. Return the `commandId` of the chosen
+  /// item, or null to dismiss.
+  ///
+  /// Chromium has already built the menu (and decided each item's enabled /
+  /// checked state); the host only DRAWS it, because an OSR browser has no
+  /// window for a native menu. Whatever id comes back is executed by Chromium,
+  /// so copy/paste/back/view-source/spellcheck behave exactly as in Chrome.
+  ///
+  /// If unset, the menu is dismissed — right-click then does nothing, which is
+  /// the behaviour before this callback existed.
+  Future<int?> Function(CefContextMenuRequest request)? onContextMenu;
+
   /// Live camera/mic status for the current page: what is actually capturing
   /// right now, plus the site's remembered decision. Drives an "in use" or
   /// "blocked" indicator; pair with [setMediaSetting] to change the decision.
@@ -274,6 +286,9 @@ class CefWebController {
         break;
       case 'mediaRequest':
         _handleMediaRequest(a);
+        break;
+      case 'contextMenu':
+        _handleContextMenu(a);
         break;
       case 'mediaState':
         mediaState.value = CefMediaState(
@@ -424,6 +439,38 @@ class CefWebController {
   /// A page asked for the camera/mic and the site has no remembered decision.
   /// Mirrors [_handleJsDialog]: the page's `getUserMedia` is blocked on the
   /// native callback until this answers, so every path must answer exactly once.
+  Future<void> _handleContextMenu(Map<String, dynamic> a) async {
+    final id = a['id'] as int? ?? 0;
+    // Answer EXACTLY ONCE, whatever happens: CEF requires the menu callback be
+    // continued or cancelled, and a dropped one wedges the page's menu handling
+    // so later right-clicks are ignored. Hence 0 (= dismiss) on every failure
+    // path, including no handler and a throwing handler.
+    int? command;
+    if (onContextMenu != null) {
+      try {
+        final req = CefContextMenuRequest.fromJson(
+          id,
+          jsonDecode(a['json'] as String? ?? '{}') as Map<String, dynamic>,
+        );
+        command = await onContextMenu?.call(req);
+      } catch (e, st) {
+        command = null;
+        FlutterError.reportError(FlutterErrorDetails(
+          exception: e,
+          stack: st,
+          library: 'flutter_cef',
+          context: ErrorDescription('handling a page context menu'),
+        ));
+      }
+    }
+    if (_disposed) return;
+    await _channel.invokeMethod('chooseContextMenu', {
+      'sessionId': sessionId,
+      'id': id,
+      'commandId': command ?? 0,
+    });
+  }
+
   Future<void> _handleMediaRequest(Map<String, dynamic> a) async {
     final id = a['id'] as int? ?? 0;
     // Bits from cef_media_access_permission_types_t: audio = 1<<0, video = 1<<1.
@@ -868,8 +915,18 @@ class CefWebController {
   }
 
   /// Open Chromium's DevTools for this page in a separate window.
-  Future<void> openDevTools() =>
-      _channel.invokeMethod('showDevTools', {'sessionId': sessionId});
+  ///
+  /// [inspectAt] (page DIP coordinates, as reported by
+  /// [CefContextMenuRequest.x]/[CefContextMenuRequest.y]) opens DevTools already
+  /// inspecting the element at that point — what "Inspect" on a right-click
+  /// means. DevTools is a real window even though the page is windowless, so
+  /// this works from an OSR view.
+  Future<void> openDevTools({Offset? inspectAt}) =>
+      _channel.invokeMethod('showDevTools', {
+        'sessionId': sessionId,
+        if (inspectAt != null) 'inspectX': inspectAt.dx.round(),
+        if (inspectAt != null) 'inspectY': inspectAt.dy.round(),
+      });
 
   /// Open the macOS Character Viewer (the emoji & symbols picker — the same
   /// panel as ⌃⌘Space) targeting this view. The view must be focused so the

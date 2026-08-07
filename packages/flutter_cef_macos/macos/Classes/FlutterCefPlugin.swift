@@ -167,6 +167,12 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
                                remember: args["remember"] as? Bool ?? false)
       }
       result(nil)
+    case "chooseContextMenu":
+      withSession(args) {
+        $0.chooseContextMenu(id: args["id"] as? Int ?? 0,
+                             commandId: args["commandId"] as? Int ?? 0)
+      }
+      result(nil)
     case "setMediaSetting":
       withSession(args) { $0.setMediaSetting(args["value"] as? Int ?? 0) }
       result(nil)
@@ -234,7 +240,13 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       }
       result(nil)
     case "showDevTools":
-      withSession(args) { $0.showDevTools() }
+      withSession(args) {
+        if let x = args["inspectX"] as? Int, let y = args["inspectY"] as? Int {
+          $0.showDevTools(inspectAt: (x: x, y: y))
+        } else {
+          $0.showDevTools()
+        }
+      }
       result(nil)
     case "enableAgentControl":
       // CEF-2b: broker a token-gated CDP endpoint scoped to THIS tile's CDP target.
@@ -467,6 +479,11 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       self?.emit("mediaRequest", [
         "sessionId": sessionId, "id": id,
         "permissions": permissions, "origin": origin,
+      ])
+    }
+    session.onContextMenu = { [weak self] id, json in
+      self?.emit("contextMenu", [
+        "sessionId": sessionId, "id": id, "json": json,
       ])
     }
     session.onMediaState = { [weak self] video, audio, setting in

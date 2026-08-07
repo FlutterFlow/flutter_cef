@@ -252,3 +252,131 @@ class CefCookie {
   String toString() => 'CefCookie($name=$value; domain=$domain path=$path'
       '${secure ? ' secure' : ''}${httpOnly ? ' httpOnly' : ''})';
 }
+
+/// One row in a page context menu, as Chromium built it.
+///
+/// Campus draws these; Chromium executes the chosen [commandId]. That split is
+/// deliberate — [enabled] and [checked] come from Chromium's own menu model, so
+/// "Paste" greys out with an empty clipboard and the spellcheck block carries
+/// live dictionary suggestions without Campus deriving any of it.
+class CefContextMenuItem {
+  const CefContextMenuItem({
+    required this.type,
+    required this.label,
+    required this.commandId,
+    required this.enabled,
+    required this.checked,
+    this.items = const <CefContextMenuItem>[],
+  });
+
+  factory CefContextMenuItem.fromJson(Map<String, dynamic> json) {
+    final rawItems = json['items'];
+    return CefContextMenuItem(
+      type: switch (json['type']) {
+        'separator' => CefContextMenuItemType.separator,
+        'check' => CefContextMenuItemType.check,
+        'radio' => CefContextMenuItemType.radio,
+        'submenu' => CefContextMenuItemType.submenu,
+        _ => CefContextMenuItemType.command,
+      },
+      label: (json['label'] as String?) ?? '',
+      commandId: (json['commandId'] as num?)?.toInt() ?? 0,
+      enabled: (json['enabled'] as bool?) ?? true,
+      checked: (json['checked'] as bool?) ?? false,
+      items: rawItems is List
+          ? rawItems
+                .whereType<Map>()
+                .map(
+                  (e) => CefContextMenuItem.fromJson(
+                    Map<String, dynamic>.from(e),
+                  ),
+                )
+                .toList(growable: false)
+          : const <CefContextMenuItem>[],
+    );
+  }
+
+  final CefContextMenuItemType type;
+  final String label;
+
+  /// Chromium's command id. Pass it back to run the command; 0 = dismissed.
+  final int commandId;
+  final bool enabled;
+  final bool checked;
+
+  /// Children, for [CefContextMenuItemType.submenu].
+  final List<CefContextMenuItem> items;
+
+  @override
+  String toString() => 'CefContextMenuItem($type, "$label", id: $commandId)';
+}
+
+enum CefContextMenuItemType { command, separator, check, radio, submenu }
+
+/// A right-click in a page: where it happened, what was under the cursor, and
+/// the menu Chromium built for it.
+class CefContextMenuRequest {
+  const CefContextMenuRequest({
+    required this.id,
+    required this.x,
+    required this.y,
+    required this.editable,
+    required this.linkUrl,
+    required this.sourceUrl,
+    required this.selectionText,
+    required this.misspelledWord,
+    required this.items,
+  });
+
+  factory CefContextMenuRequest.fromJson(int id, Map<String, dynamic> json) {
+    final rawItems = json['items'];
+    return CefContextMenuRequest(
+      id: id,
+      x: (json['x'] as num?)?.toDouble() ?? 0,
+      y: (json['y'] as num?)?.toDouble() ?? 0,
+      editable: (json['editable'] as bool?) ?? false,
+      linkUrl: (json['linkUrl'] as String?) ?? '',
+      sourceUrl: (json['sourceUrl'] as String?) ?? '',
+      selectionText: (json['selectionText'] as String?) ?? '',
+      misspelledWord: (json['misspelledWord'] as String?) ?? '',
+      items: rawItems is List
+          ? rawItems
+                .whereType<Map>()
+                .map(
+                  (e) => CefContextMenuItem.fromJson(
+                    Map<String, dynamic>.from(e),
+                  ),
+                )
+                .toList(growable: false)
+          : const <CefContextMenuItem>[],
+    );
+  }
+
+  /// Correlation id — answer with this, exactly once.
+  final int id;
+
+  /// Where the click landed, in page (DIP) coordinates relative to the view.
+  final double x;
+  final double y;
+
+  /// Whether the click was in an editable field (drives cut/paste relevance).
+  final bool editable;
+
+  /// The link under the cursor, or empty.
+  final String linkUrl;
+
+  /// The media source (image/video/audio) under the cursor, or empty.
+  final String sourceUrl;
+
+  /// The current selection, or empty.
+  final String selectionText;
+
+  /// The misspelled word under the cursor, or empty.
+  final String misspelledWord;
+
+  final List<CefContextMenuItem> items;
+
+  @override
+  String toString() =>
+      'CefContextMenuRequest(#$id at $x,$y, ${items.length} items)';
+}
