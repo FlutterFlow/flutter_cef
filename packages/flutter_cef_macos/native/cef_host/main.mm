@@ -86,6 +86,7 @@
 #include "include/cef_find_handler.h"
 #include "include/cef_jsdialog_handler.h"
 #include "include/cef_keyboard_handler.h"
+#include "mac_key_bindings.h"
 #include "include/cef_life_span_handler.h"
 #include "include/cef_permission_handler.h"
 #include "include/cef_render_handler.h"
@@ -345,6 +346,9 @@ struct Slot {
   // so reusing a fixed id silently drops the 2nd+ probe, which hung a re-enable of
   // agent-control (disable then enable again). UI-thread only, like dialog_next.
   int target_info_msg = 0;
+  // The last DevTools message id issued on this browser, shared by every caller
+  // (see NextDevToolsMsgId) so their ids stay increasing. UI-thread only.
+  int devtools_msg = 0;
 
   // External begin-frame pump (see PumpBeginFrame). With external_begin_frame_enabled, CEF's
   // internal frame timer is OFF — frames are produced ONLY when we drive them — so a per-slot
@@ -3088,6 +3092,16 @@ class TargetIdObserver : public CefDevToolsMessageObserver {
   IMPLEMENT_REFCOUNTING(TargetIdObserver);
 };
 
+// A fresh DevTools message id for this browser. The session wants increasing ids,
+// and CEF silently renumbers one that isn't — which would orphan a caller that
+// matches its reply by id — so every ExecuteDevToolsMethod here draws from this.
+int NextDevToolsMsgId(const std::shared_ptr<Slot>& slot) {
+  slot->devtools_msg = slot->devtools_msg < kTargetInfoMsgId
+                           ? kTargetInfoMsgId
+                           : slot->devtools_msg + 1;
+  return slot->devtools_msg;
+}
+
 void DoResolveTargetId(const std::shared_ptr<Slot>& slot) {
   if (!slot->browser) return;
   CefRefPtr<CefBrowserHost> host = slot->browser->GetHost();
@@ -3098,9 +3112,7 @@ void DoResolveTargetId(const std::shared_ptr<Slot>& slot) {
   }
   // Fresh, increasing id per probe (see Slot::target_info_msg) so a re-resolve on the
   // SAME browser isn't dropped by the DevTools session's monotonic-id requirement.
-  slot->target_info_msg = slot->target_info_msg < kTargetInfoMsgId
-                              ? kTargetInfoMsgId
-                              : slot->target_info_msg + 1;
+  slot->target_info_msg = NextDevToolsMsgId(slot);
   // Target.getTargetInfo with no params: executed on a specific browser's DevTools
   // agent (a page target), it returns THAT page's own targetInfo — so this resolves
   // exactly this browser's targetId, with no cross-tile ambiguity.
@@ -3175,11 +3187,43 @@ void DoPointer(const std::shared_ptr<Slot>& slot, int type, int button,
   }
 }
 
+// A keydown AppKit's key bindings give an editing meaning (⌘← = line start, ⌃K =
+// kill to paragraph end, …) goes out through DevTools with those edit commands
+// attached, as a windowed Chrome would send it: SendKeyEvent has no way to carry
+// them. The page still sees an ordinary keydown first; the commands are only its
+// default action. See mac_key_bindings.h.
+bool DispatchBoundKey(const std::shared_ptr<Slot>& slot, uint32_t modifiers,
+                      int32_t windows_key_code, int32_t native_key_code) {
+  mac_key_bindings::Match match;
+  if (!mac_key_bindings::Lookup(modifiers, windows_key_code, &match)) return false;
+  int cdp_modifiers = 0;
+  if (modifiers & EVENTFLAG_ALT_DOWN) cdp_modifiers |= 1;
+  if (modifiers & EVENTFLAG_CONTROL_DOWN) cdp_modifiers |= 2;
+  if (modifiers & EVENTFLAG_COMMAND_DOWN) cdp_modifiers |= 4;
+  if (modifiers & EVENTFLAG_SHIFT_DOWN) cdp_modifiers |= 8;
+  CefRefPtr<CefListValue> commands = CefListValue::Create();
+  for (size_t i = 0; i < match.commands.size(); i++)
+    commands->SetString(i, match.commands[i]);
+  CefRefPtr<CefDictionaryValue> params = CefDictionaryValue::Create();
+  params->SetString("type", "rawKeyDown");
+  params->SetInt("modifiers", cdp_modifiers);
+  params->SetInt("windowsVirtualKeyCode", windows_key_code);
+  params->SetInt("nativeVirtualKeyCode", native_key_code);
+  params->SetString("code", match.code);
+  params->SetString("key", match.key);
+  params->SetList("commands", commands);
+  return slot->browser->GetHost()->ExecuteDevToolsMethod(
+             NextDevToolsMsgId(slot), "Input.dispatchKeyEvent", params) != 0;
+}
+
 // type: 0=rawkeydown 2=keyup 3=char (cef_key_event_type_t).
 void DoKey(const std::shared_ptr<Slot>& slot, int type, uint32_t modifiers,
            int32_t windows_key_code, int32_t native_key_code,
            uint32_t character) {
   if (!slot->browser) return;
+  if (type == KEYEVENT_RAWKEYDOWN &&
+      DispatchBoundKey(slot, modifiers, windows_key_code, native_key_code))
+    return;
   CefKeyEvent ev;
   ev.type = static_cast<cef_key_event_type_t>(type);
   ev.modifiers = modifiers;

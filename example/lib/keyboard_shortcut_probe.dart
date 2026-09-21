@@ -31,7 +31,8 @@ const _html = '''<!doctype html><html><head><title>kbd</title></head>
 window.keys = []; window.owned = 0; window.own = false;
 document.addEventListener('keydown', function (e) {
   window.keys.push((e.metaKey ? 'M-' : '') + e.key + '/' + e.code);
-  if (window.own && e.metaKey && (e.code === 'KeyZ' || e.code === 'KeyA')) {
+  if (window.own && e.metaKey &&
+      (e.code === 'KeyZ' || e.code === 'KeyA' || e.code === 'ArrowLeft')) {
     e.preventDefault(); window.owned++;
   }
 }, true);
@@ -143,6 +144,56 @@ class _ProbeAppState extends State<ProbeApp> {
       _check('page received both', await _eval('window.owned') == 2, await _eval('window.owned'));
       _check('…and the browser undo did not also run', await _eval('t.value') == 'abc', await _eval('t.value'));
       _check('…nor the browser select-all', await _selected() == 0, await _selected());
+
+      // --- macOS text-editing bindings in a PLAIN field (no page handler).
+      // AppKit supplies these as edit commands in a windowed browser; cef_host
+      // reads the same key-binding dict and attaches them to the keydown.
+      await _eval('(window.own = false, t.value = "hello world foo", t.setSelectionRange(15, 15), 1)');
+      const alt = 1 << 3;
+      Future<void> chord(int mods, int modVk, int modNative, void Function() key) async {
+        _c.sendKey(type: 0, modifiers: mods & ~_shift, windowsKeyCode: modVk, nativeKeyCode: modNative);
+        key();
+        _c.sendKey(type: 2, windowsKeyCode: modVk, nativeKeyCode: modNative);
+        await _settle();
+      }
+      await chord(alt, 0x12, 58, () => _key(0x25, 123, 0xF702, mods: alt));
+      _check('⌥← moves by word', await _eval('t.selectionStart') == 12, await _eval('t.selectionStart'));
+      await chord(_cmd, 0x5B, 55, () => _key(0x25, 123, 0xF702, mods: _cmd));
+      _check('⌘← moves to line start', await _eval('t.selectionStart') == 0, await _eval('t.selectionStart'));
+      await chord(_cmd, 0x5B, 55, () => _key(0x27, 124, 0xF703, mods: _cmd));
+      _check('⌘→ moves to line end', await _eval('t.selectionStart') == 15, await _eval('t.selectionStart'));
+      await chord(alt | _shift, 0x12, 58, () => _key(0x25, 123, 0xF702, mods: alt | _shift));
+      _check('⇧⌥← selects a word', await _selected() == 3, await _selected());
+      await _eval('(t.setSelectionRange(15, 15), 1)');
+      await chord(alt, 0x12, 58, () => _key(0x08, 51, 0x7F, mods: alt));
+      _check('⌥⌫ deletes a word', await _eval('t.value') == 'hello world ', await _eval('t.value'));
+
+      const ctrl = 1 << 2;
+      await _eval('(t.value = "one two\\nthree four\\nfive", t.setSelectionRange(14, 14), 1)');
+      await chord(_cmd | _shift, 0x5B, 55, () => _key(0x27, 124, 0xF703, mods: _cmd | _shift));
+      _check('⇧⌘→ selects to line end', await _eval('t.selectionStart + ":" + t.selectionEnd') == '14:18',
+          await _eval('t.selectionStart + ":" + t.selectionEnd'));
+      await chord(_cmd, 0x5B, 55, () => _key(0x26, 126, 0xF700, mods: _cmd));
+      _check('⌘↑ moves to document start', await _eval('t.selectionStart') == 0, await _eval('t.selectionStart'));
+      await chord(_cmd, 0x5B, 55, () => _key(0x28, 125, 0xF701, mods: _cmd));
+      _check('⌘↓ moves to document end', await _eval('t.selectionStart') == 23, await _eval('t.selectionStart'));
+      await _eval('(t.setSelectionRange(14, 14), 1)');
+      await chord(ctrl, 0x11, 59, () => _key(0x41, 0, 0x61, mods: ctrl));
+      _check('⌃A moves to paragraph start', await _eval('t.selectionStart') == 8, await _eval('t.selectionStart'));
+      await _eval('(t.setSelectionRange(14, 14), 1)');
+      await chord(ctrl, 0x11, 59, () => _key(0x4B, 40, 0x6B, mods: ctrl));
+      _check('⌃K kills to paragraph end', await _eval('t.value') == 'one two\nthree \nfive', await _eval('t.value'));
+      await chord(_cmd, 0x5B, 55, () => _key(0x08, 51, 0x7F, mods: _cmd));
+      _check('⌘⌫ deletes to line start', await _eval('t.value') == 'one two\n\nfive', await _eval('t.value'));
+
+      // The page still comes first: an editor that owns ⌘← sees a normal keydown
+      // and its preventDefault stops the bound command.
+      await _eval('(window.own = true, window.owned = 0, window.keys = [], t.value = "abc def", t.setSelectionRange(7, 7), 1)');
+      await chord(_cmd, 0x5B, 55, () => _key(0x25, 123, 0xF702, mods: _cmd));
+      final seen = await _eval('window.keys.join(",")') as String;
+      _check('page sees ⌘← as a real keydown', seen.contains('M-ArrowLeft/ArrowLeft'), seen);
+      _check('page owns ⌘← → caret stays', await _eval('window.owned + ":" + t.selectionStart') == '1:7',
+          await _eval('window.owned + ":" + t.selectionStart'));
     } catch (e) {
       _pass = false;
       _log('EXCEPTION  $e');
