@@ -980,6 +980,51 @@ void main() {
         reason: 'Latin-1 encoding would mangle non-ASCII before the data: URL');
   });
 
+  test('loadHtmlString(baseUrl: http(s)) serves the document AT that URL',
+      () async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    final c = CefWebController(sessionId: 'auth');
+    await c.loadHtmlString('<p>x</p>', baseUrl: 'https://app.example/editor/');
+    final m = log.firstWhere((m) => m.method == 'loadAuthored');
+    expect(m.arguments, {
+      'sessionId': 'auth',
+      'url': 'https://app.example/editor/',
+      'html': '<p>x</p>',
+    });
+    expect(log.where((m) => m.method == 'loadTrusted'), isEmpty);
+  });
+
+  test('loadHtmlString(baseUrl:) falls back to data: + <base href> elsewhere',
+      () async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    final c = CefWebController(sessionId: 'base');
+    await c.loadHtmlString('<html><head><title>t</title></head></html>',
+        baseUrl: 'https://app.example/a"b/');
+    expect(log.where((m) => m.method == 'loadAuthored'), isEmpty);
+    final url = (log.firstWhere((m) => m.method == 'loadTrusted').arguments
+        as Map)['url'] as String;
+    expect(utf8.decode(base64Decode(url.split('base64,').last)),
+        '<html><head><base href="https://app.example/a&quot;b/"><title>t</title></head></html>');
+  });
+
+  test('create(html:, htmlBaseUrl:) creates ON the base URL with the html',
+      () async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    final c = CefWebController(sessionId: 'cauth');
+    await c.create(
+        url: 'about:blank',
+        width: 1,
+        height: 1,
+        html: '<p>y</p>',
+        htmlBaseUrl: 'https://app.example/');
+    final a = log.firstWhere((m) => m.method == 'create').arguments as Map;
+    expect(a['url'], 'https://app.example/');
+    expect(a['authoredHtml'], '<p>y</p>');
+  });
+
   test('getScrollPosition falls back to Offset.zero on a non-list result',
       () async {
     final c = CefWebController(sessionId: 'gpz');

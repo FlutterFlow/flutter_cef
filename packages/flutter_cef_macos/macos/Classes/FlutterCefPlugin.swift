@@ -123,6 +123,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     case "navigate": navigate(args, result)
     case "openAuthWindow": openAuthWindow(args, result)
     case "loadTrusted": loadTrusted(args, result)
+    case "loadAuthored": loadAuthored(args, result)
     case "resize": resize(args, result)
     case "getFrameSurface": getFrameSurface(args, result)
     case "sessionStats":
@@ -507,6 +508,9 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     // Allocate the wire browserId + (when ready) issue opCreateBrowser. The
     // process arg --allowed-schemes is shared by every browser in the profile;
     // it's taken from the first browser that triggered the spawn.
+    if let html = a["authoredHtml"] as? String, !html.isEmpty {
+      session.setAuthoredDoc((url, html))
+    }
     _ = host.createBrowser(session, url: url, allowedSchemes: allowedSchemes)
     sessions[sessionId] = session
     sessionHost[sessionId] = host
@@ -710,6 +714,15 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   private func loadTrusted(_ a: [String: Any], _ result: @escaping FlutterResult) {
     if let id = a["sessionId"] as? String, let url = a["url"] as? String {
       sessions[id]?.loadTrusted(url)
+    }
+    result(nil)
+  }
+
+  /// loadHtmlString(html, baseUrl:) — serve `html` as the document AT `url`.
+  private func loadAuthored(_ a: [String: Any], _ result: @escaping FlutterResult) {
+    if let id = a["sessionId"] as? String, let url = a["url"] as? String,
+       let html = a["html"] as? String {
+      sessions[id]?.loadAuthored(url: url, html: html)
     }
     result(nil)
   }

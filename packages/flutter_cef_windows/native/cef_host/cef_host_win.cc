@@ -1526,7 +1526,13 @@ const char* SameSiteToString(cef_cookie_same_site_t v) {
   }
 }
 
-void DoSetCookie(const std::shared_ptr<Slot>& slot, const std::string& url,
+// COOKIE VERBS TAKE A WIRE ID, NOT A SLOT (parity with macOS main.mm). The jar is
+// process-global, so nothing here needs the browser — the id only routes the
+// reply/log. Requiring a live slot on the reader thread silently DROPPED any cookie
+// verb that raced the create (the slot is registered by a later TID_UI task): a
+// dropped setCookie meant an unauthenticated first load, and a dropped getCookies
+// never replied, so the caller's future hung forever.
+void DoSetCookie(uint32_t wire_id, const std::string& url,
                  const std::string& name, const std::string& value,
                  const std::string& domain, const std::string& path,
                  bool secure, bool http_only, const std::string& same_site) {
@@ -1544,20 +1550,18 @@ void DoSetCookie(const std::shared_ptr<Slot>& slot, const std::string& url,
   cookie.httponly = http_only ? 1 : 0;
   cookie.same_site = ParseSameSite(same_site);
   if (!mgr->SetCookie(url, cookie, nullptr)) {
-    SendLog(slot->browser_id,
+    SendLog(wire_id,
             "setCookie rejected for " + url + " (name '" + name + "')");
   }
 }
-void DoClearCookies(const std::shared_ptr<Slot>& slot) {
-  (void)slot;
+void DoClearCookies() {
   CefRefPtr<CefCookieManager> mgr = CefCookieManager::GetGlobalManager(nullptr);
   if (mgr) mgr->DeleteCookies(CefString(), CefString(), nullptr);
 }
-void DoVisitCookies(const std::shared_ptr<Slot>& slot, uint32_t id,
-                    const std::string& url) {
+void DoVisitCookies(uint32_t wire_id, uint32_t id, const std::string& url) {
   CefRefPtr<CefCookieManager> mgr = CefCookieManager::GetGlobalManager(nullptr);
   CefRefPtr<HostCookieVisitor> visitor =
-      new HostCookieVisitor(slot->browser_id, id);
+      new HostCookieVisitor(wire_id, id);
   if (!mgr) return;
   if (url.empty()) {
     mgr->VisitAllCookies(visitor);
@@ -1565,9 +1569,7 @@ void DoVisitCookies(const std::shared_ptr<Slot>& slot, uint32_t id,
     mgr->VisitUrlCookies(url, true, visitor);
   }
 }
-void DoDeleteCookie(const std::shared_ptr<Slot>& slot, const std::string& url,
-                    const std::string& name) {
-  (void)slot;
+void DoDeleteCookie(const std::string& url, const std::string& name) {
   CefRefPtr<CefCookieManager> mgr = CefCookieManager::GetGlobalManager(nullptr);
   if (mgr) mgr->DeleteCookies(url, name, nullptr);
 }
@@ -1866,7 +1868,7 @@ void IpcReadLoop() {
         break;
       }
       case kOpSetCookie: {
-        if (!slot) break;
+        // No slot needed — see DoSetCookie (a verb racing the create must not drop).
         std::string s(reinterpret_cast<const char*>(p), plen);
         std::vector<std::string> f;
         size_t start = 0;
@@ -1878,29 +1880,26 @@ void IpcReadLoop() {
         }
         while (f.size() < 8) f.push_back("");
         CefPostTask(TID_UI,
-                    base::BindOnce(&DoSetCookie, slot, f[0], f[1], f[2], f[3],
+                    base::BindOnce(&DoSetCookie, wire_id, f[0], f[1], f[2], f[3],
                                    f[4], f[5] == "1", f[6] == "1", f[7]));
         break;
       }
       case kOpClearCookies:
-        if (!slot) break;
-        CefPostTask(TID_UI, base::BindOnce(&DoClearCookies, slot));
+        CefPostTask(TID_UI, base::BindOnce(&DoClearCookies));
         break;
       case kOpVisitCookies: {
-        if (!slot) break;
         if (plen < 4) break;
         uint32_t id = ReadU32BE(p);
         std::string url(reinterpret_cast<const char*>(p + 4), plen - 4);
-        CefPostTask(TID_UI, base::BindOnce(&DoVisitCookies, slot, id, url));
+        CefPostTask(TID_UI, base::BindOnce(&DoVisitCookies, wire_id, id, url));
         break;
       }
       case kOpDeleteCookie: {
-        if (!slot) break;
         std::string s(reinterpret_cast<const char*>(p), plen);
         const size_t nul = s.find('\0');
         std::string url = nul == std::string::npos ? s : s.substr(0, nul);
         std::string name = nul == std::string::npos ? "" : s.substr(nul + 1);
-        CefPostTask(TID_UI, base::BindOnce(&DoDeleteCookie, slot, url, name));
+        CefPostTask(TID_UI, base::BindOnce(&DoDeleteCookie, url, name));
         break;
       }
       case kOpImeSetComp: {

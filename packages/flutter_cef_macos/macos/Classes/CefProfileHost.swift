@@ -30,6 +30,7 @@ final class CefProfileHost {
   static let opCreated: UInt8 = 0x1c          // cef_host -> us: OnAfterCreated — advance the create pacer (H3)
   static let opCreateFailed: UInt8 = 0x1d     // cef_host -> us: create dispatch failed — drop the session (H7)
   static let opInvalidate: UInt8 = 0x37       // us -> cef_host: force a repaint to re-kick a stalled first frame (C1)
+  static let opSetAuthoredHtml: UInt8 = 0x3f  // us -> cef_host: {url}\0{html} served as the main-frame response for url
   static let opSetVisible: UInt8 = 0x35       // us -> cef_host: WasHidden(!visible); peeked to make the C1 watchdog visibility-aware
 
   // Expected kOp wire-protocol version, announced by the host in opReady's payload
@@ -543,7 +544,13 @@ final class CefProfileHost {
     // resize-before-create / since-freed-sid race the snapshot was guarding.)
     payload.append(contentsOf: Array(url.utf8))
     createEnqueued.insert(id)
-    let frame = frameBytes(id, Self.opCreateBrowser, payload)
+    var frame = frameBytes(id, Self.opCreateBrowser, payload)
+    // Create ON an authored document: its opSetAuthoredHtml goes out as ONE write
+    // with, and ahead of, the create — cef_host stores it on its reader thread, so
+    // it is in place before the browser's first request can be made.
+    if let authored = session.authoredPayload(for: url) {
+      frame = frameBytes(id, Self.opSetAuthoredHtml, authored) + frame
+    }
     var ok = true
     if connFd < 0 {
       pendingFrames.append(frame)

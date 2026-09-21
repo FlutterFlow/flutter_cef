@@ -67,6 +67,7 @@ class CefWebView extends StatefulWidget {
     this.renderScale,
     this.onFind,
     this.html,
+    this.htmlBaseUrl,
   }) : assert(!(enableCdp && !agentControl && profile != null && profile != ''),
             'enableCdp cannot be combined with a named profile: CDP-over-TCP '
             'exposes an unauthenticated localhost port that could read the '
@@ -81,6 +82,11 @@ class CefWebView extends StatefulWidget {
   /// document; [url] should be `about:blank`. Changing it after create does NOT
   /// re-navigate (call `controller.loadHtmlString` for a live update).
   final String? html;
+
+  /// The URL [html] is served AT. With an http(s) value the document has that
+  /// URL's real origin (see `CefWebController.loadHtmlString`); otherwise it only
+  /// anchors relative URLs. Ignored without [html].
+  final String? htmlBaseUrl;
 
   /// Optional external controller (to script the view). If null, one is created
   /// and owned internally (and disposed with the view).
@@ -268,6 +274,7 @@ class _CefWebViewState extends State<CefWebView>
         final id = await _controller.create(
             url: widget.url,
             html: widget.html,
+            htmlBaseUrl: widget.htmlBaseUrl,
             width: w,
             height: h,
             dpr: dpr,
