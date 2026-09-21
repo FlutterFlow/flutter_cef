@@ -85,6 +85,7 @@
 #include "include/cef_download_handler.h"
 #include "include/cef_find_handler.h"
 #include "include/cef_jsdialog_handler.h"
+#include "include/cef_keyboard_handler.h"
 #include "include/cef_life_span_handler.h"
 #include "include/cef_permission_handler.h"
 #include "include/cef_render_handler.h"
@@ -1633,6 +1634,7 @@ class HostClient : public CefClient,
                    public CefJSDialogHandler,
                    public CefDownloadHandler,
                    public CefRequestHandler,
+                   public CefKeyboardHandler,
                    public CefContextMenuHandler,
                    public CefMessageRouterBrowserSide::Handler {
  public:
@@ -1655,6 +1657,7 @@ class HostClient : public CefClient,
   CefRefPtr<CefJSDialogHandler> GetJSDialogHandler() override { return this; }
   CefRefPtr<CefDownloadHandler> GetDownloadHandler() override { return this; }
   CefRefPtr<CefRequestHandler> GetRequestHandler() override { return this; }
+  CefRefPtr<CefKeyboardHandler> GetKeyboardHandler() override { return this; }
   CefRefPtr<CefContextMenuHandler> GetContextMenuHandler() override {
     return this;
   }
@@ -2050,6 +2053,33 @@ class HostClient : public CefClient,
       slot_->dst_mtl_sid = 0;
     }
     slot_->browser = nullptr;
+  }
+  // ⌘-key editing shortcuts, as the FALLBACK they are in a real browser. AppKit
+  // turns ⌘Z/⌘A/⌘C… into undo:/selectAll:/copy: only after the page declined the
+  // keydown; windowless rendering has no responder chain to do that, so do it
+  // here — OnKeyEvent is called exactly when the renderer left the key unhandled.
+  // The PAGE gets first refusal: an editor that owns its own undo stack and
+  // selection (Monaco, CodeMirror, Docs) handles ⌘Z/⌘A in its keydown listener,
+  // and running the browser's command instead would bypass it (undo did nothing,
+  // select-all selected the wrong thing).
+  bool OnKeyEvent(CefRefPtr<CefBrowser> browser, const CefKeyEvent& event,
+                  CefEventHandle) override {
+    if (event.type != KEYEVENT_RAWKEYDOWN) return false;
+    const uint32_t m = event.modifiers;
+    if (!(m & EVENTFLAG_COMMAND_DOWN) ||
+        (m & (EVENTFLAG_CONTROL_DOWN | EVENTFLAG_ALT_DOWN)))
+      return false;
+    CefRefPtr<CefFrame> frame = browser->GetFocusedFrame();
+    if (!frame) return false;
+    const bool shift = (m & EVENTFLAG_SHIFT_DOWN) != 0;
+    switch (event.windows_key_code) {
+      case 'C': if (shift) return false; frame->Copy(); return true;
+      case 'X': if (shift) return false; frame->Cut(); return true;
+      case 'V': if (shift) return false; frame->Paste(); return true;
+      case 'A': if (shift) return false; frame->SelectAll(); return true;
+      case 'Z': if (shift) frame->Redo(); else frame->Undo(); return true;
+      default: return false;
+    }
   }
   // IO thread. Answer the main-frame navigation to an authored document's URL
   // with the document itself (see g_authored); everything else is untouched.

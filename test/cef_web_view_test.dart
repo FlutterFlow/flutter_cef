@@ -493,36 +493,63 @@ void main() {
     });
   }
 
-  // Browser editing shortcuts (⌘C/X/V/A/Z) route to explicit edit commands —
-  // OSR has no responder chain, so a raw ⌘-key never becomes an editor action.
+  // Browser editing shortcuts (⌘C/X/V/A/Z). On macOS the PAGE gets them first,
+  // as raw keys — an editor with its own undo stack / selection (Monaco) handles
+  // them in its keydown listener — and cef_host runs the browser's edit command
+  // only if the page left the key unhandled. So: a raw key, no editCommand.
   int? editCommandOf(MethodCall c) =>
       (c.arguments as Map)['command'] as int?;
 
-  for (final (name, key, shift, cmd) in <(String, LogicalKeyboardKey, bool, int)>[
-    ('⌘C copies', LogicalKeyboardKey.keyC, false, 0),
-    ('⌘X cuts', LogicalKeyboardKey.keyX, false, 1),
-    ('⌘V pastes', LogicalKeyboardKey.keyV, false, 2),
-    ('⌘A selects all', LogicalKeyboardKey.keyA, false, 3),
-    ('⌘Z undoes', LogicalKeyboardKey.keyZ, false, 4),
-    ('⌘⇧Z redoes', LogicalKeyboardKey.keyZ, true, 5),
+  for (final (name, key, shift, vk) in <(String, LogicalKeyboardKey, bool, int)>[
+    ('⌘C', LogicalKeyboardKey.keyC, false, 0x43),
+    ('⌘X', LogicalKeyboardKey.keyX, false, 0x58),
+    ('⌘V', LogicalKeyboardKey.keyV, false, 0x56),
+    ('⌘A', LogicalKeyboardKey.keyA, false, 0x41),
+    ('⌘Z', LogicalKeyboardKey.keyZ, false, 0x5A),
+    ('⌘⇧Z', LogicalKeyboardKey.keyZ, true, 0x5A),
   ]) {
-    testWidgets('$name via an editCommand (not a raw key)', (tester) async {
+    testWidgets('$name reaches the page as a raw key (not an editCommand)',
+        (tester) async {
       await focusedView(tester);
-      log.clear();
       await tester.sendKeyDownEvent(LogicalKeyboardKey.meta);
       if (shift) await tester.sendKeyDownEvent(LogicalKeyboardKey.shift);
-      await tester.sendKeyEvent(key);
+      log.clear();
+      await tester.sendKeyDownEvent(key);
+      await tester.pump();
+      expect(callsTo('editCommand'), isEmpty);
+      final down = callsTo('key').single.arguments as Map;
+      expect(down['type'], 0, reason: 'RAWKEYDOWN');
+      expect(down['windowsKeyCode'], vk);
+      expect((down['modifiers'] as int) & (1 << 7),
+          (1 << 7));
+      expect((down['modifiers'] as int) & (1 << 1),
+          shift ? (1 << 1) : 0);
+      // A command is not text: nothing is typed into the page.
+      expect(callsTo('imeCommitText'), isEmpty);
+      expect(
+          callsTo('key').where((c) => (c.arguments as Map)['type'] == 3),
+          isEmpty);
+      await tester.sendKeyUpEvent(key);
       if (shift) await tester.sendKeyUpEvent(LogicalKeyboardKey.shift);
       await tester.sendKeyUpEvent(LogicalKeyboardKey.meta);
-      await tester.pump();
-      final edits = callsTo('editCommand');
-      expect(edits, hasLength(1), reason: 'exactly one edit command');
-      expect(editCommandOf(edits.single), cmd);
-      // The shortcut LETTER isn't also forwarded to the page as a text char
-      // (the ⌘/⇧ modifier keydowns themselves do forward, like a real browser).
-      expect(callsTo('imeCommitText'), isEmpty);
     });
   }
+
+  // A modifier pressed on its own must name ITSELF. Unmapped it went out as
+  // keycode 0 — the `A` key on macOS — so a bare ⌘ press reached the page as ⌘A
+  // and selected everything in Monaco.
+  testWidgets('a bare ⌘ press is sent as the Command key, not as keycode 0',
+      (tester) async {
+    await focusedView(tester);
+    log.clear();
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.metaLeft);
+    await tester.pump();
+    final down = callsTo('key').single.arguments as Map;
+    expect(down['nativeKeyCode'], 55, reason: 'kVK_Command');
+    expect(down['windowsKeyCode'], 0x5B, reason: 'VK_LWIN');
+    expect(down['character'], 0, reason: 'FlagsChanged, like AppKit');
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.metaLeft);
+  });
 
   for (final (name, key, expectLevel) in <(String, LogicalKeyboardKey, double)>[
     ('⌘= zooms in', LogicalKeyboardKey.equal, 0.5),

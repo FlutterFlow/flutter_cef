@@ -102,6 +102,18 @@ void main() {
   });
 
   group('cefMacNativeKeyCode — physical key -> macOS keycode', () {
+    // Unmapped, a modifier fell back to 0 — which IS a keycode: the `A` key.
+    test('modifier keys carry their own kVK_* code', () {
+      expect(cefMacNativeKeyCode(PhysicalKeyboardKey.metaLeft), 55);
+      expect(cefMacNativeKeyCode(PhysicalKeyboardKey.metaRight), 54);
+      expect(cefMacNativeKeyCode(PhysicalKeyboardKey.shiftLeft), 56);
+      expect(cefMacNativeKeyCode(PhysicalKeyboardKey.controlLeft), 59);
+      expect(cefMacNativeKeyCode(PhysicalKeyboardKey.altLeft), 58);
+      expect(cefWindowsKeyCode(LogicalKeyboardKey.metaLeft), 0x5B);
+      expect(cefWindowsKeyCode(LogicalKeyboardKey.shiftLeft), 0x10);
+      expect(cefWindowsKeyCode(LogicalKeyboardKey.controlRight), 0x11);
+      expect(cefWindowsKeyCode(LogicalKeyboardKey.altLeft), 0x12);
+    });
     test('digit 0 -> 29 (kVK_ANSI_0), NOT 48 (Tab) — the focus-move bug', () {
       expect(cefMacNativeKeyCode(PhysicalKeyboardKey.digit0), 29);
       expect(cefMacNativeKeyCode(PhysicalKeyboardKey.digit0), isNot(48));

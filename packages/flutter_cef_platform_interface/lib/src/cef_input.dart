@@ -67,6 +67,20 @@ final Map<LogicalKeyboardKey, int> kCefSpecialWindowsKeyCodes =
   LogicalKeyboardKey.arrowRight: 0x27,
   LogicalKeyboardKey.arrowDown: 0x28,
   LogicalKeyboardKey.delete: 0x2E,
+  // Modifiers. A modifier pressed on its own is a key event too, and it MUST
+  // name itself: left at 0, the page was told the key was whatever code 0 means
+  // — on macOS that is keycode 0 = the `A` key, so a bare ⌘ press arrived as
+  // ⌘A and selected everything in any editor that binds it (Monaco), and a
+  // bare ⌃ press as ⌃A (line start).
+  LogicalKeyboardKey.shiftLeft: 0x10,
+  LogicalKeyboardKey.shiftRight: 0x10,
+  LogicalKeyboardKey.controlLeft: 0x11,
+  LogicalKeyboardKey.controlRight: 0x11,
+  LogicalKeyboardKey.altLeft: 0x12,
+  LogicalKeyboardKey.altRight: 0x12,
+  LogicalKeyboardKey.capsLock: 0x14,
+  LogicalKeyboardKey.metaLeft: 0x5B,
+  LogicalKeyboardKey.metaRight: 0x5C,
 };
 
 /// macOS virtual keycodes (`kVK_*`) keyed by **physical** key. CEF on macOS
@@ -76,6 +90,13 @@ final Map<LogicalKeyboardKey, int> kCefSpecialWindowsKeyCodes =
 /// Physical keys are layout-independent, so this is correct on any layout.
 final Map<PhysicalKeyboardKey, int> kCefMacKeyCodesByPhysical =
     <PhysicalKeyboardKey, int>{
+  // Modifiers (kVK_Command … kVK_Function). See kCefSpecialWindowsKeyCodes:
+  // unmapped, these fell back to 0, which is the `A` key.
+  PhysicalKeyboardKey.metaLeft: 55, PhysicalKeyboardKey.metaRight: 54,
+  PhysicalKeyboardKey.shiftLeft: 56, PhysicalKeyboardKey.shiftRight: 60,
+  PhysicalKeyboardKey.altLeft: 58, PhysicalKeyboardKey.altRight: 61,
+  PhysicalKeyboardKey.controlLeft: 59, PhysicalKeyboardKey.controlRight: 62,
+  PhysicalKeyboardKey.capsLock: 57, PhysicalKeyboardKey.fn: 63,
   // Letters
   PhysicalKeyboardKey.keyA: 0, PhysicalKeyboardKey.keyS: 1,
   PhysicalKeyboardKey.keyD: 2, PhysicalKeyboardKey.keyF: 3,
