@@ -29,9 +29,12 @@ namespace flutter_cef {
 
 // ---- Wire protocol version ----
 // Announced in kOpReady's payload byte 1 (byte 0 is the ready-flags byte).
-// Must stay equal to main.mm:108 kCefHostProtocolVersion and
-// CefProfileHost.swift:42 — the wire is shared cross-platform.
-constexpr uint8_t kCefHostProtocolVersion = 3;
+// Versioned per platform: this header is shared by the Windows host and the
+// Windows plugin, which must agree; macOS (main.mm / CefProfileHost.swift)
+// counts separately. Bump on any change the other side can't ignore — a
+// mismatch fails every session with processGone("protocolMismatch(host=vN)").
+//   4: kOpSetAuthoredHtml (0x3f) + kOpSetDocumentStart (0x41).
+constexpr uint8_t kCefHostProtocolVersion = 4;
 
 // Framing guard (main.mm:2347): minimum body = 4 (browserId) + 1 (op).
 constexpr uint32_t kMinBodyLen = 5;
@@ -94,6 +97,13 @@ constexpr uint8_t kOpSetVisible = 0x35;     // {u8 visible} -> CefBrowserHost::W
 constexpr uint8_t kOpResolveTargetId = 0x36;// {} resolve CDP targetId -> kOpTargetId
 constexpr uint8_t kOpInvalidate = 0x37;     // {} force a repaint (re-kick a stalled first frame)
 constexpr uint8_t kOpEditCommand = 0x38;    // {u8 cmd} 0=copy 1=cut 2=paste 3=selectAll 4=undo 5=redo
+// {utf8 baseUrl}\0{utf8 html}: an AUTHORED document served as the main-frame
+// response for exactly baseUrl (empty html clears it). Store-only — the load
+// is a following kOpCreateBrowser / kOpLoadTrusted for that URL.
+constexpr uint8_t kOpSetAuthoredHtml = 0x3f;
+// Document-start scripts + JS channel names for the browser created right
+// behind it (payload: document_start.h). Store-only, like kOpSetAuthoredHtml.
+constexpr uint8_t kOpSetDocumentStart = 0x41;
 
 // 0x1e is RESERVED (PLAN §4.3's kOpPresentV2 earmark) — do not assign.
 

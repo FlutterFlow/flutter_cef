@@ -26,7 +26,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   // browser at the original url unless the thaw call overrides it.
   private var sessionCreateArgs: [String: (url: String, allowedSchemes: String,
                                            agentControl: Bool, profile: String?,
-                                           enableCdp: Bool)] = [:]
+                                           enableCdp: Bool, hostGroup: String?)] = [:]
   // Sessions whose native browser was torn down by freezeSession while the
   // session + texture live on serving the last painted frame. Not in
   // sessionHost/sessionKey while frozen (their host may be gone entirely).
@@ -344,6 +344,9 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     // behaves exactly as before.
     let profile = a["profile"] as? String
     let namedProfile = profile != nil && !profile!.isEmpty
+    // A non-empty `hostGroup` (without a profile) => one ephemeral host SHARED by
+    // every session in the group, instead of one throwaway host per session.
+    let hostGroup = (a["hostGroup"] as? String).flatMap { $0.isEmpty ? nil : $0 }
 
     // Dispose any prior session with this id first (route teardown through its
     // host), so re-creating the same id is idempotent and doesn't trip the
@@ -380,11 +383,11 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     // C2: if a running ad-hoc host already refused this named profile, don't race onto
     // a doomed shared host — go ephemeral directly.
     let effectiveNamed = namedProfile && !adhocBlockedProfiles.contains(profile ?? "")
-    let (profileDir, isEphemeral) = resolveProfileDir(effectiveNamed ? profile : nil)
-    let key = effectiveNamed ? profile! : "~ephemeral~" + sessionId
+    let key = effectiveNamed
+      ? profile! : Self.ephemeralKey(sessionId: sessionId, hostGroup: hostGroup)
 
     guard let host = resolveOrSpawnHost(
-      key: key, profileDir: profileDir, isEphemeral: isEphemeral,
+      key: key, namedProfile: effectiveNamed ? profile : nil,
       cefHostPath: cefHost, enableCdp: enableCdp, allowedSchemes: allowedSchemes,
       agentControl: agentControl)
     else {
@@ -511,12 +514,19 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     if let html = a["authoredHtml"] as? String, !html.isEmpty {
       session.setAuthoredDoc((url, html))
     }
+    // Document-start scripts + the JS channels registered before create: carried
+    // into the renderer with the browser itself (every create/thaw/re-home of this
+    // session re-sends them — see CefProfileHost.sendCreate).
+    session.setDocumentStart(
+      scripts: a["documentStartScripts"] as? [String] ?? [],
+      channels: a["channels"] as? [String] ?? [])
     _ = host.createBrowser(session, url: url, allowedSchemes: allowedSchemes)
     sessions[sessionId] = session
     sessionHost[sessionId] = host
     sessionKey[sessionId] = key
     // C2 re-home + freeze/thaw recipe.
-    sessionCreateArgs[sessionId] = (url, allowedSchemes, agentControl, profile, enableCdp)
+    sessionCreateArgs[sessionId] =
+      (url, allowedSchemes, agentControl, profile, enableCdp, hostGroup)
     result([
       "textureId": session.textureId, "width": width, "height": height,
       "cdpPort": host.cdpPort,
@@ -532,15 +542,19 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   /// tile — the host was already spawned in agent-control mode by the first, and
   /// each tile gets its own per-target CDP relay (see CefProfileHost.enableAgentControl).
   private func resolveOrSpawnHost(
-    key: String, profileDir: String, isEphemeral: Bool, cefHostPath: String,
+    key: String, namedProfile: String?, cefHostPath: String,
     enableCdp: Bool, allowedSchemes: String, agentControl: Bool
   ) -> CefProfileHost? {
     if let existing = profiles[key] { return existing }
+    // Only a host we actually spawn gets a profile dir — a host-group member
+    // joining a running host must not mint (and strand) a throwaway temp dir.
+    let (profileDir, isEphemeral) = resolveProfileDir(namedProfile)
     let host = CefProfileHost(
       profileId: key, profileDir: profileDir, isEphemeral: isEphemeral)
     guard host.spawn(cefHostPath: cefHostPath, enableCdp: enableCdp,
                      allowedSchemes: allowedSchemes, agentControl: agentControl)
     else {
+      if isEphemeral { try? FileManager.default.removeItem(atPath: profileDir) }
       return nil
     }
     wireHostDied(host)
@@ -850,10 +864,10 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     let namedProfile = profile != nil && !profile!.isEmpty
     // Mirrors create(): skip a named profile a running ad-hoc host already refused.
     let effectiveNamed = namedProfile && !adhocBlockedProfiles.contains(profile ?? "")
-    let (profileDir, isEphemeral) = resolveProfileDir(effectiveNamed ? profile : nil)
-    let key = effectiveNamed ? profile! : "~ephemeral~" + id
+    let key = effectiveNamed
+      ? profile! : Self.ephemeralKey(sessionId: id, hostGroup: args.hostGroup)
     guard let host = resolveOrSpawnHost(
-      key: key, profileDir: profileDir, isEphemeral: isEphemeral,
+      key: key, namedProfile: effectiveNamed ? profile : nil,
       cefHostPath: cefHost, enableCdp: args.enableCdp,
       allowedSchemes: args.allowedSchemes, agentControl: args.agentControl)
     else {
@@ -878,6 +892,15 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     // sessionCreateArgs keeps the ORIGINAL url: a later thaw without an
     // override falls back to it again (the thaw url is transient).
     result(["textureId": session.textureId])
+  }
+
+  /// The profiles[] key of a session without a (usable) named profile: its own
+  /// throwaway host, or — with a `hostGroup` — the group's shared ephemeral host.
+  /// Named profiles are keyed by their name verbatim, so names starting with
+  /// "~ephemeral~" / "~group~" are reserved for these.
+  static func ephemeralKey(sessionId: String, hostGroup: String?) -> String {
+    if let group = hostGroup { return "~group~" + group }
+    return "~ephemeral~" + sessionId
   }
 
   /// Resolve the on-disk cache dir for a profile. F.4: a null/empty profile gets

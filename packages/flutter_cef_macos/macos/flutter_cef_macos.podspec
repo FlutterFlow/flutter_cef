@@ -27,10 +27,12 @@ rendering when off-screen. macOS only.
   s.swift_version = '5.0'
   s.resource_bundles = {'flutter_cef_privacy' => ['Resources/PrivacyInfo.xcprivacy']}
 
-  # Fetch the prebuilt, version-matched cef_host.app at `pod install` (downloads + SHA256-verifies
-  # the artifact named in cef_host_prebuilt.json into native/cef_host/prebuilt/). Fail-open + cached;
-  # FLUTTER_CEF_FROM_SOURCE=1 skips it for co-dev. The :after_compile phase below embeds whatever
-  # lands there, so `flutter pub get` + `flutter build macos` is turnkey with no make/host steps.
+  # Fetch the prebuilt cef_host.app keyed by the content hash of native/cef_host at `pod install`
+  # (a GitHub Release on the plugin repo; SHA-256 + Developer-ID-verified) into
+  # native/cef_host/prebuilt/. Fail-open + cached for development; FLUTTER_CEF_FROM_SOURCE=1 skips
+  # it for co-dev, and FLUTTER_CEF_REQUIRE_PREBUILT=1 (release builds) makes every miss an error.
+  # The :after_compile phase below embeds it, so `flutter pub get` + `flutter build macos` is
+  # turnkey with no make/host steps.
   s.prepare_command = 'bash ../tool/fetch_cef_host.sh'
 
   # Auto-embed cef_host.app into the consuming app's Contents/Frameworks. cef_host.app is a
@@ -42,26 +44,41 @@ rendering when off-screen. macOS only.
   # Contents/Frameworks is real (the old "a pod script-phase runs before the app bundle exists"
   # was only true for :before_compile). ditto (never cp -R) preserves the prebuilt's inside-out
   # signatures. The prebuilt is fetched at `pod install` by prepare_command (see fetch_cef_host.sh)
-  # into native/cef_host/prebuilt/. When absent (co-dev from-source, or FLUTTER_CEF_HOST set) this
-  # is a clean no-op — the runtime resolver falls back to FLUTTER_CEF_HOST / a make-built host.
+  # into native/cef_host/prebuilt/. Only a prebuilt built from THESE sources (its stamped input hash
+  # matches) is embedded: a stale one would speak an older wire protocol. When absent (co-dev
+  # from-source, or FLUTTER_CEF_HOST set) this is a clean no-op — the runtime resolver falls back to
+  # FLUTTER_CEF_HOST / a make-built host — unless FLUTTER_CEF_REQUIRE_PREBUILT is set, which fails
+  # the build rather than ship an app with no (or a mismatched) cef_host.
   s.script_phase = {
     :name => 'Embed cef_host.app',
     :execution_position => :after_compile,
+    :shell_path => '/bin/bash',
     :script => <<-SCRIPT
 set -e
-PREBUILT="${PODS_TARGET_SRCROOT}/../native/cef_host/prebuilt/cef_host.app"
+NATIVE="${PODS_TARGET_SRCROOT}/../native"
+PREBUILT="${NATIVE}/cef_host/prebuilt/cef_host.app"
 DEST_DIR="${BUILT_PRODUCTS_DIR}/${FRAMEWORKS_FOLDER_PATH}"
 echo "[flutter_cef] embed: PODS_TARGET_SRCROOT=${PODS_TARGET_SRCROOT}"
 echo "[flutter_cef] embed: prebuilt=${PREBUILT}"
 echo "[flutter_cef] embed: dest=${DEST_DIR}/cef_host.app"
-if [ -d "${PREBUILT}" ]; then
-  mkdir -p "${DEST_DIR}"
+refuse() {
+  if [ -n "${FLUTTER_CEF_REQUIRE_PREBUILT:-}" ]; then
+    echo "error: [flutter_cef] $1 — FLUTTER_CEF_REQUIRE_PREBUILT is set, refusing to build an app without a matching cef_host. Publish it (make publish-cef-host in flutter_cef) and re-run pod install."
+    exit 1
+  fi
+  echo "[flutter_cef] $1; skipping (co-dev from-source / FLUTTER_CEF_HOST path)"
   rm -rf "${DEST_DIR}/cef_host.app"
-  ditto "${PREBUILT}" "${DEST_DIR}/cef_host.app"
-  echo "[flutter_cef] embedded cef_host.app into Contents/Frameworks"
-else
-  echo "[flutter_cef] no prebuilt cef_host.app; skipping (co-dev from-source / FLUTTER_CEF_HOST path)"
-fi
+  exit 0
+}
+[ -d "${PREBUILT}" ] || refuse "no prebuilt cef_host.app"
+. "${PODS_TARGET_SRCROOT}/../tool/cef_host_hash.sh"
+WANT="$(cef_host_input_hash "${NATIVE}")"
+HAVE="$(cat "${NATIVE}/cef_host/prebuilt/cef_host_input_hash.txt" 2>/dev/null || true)"
+[ "${HAVE}" = "${WANT}" ] || refuse "prebuilt cef_host.app is for input hash '${HAVE}', these sources are '${WANT}'"
+mkdir -p "${DEST_DIR}"
+rm -rf "${DEST_DIR}/cef_host.app"
+ditto "${PREBUILT}" "${DEST_DIR}/cef_host.app"
+echo "[flutter_cef] embedded cef_host.app (${WANT}) into Contents/Frameworks"
 SCRIPT
   }
 end

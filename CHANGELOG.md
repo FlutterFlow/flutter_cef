@@ -1,3 +1,32 @@
+## Unreleased
+
+* **Document-start scripts**: `CefWebController(documentStartScripts: [...])`
+  runs each script in every main-frame document before the page's own scripts
+  (also after a cross-site navigation). A script that throws is reported to the
+  console, and the scripts after it still run.
+* **Create-time JS channels**: channels added with `addJavaScriptChannel` before
+  create are available to the page's first `<head>` script. Before this, they
+  arrived on load start and raced the page.
+* **Host groups**: `CefWebController(hostGroup: 'name')` puts ephemeral sessions
+  on one shared `cef_host` process, which exits with the group's last session.
+  Use it for several short-lived views of one app, such as editors.
+* **`onCreateFailed`**: `CefWebView` stops retrying a failed create. The failure
+  goes to `CefWebController.onCreateFailed`, which is also called on a
+  `createFailed` or `protocolMismatch` `processGone`, so a consumer can fall back
+  to another web view.
+* **Windows**: `loadHtmlString(baseUrl:)` and create-with-html now serve the
+  document at its http(s) origin, as macOS does. This means no `data:` URL and no
+  2 MB cap. The Windows wire protocol is now v4.
+* **macOS prebuilt**:
+  * `FLUTTER_CEF_REQUIRE_PREBUILT=1` makes pod install / build fail when the
+    matching prebuilt `cef_host.app` can't be fetched or embedded. Release
+    pipelines should set it.
+  * A stale prebuilt (one that doesn't match the sources' hash) is no longer
+    embedded.
+  * `cef_host.app` keeps only the English locale paks, since CEF runs en-US
+    regardless of the system language. This saves about 49 MB installed and
+    about 12 MB compressed. See `CEF_HOST_LOCALES`.
+
 ## 0.2.0
 
 * **Persistent, shared profiles**: `CefWebView(profile: 'name')` /

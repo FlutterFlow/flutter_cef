@@ -187,6 +187,7 @@ class _CefWebViewState extends State<CefWebView>
   Size? _lastSize;
   double? _lastDpr;
   bool _creating = false;
+  bool _createFailed = false;
 
   // ── IME / text input ─────────────────────────────────────────────
   // While focused we hold a TextInputConnection so the platform IME drives
@@ -268,7 +269,7 @@ class _CefWebViewState extends State<CefWebView>
     final w = size.width.round();
     final h = size.height.round();
     if (w <= 0 || h <= 0) return;
-    if (_textureId == null && !_creating) {
+    if (_textureId == null && !_creating && !_createFailed) {
       _creating = true;
       try {
         final id = await _controller.create(
@@ -287,6 +288,22 @@ class _CefWebViewState extends State<CefWebView>
         // makes the resize branch below reconcile to the real laid-out size on
         // the next frame (a no-op resize when create() did size to `size`).
         if (mounted) setState(() => _textureId = id);
+      } catch (e, st) {
+        // No cef_host, or it failed to spawn. Retrying on every rebuild would
+        // just fail again, so keep the placeholder and hand the failure to the
+        // consumer (which may fall back to another engine).
+        _createFailed = true;
+        final onFailed = _controller.onCreateFailed;
+        if (onFailed != null) {
+          onFailed(e);
+        } else {
+          FlutterError.reportError(FlutterErrorDetails(
+            exception: e,
+            stack: st,
+            library: 'flutter_cef',
+            context: ErrorDescription('creating the CEF browser session'),
+          ));
+        }
       } finally {
         _creating = false;
       }

@@ -91,6 +91,19 @@ bool GetBool(const flutter::EncodableMap& m, const char* key, bool fallback) {
   return b ? *b : fallback;
 }
 
+std::vector<std::string> GetStringList(const flutter::EncodableMap& m,
+                                       const char* key) {
+  std::vector<std::string> out;
+  auto it = m.find(flutter::EncodableValue(std::string(key)));
+  if (it == m.end()) return out;
+  const auto* list = std::get_if<flutter::EncodableList>(&it->second);
+  if (!list) return out;
+  for (const auto& v : *list) {
+    if (const auto* s = std::get_if<std::string>(&v)) out.push_back(*s);
+  }
+  return out;
+}
+
 // A `profile` arg is "named" only when present AND non-empty (Swift:288-289).
 bool HasNamedProfile(const flutter::EncodableMap& m) {
   auto it = m.find(flutter::EncodableValue(std::string("profile")));
@@ -115,6 +128,33 @@ void AppendF64(std::vector<uint8_t>& out, double v) {
 
 void AppendUtf8(std::vector<uint8_t>& out, const std::string& s) {
   out.insert(out.end(), s.begin(), s.end());
+}
+
+// kOpSetAuthoredHtml: {utf8 url}\0{utf8 html}.
+std::vector<uint8_t> AuthoredPayload(const std::string& url,
+                                     const std::string& html) {
+  std::vector<uint8_t> out;
+  AppendUtf8(out, url);
+  out.push_back(0);
+  AppendUtf8(out, html);
+  return out;
+}
+
+// kOpSetDocumentStart (native/cef_host/document_start.h): one
+// {u8 kind}{u32 len BE}{utf8} item per JS channel name (kind 0) and script
+// (kind 1). Empty when there is neither.
+std::vector<uint8_t> DocumentStartPayload(
+    const std::vector<std::string>& channels,
+    const std::vector<std::string>& scripts) {
+  std::vector<uint8_t> out;
+  auto item = [&out](uint8_t kind, const std::string& s) {
+    out.push_back(kind);
+    AppendU32(out, static_cast<uint32_t>(s.size()));
+    AppendUtf8(out, s);
+  };
+  for (const auto& c : channels) item(0, c);
+  for (const auto& s : scripts) item(1, s);
+  return out;
 }
 
 // ---- inbound payload decoding ----
@@ -381,6 +421,20 @@ void FlutterCefPlugin::HandleMethodCall(
       AppendUtf8(p, url);
       SendOrQueue(s, method == "navigate" ? kOpNavigate : kOpLoadTrusted,
                   std::move(p));
+    }
+    result->Success();
+    return;
+  }
+  if (method == "loadAuthored") {
+    // loadHtmlString(html, baseUrl:) — serve `html` as the document AT `url`:
+    // park it on the host, then load that URL as a host-trusted navigation.
+    const std::string url = GetString(args, "url");
+    const std::string html = GetString(args, "html");
+    if (s && !url.empty()) {
+      SendOrQueue(s, kOpSetAuthoredHtml, AuthoredPayload(url, html));
+      std::vector<uint8_t> p;
+      AppendUtf8(p, url);
+      SendOrQueue(s, kOpLoadTrusted, std::move(p));
     }
     result->Success();
     return;
@@ -656,6 +710,7 @@ void FlutterCefPlugin::HandleCreate(
   const std::string allowed_schemes = GetString(args, "allowedSchemes");
   const bool named_profile = HasNamedProfile(args);
   const std::string profile = GetString(args, "profile");
+  const std::string host_group = GetString(args, "hostGroup");
   // Agent control (P9): CDP-over-pipe launch. Off by default; when set, the host
   // is spawned with the two inherited CDP pipes (the S3 recipe). Independent of
   // enableCdp (TCP) — the pipe path never opens a listening port.
@@ -672,28 +727,34 @@ void FlutterCefPlugin::HandleCreate(
     return;
   }
 
-  // Resolve the profile dir + host key. A named profile -> a shared persistent
-  // dir + a host keyed by name (reused by every session naming it); ephemeral
-  // -> a throwaway dir + a host keyed uniquely per session.
-  std::wstring profile_dir;
-  bool ephemeral = true;
-  std::string key;
-  if (named_profile) {
-    profile_dir = MakePersistentProfileDir(profile);
+  // Resolve the host key. A named profile -> a host keyed by name (reused by
+  // every session naming it) on a shared persistent dir. Otherwise ephemeral
+  // (a throwaway dir): a host keyed by `hostGroup`, shared by the group's
+  // sessions and torn down with the last of them, or without one a host of
+  // its own. Profile names starting with "~ephemeral~" / "~group~" are
+  // reserved.
+  const bool ephemeral = !named_profile;
+  const std::string key = named_profile        ? profile
+                          : !host_group.empty() ? "~group~" + host_group
+                                                : "~ephemeral~" + session_id;
+
+  // Reuse a live host for this key (a named profile's or group's 2nd+ tile);
+  // only a spawn needs a profile dir.
+  Host* host = nullptr;
+  auto live = hosts_.find(key);
+  if (live != hosts_.end() && !live->second->closing) {
+    host = live->second.get();
+  } else {
+    const std::wstring profile_dir = named_profile
+                                         ? MakePersistentProfileDir(profile)
+                                         : MakeEphemeralProfileDir();
     if (profile_dir.empty()) {
       result->Error("spawn_failed", "failed to create persistent profile dir");
       return;
     }
-    ephemeral = false;
-    key = profile;
-  } else {
-    profile_dir = MakeEphemeralProfileDir();
-    ephemeral = true;
-    key = "~ephemeral~" + session_id;
+    host = ResolveOrSpawnHost(key, profile_dir, ephemeral, host_exe,
+                              allowed_schemes, agent_control);
   }
-
-  Host* host = ResolveOrSpawnHost(key, profile_dir, ephemeral, host_exe,
-                                  allowed_schemes, agent_control);
   if (!host) {
     result->Error("spawn_failed", "failed to spawn cef_host");
     return;
@@ -747,21 +808,37 @@ void FlutterCefPlugin::HandleCreate(
       (std::max)(1.0, std::round(static_cast<double>(height) * dpr)));
   session->watchdog_id = next_timer_id_++;
 
+  // The new browser's frames, in wire order. Send directly on a ready host (2nd+
+  // tile on a shared host), else queue on the host for flush at kOpReady.
+  auto send = [host, browser_id](uint8_t op, std::vector<uint8_t> payload) {
+    if (host->ready) {
+      host->pipe->SendFrame(browser_id, op, payload.data(),
+                            static_cast<uint32_t>(payload.size()));
+    } else {
+      host->pending_frames.push_back(
+          PendingFrame{browser_id, op, std::move(payload)});
+    }
+  };
+  // Parked by the host ahead of the create that uses them: the document-start
+  // scripts + the JS channels registered before create (they ride into the
+  // renderer with the browser, ahead of the page's first script), and an
+  // authored document to create ON (served as `url`'s main-frame response).
+  std::vector<uint8_t> doc_start =
+      DocumentStartPayload(GetStringList(args, "channels"),
+                           GetStringList(args, "documentStartScripts"));
+  if (!doc_start.empty()) send(kOpSetDocumentStart, std::move(doc_start));
+  const std::string authored_html = GetString(args, "authoredHtml");
+  if (!authored_html.empty()) {
+    send(kOpSetAuthoredHtml, AuthoredPayload(url, authored_html));
+  }
   // kOpCreateBrowser: {u32 w}{u32 h}{f64 dpr}{utf8 url}; frame browserId = the
-  // NEW wire id. Send directly on a ready host (2nd+ tile on a shared host),
-  // else queue on the host for flush at kOpReady.
+  // NEW wire id.
   std::vector<uint8_t> create;
   AppendU32(create, static_cast<uint32_t>(width));
   AppendU32(create, static_cast<uint32_t>(height));
   AppendF64(create, dpr);
   AppendUtf8(create, url);
-  if (host->ready) {
-    host->pipe->SendFrame(browser_id, kOpCreateBrowser, create.data(),
-                          static_cast<uint32_t>(create.size()));
-  } else {
-    host->pending_frames.push_back(
-        PendingFrame{browser_id, kOpCreateBrowser, std::move(create)});
-  }
+  send(kOpCreateBrowser, std::move(create));
 
   host->browsers[browser_id] = session_id;
   Session* raw = session.get();

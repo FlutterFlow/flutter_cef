@@ -53,6 +53,38 @@ void main() {
     expect(find.text('loading'), findsNothing);
   });
 
+  testWidgets('a failed create reports once and is not retried',
+      (tester) async {
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      log.add(call);
+      if (call.method == 'create') {
+        throw PlatformException(code: 'no_cef_host', message: 'missing');
+      }
+      return null;
+    });
+    final failures = <Object>[];
+    final controller = CefWebController()..onCreateFailed = failures.add;
+    await tester.pumpWidget(boxed(CefWebView(
+      url: 'about:blank',
+      controller: controller,
+      placeholder: const Text('loading'),
+    )));
+    await tester.pumpAndSettle();
+    // A relayout would normally re-enter create — it must not after a failure.
+    await tester.pumpWidget(boxed(
+        CefWebView(
+          url: 'about:blank',
+          controller: controller,
+          placeholder: const Text('loading'),
+        ),
+        w: 300));
+    await tester.pumpAndSettle();
+    expect(callsTo('create'), hasLength(1));
+    expect(failures, hasLength(1));
+    expect(failures.single, isA<PlatformException>());
+    expect(find.text('loading'), findsOneWidget);
+  });
+
   testWidgets('creates exactly one session sized to the layout',
       (tester) async {
     await tester.pumpWidget(boxed(const CefWebView(url: 'https://a.test')));

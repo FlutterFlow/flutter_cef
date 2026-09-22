@@ -86,6 +86,7 @@
 #include "include/cef_find_handler.h"
 #include "include/cef_jsdialog_handler.h"
 #include "include/cef_keyboard_handler.h"
+#include "document_start.h"
 #include "mac_key_bindings.h"
 #include "include/cef_life_span_handler.h"
 #include "include/cef_permission_handler.h"
@@ -111,7 +112,7 @@ namespace {
 // stale embedded copy). BUMP THIS on any semantic change to the kOp wire protocol
 // below, together with CefProfileHost.protocolVersion (Swift side) — the two must
 // stay equal. Hosts predating the handshake send a 1-byte payload and read as v0.
-constexpr uint8_t kCefHostProtocolVersion = 7;
+constexpr uint8_t kCefHostProtocolVersion = 8;
 
 // ---- Opcodes ----
 constexpr uint8_t kOpPresent = 0x01;
@@ -180,6 +181,10 @@ constexpr uint8_t kOpSetPumpInterval = 0x3b;  // {u16 BE ms} visible begin-frame
 // response for exactly `baseUrl` (empty html clears it). Store-only — the load is a
 // following kOpCreateBrowser / kOpLoadTrusted for that URL. See g_authored.
 constexpr uint8_t kOpSetAuthoredHtml = 0x3f;
+// Document-start scripts + JS channel names for the browser created right behind
+// it (see document_start.h for the payload). Store-only, like kOpSetAuthoredHtml:
+// DoCreateBrowser folds it into the browser's extra_info for the renderer.
+constexpr uint8_t kOpSetDocumentStart = 0x41;
 constexpr uint8_t kOpContextMenuCommand = 0x3e;  // {u32 id}{u32 commandId} run the chosen command from a kOpContextMenu (commandId 0 = dismissed); Chromium executes it, so copy/paste/back/spellcheck behave exactly as in Chrome
 
 // ---- Shared runtime state ----
@@ -461,32 +466,50 @@ bool g_cdp_pipe = false;
 // (the CefMessageRouter channel — renderer half lives in process_helper.mm).
 std::set<std::string> g_channels;
 
-// A JS channel name is interpolated into the injected shim's source, so it MUST
-// be a plain JS identifier — otherwise a crafted name could break out of the
-// string literal and run arbitrary script on every page load. Reject anything
-// else (DoAddChannel drops invalid names).
-bool IsValidChannelName(const std::string& n) {
-  if (n.empty() || n.size() > 64) return false;
-  auto isFirst = [](unsigned char c) {
-    return std::isalpha(c) || c == '_' || c == '$';
-  };
-  auto isRest = [](unsigned char c) {
-    return std::isalnum(c) || c == '_' || c == '$';
-  };
-  if (!isFirst(static_cast<unsigned char>(n[0]))) return false;
-  for (size_t i = 1; i < n.size(); ++i) {
-    if (!isRest(static_cast<unsigned char>(n[i]))) return false;
-  }
-  return true;
-}
+// A JS channel name is interpolated into the injected shim's source — see
+// document_start::IsValidChannelName (DoAddChannel drops invalid names).
+using document_start::IsValidChannelName;
 
 void InjectChannelShim(CefRefPtr<CefFrame> frame, const std::string& name) {
   if (!frame) return;
-  std::string js = "window['" + name +
-                   "']={postMessage:function(m){window.cefQuery({request:'ch:" +
-                   name + ":'+String(m),persistent:false,"
-                   "onSuccess:function(){},onFailure:function(){}});}};";
-  frame->ExecuteJavaScript(js, "", 0);
+  frame->ExecuteJavaScript(document_start::ChannelShimJs(name), "", 0);
+}
+
+// Document-start config parked by kOpSetDocumentStart until its browser's
+// DoCreateBrowser takes it. Keyed by wire id and set on the reader thread ahead
+// of the create frame (like g_authored), read on TID_UI — hence the mutex.
+std::mutex g_doc_start_mutex;
+std::map<uint32_t, document_start::Config> g_doc_start;
+
+void SetDocumentStart(uint32_t wire_id, document_start::Config config) {
+  std::lock_guard<std::mutex> lock(g_doc_start_mutex);
+  if (config.empty()) {
+    g_doc_start.erase(wire_id);
+  } else {
+    g_doc_start[wire_id] = std::move(config);
+  }
+}
+
+// The browser's creation info carrying its document-start config to every
+// renderer that hosts it, or null when it has none. Consumes the parked entry.
+CefRefPtr<CefDictionaryValue> TakeDocumentStartExtraInfo(uint32_t wire_id) {
+  document_start::Config config;
+  {
+    std::lock_guard<std::mutex> lock(g_doc_start_mutex);
+    auto it = g_doc_start.find(wire_id);
+    if (it == g_doc_start.end()) return nullptr;
+    config = std::move(it->second);
+    g_doc_start.erase(it);
+  }
+  auto to_list = [](const std::vector<std::string>& v) {
+    CefRefPtr<CefListValue> list = CefListValue::Create();
+    for (size_t i = 0; i < v.size(); ++i) list->SetString(i, v[i]);
+    return list;
+  };
+  CefRefPtr<CefDictionaryValue> info = CefDictionaryValue::Create();
+  info->SetList(document_start::kChannelsKey, to_list(config.channels));
+  info->SetList(document_start::kScriptsKey, to_list(config.scripts));
+  return info;
 }
 
 // ---- IPC helpers ----
@@ -2506,8 +2529,12 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr,
   // every sibling. CreateBrowser returns immediately; the browser is bound to its slot
   // in HostClient::OnAfterCreated, which acks kOpCreated so the host's pacer sends the
   // NEXT create — serialized by COMPLETION, not a wall-clock guess.
+  // Document-start scripts + create-time JS channels ride into the renderer as
+  // the browser's extra_info (see document_start.h) — the only channel that is
+  // in place before the first document's scripts run.
   bool dispatched = CefBrowserHost::CreateBrowser(
-      window_info, client, create_url, settings, nullptr, nullptr);
+      window_info, client, create_url, settings,
+      TakeDocumentStartExtraInfo(wire_id), nullptr);
   if (!dispatched) {
     // H7: the create couldn't even be dispatched — OnAfterCreated/OnBeforeClose will
     // never fire, so reclaim the slot + the looked-up IOSurface (+1 ref) here (else
@@ -2542,6 +2569,7 @@ void DoDisposeBrowser(uint32_t wire_id) {
     // Never created (disposed while its create was still paced host-side), or
     // already closed: drop whatever was parked for it.
     SetAuthoredDoc(wire_id, "", "");
+    SetDocumentStart(wire_id, {});
     g_early_nav.erase(wire_id);
     return;
   }
@@ -3338,6 +3366,10 @@ void IpcReadLoop() {
         SetAuthoredDoc(wire_id, s.substr(0, nul), s.substr(nul + 1));
         break;
       }
+      case kOpSetDocumentStart:
+        // Parked on the reader thread, ahead of the create frame right behind it.
+        SetDocumentStart(wire_id, document_start::ParsePayload(p, plen));
+        break;
       case kOpNavigate: {
         // Resolve by wire id on TID_UI (see DoNavigateByWireId): do NOT require the slot
         // here, or a nav landing behind a still-queued create on a shared host is dropped.

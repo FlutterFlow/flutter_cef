@@ -76,7 +76,7 @@ Direction `H<-C` = cef_host -> plugin (event), `H->C` = plugin -> cef_host
 | Op | Name | Payload | Source |
 |---|---|---|---|
 | 0x01 | kOpPresent | **WINDOWS**: `{u64 bridgeHandle BE}{u32 srcW BE}{u32 srcH BE}` = 16 bytes. bridgeHandle = the DXGI **legacy** shared handle (`IDXGIResource::GetSharedHandle`) of the host-minted `MISC_SHARED` bridge texture; srcW/srcH = the PHYSICAL px dims of the frame actually composited (the size-gate signal). macOS reference is 12 bytes `{u32 iosurfaceId}{u32 srcW}{u32 srcH}` — same semantics, different token width. | main.mm:654-665 (semantics + size gate), SPIKES.md S1/S4, LAW 10 |
-| 0x02 | kOpReady | `{u8 readyFlags}{u8 protocolVersion}` on browserId 0. readyFlags bit0 = ad-hoc/mock-keychain build (macOS-only concern; Windows sends 0). protocolVersion = 3. Sent from `OnContextInitialized`, BEFORE any browser exists. | main.mm:1664-1682 |
+| 0x02 | kOpReady | `{u8 readyFlags}{u8 protocolVersion}` on browserId 0. readyFlags bit0 = ad-hoc/mock-keychain build (macOS-only concern; Windows sends 0). protocolVersion = 4 (Windows-only numbering — see cef_host_protocol.h). Sent from `OnContextInitialized`, BEFORE any browser exists. | main.mm:1664-1682 |
 | 0x03 | kOpCursor | `{u32 cef_cursor_type_t}` | main.mm:1456-1466 |
 | 0x04 | kOpLog | `{utf8 message}` (browserId 0 = process-level) | main.mm:448-450 |
 | 0x05 | kOpLoadState | `{u8 loading}{u8 canGoBack}{u8 canGoForward}` | main.mm:115, 456-462 |
@@ -99,7 +99,7 @@ Direction `H<-C` = cef_host -> plugin (event), `H->C` = plugin -> cef_host
 | 0x1c | kOpCreated | `{}` OnAfterCreated — browser is up (create pacer advance) | main.mm:132, 1406 |
 | 0x1d | kOpCreateFailed | `{}` async CreateBrowser dispatch failed — drop the session | main.mm:133, 1705 |
 
-### plugin -> cef_host (0x10-0x38)
+### plugin -> cef_host (0x10-0x41)
 
 Payload minimums are enforced host-side exactly as the macOS read loop does
 (cited); short frames are dropped per-op, not fatal.
@@ -137,6 +137,8 @@ Payload minimums are enforced host-side exactly as the macOS read loop does
 | 0x36 | kOpResolveTargetId | `{}` resolve this browser's CDP targetId -> kOpTargetId | main.mm:162 |
 | 0x37 | kOpInvalidate | `{}` force a repaint (`Invalidate(PET_VIEW)`) to re-kick a stalled first frame | main.mm:163 |
 | 0x38 | kOpEditCommand | `{u8 cmd}` focused-frame edit command: 0=copy 1=cut 2=paste 3=selectAll 4=undo 5=redo | main.mm:164, 2440-2445 |
+| 0x3f | kOpSetAuthoredHtml | `{utf8 baseUrl}\0{utf8 html}` — store-only: serve `html` as the MAIN-FRAME response for exactly `baseUrl` (normalized: no fragment, bare authority gets `/`), so the document has that URL's real origin and no 2 MB `data:` cap. Consumed by the following kOpCreateBrowser / kOpLoadTrusted for that URL; sticky across reloads; cleared by kOpNavigate, a kOpLoadTrusted to another URL, or dispose. Stored on the reader thread (no slot required). | main.mm:183, g_authored |
+| 0x41 | kOpSetDocumentStart | `{u8 kind}{u32 len}{utf8}`* (kind 0 = JS channel name, 1 = script) — store-only, ahead of kOpCreateBrowser: rides into every renderer hosting the browser as CreateBrowser `extra_info`; the renderer installs the channel shims then evals each script in `OnContextCreated` for every main-frame document, before its own scripts. A throwing script is reported via `console.error` and the next one still runs. | main.mm:187, document_start.h |
 
 Reserved (do NOT reuse): `0x1e` was earmarked `kOpPresentV2` by PLAN §4.3
 stage-1; the slice instead reuses `kOpPresent 0x01` with the Windows payload
@@ -154,9 +156,10 @@ reply success/null + `OutputDebugString` warning, never an error.
 
 | Verb | Args (beyond sessionId) | Returns | Maps to | Slice? | Source |
 |---|---|---|---|---|---|
-| create | url:String, width:int, height:int, dpr:double, allowedSchemes:String? (csv, omit-when-empty), enableCdp:bool? (omit-when-false), agentControl:bool? (omit-when-false), profile:String? (omit-when-empty) | `{textureId:int, width:int, height:int, cdpPort:int}` | spawn host (if needed) + kOpCreateBrowser 0x13 | SLICE | Swift:255-446, controller:506-523 |
+| create | url:String, width:int, height:int, dpr:double, allowedSchemes:String? (csv, omit-when-empty), enableCdp:bool? (omit-when-false), agentControl:bool? (omit-when-false), profile:String? (omit-when-empty), hostGroup:String? (omit-when-empty), authoredHtml:String? (serve as `url`), documentStartScripts:List<String>?, channels:List<String>? (JS channels registered before create) | `{textureId:int, width:int, height:int, cdpPort:int}` | spawn host (if needed) + [kOpSetDocumentStart 0x41] + [kOpSetAuthoredHtml 0x3f] + kOpCreateBrowser 0x13 | SLICE | Swift:255-446, controller:506-523 |
 | navigate | url:String | null | 0x20 | SLICE | Swift:617-622, controller:566 |
 | loadTrusted | url:String | null | 0x34 | SLICE (stub-ok) | Swift:626-631, controller:634 |
+| loadAuthored | url:String, html:String | null | 0x3f then 0x34 | SLICE | Swift loadAuthored, controller loadHtmlString |
 | resize | width:int, height:int, dpr:double | `{textureId:int}` (or null if unknown session) | 0x11 | SLICE | Swift:633-641, controller:874 |
 | getFrameSurface | — | `{surfaceId:int, width:int, height:int}` (physical px) or null | plugin-local | STUB | Swift:649-658 |
 | dispose | — | null | 0x15 (last browser: 0x14 + host teardown) | SLICE | Swift:660-663, controller:530/948 |
@@ -224,7 +227,7 @@ thread (marshal from the reader thread).
 ## 5. Handshake + lifecycle rules (carry-over)
 
 - Plugin sends NOTHING until it receives `kOpReady`; it then checks
-  `protocolVersion == 3` and refuses (teardown + `processGone
+  `protocolVersion == kCefHostProtocolVersion` (4) and refuses (teardown + `processGone
   protocolMismatch`) on skew (main.mm:100-108, Swift:528-533).
 - Host exit code 2 after a `kOpLog "profile-locked"` = profile already open
   elsewhere -> `processGone reason:"locked"` (main.mm:2786-2806, Swift:521).
@@ -248,10 +251,12 @@ thread (marshal from the reader thread).
 The plugin owns ONE `cef_host` process per **profile key** and multiplexes N
 browsers over it (one wire browserId each) — the macOS
 `CefProfileHost`/`FlutterCefPlugin` model transcribed to Windows. Key =
-the sanitized `profile` name for a named profile, or `"~ephemeral~"+sessionId`
-for the default (throwaway) case, so every ephemeral session gets its own host
-and every view with the same non-null `profile` shares one host → one cookie
-jar → one login (macOS: FlutterCefPlugin.swift:326-327, CefProfileHost.swift:1-12).
+the sanitized `profile` name for a named profile, `"~group~"+hostGroup` for an
+ephemeral session in a host group, or `"~ephemeral~"+sessionId` for the default
+(throwaway) case, so an ungrouped ephemeral session gets its own host, a group's
+sessions share one throwaway host (torn down with the last of them), and every
+view with the same non-null `profile` shares one host → one cookie jar → one
+login (macOS: FlutterCefPlugin.swift ephemeralKey, CefProfileHost.swift:1-12).
 
 ### 6.1 Profile-dir resolution (plugin side)
 
