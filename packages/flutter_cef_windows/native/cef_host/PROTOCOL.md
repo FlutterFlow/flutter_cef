@@ -221,7 +221,7 @@ thread (marshal from the reader thread).
 | imeCompositionBounds | x:int, y:int, w:int, h:int | 0x19 | Swift:417-421 |
 | cookies | id:int, json:String | 0x1a | Swift:422-424 |
 | onSurface | surfaceId:int, width:int, height:int (physical px) — Windows: surfaceId = the bridge-handle token as int64 | 0x01 (on surface (re)alloc) | Swift:425-433 |
-| processGone | reason:String — "crashed" \| "locked" (host exit code 2) \| "createFailed" (0x1d) \| "respawnFailed" \| "protocolMismatch(host=vN)" | host death / 0x1d / handshake | Swift:490, 521, 531, 541, 601 |
+| processGone | reason:String — "crashed" \| "locked" (host exit code 2) \| "createFailed" (0x1d, or the host died before kOpReady) \| "respawnFailed" \| "protocolMismatch(host=vN)" | host death / 0x1d / handshake | Swift:490, 521, 531, 541, 601 |
 | paintStalled | — | watchdog (no 0x01 after create + 0x37 re-kick) | Swift:554-558 |
 
 ## 5. Handshake + lifecycle rules (carry-over)

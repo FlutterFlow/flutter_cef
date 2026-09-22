@@ -14,6 +14,10 @@
   goes to `CefWebController.onCreateFailed`, which is also called on a
   `createFailed` or `protocolMismatch` `processGone`, so a consumer can fall back
   to another web view.
+* **A `cef_host` that exits before it's ready is reported**: sessions get
+  `onProcessGone('createFailed')` and `onCreateFailed`, so a consumer falls back
+  instead of showing a blank view. On macOS, a host that exited before
+  connecting used to go unreported.
 * **Windows**: `loadHtmlString(baseUrl:)` and create-with-html now serve the
   document at its http(s) origin, as macOS does. This means no `data:` URL and no
   2 MB cap. The Windows wire protocol is now v4.

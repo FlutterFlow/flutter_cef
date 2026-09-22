@@ -79,12 +79,12 @@ class CefWebController {
   final List<String> documentStartScripts;
 
   /// Called when the native session can't be created — `cef_host` is missing
-  /// or failed to spawn (the [PlatformException] [create] throws), or the
-  /// browser couldn't be dispatched once the host was up (reported as
-  /// [onProcessGone] with reason `"createFailed"` too). Lets a consumer that
-  /// embeds a [CefWebView] fall back to another engine; the view itself shows
-  /// its placeholder and stops retrying. When unset, [CefWebView] reports the
-  /// error through [FlutterError.reportError].
+  /// or failed to spawn (the [PlatformException] [create] throws), exited
+  /// before it was ready, or couldn't dispatch the browser (these two are
+  /// reported as [onProcessGone] with reason `"createFailed"` too). Lets a
+  /// consumer that embeds a [CefWebView] fall back to another engine; the view
+  /// itself shows its placeholder and stops retrying. When unset, [CefWebView]
+  /// reports the error through [FlutterError.reportError].
   void Function(Object error)? onCreateFailed;
 
   /// The registered [Texture] id once [create] has resolved, else null.
@@ -152,7 +152,9 @@ class CefWebController {
   /// (crash) or lost the profile's cross-process cache lock. The texture is
   /// frozen on its last frame and the session is no longer usable; recreate the
   /// view (or controller) to recover. [reason] is `"locked"` when the profile is
-  /// already open in another process (show "already open elsewhere") or
+  /// already open in another process (show "already open elsewhere"),
+  /// `"createFailed"` when the browser never came up (including a `cef_host`
+  /// that exited before it was ready; [onCreateFailed] is called too), or
   /// `"crashed"` for a generic process death.
   void Function(String reason)? onProcessGone;
 

@@ -8,6 +8,11 @@
   closed. A prebuilt whose hash doesn't match the sources is removed, not
   embedded.
 * `cef_host.app` bundles only the `CEF_HOST_LOCALES` (default `en`) locale paks.
+* Fix: a `cef_host` that exits before connecting is reported. Its sessions got
+  no `processGone` and stayed blank, and disposing them waited 2 s on a reader
+  thread stuck in `accept()`.
+* A host that dies before `opReady` is reported as `createFailed`, not
+  `crashed` (exit code 2 is still `locked`).
 
 ## 0.2.0
 

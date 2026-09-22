@@ -923,6 +923,14 @@ final class CefProfileHost {
     return !browsers.isEmpty
   }
 
+  /// Whether cef_host ever announced opReady at our protocol version. A host that
+  /// died before that never created a browser, so the plugin reports its
+  /// sessions' deaths as `createFailed`, not `crashed`.
+  var everReady: Bool {
+    writeLock.lock(); defer { writeLock.unlock() }
+    return ready
+  }
+
   /// Close ONE browser (opDisposeBrowser) and unregister it under lock. Returns
   /// the number of browsers still registered on this host afterward.
   func removeBrowser(_ browserId: UInt32) -> Int {
@@ -958,7 +966,8 @@ final class CefProfileHost {
   // MARK: Teardown
 
   /// Tear down the WHOLE process: opShutdown(0), stop the reader thread (flag it,
-  /// wake its blocking accept()/read() by shutting down the fds, wait for it to
+  /// wake its blocking read() by shutting down the conn fd — a reader still waiting
+  /// for the host to connect sees the flag at its next poll — wait for it to
   /// exit), close the fds, unlink the socket, drop an ephemeral profile dir, and
   /// terminate cef_host. Closing an fd a thread is blocked on, or freeing state
   /// under the reader, is a use-after-free — the join makes teardown deterministic.
@@ -994,12 +1003,12 @@ final class CefProfileHost {
     for r in relays { r.stop() }
     send(0, Self.opShutdown, [])
     writeLock.lock()
-    let c = connFd, l = listenFd
+    let c = connFd
     writeLock.unlock()
     // Darwin.shutdown — disambiguate from this class's own shutdown() method,
-    // which Swift would otherwise resolve these unqualified calls to.
+    // which Swift would otherwise resolve this unqualified call to. Not the
+    // listening socket: on Darwin that fails with ENOTCONN and wakes nothing.
     if c >= 0 { Darwin.shutdown(c, SHUT_RDWR) }
-    if l >= 0 { Darwin.shutdown(l, SHUT_RDWR) }
     // H1: gate the join on `readerStarted` ALONE (not the old `wasRunning`). The
     // semaphore is level-triggered — if the reader already exited (e.g. it drove the
     // crash path and signalled readerDone before this runs), wait() returns at once.
@@ -1117,18 +1126,51 @@ final class CefProfileHost {
     return Int(UInt16(bigEndian: assigned.sin_port))
   }
 
+  /// Wait for cef_host to connect and return the accepted fd; nil when the host
+  /// exits first, shutdown() begins, or accept() fails. Polls instead of blocking
+  /// in accept(): Darwin's shutdown() of a listening socket fails (ENOTCONN) and
+  /// wakes nothing, so a blocked accept() outlived a host that died before
+  /// connecting — no death was reported, and shutdown()'s join timed out.
+  private func acceptHost() -> Int32? {
+    var pfd = pollfd(fd: listenFd, events: Int16(POLLIN), revents: 0)
+    while true {
+      let r = poll(&pfd, 1, 100)
+      if r > 0 {
+        let fd = accept(listenFd, nil, nil)
+        return fd >= 0 ? fd : nil
+      }
+      if r < 0 && errno != EINTR { return nil }
+      writeLock.lock()
+      let stopping = !running
+      writeLock.unlock()
+      if stopping || hostExited() { return nil }
+    }
+  }
+
+  /// Whether cef_host has exited. Doesn't reap it: handleHostDeath() does that
+  /// and reads its exit status.
+  private func hostExited() -> Bool {
+    writeLock.lock()
+    let p = process, pid = spawnedPid
+    writeLock.unlock()
+    if let p = p { return !p.isRunning }
+    guard pid > 0 else { return false }
+    var info = siginfo_t()
+    return waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT) == 0
+      && info.si_pid == pid
+  }
+
   private func acceptAndRead() {
     defer { readerDone.signal() }  // let shutdown() join us on every exit path
-    let fd = accept(listenFd, nil, nil)
-    guard fd >= 0 else {
-      // A failed accept() with no clean shutdown in flight is a dead host too
-      // (cef_host exited before connecting — e.g. a crash during CefInitialize
-      // that never reached the IPC). handleHostDeath() no-ops on a clean
-      // shutdown (running==false, which wakes accept() via the listen-fd
-      // shutdown). The C2 cache-lock loss connects first (it SendLogs
-      // "profile-locked" then exits 2), so it surfaces via the read-loop EOF
-      // below with a real terminationStatus, not here.
-      NSLog("[cef] accept() failed")
+    guard let fd = acceptHost() else {
+      // No connection and no clean shutdown in flight is a dead host too:
+      // cef_host exited before connecting (e.g. a crash during CefInitialize, or
+      // a FLUTTER_CEF_HOST that isn't cef_host), or accept() failed.
+      // handleHostDeath() no-ops on a clean shutdown (running==false). The C2
+      // cache-lock loss connects first (it SendLogs "profile-locked" then exits
+      // 2), so it usually surfaces via the read-loop EOF below; either way
+      // handleHostDeath() reads the real exit status.
+      NSLog("[cef] cef_host for profile '\(profileId)' never connected")
       handleHostDeath()
       return
     }
