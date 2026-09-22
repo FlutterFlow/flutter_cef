@@ -85,11 +85,15 @@
 #include "include/cef_download_handler.h"
 #include "include/cef_find_handler.h"
 #include "include/cef_jsdialog_handler.h"
+#include "include/cef_keyboard_handler.h"
+#include "mac_key_bindings.h"
 #include "include/cef_life_span_handler.h"
 #include "include/cef_permission_handler.h"
 #include "include/cef_render_handler.h"
 #include "include/cef_request_context.h"
 #include "include/cef_request_handler.h"
+#include "include/cef_resource_handler.h"
+#include "include/cef_resource_request_handler.h"
 #include "include/cef_task.h"
 #include "include/wrapper/cef_closure_task.h"
 #include "include/wrapper/cef_helpers.h"
@@ -154,7 +158,7 @@ constexpr uint8_t kOpStopFind = 0x28;   // {u8 clearSelection}
 constexpr uint8_t kOpJsDialogResp = 0x29;  // {u32 id}{u8 ok}{utf8 text}
 constexpr uint8_t kOpEvalReturning = 0x2a;  // {u32 id}{utf8 code}
 constexpr uint8_t kOpAddChannel = 0x2b;     // {utf8 name} register a JS channel
-constexpr uint8_t kOpSetCookie = 0x2c;      // {utf8 url\0name\0value\0domain\0path}
+constexpr uint8_t kOpSetCookie = 0x2c;      // {utf8 url\0name\0value\0domain\0path[\0secure(0|1)\0httpOnly(0|1)\0sameSite(unspecified|none|lax|strict)]}
 constexpr uint8_t kOpClearCookies = 0x2d;   // {} delete all cookies
 constexpr uint8_t kOpVisitCookies = 0x2e;   // {u32 id}{utf8 url} enumerate (url empty = all)
 constexpr uint8_t kOpDeleteCookie = 0x2f;   // {utf8 url\0name} delete one
@@ -172,6 +176,10 @@ constexpr uint8_t kOpEditCommand = 0x38;      // {u8 cmd} run a focused-frame ed
 constexpr uint8_t kOpOpenAuthWindow = 0x39;   // {utf8 url} open a windowed Chrome-runtime browser for a WebAuthn/Touch ID ceremony the OSR tile can't host (shares the tile's cookie jar)
 constexpr uint8_t kOpSetAudioMuted = 0x3a;    // {u8 muted} -> CefBrowserHost::SetAudioMuted; a hidden AND muted page regains intensive wake-up throttling (audible pages are exempt)
 constexpr uint8_t kOpSetPumpInterval = 0x3b;  // {u16 BE ms} visible begin-frame cadence for this slot, clamped to [8, 250]; hidden slots stay on the 100ms no-op poll
+// {utf8 baseUrl}\0{utf8 html}: an AUTHORED document to serve as the main-frame
+// response for exactly `baseUrl` (empty html clears it). Store-only — the load is a
+// following kOpCreateBrowser / kOpLoadTrusted for that URL. See g_authored.
+constexpr uint8_t kOpSetAuthoredHtml = 0x3f;
 constexpr uint8_t kOpContextMenuCommand = 0x3e;  // {u32 id}{u32 commandId} run the chosen command from a kOpContextMenu (commandId 0 = dismissed); Chromium executes it, so copy/paste/back/spellcheck behave exactly as in Chrome
 
 // ---- Shared runtime state ----
@@ -338,6 +346,9 @@ struct Slot {
   // so reusing a fixed id silently drops the 2nd+ probe, which hung a re-enable of
   // agent-control (disable then enable again). UI-thread only, like dialog_next.
   int target_info_msg = 0;
+  // The last DevTools message id issued on this browser, shared by every caller
+  // (see NextDevToolsMsgId) so their ids stay increasing. UI-thread only.
+  int devtools_msg = 0;
 
   // External begin-frame pump (see PumpBeginFrame). With external_begin_frame_enabled, CEF's
   // internal frame timer is OFF — frames are produced ONLY when we drive them — so a per-slot
@@ -1499,6 +1510,126 @@ std::string SerializeMenuModel(CefRefPtr<CefMenuModel> model) {
   return out;
 }
 
+// ---- Authored documents at a real origin (loadHtmlString(baseUrl:)) ----
+//
+// A data: URL gives the document an OPAQUE origin: relative URLs don't resolve, and
+// every fetch/XHR/worker it makes is cross-origin with `Origin: null`. Content that
+// was written to live at a site — an editor bundle that loads its workers and
+// siblings from its own origin — cannot run that way. So the host can hand us the
+// HTML plus the URL it should appear to come from, and we answer the MAIN-FRAME
+// request for exactly that URL with the HTML instead of the network. The document
+// then has that URL's real origin; everything else it loads goes to the network
+// as normal.
+//
+// Keyed by WIRE ID and written on the reader thread, not stored on the Slot: the
+// frame is sent immediately ahead of the create / load it belongs to, and must be
+// in place before that op runs — including when the slot doesn't exist yet. Read
+// on the IO thread (GetResourceRequestHandler), hence the mutex. Sticky across
+// reloads; replaced by the next set, cleared by a plain navigate or by dispose.
+struct AuthoredDoc {
+  std::string url;  // normalized (NormalizeAuthoredUrl)
+  std::string html;
+};
+std::mutex g_authored_mutex;
+std::map<uint32_t, AuthoredDoc> g_authored;
+
+// Compare URLs the way the network stack will present them: no fragment, and a
+// bare authority ("https://host") carries the implicit "/" path.
+std::string NormalizeAuthoredUrl(std::string url) {
+  // http(s) only: a data: URL is matched verbatim (its payload may contain "://").
+  if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) return url;
+  const size_t hash = url.find('#');
+  if (hash != std::string::npos) url.resize(hash);
+  const size_t scheme_end = url.find("://");
+  if (scheme_end != std::string::npos &&
+      url.find('/', scheme_end + 3) == std::string::npos) {
+    const size_t q = url.find('?', scheme_end + 3);
+    if (q == std::string::npos) url += '/';
+    else url.insert(q, "/");
+  }
+  return url;
+}
+
+void SetAuthoredDoc(uint32_t wire_id, const std::string& url,
+                    const std::string& html) {
+  std::lock_guard<std::mutex> lock(g_authored_mutex);
+  if (html.empty() || url.empty()) {
+    g_authored.erase(wire_id);
+  } else {
+    g_authored[wire_id] = AuthoredDoc{NormalizeAuthoredUrl(url), html};
+  }
+}
+// Drop the authored doc unless it is for `keep_url` (the load that follows a set
+// targets the same URL and must keep it).
+void ClearAuthoredDocUnless(uint32_t wire_id, const std::string& keep_url) {
+  std::lock_guard<std::mutex> lock(g_authored_mutex);
+  auto it = g_authored.find(wire_id);
+  if (it == g_authored.end()) return;
+  if (keep_url.empty() || it->second.url != NormalizeAuthoredUrl(keep_url))
+    g_authored.erase(it);
+}
+bool LookupAuthoredDoc(uint32_t wire_id, const std::string& url,
+                       std::string* html) {
+  std::lock_guard<std::mutex> lock(g_authored_mutex);
+  auto it = g_authored.find(wire_id);
+  if (it == g_authored.end()) return false;
+  if (it->second.url != NormalizeAuthoredUrl(url)) return false;
+  if (html) *html = it->second.html;
+  return true;
+}
+
+// Serves one authored document. Owns its bytes (CefStreamReader::CreateForData
+// borrows, and the doc can be replaced mid-read).
+class AuthoredResourceHandler : public CefResourceHandler {
+ public:
+  explicit AuthoredResourceHandler(std::string html) : html_(std::move(html)) {}
+  bool Open(CefRefPtr<CefRequest>, bool& handle_request,
+            CefRefPtr<CefCallback>) override {
+    handle_request = true;
+    return true;
+  }
+  void GetResponseHeaders(CefRefPtr<CefResponse> response,
+                          int64_t& response_length, CefString&) override {
+    response->SetStatus(200);
+    response->SetStatusText("OK");
+    response->SetMimeType("text/html");
+    response->SetCharset("utf-8");
+    response->SetHeaderByName("Cache-Control", "no-store", true);
+    response_length = static_cast<int64_t>(html_.size());
+  }
+  bool Read(void* data_out, int bytes_to_read, int& bytes_read,
+            CefRefPtr<CefResourceReadCallback>) override {
+    bytes_read = 0;
+    if (offset_ >= html_.size() || bytes_to_read <= 0) return false;
+    const size_t n =
+        std::min(static_cast<size_t>(bytes_to_read), html_.size() - offset_);
+    memcpy(data_out, html_.data() + offset_, n);
+    offset_ += n;
+    bytes_read = static_cast<int>(n);
+    return true;
+  }
+  void Cancel() override {}
+
+ private:
+  std::string html_;
+  size_t offset_ = 0;
+  IMPLEMENT_REFCOUNTING(AuthoredResourceHandler);
+};
+
+class AuthoredRequestHandler : public CefResourceRequestHandler {
+ public:
+  explicit AuthoredRequestHandler(std::string html) : html_(std::move(html)) {}
+  CefRefPtr<CefResourceHandler> GetResourceHandler(
+      CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>,
+      CefRefPtr<CefRequest>) override {
+    return new AuthoredResourceHandler(html_);
+  }
+
+ private:
+  std::string html_;
+  IMPLEMENT_REFCOUNTING(AuthoredRequestHandler);
+};
+
 class HostClient : public CefClient,
                    public CefLoadHandler,
                    public CefDisplayHandler,
@@ -1507,6 +1638,7 @@ class HostClient : public CefClient,
                    public CefJSDialogHandler,
                    public CefDownloadHandler,
                    public CefRequestHandler,
+                   public CefKeyboardHandler,
                    public CefContextMenuHandler,
                    public CefMessageRouterBrowserSide::Handler {
  public:
@@ -1529,6 +1661,7 @@ class HostClient : public CefClient,
   CefRefPtr<CefJSDialogHandler> GetJSDialogHandler() override { return this; }
   CefRefPtr<CefDownloadHandler> GetDownloadHandler() override { return this; }
   CefRefPtr<CefRequestHandler> GetRequestHandler() override { return this; }
+  CefRefPtr<CefKeyboardHandler> GetKeyboardHandler() override { return this; }
   CefRefPtr<CefContextMenuHandler> GetContextMenuHandler() override {
     return this;
   }
@@ -1908,6 +2041,7 @@ class HostClient : public CefClient,
       if (kv.second.callback) kv.second.callback->Cancel();
     }
     slot_->media_requests.clear();
+    SetAuthoredDoc(slot_->browser_id, "", "");
     {
       std::lock_guard<std::mutex> lock(g_slots_mutex);
       g_slots_by_wire_id.erase(slot_->browser_id);
@@ -1923,6 +2057,48 @@ class HostClient : public CefClient,
       slot_->dst_mtl_sid = 0;
     }
     slot_->browser = nullptr;
+  }
+  // ⌘-key editing shortcuts, as the FALLBACK they are in a real browser. AppKit
+  // turns ⌘Z/⌘A/⌘C… into undo:/selectAll:/copy: only after the page declined the
+  // keydown; windowless rendering has no responder chain to do that, so do it
+  // here — OnKeyEvent is called exactly when the renderer left the key unhandled.
+  // The PAGE gets first refusal: an editor that owns its own undo stack and
+  // selection (Monaco, CodeMirror, Docs) handles ⌘Z/⌘A in its keydown listener,
+  // and running the browser's command instead would bypass it (undo did nothing,
+  // select-all selected the wrong thing).
+  bool OnKeyEvent(CefRefPtr<CefBrowser> browser, const CefKeyEvent& event,
+                  CefEventHandle) override {
+    if (event.type != KEYEVENT_RAWKEYDOWN) return false;
+    const uint32_t m = event.modifiers;
+    if (!(m & EVENTFLAG_COMMAND_DOWN) ||
+        (m & (EVENTFLAG_CONTROL_DOWN | EVENTFLAG_ALT_DOWN)))
+      return false;
+    CefRefPtr<CefFrame> frame = browser->GetFocusedFrame();
+    if (!frame) return false;
+    const bool shift = (m & EVENTFLAG_SHIFT_DOWN) != 0;
+    switch (event.windows_key_code) {
+      case 'C': if (shift) return false; frame->Copy(); return true;
+      case 'X': if (shift) return false; frame->Cut(); return true;
+      case 'V': if (shift) return false; frame->Paste(); return true;
+      case 'A': if (shift) return false; frame->SelectAll(); return true;
+      case 'Z': if (shift) frame->Redo(); else frame->Undo(); return true;
+      default: return false;
+    }
+  }
+  // IO thread. Answer the main-frame navigation to an authored document's URL
+  // with the document itself (see g_authored); everything else is untouched.
+  CefRefPtr<CefResourceRequestHandler> GetResourceRequestHandler(
+      CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
+      CefRefPtr<CefRequest> request, bool is_navigation, bool is_download,
+      const CefString&, bool&) override {
+    if (!is_navigation || is_download) return nullptr;
+    if (frame && !frame->IsMain()) return nullptr;
+    if (request->GetMethod().ToString() != "GET") return nullptr;
+    std::string html;
+    if (!LookupAuthoredDoc(slot_->browser_id, request->GetURL().ToString(),
+                           &html))
+      return nullptr;
+    return new AuthoredRequestHandler(std::move(html));
   }
   bool OnBeforeBrowse(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame,
                       CefRefPtr<CefRequest> request, bool, bool) override {
@@ -2206,6 +2382,15 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
 
 // ---- CEF-thread task helpers (IPC reader runs off the UI thread) ----
 
+// UI-thread only. A navigate / loadTrusted that arrived before its browser's create
+// frame (see DoNavigateByWireId), and the highest wire id a create has been seen for.
+struct EarlyNav {
+  std::string url;
+  bool trusted;
+};
+std::map<uint32_t, EarlyNav> g_early_nav;
+uint32_t g_max_created_wire_id = 0;
+
 // Create a windowless browser for a CefWebView (kOpCreateBrowser). Runs on the
 // CEF UI thread. wire_id is the Swift-assigned browser id this slot is keyed by;
 // sid is the host's IOSurface for this view (0 / lookup-failure -> no surface
@@ -2214,6 +2399,17 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
 void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr,
                      std::string url) {
   CEF_REQUIRE_UI_THREAD();
+  if (wire_id > g_max_created_wire_id) g_max_created_wire_id = wire_id;
+  // A load that beat this (paced) create frame here supersedes the create URL.
+  bool early_trusted = false;
+  {
+    auto early = g_early_nav.find(wire_id);
+    if (early != g_early_nav.end()) {
+      url = early->second.url;
+      early_trusted = early->second.trusted;
+      g_early_nav.erase(early);
+    }
+  }
   // WIRE-ID REUSE GUARD: the Swift side allocates ids monotonically, so a collision should be
   // impossible — but if one ever happened, registering the new slot would let the OLD browser's
   // OnBeforeClose later erase the NEW slot (g_slots_by_wire_id.erase(id)), leaving an unroutable
@@ -2294,6 +2490,14 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr,
        create_url.rfind("file:", 0) == 0)) {
     slot->trusted_pending.insert(create_url);
   }
+  // Same exemption for a parked trusted load, and for a create ON an authored
+  // document's URL (the host chose that content). Armed for `url`, not
+  // `create_url`: under blank-first the real load is the deferred one.
+  if (!g_allowed_schemes.empty() && create_url.rfind("data:", 0) != 0 &&
+      create_url.rfind("file:", 0) != 0 &&
+      (early_trusted || LookupAuthoredDoc(wire_id, url, nullptr))) {
+    slot->trusted_pending.insert(NormalizeAuthoredUrl(url));
+  }
   CefRefPtr<HostClient> client = new HostClient(slot);
   // H3: ASYNC create. CreateBrowserSync BLOCKS this (the single CEF UI) thread until
   // the renderer + GPU/Viz accelerated-surface handshake completes — so a burst of
@@ -2334,7 +2538,13 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr,
 void DoDisposeBrowser(uint32_t wire_id) {
   CEF_REQUIRE_UI_THREAD();
   std::shared_ptr<Slot> slot = LookupWireId(wire_id);
-  if (!slot) return;
+  if (!slot) {
+    // Never created (disposed while its create was still paced host-side), or
+    // already closed: drop whatever was parked for it.
+    SetAuthoredDoc(wire_id, "", "");
+    g_early_nav.erase(wire_id);
+    return;
+  }
   if (slot->browser) {
     slot->browser->GetHost()->CloseBrowser(true);
   } else {
@@ -2417,7 +2627,10 @@ void DoNavigate(const std::shared_ptr<Slot>& slot, const std::string& url) {
 // because the host explicitly chose this content, not the page.
 void DoNavigateTrusted(const std::shared_ptr<Slot>& slot,
                        const std::string& url) {
-  if (!g_allowed_schemes.empty()) slot->trusted_pending.insert(url);
+  // Normalized: OnBeforeBrowse matches against the CANONICAL request URL, so an
+  // authored load for "https://host" must be armed as "https://host/".
+  if (!g_allowed_schemes.empty())
+    slot->trusted_pending.insert(NormalizeAuthoredUrl(url));
   DoNavigate(slot, url);
 }
 
@@ -2430,7 +2643,14 @@ void DoNavigateTrusted(const std::shared_ptr<Slot>& slot,
 // pending_nav_url (DoNavigate above).
 void DoNavigateByWireId(uint32_t wire_id, std::string url, bool trusted) {
   auto slot = LookupWireId(wire_id);
-  if (!slot) return;  // genuinely disposed before the nav landed
+  if (!slot) {
+    // Ids are monotonic: an id ABOVE every create we've seen is a browser whose
+    // create frame the host is still pacing (it sends creates one establishment at
+    // a time, but every other op immediately) — park the load for DoCreateBrowser.
+    // An id at or below it was genuinely disposed before the nav landed.
+    if (wire_id > g_max_created_wire_id) g_early_nav[wire_id] = {url, trusted};
+    return;
+  }
   if (trusted)
     DoNavigateTrusted(slot, url);
   else
@@ -2633,11 +2853,18 @@ void DoJsDialogResp(const std::shared_ptr<Slot>& slot, uint32_t id, bool ok,
   it->second->Continue(ok, text);
   slot->dialogs.erase(it);
 }
-void DoEvalReturning(const std::shared_ptr<Slot>& slot, uint32_t id,
-                     const std::string& code) {
-  if (!slot->browser) return;
-  CefRefPtr<CefFrame> frame = slot->browser->GetMainFrame();
-  if (!frame) return;
+// ALWAYS REPLIES. Resolved by wire id on TID_UI (FIFO behind a queued create, like
+// DoNavigateByWireId); with no browser/frame to run in, answer {ok:false} rather
+// than return silently — a silent return left the caller's future pending forever.
+void DoEvalReturning(uint32_t wire_id, uint32_t id, const std::string& code) {
+  auto slot = LookupWireId(wire_id);
+  CefRefPtr<CefFrame> frame =
+      (slot && slot->browser) ? slot->browser->GetMainFrame() : nullptr;
+  if (!frame) {
+    SendUtf8(wire_id, kOpEvalResult,
+             std::to_string(id) + ":{\"ok\":false,\"v\":\"no browser\"}");
+    return;
+  }
   // Evaluate the user expression and post its JSON result back via window.cefQuery
   // (OnQuery -> kOpEvalResult). `code` is the trusted host's JS (same trust level
   // as executeJavaScript) and must be a single expression. We splice it rather
@@ -2672,9 +2899,33 @@ void DoAddChannel(const std::shared_ptr<Slot>& slot, const std::string& name) {
 // login in one browser is visible to every browser sharing this profile. They
 // take `slot` only to stamp the reply browserId / route a log. Note clear/delete
 // affect the WHOLE shared jar by design (the contract's kOpClearCookies semantics).
-void DoSetCookie(const std::shared_ptr<Slot>& slot, const std::string& url,
+// Map the wire sameSite token to Chromium's enum (and back for getCookies).
+cef_cookie_same_site_t ParseSameSite(const std::string& s) {
+  if (s == "none") return CEF_COOKIE_SAME_SITE_NO_RESTRICTION;
+  if (s == "lax") return CEF_COOKIE_SAME_SITE_LAX_MODE;
+  if (s == "strict") return CEF_COOKIE_SAME_SITE_STRICT_MODE;
+  return CEF_COOKIE_SAME_SITE_UNSPECIFIED;
+}
+const char* SameSiteToString(cef_cookie_same_site_t v) {
+  switch (v) {
+    case CEF_COOKIE_SAME_SITE_NO_RESTRICTION: return "none";
+    case CEF_COOKIE_SAME_SITE_LAX_MODE: return "lax";
+    case CEF_COOKIE_SAME_SITE_STRICT_MODE: return "strict";
+    default: return "unspecified";
+  }
+}
+
+// COOKIE VERBS TAKE A WIRE ID, NOT A SLOT. The jar is process-global, so nothing
+// here needs the browser — the id only routes the reply/log. Requiring a live slot
+// (the old `if (!slot) break` on the reader thread) silently DROPPED any cookie verb
+// that raced the create: the slot is registered by a TID_UI task, and on a shared
+// host the create frame itself is paced behind earlier ones. A dropped setCookie
+// meant an unauthenticated first load; a dropped getCookies never replied at all,
+// so the caller's future hung forever.
+void DoSetCookie(uint32_t wire_id, const std::string& url,
                  const std::string& name, const std::string& value,
-                 const std::string& domain, const std::string& path) {
+                 const std::string& domain, const std::string& path,
+                 bool secure, bool http_only, const std::string& same_site) {
   CefRefPtr<CefCookieManager> mgr = CefCookieManager::GetGlobalManager(nullptr);
   if (!mgr) return;
   CefCookie cookie;
@@ -2683,13 +2934,17 @@ void DoSetCookie(const std::shared_ptr<Slot>& slot, const std::string& url,
   if (!domain.empty()) CefString(&cookie.domain).FromString(domain);
   CefString(&cookie.path).FromString(path.empty() ? "/" : path);
   cookie.has_expires = false;
+  // SameSite=None without Secure is rejected by Chromium (the cookie is
+  // dropped at SetCookie time), so force Secure on for that combination.
+  cookie.secure = (secure || same_site == "none") ? 1 : 0;
+  cookie.httponly = http_only ? 1 : 0;
+  cookie.same_site = ParseSameSite(same_site);
   if (!mgr->SetCookie(url, cookie, nullptr)) {
-    SendLog(slot->browser_id,
+    SendLog(wire_id,
             "setCookie rejected for " + url + " (name '" + name + "')");
   }
 }
-void DoClearCookies(const std::shared_ptr<Slot>& slot) {
-  (void)slot;  // shared jar; slot unused beyond routing the op here
+void DoClearCookies() {
   CefRefPtr<CefCookieManager> mgr = CefCookieManager::GetGlobalManager(nullptr);
   if (mgr) mgr->DeleteCookies(CefString(), CefString(), nullptr);
 }
@@ -2725,7 +2980,8 @@ std::string CookieToJson(const CefCookie& c) {
   out += "\"domain\":\"" + JsonEscape(CefString(&c.domain).ToString()) + "\",";
   out += "\"path\":\"" + JsonEscape(CefString(&c.path).ToString()) + "\",";
   out += "\"secure\":" + std::string(c.secure ? "true" : "false") + ",";
-  out += "\"httpOnly\":" + std::string(c.httponly ? "true" : "false");
+  out += "\"httpOnly\":" + std::string(c.httponly ? "true" : "false") + ",";
+  out += "\"sameSite\":\"" + std::string(SameSiteToString(c.same_site)) + "\"";
   return out + "}";
 }
 
@@ -2753,12 +3009,11 @@ class HostCookieVisitor : public CefCookieVisitor {
   IMPLEMENT_REFCOUNTING(HostCookieVisitor);
 };
 
-void DoVisitCookies(const std::shared_ptr<Slot>& slot, uint32_t id,
-                    const std::string& url) {
+void DoVisitCookies(uint32_t wire_id, uint32_t id, const std::string& url) {
   CefRefPtr<CefCookieManager> mgr = CefCookieManager::GetGlobalManager(nullptr);
   // The visitor replies on destruction; a null manager just yields [].
   CefRefPtr<HostCookieVisitor> visitor =
-      new HostCookieVisitor(slot->browser_id, id);
+      new HostCookieVisitor(wire_id, id);
   if (!mgr) return;
   if (url.empty()) {
     mgr->VisitAllCookies(visitor);
@@ -2767,9 +3022,7 @@ void DoVisitCookies(const std::shared_ptr<Slot>& slot, uint32_t id,
   }
 }
 
-void DoDeleteCookie(const std::shared_ptr<Slot>& slot, const std::string& url,
-                    const std::string& name) {
-  (void)slot;  // shared jar; slot unused beyond routing the op here
+void DoDeleteCookie(const std::string& url, const std::string& name) {
   CefRefPtr<CefCookieManager> mgr = CefCookieManager::GetGlobalManager(nullptr);
   if (mgr) mgr->DeleteCookies(url, name, nullptr);
 }
@@ -2839,6 +3092,16 @@ class TargetIdObserver : public CefDevToolsMessageObserver {
   IMPLEMENT_REFCOUNTING(TargetIdObserver);
 };
 
+// A fresh DevTools message id for this browser. The session wants increasing ids,
+// and CEF silently renumbers one that isn't — which would orphan a caller that
+// matches its reply by id — so every ExecuteDevToolsMethod here draws from this.
+int NextDevToolsMsgId(const std::shared_ptr<Slot>& slot) {
+  slot->devtools_msg = slot->devtools_msg < kTargetInfoMsgId
+                           ? kTargetInfoMsgId
+                           : slot->devtools_msg + 1;
+  return slot->devtools_msg;
+}
+
 void DoResolveTargetId(const std::shared_ptr<Slot>& slot) {
   if (!slot->browser) return;
   CefRefPtr<CefBrowserHost> host = slot->browser->GetHost();
@@ -2849,9 +3112,7 @@ void DoResolveTargetId(const std::shared_ptr<Slot>& slot) {
   }
   // Fresh, increasing id per probe (see Slot::target_info_msg) so a re-resolve on the
   // SAME browser isn't dropped by the DevTools session's monotonic-id requirement.
-  slot->target_info_msg = slot->target_info_msg < kTargetInfoMsgId
-                              ? kTargetInfoMsgId
-                              : slot->target_info_msg + 1;
+  slot->target_info_msg = NextDevToolsMsgId(slot);
   // Target.getTargetInfo with no params: executed on a specific browser's DevTools
   // agent (a page target), it returns THAT page's own targetInfo — so this resolves
   // exactly this browser's targetId, with no cross-tile ambiguity.
@@ -2926,11 +3187,43 @@ void DoPointer(const std::shared_ptr<Slot>& slot, int type, int button,
   }
 }
 
+// A keydown AppKit's key bindings give an editing meaning (⌘← = line start, ⌃K =
+// kill to paragraph end, …) goes out through DevTools with those edit commands
+// attached, as a windowed Chrome would send it: SendKeyEvent has no way to carry
+// them. The page still sees an ordinary keydown first; the commands are only its
+// default action. See mac_key_bindings.h.
+bool DispatchBoundKey(const std::shared_ptr<Slot>& slot, uint32_t modifiers,
+                      int32_t windows_key_code, int32_t native_key_code) {
+  mac_key_bindings::Match match;
+  if (!mac_key_bindings::Lookup(modifiers, windows_key_code, &match)) return false;
+  int cdp_modifiers = 0;
+  if (modifiers & EVENTFLAG_ALT_DOWN) cdp_modifiers |= 1;
+  if (modifiers & EVENTFLAG_CONTROL_DOWN) cdp_modifiers |= 2;
+  if (modifiers & EVENTFLAG_COMMAND_DOWN) cdp_modifiers |= 4;
+  if (modifiers & EVENTFLAG_SHIFT_DOWN) cdp_modifiers |= 8;
+  CefRefPtr<CefListValue> commands = CefListValue::Create();
+  for (size_t i = 0; i < match.commands.size(); i++)
+    commands->SetString(i, match.commands[i]);
+  CefRefPtr<CefDictionaryValue> params = CefDictionaryValue::Create();
+  params->SetString("type", "rawKeyDown");
+  params->SetInt("modifiers", cdp_modifiers);
+  params->SetInt("windowsVirtualKeyCode", windows_key_code);
+  params->SetInt("nativeVirtualKeyCode", native_key_code);
+  params->SetString("code", match.code);
+  params->SetString("key", match.key);
+  params->SetList("commands", commands);
+  return slot->browser->GetHost()->ExecuteDevToolsMethod(
+             NextDevToolsMsgId(slot), "Input.dispatchKeyEvent", params) != 0;
+}
+
 // type: 0=rawkeydown 2=keyup 3=char (cef_key_event_type_t).
 void DoKey(const std::shared_ptr<Slot>& slot, int type, uint32_t modifiers,
            int32_t windows_key_code, int32_t native_key_code,
            uint32_t character) {
   if (!slot->browser) return;
+  if (type == KEYEVENT_RAWKEYDOWN &&
+      DispatchBoundKey(slot, modifiers, windows_key_code, native_key_code))
+    return;
   CefKeyEvent ev;
   ev.type = static_cast<cef_key_event_type_t>(type);
   ev.modifiers = modifiers;
@@ -3017,8 +3310,10 @@ void IpcReadLoop() {
         break;
       }
       case kOpDisposeBrowser:
-        if (slot)
-          CefPostTask(TID_UI, base::BindOnce(&DoDisposeBrowser, wire_id));
+        // Resolved on TID_UI (FIFO behind a create still queued there) — requiring
+        // the slot here dropped a dispose that raced its own create, leaking the
+        // browser.
+        CefPostTask(TID_UI, base::BindOnce(&DoDisposeBrowser, wire_id));
         break;
       case kOpShutdown:
         CefPostTask(TID_UI, base::BindOnce(&DoShutdown));
@@ -3034,10 +3329,21 @@ void IpcReadLoop() {
         CefPostTask(TID_UI, base::BindOnce(&DoResize, slot, w, h, dpr));
         break;
       }
+      case kOpSetAuthoredHtml: {
+        // Stored HERE, on the reader thread, so it is in place before the create /
+        // load frame right behind it is even dispatched. No slot needed.
+        std::string s(reinterpret_cast<const char*>(p), plen);
+        const size_t nul = s.find('\0');
+        if (nul == std::string::npos) break;
+        SetAuthoredDoc(wire_id, s.substr(0, nul), s.substr(nul + 1));
+        break;
+      }
       case kOpNavigate: {
         // Resolve by wire id on TID_UI (see DoNavigateByWireId): do NOT require the slot
         // here, or a nav landing behind a still-queued create on a shared host is dropped.
         std::string url(reinterpret_cast<const char*>(p), plen);
+        // A plain navigate means the consumer wants the real site again.
+        ClearAuthoredDocUnless(wire_id, "");
         CefPostTask(TID_UI,
                     base::BindOnce(&DoNavigateByWireId, wire_id, url, false));
         break;
@@ -3047,6 +3353,7 @@ void IpcReadLoop() {
         // must not be dropped — that was the blank-tile bug. Resolved on TID_UI, FIFO-after
         // the create, and tolerant of a not-yet-bound browser via pending_nav_url.
         std::string url(reinterpret_cast<const char*>(p), plen);
+        ClearAuthoredDocUnless(wire_id, url);  // keeps the doc this load is for
         CefPostTask(TID_UI,
                     base::BindOnce(&DoNavigateByWireId, wire_id, url, true));
         break;
@@ -3170,11 +3477,10 @@ void IpcReadLoop() {
         break;
       }
       case kOpEvalReturning: {
-        if (!slot) break;
         if (plen < 4) break;
         uint32_t id = ReadU32BE(p);
         std::string code(reinterpret_cast<const char*>(p + 4), plen - 4);
-        CefPostTask(TID_UI, base::BindOnce(&DoEvalReturning, slot, id, code));
+        CefPostTask(TID_UI, base::BindOnce(&DoEvalReturning, wire_id, id, code));
         break;
       }
       case kOpAddChannel: {
@@ -3190,7 +3496,7 @@ void IpcReadLoop() {
         break;
       }
       case kOpSetCookie: {
-        if (!slot) break;
+        // No slot needed — see DoSetCookie (a verb racing the create must not drop).
         std::string s(reinterpret_cast<const char*>(p), plen);
         std::vector<std::string> f;
         size_t start = 0;
@@ -3200,30 +3506,28 @@ void IpcReadLoop() {
             start = i + 1;
           }
         }
-        while (f.size() < 5) f.push_back("");
-        CefPostTask(TID_UI, base::BindOnce(&DoSetCookie, slot, f[0], f[1], f[2],
-                                           f[3], f[4]));
+        while (f.size() < 8) f.push_back("");
+        CefPostTask(TID_UI,
+                    base::BindOnce(&DoSetCookie, wire_id, f[0], f[1], f[2], f[3],
+                                   f[4], f[5] == "1", f[6] == "1", f[7]));
         break;
       }
       case kOpClearCookies:
-        if (!slot) break;
-        CefPostTask(TID_UI, base::BindOnce(&DoClearCookies, slot));
+        CefPostTask(TID_UI, base::BindOnce(&DoClearCookies));
         break;
       case kOpVisitCookies: {
-        if (!slot) break;
         if (plen < 4) break;
         uint32_t id = ReadU32BE(p);
         std::string url(reinterpret_cast<const char*>(p + 4), plen - 4);
-        CefPostTask(TID_UI, base::BindOnce(&DoVisitCookies, slot, id, url));
+        CefPostTask(TID_UI, base::BindOnce(&DoVisitCookies, wire_id, id, url));
         break;
       }
       case kOpDeleteCookie: {
-        if (!slot) break;
         std::string s(reinterpret_cast<const char*>(p), plen);
         const size_t nul = s.find('\0');
         std::string url = nul == std::string::npos ? s : s.substr(0, nul);
         std::string name = nul == std::string::npos ? "" : s.substr(nul + 1);
-        CefPostTask(TID_UI, base::BindOnce(&DoDeleteCookie, slot, url, name));
+        CefPostTask(TID_UI, base::BindOnce(&DoDeleteCookie, url, name));
         break;
       }
       case kOpImeSetComp: {

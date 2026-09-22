@@ -67,6 +67,7 @@ class CefWebView extends StatefulWidget {
     this.renderScale,
     this.onFind,
     this.html,
+    this.htmlBaseUrl,
   }) : assert(!(enableCdp && !agentControl && profile != null && profile != ''),
             'enableCdp cannot be combined with a named profile: CDP-over-TCP '
             'exposes an unauthenticated localhost port that could read the '
@@ -81,6 +82,11 @@ class CefWebView extends StatefulWidget {
   /// document; [url] should be `about:blank`. Changing it after create does NOT
   /// re-navigate (call `controller.loadHtmlString` for a live update).
   final String? html;
+
+  /// The URL [html] is served AT. With an http(s) value the document has that
+  /// URL's real origin (see `CefWebController.loadHtmlString`); otherwise it only
+  /// anchors relative URLs. Ignored without [html].
+  final String? htmlBaseUrl;
 
   /// Optional external controller (to script the view). If null, one is created
   /// and owned internally (and disposed with the view).
@@ -268,6 +274,7 @@ class _CefWebViewState extends State<CefWebView>
         final id = await _controller.create(
             url: widget.url,
             html: widget.html,
+            htmlBaseUrl: widget.htmlBaseUrl,
             width: w,
             height: h,
             dpr: dpr,
@@ -503,12 +510,16 @@ class _CefWebViewState extends State<CefWebView>
     }
 
     // Standard browser shortcuts. In OSR there's no AppKit responder chain, so a
-    // raw ⌘-key event never becomes an editor action or a zoom — route the common
-    // ones to explicit controller calls so a focused webview behaves like a real
-    // browser (⌘C/X/V/A/Z, ⌘+/-/0). Handled on key-down; zoom also on repeat
-    // (hold to keep zooming). Returning `handled` keeps the raw combo off the page
-    // AND off Flutter's own shortcuts. The accelerator modifier is ⌘ on macOS
-    // and Ctrl on Windows (Ctrl+C/V/X/A/Z, Ctrl+/-/0, Ctrl+F).
+    // raw ⌘-key event never becomes an editor action or a zoom.
+    //   - Zoom (⌘+/-/0) and find (⌘F) are the HOST's: handled here, on key-down
+    //     (zoom also on repeat), and kept off the page.
+    //   - Editing (⌘C/X/V/A/Z, ⌘⇧Z) is the PAGE's first. On macOS the raw combo
+    //     goes to the page like any other key, and cef_host runs the browser's
+    //     edit command only if the page left it unhandled (its OnKeyEvent) — the
+    //     order a real browser uses. Running the command here instead starved
+    //     editors that own their undo stack and selection (Monaco: ⌘Z did
+    //     nothing, ⌘A selected the wrong thing). Windows still maps Ctrl+C/V/X/
+    //     A/Z(/Y) to explicit commands here.
     final isAccelOnly = _isWindows
         ? (keys.isControlPressed &&
             !keys.isMetaPressed &&
@@ -519,7 +530,7 @@ class _CefWebViewState extends State<CefWebView>
     if (isAccelOnly && (event is KeyDownEvent || event is KeyRepeatEvent)) {
       final k = event.logicalKey;
       // Editing commands: key-down only (repeat would re-cut/re-paste).
-      if (event is KeyDownEvent && !keys.isShiftPressed) {
+      if (_isWindows && event is KeyDownEvent && !keys.isShiftPressed) {
         if (k == LogicalKeyboardKey.keyC) {
           unawaited(_controller.copy());
           return KeyEventResult.handled;
@@ -541,7 +552,8 @@ class _CefWebViewState extends State<CefWebView>
           return KeyEventResult.handled;
         }
       }
-      if (event is KeyDownEvent &&
+      if (_isWindows &&
+          event is KeyDownEvent &&
           keys.isShiftPressed &&
           k == LogicalKeyboardKey.keyZ) {
         unawaited(_controller.redo());
@@ -596,7 +608,12 @@ class _CefWebViewState extends State<CefWebView>
     final nkc =
         _isWindows ? wkc : (cefMacNativeKeyCode(event.physicalKey) ?? wkc);
     final ch = event.character;
-    final isText = ch != null && _isPrintable(ch);
+    // A ⌘ combo is a command, never text, even where the platform reports the
+    // letter as the event's character: keep it off the IME (and the app's own
+    // Edit menu) — the page, then cef_host's fallback, own it.
+    final isText = ch != null &&
+        _isPrintable(ch) &&
+        (_isWindows || !keys.isMetaPressed);
     // Every key MUST carry its macOS NSEvent character. Editing/navigation keys
     // because CEF OSR otherwise double-applies them (one Backspace deletes two,
     // one arrow moves two); printable keys because a zero character pair makes

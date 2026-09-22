@@ -418,7 +418,38 @@ final class CefWebSession: NSObject, FlutterTexture {
   private func nowNs() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
 
   func navigate(_ url: String) {
+    setAuthoredDoc(nil)  // a plain navigate wants the real site (cef_host clears too)
     sendFrame(Self.opNavigate, Array(url.utf8))
+  }
+
+  // MARK: Authored document at a real origin (loadHtmlString(baseUrl:))
+
+  /// HTML the host serves as the main-frame response for exactly `url`, so the
+  /// document has that URL's origin instead of a `data:` URL's opaque one. Kept on
+  /// the session (not just sent once) because EVERY create of this browser —
+  /// first, deferred, or a re-home after a host crash — must put the frame on the
+  /// wire ahead of its opCreateBrowser: see `CefProfileHost.sendCreate`.
+  private let authoredLock = NSLock()
+  private var authoredDoc: (url: String, html: String)?
+
+  func setAuthoredDoc(_ doc: (url: String, html: String)?) {
+    authoredLock.lock(); authoredDoc = doc; authoredLock.unlock()
+  }
+
+  /// The opSetAuthoredHtml payload ({url}\0{html}) if this session has an authored
+  /// document for `url`, else nil.
+  func authoredPayload(for url: String) -> [UInt8]? {
+    authoredLock.lock(); defer { authoredLock.unlock() }
+    guard let doc = authoredDoc, doc.url == url else { return nil }
+    return Array(doc.url.utf8) + [0] + Array(doc.html.utf8)
+  }
+
+  /// loadHtmlString(html, baseUrl:) — store the document, then load its URL as a
+  /// host-trusted navigation. Two frames, in this order, from this one thread.
+  func loadAuthored(url: String, html: String) {
+    setAuthoredDoc((url, html))
+    sendFrame(CefProfileHost.opSetAuthoredHtml, Array(url.utf8) + [0] + Array(html.utf8))
+    sendFrame(Self.opLoadTrusted, Array(url.utf8))
   }
 
   /// Open a windowed Chrome-runtime browser at |url| for a WebAuthn / Touch ID
@@ -440,6 +471,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   /// A host content-injection load (loadHtmlString -> data:, loadFile -> file:):
   /// exempt from the navigation scheme allowlist, unlike `navigate`.
   func loadTrusted(_ url: String) {
+    setAuthoredDoc(nil)
     sendFrame(Self.opLoadTrusted, Array(url.utf8))
   }
 
@@ -552,8 +584,13 @@ final class CefWebSession: NSObject, FlutterTexture {
   }
 
   func setCookie(url: String, name: String, value: String, domain: String,
-                 path: String) {
-    let payload = [url, name, value, domain, path].joined(separator: "\u{0}")
+                 path: String, secure: Bool = false, httpOnly: Bool = false,
+                 sameSite: String = "unspecified") {
+    // Eight NUL-separated fields. Hosts older than the attribute fields read
+    // only the first five and ignore the rest; newer hosts pad missing ones.
+    let payload = [url, name, value, domain, path,
+                   secure ? "1" : "0", httpOnly ? "1" : "0", sameSite]
+      .joined(separator: "\u{0}")
     sendFrame(Self.opSetCookie, Array(payload.utf8))
   }
 

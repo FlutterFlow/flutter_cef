@@ -1,7 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
 
-import 'package:flutter/foundation.dart' show defaultTargetPlatform;
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, defaultTargetPlatform;
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:meta/meta.dart';
@@ -573,6 +574,9 @@ class CefWebController {
   /// about:blank → later loadHtmlString race). [html] wins when both are given;
   /// [url] should be `about:blank` in that case.
   ///
+  /// With an http(s) [htmlBaseUrl] the document is served AT that URL rather than
+  /// as a `data:` URL, so it has that URL's real origin — see [loadHtmlString].
+  ///
   /// Idempotent under concurrency: if a session already exists ([isCreated]) the
   /// existing [textureId] is returned, and if a create() is already in flight
   /// this call adopts it (same future, no second spawn) — [url]/[width]/[height]
@@ -586,6 +590,7 @@ class CefWebController {
     bool enableCdp = false,
     bool agentControl = false,
     String? html,
+    String? htmlBaseUrl,
   }) {
     // The TCP enableCdp+named-profile combination is rejected because CDP-over-TCP
     // is an unauthenticated localhost port that could read the shared cookie jar.
@@ -600,9 +605,15 @@ class CefWebController {
     // create-with-html: a base64 data: URL (as loadHtmlString builds). cef_host
     // arms the trusted-load exemption for a data:/file: create URL, so this
     // renders the authored doc as the browser's first (and only) page.
-    final createUrl = html != null ? _htmlDataUrl(html) : url;
+    final authored = html != null && _servesAtOrigin(htmlBaseUrl);
+    final createUrl = html == null
+        ? url
+        : authored
+            ? htmlBaseUrl!
+            : _htmlDataUrl(_withBaseHref(html, htmlBaseUrl));
     return _createInFlight ??= _createSession(
       url: createUrl,
+      authoredHtml: authored ? html : null,
       width: width,
       height: height,
       dpr: dpr,
@@ -620,6 +631,7 @@ class CefWebController {
     required Set<String>? allowedSchemes,
     required bool enableCdp,
     required bool agentControl,
+    String? authoredHtml,
   }) async {
     await _acquireCreateSlot();
     // Disposed while parked in the spawn-throttle queue — never fork for a dead
@@ -633,6 +645,7 @@ class CefWebController {
       res = await _channel.invokeMapMethod<String, dynamic>('create', {
         'sessionId': sessionId,
         'url': url,
+        if (authoredHtml != null) 'authoredHtml': authoredHtml,
         'width': width,
         'height': height,
         'dpr': dpr,
@@ -863,12 +876,22 @@ class CefWebController {
 
   /// Set a cookie in the global (process-wide) cookie store. [url] scopes the
   /// cookie; [domain] defaults to the url's host.
+  ///
+  /// [secure], [httpOnly], and [sameSite] mirror the cookie attributes of the
+  /// same names. [CefCookieSameSite.none] requires [secure] — Chromium rejects
+  /// `SameSite=None` without `Secure` — and is what lets the cookie ride
+  /// cross-site subresource requests (fetches, websocket handshakes). Hosts
+  /// older than these fields ignore them and store the cookie `SameSite`
+  /// unspecified (treated as Lax).
   Future<void> setCookie({
     required String url,
     required String name,
     required String value,
     String domain = '',
     String path = '/',
+    bool secure = false,
+    bool httpOnly = false,
+    CefCookieSameSite sameSite = CefCookieSameSite.unspecified,
   }) =>
       _channel.invokeMethod('setCookie', {
         'sessionId': sessionId,
@@ -877,6 +900,9 @@ class CefWebController {
         'value': value,
         'domain': domain,
         'path': path,
+        'secure': secure,
+        'httpOnly': httpOnly,
+        'sameSite': sameSite.name,
       });
 
   /// Delete all cookies from the global cookie store.
@@ -955,12 +981,47 @@ class CefWebController {
       'data:text/html;charset=utf-8;base64,'
       '${base64Encode(const Utf8Encoder().convert(html))}';
 
-  /// Load an HTML string. (`baseUrl` is accepted for API familiarity but not yet
-  /// honoured — relative URLs resolve against the `data:` document.)
+  /// Whether an authored document can be served AT [baseUrl] (so it has that
+  /// URL's real origin). http(s) only, and only where the native host implements
+  /// it — macOS today; elsewhere the `data:` fallback below applies.
+  static bool _servesAtOrigin(String? baseUrl) {
+    if (baseUrl == null || defaultTargetPlatform != TargetPlatform.macOS) {
+      return false;
+    }
+    final scheme = Uri.tryParse(baseUrl)?.scheme.toLowerCase();
+    return scheme == 'http' || scheme == 'https';
+  }
+
+  /// The `data:` fallback for a [baseUrl]: relative URLs resolve against it via
+  /// `<base href>`, but the document's ORIGIN stays opaque.
+  static String _withBaseHref(String html, String? baseUrl) {
+    if (baseUrl == null || baseUrl.isEmpty) return html;
+    final tag = '<base href="${const HtmlEscape(HtmlEscapeMode.attribute).convert(baseUrl)}">';
+    final head = RegExp(r'<head[^>]*>', caseSensitive: false).firstMatch(html);
+    return head == null
+        ? '$tag$html'
+        : html.replaceRange(head.end, head.end, tag);
+  }
+
+  /// Load an HTML string.
+  ///
+  /// With an http(s) [baseUrl] the document is served AT that URL: the browser
+  /// navigates to [baseUrl] and the host answers that one main-frame request with
+  /// [html] instead of the network. The page then has [baseUrl]'s real origin — its
+  /// relative URLs, fetches, workers and storage all behave as if the site had
+  /// served it — which a `data:` URL (opaque origin) cannot give. It stays in
+  /// effect across [reload]; [navigate] to anywhere, or another load, ends it.
+  ///
+  /// Without a [baseUrl] (or where serving at an origin is unsupported) it loads
+  /// as a `data:` URL, with `<base href>` standing in for [baseUrl].
   ///
   /// Host-trusted content: rendered regardless of the view's `allowedSchemes`.
   Future<void> loadHtmlString(String html, {String? baseUrl}) {
-    return _loadTrusted(_htmlDataUrl(html));
+    if (_servesAtOrigin(baseUrl)) {
+      return _channel.invokeMethod('loadAuthored',
+          {'sessionId': sessionId, 'url': baseUrl, 'html': html});
+    }
+    return _loadTrusted(_htmlDataUrl(_withBaseHref(html, baseUrl)));
   }
 
   /// Load a local file by absolute path.
