@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Fetch a prebuilt, Developer-ID-signed cef_host.app keyed by a CONTENT HASH of
-# the build inputs, from public GCS. Runs at `pod install` via the podspec's
+# the build inputs, from a GitHub Release on the (public) plugin repo — tag
+# `cef-host-<hash>`, see publish-cef-host.sh. Runs at `pod install` via the podspec's
 # prepare_command; the :after_compile phase then embeds native/cef_host/prebuilt/
 # cef_host.app into the app's Contents/Frameworks. Self-locating (CWD-independent).
 #
@@ -12,7 +13,7 @@
 # build-from-source / FLUTTER_CEF_HOST); fail-CLOSED on checksum mismatch and on
 # a bad/foreign code signature.
 #
-# AUTHENTICITY: the .sha256 sidecar lives in the same public bucket as the tarball,
+# AUTHENTICITY: the .sha256 sidecar lives in the same public release as the tarball,
 # so it is transport-integrity only — anyone who could tamper with the tarball could
 # tamper with the sidecar. The real root of trust is the Developer-ID signature
 # sealed inside the app (tar round-trips it), so after extraction we REQUIRE a
@@ -42,9 +43,10 @@ esac
 . "$HERE/cef_host_hash.sh"
 HASH="$(cef_host_input_hash "$NATIVE")"
 
-BASE="${FLUTTER_CEF_GCS_BASE:-https://storage.googleapis.com/flutterflow-downloads/campus_prebuilt_cef_host}"
+# One release per content hash; override the base to fetch from a fork or mirror.
+BASE="${FLUTTER_CEF_PREBUILT_BASE:-https://github.com/FlutterFlow/flutter_cef/releases/download}"
 FILE="cef_host-macos-${arch}.tar.gz"
-URL="$BASE/$HASH/$FILE"
+URL="$BASE/cef-host-$HASH/$FILE"
 SHA_URL="$URL.sha256"
 
 # Already current? the extracted prebuilt carries the input hash it was built from.

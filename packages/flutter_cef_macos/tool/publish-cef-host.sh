@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # Build the SANDBOXED (CEF_HOST_ADHOC=OFF, Developer-ID) cef_host, key it by a
-# content hash of the build inputs, and idempotently publish it to public GCS.
-# Run by the private flutter_cef Codemagic workflow (which holds the signing
-# material + a GCS-writable service account) on push-to-main and cef-host-v* tags.
+# content hash of the build inputs, and idempotently publish it as a GitHub
+# Release on the plugin's own (public) repo: tag `cef-host-<hash>`, pointed at
+# the publishing commit for provenance, assets = the tarball + its .sha256.
+# Consumers fetch it anonymously at `pod install` (fetch_cef_host.sh).
 #
 # The SANDBOXED variant is deliberate: the ad-hoc variant (get-task-allow + mock
 # keychain + Mach-port bypass) fails to render agent_ui in a consuming app. The
 # Developer-ID signature is inside-out; release consumers re-sign it with their
 # own identity, so only the (rare) direct-run case depends on it.
 #
-# Requires: gsutil/gcloud authed with object-create on gs://$GCS_BUCKET, and a
+# Requires: `gh` authenticated with push on $FLUTTER_CEF_RELEASE_REPO, and a
 # Developer-ID Application identity in the keychain named by $CODESIGN_ID.
 set -euo pipefail
 
@@ -19,8 +20,8 @@ NATIVE="$PKG/native"
 REPO="$(cd "$PKG/../.." && pwd)"                # repo root (git provenance)
 
 : "${CODESIGN_ID:?CODESIGN_ID (Developer ID Application identity) must be set}"
-GCS_BUCKET="${GCS_BUCKET:-flutterflow-downloads}"
-GCS_PREFIX="${GCS_PREFIX:-campus_prebuilt_cef_host}"
+GH_REPO="${FLUTTER_CEF_RELEASE_REPO:-FlutterFlow/flutter_cef}"
+command -v gh >/dev/null 2>&1 || { echo "::error:: gh (GitHub CLI) not found" >&2; exit 1; }
 arch=arm64
 FILE="cef_host-macos-${arch}.tar.gz"
 
@@ -29,17 +30,19 @@ FILE="cef_host-macos-${arch}.tar.gz"
 HASH="$(cef_host_input_hash "$NATIVE")"
 echo "[publish] cef_host input hash: $HASH"
 
-DST="gs://$GCS_BUCKET/$GCS_PREFIX/$HASH/$FILE"
+TAG="cef-host-$HASH"
+DST="$GH_REPO release $TAG"
+release_exists() { gh release view "$TAG" -R "$GH_REPO" >/dev/null 2>&1; }
 
 # Idempotency: this exact tree was already built + uploaded -> nothing to do — but VERIFY the
-# remote object first. The keys are content hashes of PUBLIC sources, so anyone with bucket write
-# could pre-plant a malicious object for a future commit and this skip would then permanently
+# remote asset first. The keys are content hashes of PUBLIC sources, so anyone with repo write
+# could pre-plant a malicious release for a future commit and this skip would then permanently
 # suppress the legitimate upload. Verifying the remote's Developer-ID signature (same gate the
-# fetch applies) makes a planted object loud instead of load-bearing.
-if gsutil -q stat "$DST" 2>/dev/null; then
+# fetch applies) makes a planted asset loud instead of load-bearing.
+if release_exists; then
   echo "[publish] $DST already exists — verifying the remote artifact's signature…"
   CHECK="$(mktemp -d)"
-  gsutil -q cp "$DST" "$CHECK/$FILE"
+  gh release download "$TAG" -R "$GH_REPO" -p "$FILE" -D "$CHECK"
   tar -xzf "$CHECK/$FILE" -C "$CHECK"
   TEAM="${FLUTTER_CEF_TEAM_ID:-KLAJ5X6PJP}"
   if codesign --verify --deep --strict \
@@ -50,7 +53,7 @@ if gsutil -q stat "$DST" 2>/dev/null; then
     exit 0
   fi
   echo "::error:: remote $DST FAILED signature verification (team $TEAM) — possible planted/corrupt object." >&2
-  echo "::error:: refusing to skip; investigate + delete the object, then re-run to publish a clean build." >&2
+  echo "::error:: refusing to skip; investigate + delete the release, then re-run to publish a clean build." >&2
   rm -rf "$CHECK"
   exit 1
 fi
@@ -93,11 +96,14 @@ else
 fi
 printf '%s  %s\n' "$TAR_SHA" "$FILE" > "$TARBALL.sha256"
 
-# --- Upload (re-check to close a publish race; objects are immutable) ---
-if gsutil -q stat "$DST" 2>/dev/null; then
+# --- Upload (re-check to close a publish race; a hash's release is never edited) ---
+if release_exists; then
   echo "[publish] $DST appeared during build — skipping upload."
   exit 0
 fi
-gsutil -h "Cache-Control:public,max-age=31536000,immutable" cp "$TARBALL"        "$DST"
-gsutil -h "Cache-Control:public,max-age=31536000,immutable" cp "$TARBALL.sha256" "$DST.sha256"
+NOTES="$(printf 'Prebuilt, Developer-ID-signed cef_host.app (macOS %s) for native/cef_host input hash `%s`.\n\nSource: %s\nCEF: %s\n\nFetched at `pod install` by fetch_cef_host.sh — not a plugin release.' \
+  "$arch" "$HASH" "$SRC_SHA" "$CEF_VER")"
+gh release create "$TAG" -R "$GH_REPO" --target "$SRC_SHA" \
+  --title "cef_host prebuilt $HASH" --notes "$NOTES" \
+  "$TARBALL" "$TARBALL.sha256"
 echo "[publish] uploaded $DST (tarball sha256 $TAR_SHA)"
