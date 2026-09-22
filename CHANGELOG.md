@@ -17,6 +17,12 @@
 * **Windows**: `loadHtmlString(baseUrl:)` and create-with-html now serve the
   document at its http(s) origin, as macOS does. This means no `data:` URL and no
   2 MB cap. The Windows wire protocol is now v4.
+* **Windows editing shortcuts go to the page first**: Ctrl+C/X/V/A/Z/Y and
+  Ctrl+Shift+Z reach the page as keys, as ⌘-shortcuts already do on macOS.
+  Before, `CefWebView` ran the browser's edit command in their place, so an
+  editor with its own undo stack and selection (Monaco) never saw them: undo did
+  nothing and select-all selected the wrong text. `cef_host` still runs the
+  command when the page leaves the key unhandled.
 * **macOS prebuilt**:
   * `FLUTTER_CEF_REQUIRE_PREBUILT=1` makes pod install / build fail when the
     matching prebuilt `cef_host.app` can't be fetched or embedded. Release

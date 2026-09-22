@@ -529,9 +529,6 @@ void main() {
   // as raw keys — an editor with its own undo stack / selection (Monaco) handles
   // them in its keydown listener — and cef_host runs the browser's edit command
   // only if the page left the key unhandled. So: a raw key, no editCommand.
-  int? editCommandOf(MethodCall c) =>
-      (c.arguments as Map)['command'] as int?;
-
   for (final (name, key, shift, vk) in <(String, LogicalKeyboardKey, bool, int)>[
     ('⌘C', LogicalKeyboardKey.keyC, false, 0x43),
     ('⌘X', LogicalKeyboardKey.keyX, false, 0x58),
@@ -644,27 +641,33 @@ void main() {
       TargetPlatform.windows,
     });
 
-    for (final (name, key, shift, cmd) in <(String, LogicalKeyboardKey, bool, int)>[
-      ('Ctrl+C copies', LogicalKeyboardKey.keyC, false, 0),
-      ('Ctrl+X cuts', LogicalKeyboardKey.keyX, false, 1),
-      ('Ctrl+V pastes', LogicalKeyboardKey.keyV, false, 2),
-      ('Ctrl+A selects all', LogicalKeyboardKey.keyA, false, 3),
-      ('Ctrl+Z undoes', LogicalKeyboardKey.keyZ, false, 4),
-      ('Ctrl+Shift+Z redoes', LogicalKeyboardKey.keyZ, true, 5),
-      ('Ctrl+Y redoes', LogicalKeyboardKey.keyY, false, 5),
+    // Editing chords are the page's first on Windows too (see the ⌘ tests
+    // above): a raw key with Ctrl set, no editCommand, nothing typed. Blink's
+    // key bindings, then cef_host's OnKeyEvent, run the command if the page
+    // leaves the key unhandled.
+    for (final (name, key, shift, vk) in <(String, LogicalKeyboardKey, bool, int)>[
+      ('Ctrl+C', LogicalKeyboardKey.keyC, false, 0x43),
+      ('Ctrl+X', LogicalKeyboardKey.keyX, false, 0x58),
+      ('Ctrl+V', LogicalKeyboardKey.keyV, false, 0x56),
+      ('Ctrl+A', LogicalKeyboardKey.keyA, false, 0x41),
+      ('Ctrl+Z', LogicalKeyboardKey.keyZ, false, 0x5A),
+      ('Ctrl+Shift+Z', LogicalKeyboardKey.keyZ, true, 0x5A),
+      ('Ctrl+Y', LogicalKeyboardKey.keyY, false, 0x59),
     ]) {
-      testWidgets('$name via an editCommand', (tester) async {
+      testWidgets('$name reaches the page as a raw key (not an editCommand)',
+          (tester) async {
         await focusedView(tester);
-        log.clear();
         await tester.sendKeyDownEvent(LogicalKeyboardKey.control);
         if (shift) await tester.sendKeyDownEvent(LogicalKeyboardKey.shift);
-        await tester.sendKeyEvent(key);
-        if (shift) await tester.sendKeyUpEvent(LogicalKeyboardKey.shift);
-        await tester.sendKeyUpEvent(LogicalKeyboardKey.control);
+        log.clear();
+        await tester.sendKeyDownEvent(key);
         await tester.pump();
-        final edits = callsTo('editCommand');
-        expect(edits, hasLength(1));
-        expect(editCommandOf(edits.single), cmd);
+        expect(callsTo('editCommand'), isEmpty);
+        final down = callsTo('key').single.arguments as Map;
+        expect(down['type'], 0, reason: 'RAWKEYDOWN');
+        expect(down['windowsKeyCode'], vk);
+        expect((down['modifiers'] as int) & (1 << 2), (1 << 2)); // Ctrl
+        expect((down['modifiers'] as int) & (1 << 1), shift ? (1 << 1) : 0);
         expect(callsTo('imeCommitText'), isEmpty);
       }, variant: onWindows);
     }

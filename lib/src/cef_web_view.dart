@@ -530,13 +530,13 @@ class _CefWebViewState extends State<CefWebView>
     // raw ⌘-key event never becomes an editor action or a zoom.
     //   - Zoom (⌘+/-/0) and find (⌘F) are the HOST's: handled here, on key-down
     //     (zoom also on repeat), and kept off the page.
-    //   - Editing (⌘C/X/V/A/Z, ⌘⇧Z) is the PAGE's first. On macOS the raw combo
-    //     goes to the page like any other key, and cef_host runs the browser's
-    //     edit command only if the page left it unhandled (its OnKeyEvent) — the
-    //     order a real browser uses. Running the command here instead starved
-    //     editors that own their undo stack and selection (Monaco: ⌘Z did
-    //     nothing, ⌘A selected the wrong thing). Windows still maps Ctrl+C/V/X/
-    //     A/Z(/Y) to explicit commands here.
+    //   - Editing (⌘C/X/V/A/Z, ⌘⇧Z; Ctrl+C/X/V/A/Z/Y, Ctrl+Shift+Z on Windows)
+    //     is the PAGE's first. The raw combo goes to the page like any other
+    //     key, and cef_host runs the browser's edit command only if the page left
+    //     it unhandled (its OnKeyEvent) — the order a real browser uses. Running
+    //     the command here instead starved editors that own their undo stack and
+    //     selection (Monaco: undo did nothing, select-all selected the wrong
+    //     thing).
     final isAccelOnly = _isWindows
         ? (keys.isControlPressed &&
             !keys.isMetaPressed &&
@@ -546,44 +546,6 @@ class _CefWebViewState extends State<CefWebView>
             !keys.isAltPressed);
     if (isAccelOnly && (event is KeyDownEvent || event is KeyRepeatEvent)) {
       final k = event.logicalKey;
-      // Editing commands: key-down only (repeat would re-cut/re-paste).
-      if (_isWindows && event is KeyDownEvent && !keys.isShiftPressed) {
-        if (k == LogicalKeyboardKey.keyC) {
-          unawaited(_controller.copy());
-          return KeyEventResult.handled;
-        }
-        if (k == LogicalKeyboardKey.keyX) {
-          unawaited(_controller.cut());
-          return KeyEventResult.handled;
-        }
-        if (k == LogicalKeyboardKey.keyV) {
-          unawaited(_controller.paste());
-          return KeyEventResult.handled;
-        }
-        if (k == LogicalKeyboardKey.keyA) {
-          unawaited(_controller.selectAll());
-          return KeyEventResult.handled;
-        }
-        if (k == LogicalKeyboardKey.keyZ) {
-          unawaited(_controller.undo());
-          return KeyEventResult.handled;
-        }
-      }
-      if (_isWindows &&
-          event is KeyDownEvent &&
-          keys.isShiftPressed &&
-          k == LogicalKeyboardKey.keyZ) {
-        unawaited(_controller.redo());
-        return KeyEventResult.handled;
-      }
-      // Windows convention: Ctrl+Y is redo (alongside Ctrl+Shift+Z above).
-      if (_isWindows &&
-          event is KeyDownEvent &&
-          !keys.isShiftPressed &&
-          k == LogicalKeyboardKey.keyY) {
-        unawaited(_controller.redo());
-        return KeyEventResult.handled;
-      }
       // Content zoom (⌘+/-/0). `=`/`+` in, `-` in, `0` reset. Repeat-friendly.
       if (k == LogicalKeyboardKey.equal || k == LogicalKeyboardKey.add) {
         _applyZoom((_zoomLevel + _kZoomStep).clamp(_kZoomMin, _kZoomMax));
@@ -625,12 +587,14 @@ class _CefWebViewState extends State<CefWebView>
     final nkc =
         _isWindows ? wkc : (cefMacNativeKeyCode(event.physicalKey) ?? wkc);
     final ch = event.character;
-    // A ⌘ combo is a command, never text, even where the platform reports the
-    // letter as the event's character: keep it off the IME (and the app's own
-    // Edit menu) — the page, then cef_host's fallback, own it.
-    final isText = ch != null &&
-        _isPrintable(ch) &&
-        (_isWindows || !keys.isMetaPressed);
+    // A ⌘ combo (Ctrl on Windows, where Ctrl+Alt is AltGr and types) is a
+    // command, never text, even where the platform reports the letter as the
+    // event's character: keep it off the IME (and the app's own Edit menu) —
+    // the page, then cef_host's fallback, own it.
+    final isCommandChord = _isWindows
+        ? keys.isControlPressed && !keys.isAltPressed
+        : keys.isMetaPressed;
+    final isText = ch != null && _isPrintable(ch) && !isCommandChord;
     // Every key MUST carry its macOS NSEvent character. Editing/navigation keys
     // because CEF OSR otherwise double-applies them (one Backspace deletes two,
     // one arrow moves two); printable keys because a zero character pair makes

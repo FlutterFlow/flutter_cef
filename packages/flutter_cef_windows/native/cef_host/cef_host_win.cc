@@ -73,6 +73,7 @@
 #include "include/cef_download_handler.h"
 #include "include/cef_find_handler.h"
 #include "include/cef_jsdialog_handler.h"
+#include "include/cef_keyboard_handler.h"
 #include "include/cef_life_span_handler.h"
 #include "include/cef_permission_handler.h"
 #include "include/cef_render_handler.h"
@@ -876,6 +877,7 @@ class HostClient : public CefClient,
                    public CefLifeSpanHandler,
                    public CefFindHandler,
                    public CefJSDialogHandler,
+                   public CefKeyboardHandler,
                    public CefDownloadHandler,
                    public CefRequestHandler,
                    public CefMessageRouterBrowserSide::Handler {
@@ -904,6 +906,7 @@ class HostClient : public CefClient,
   CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
   CefRefPtr<CefFindHandler> GetFindHandler() override { return this; }
   CefRefPtr<CefJSDialogHandler> GetJSDialogHandler() override { return this; }
+  CefRefPtr<CefKeyboardHandler> GetKeyboardHandler() override { return this; }
   CefRefPtr<CefDownloadHandler> GetDownloadHandler() override { return this; }
   CefRefPtr<CefRequestHandler> GetRequestHandler() override { return this; }
 
@@ -1181,6 +1184,33 @@ class HostClient : public CefClient,
       slot_->bridge_h = 0;
     }
     slot_->browser = nullptr;
+  }
+
+  // Ctrl-key editing shortcuts as the FALLBACK they are in a real browser
+  // (main.mm OnKeyEvent). CefWebView sends Ctrl+C/X/V/A/Z/Y to the page as raw
+  // keys, so an editor that owns its undo stack and selection (Monaco) handles
+  // them in its keydown listener; Blink's own key bindings run the edit command
+  // when the page doesn't. OnKeyEvent is called only for a key both left
+  // unhandled, so this can't run a command twice.
+  bool OnKeyEvent(CefRefPtr<CefBrowser> browser, const CefKeyEvent& event,
+                  CefEventHandle) override {
+    if (event.type != KEYEVENT_RAWKEYDOWN) return false;
+    const uint32_t m = event.modifiers;
+    if (!(m & EVENTFLAG_CONTROL_DOWN) ||
+        (m & (EVENTFLAG_ALT_DOWN | EVENTFLAG_COMMAND_DOWN)))
+      return false;
+    CefRefPtr<CefFrame> frame = browser->GetFocusedFrame();
+    if (!frame) return false;
+    const bool shift = (m & EVENTFLAG_SHIFT_DOWN) != 0;
+    switch (event.windows_key_code) {
+      case 'C': if (shift) return false; frame->Copy(); return true;
+      case 'X': if (shift) return false; frame->Cut(); return true;
+      case 'V': if (shift) return false; frame->Paste(); return true;
+      case 'A': if (shift) return false; frame->SelectAll(); return true;
+      case 'Z': if (shift) frame->Redo(); else frame->Undo(); return true;
+      case 'Y': if (shift) return false; frame->Redo(); return true;
+      default: return false;
+    }
   }
 
   // IO thread. Answer the main-frame navigation to an authored document's URL

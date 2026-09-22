@@ -7,6 +7,10 @@
   0x41).
 * `hostGroup`: ephemeral sessions in one group share a `cef_host`.
 * Fix: a dispose that raced its own create no longer leaks the browser.
+* Ctrl editing shortcuts are the page's first: `cef_host` runs the edit command
+  (`OnKeyEvent`) only for a key the page and Blink left unhandled.
+* `fetch_cef.ps1` checks the CEF download against a SHA-1 pinned in the script,
+  not one fetched from the same CDN, and fails when it doesn't match.
 * Protocol v4.
 
 # 0.1.0
