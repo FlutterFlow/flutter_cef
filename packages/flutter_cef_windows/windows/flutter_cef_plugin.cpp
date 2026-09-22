@@ -1313,8 +1313,11 @@ void FlutterCefPlugin::HandleHostGone(const std::string& host_key,
     code = h->process ? h->process->WaitForExit(0) : HostProcess::kStillRunning;
   }
   // Exit code 2 after kOpLog "profile-locked" = profile already open elsewhere
-  // (main.mm:2786-2806, Swift:521).
-  const std::string reason = (code == 2) ? "locked" : "crashed";
+  // (main.mm:2786-2806, Swift:521). A host that died before kOpReady never
+  // created a browser: its sessions' creates failed, so consumers fall back at
+  // once instead of recreating on a host that can't start.
+  const std::string reason =
+      (code == 2) ? "locked" : (h->ready ? "crashed" : "createFailed");
   Log("host gone for profile '" + host_key + "' (reason=" + reason + ")");
   FailHost(host_key, reason);
 }

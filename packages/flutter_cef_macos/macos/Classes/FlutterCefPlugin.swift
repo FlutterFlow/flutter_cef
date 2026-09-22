@@ -609,8 +609,11 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       // C2 cross-group contract: cef_host exits 2 (after SendLog "profile-locked")
       // when it loses the cache singleton lock to another process. Surface that as
       // a distinct reason so the widget can say "already open elsewhere" instead of
-      // a generic crash.
-      self.failHost(host, reason: (status == 2) ? "locked" : "crashed")
+      // a generic crash. A host that died before opReady never created a browser:
+      // its sessions' creates failed, so consumers fall back at once instead of
+      // recreating on a host that can't start.
+      let reason = status == 2 ? "locked" : (host.everReady ? "crashed" : "createFailed")
+      self.failHost(host, reason: reason)
     }
     // Protocol handshake refusal: the host announced a wire-protocol version this
     // plugin doesn't speak (see CefProfileHost.protocolVersion). Nothing was flushed

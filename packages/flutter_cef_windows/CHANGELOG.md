@@ -11,6 +11,8 @@
   (`OnKeyEvent`) only for a key the page and Blink left unhandled.
 * `fetch_cef.ps1` checks the CEF download against a SHA-1 pinned in the script,
   not one fetched from the same CDN, and fails when it doesn't match.
+* A host that dies before `kOpReady` is reported as `createFailed`, not
+  `crashed` (exit code 2 is still `locked`).
 * Protocol v4.
 
 # 0.1.0
