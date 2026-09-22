@@ -6,9 +6,9 @@
 #
 # Resolution order (shared with both CMakeLists): env CEF_ROOT, then
 # %LOCALAPPDATA%/flutter_cef/<dist>. If neither exists, download the pinned
-# tarball from cef-builds.spotifycdn.com, verify its SHA-1 fail-closed, extract
-# with native tar.exe (bsdtar handles .tar.bz2, SPIKES.md S6), and cache it
-# under %LOCALAPPDATA%/flutter_cef for later builds.
+# tarball from cef-builds.spotifycdn.com, verify it against the SHA-1 pinned
+# below (fail closed), extract with native tar.exe (bsdtar handles .tar.bz2,
+# SPIKES.md S6), and cache it under %LOCALAPPDATA%/flutter_cef for later builds.
 
 $ErrorActionPreference = 'Stop'
 
@@ -20,6 +20,11 @@ function Info($m) { [Console]::Error.WriteLine($m) }
 # The pin (matches build_cef_host.sh:17 / SPIKES.md header).
 $CefVersion = '144.0.27+g3fae261+chromium-144.0.7559.254'
 $CefDistName = "cef_binary_${CefVersion}_windows64_minimal"
+# SHA-1 of that tarball, from the CEF builds index (index.json and the .sha1
+# beside the tarball agree). Pinned here, not fetched from the host that
+# serves the tarball, so a tampered mirror can't vouch for itself. Update it
+# with $CefVersion.
+$CefDistSha1 = '4bdedf91fb973c99570728d228098638f004c5e9'
 
 $Candidates = @()
 if ($env:CEF_ROOT) { $Candidates += $env:CEF_ROOT }
@@ -49,23 +54,14 @@ if ($LASTEXITCODE -ne 0) {
   exit 1
 }
 
-# Fail-closed SHA-1 check against the published .sha1 (a bare hex digest).
-$expected = ''
-$sha1line = & curl.exe -fsL "$url.sha1"
-if ($sha1line) {
-  $expected = ([string]$sha1line).Trim().ToLower()
+# Fail-closed SHA-1 check against the pinned digest.
+$actual = (Get-FileHash -Algorithm SHA1 -Path $tarball).Hash.ToLower()
+if ($actual -ne $CefDistSha1) {
+  Remove-Item $tarball -Force -ErrorAction SilentlyContinue
+  Write-Error "fetch_cef: SHA-1 mismatch (got $actual, pinned $CefDistSha1)"
+  exit 1
 }
-if ($expected.Length -eq 40) {
-  $actual = (Get-FileHash -Algorithm SHA1 -Path $tarball).Hash.ToLower()
-  if ($actual -ne $expected) {
-    Remove-Item $tarball -Force -ErrorAction SilentlyContinue
-    Write-Error "fetch_cef: SHA-1 mismatch"
-    exit 1
-  }
-  Info "fetch_cef: SHA-1 verified $actual"
-} else {
-  Info "fetch_cef: WARNING no usable .sha1 digest; skipping integrity check"
-}
+Info "fetch_cef: SHA-1 verified $actual"
 
 # Extract into a temp dir, then move into place, so a partial extract is never
 # resolved by a concurrent build.

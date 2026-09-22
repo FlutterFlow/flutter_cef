@@ -1,3 +1,14 @@
+## Unreleased
+
+* Document-start scripts and create-time JS channels, sent in the browser's
+  `extra_info` and installed by the renderer in `OnContextCreated`.
+* `hostGroup`: ephemeral sessions in one group share a `cef_host`.
+* Protocol v8 (`opSetDocumentStart` 0x41).
+* `FLUTTER_CEF_REQUIRE_PREBUILT=1` makes the prebuilt fetch and embed fail
+  closed. A prebuilt whose hash doesn't match the sources is removed, not
+  embedded.
+* `cef_host.app` bundles only the `CEF_HOST_LOCALES` (default `en`) locale paks.
+
 ## 0.2.0
 
 * Persistent + shared named profiles (`profile:`): one `cef_host` process with one

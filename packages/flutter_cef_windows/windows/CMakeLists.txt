@@ -132,6 +132,7 @@ add_custom_command(
   DEPENDS
     "${CEF_HOST_SRC_DIR}/cef_host_win.cc"
     "${CEF_HOST_SRC_DIR}/cef_host_protocol.h"
+    "${CEF_HOST_SRC_DIR}/document_start.h"
     "${CEF_HOST_SRC_DIR}/CMakeLists.txt"
     "${CEF_HOST_SRC_DIR}/build_cef_host.bat"
   COMMENT "Building cef_host (CEF OSR host) via build_cef_host.bat"

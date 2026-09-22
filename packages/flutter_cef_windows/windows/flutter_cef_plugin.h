@@ -6,9 +6,11 @@
 // .swift):
 //  - ONE cef_host.exe per PROFILE. A non-empty `profile` create arg -> a
 //    shared, persistent Host (keyed by profile name) reused by every session
-//    that names it; an absent/empty profile -> a unique ephemeral Host per
-//    create (keyed "~ephemeral~"+sessionId). Views sharing a `profile` share
-//    one host -> one cookie jar -> one login (macOS parity).
+//    that names it; an absent/empty profile -> an ephemeral Host, shared by a
+//    `hostGroup`'s sessions (keyed "~group~"+hostGroup, torn down with the
+//    last) or else unique per create (keyed "~ephemeral~"+sessionId). Views
+//    sharing a `profile` share one host -> one cookie jar -> one login (macOS
+//    parity).
 //  - A Host owns the process (Job-Object-guarded), the IpcPipe (+ reader
 //    thread), the process-exit watcher, the pre-ready send queue, the
 //    monotonic wire-browserId allocator, and the profile identity. It serves
@@ -25,8 +27,9 @@
 //    on the HOST's generation, so a dead host's straggler frames (posted
 //    during the reaper grace after a same-profile respawn) can't reach a
 //    session on the fresh host.
-//  - Handshake: nothing is sent until kOpReady; protocolVersion must be 3
-//    (else processGone "protocolMismatch(host=vN)" for every session). Verbs
+//  - Handshake: nothing is sent until kOpReady; protocolVersion must equal
+//    kCefHostProtocolVersion (else processGone "protocolMismatch(host=vN)" for
+//    every session). Verbs
 //    issued before ready are queued on the Host and flushed on ready.
 //  - Present size-gate (LAW 4): a present is promoted only when its
 //    {srcW,srcH} matches round(logical*dpr) ±1 px for the CURRENT size.
@@ -105,7 +108,8 @@ class FlutterCefPlugin : public flutter::Plugin {
   // One cef_host.exe process serving N Sessions. Platform-thread confined (the
   // reader/watcher threads only post events). Mirrors CefProfileHost.swift.
   struct Host {
-    std::string key;  // hosts_ map key: profile name OR "~ephemeral~"+sessionId
+    // hosts_ map key: profile name, "~group~"+hostGroup or "~ephemeral~"+sessionId
+    std::string key;
     // Monotonic per-spawn identity (C1 host-object-identity analogue of macOS
     // failHost, FlutterCefPlugin.swift:484-511). The reader/exit-watcher
     // lambdas capture THIS value; a stale OLD-host event posted during the

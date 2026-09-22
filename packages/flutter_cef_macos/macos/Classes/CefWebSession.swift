@@ -431,6 +431,37 @@ final class CefWebSession: NSObject, FlutterTexture {
   /// wire ahead of its opCreateBrowser: see `CefProfileHost.sendCreate`.
   private let authoredLock = NSLock()
   private var authoredDoc: (url: String, html: String)?
+  // The opSetDocumentStart payload (see setDocumentStart), or nil when the
+  // session has neither document-start scripts nor create-time channels. Fixed
+  // at create; guarded by authoredLock (read by the host's create sender).
+  private var documentStart: [UInt8]?
+
+  /// Document-start scripts + JS channel names, installed by the renderer at
+  /// JS-context creation of every main-frame document — ahead of page scripts.
+  /// Wire payload: a sequence of items {u8 kind}{u32 len BE}{utf8}, kind 0 = a
+  /// channel name, 1 = a script. Must reach cef_host ahead of opCreateBrowser
+  /// (it rides in the browser's creation info), so it is sent by sendCreate.
+  func setDocumentStart(scripts: [String], channels: [String]) {
+    var payload = [UInt8]()
+    func item(_ kind: UInt8, _ s: String) {
+      let bytes = Array(s.utf8)
+      payload.append(kind)
+      let n = UInt32(bytes.count)
+      payload.append(contentsOf: [UInt8(n >> 24 & 0xff), UInt8(n >> 16 & 0xff),
+                                  UInt8(n >> 8 & 0xff), UInt8(n & 0xff)])
+      payload.append(contentsOf: bytes)
+    }
+    for c in channels { item(0, c) }
+    for s in scripts { item(1, s) }
+    authoredLock.lock()
+    documentStart = payload.isEmpty ? nil : payload
+    authoredLock.unlock()
+  }
+
+  func documentStartPayload() -> [UInt8]? {
+    authoredLock.lock(); defer { authoredLock.unlock() }
+    return documentStart
+  }
 
   func setAuthoredDoc(_ doc: (url: String, html: String)?) {
     authoredLock.lock(); authoredDoc = doc; authoredLock.unlock()

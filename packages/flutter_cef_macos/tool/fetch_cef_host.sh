@@ -11,7 +11,11 @@
 # SHA/branch/tag pin that checks out the same native sources resolves to the same
 # object). Fail-OPEN on network/missing (co-dev + offline builds fall back to
 # build-from-source / FLUTTER_CEF_HOST); fail-CLOSED on checksum mismatch and on
-# a bad/foreign code signature.
+# a bad/foreign code signature. FLUTTER_CEF_REQUIRE_PREBUILT=1 (set by release
+# builds) turns every fail-open path into an error too: a release must never
+# quietly ship without its cef_host. A prebuilt left over from OTHER sources is
+# removed on the way out of a miss, so it can't be embedded by mistake (it would
+# speak an older wire protocol).
 #
 # AUTHENTICITY: the .sha256 sidecar lives in the same public release as the tarball,
 # so it is transport-integrity only — anyone who could tamper with the tarball could
@@ -22,26 +26,43 @@
 # placed where a build (or posix_spawn, which bypasses Gatekeeper) can use it.
 set -euo pipefail
 
-# Escape hatch: co-dev / build-from-source (native/build_cef_host.sh + a make host).
-if [ -n "${FLUTTER_CEF_FROM_SOURCE:-}" ]; then
-  echo "[flutter_cef] FLUTTER_CEF_FROM_SOURCE set — skipping prebuilt fetch (build from source)."
-  exit 0
-fi
-
 HERE="$(cd "$(dirname "$0")" && pwd)"          # .../tool
 PKG="$(cd "$HERE/.." && pwd)"                   # .../flutter_cef_macos
 NATIVE="$PKG/native"
 DEST="$NATIVE/cef_host/prebuilt"
 
-# Only macos-arm64 is published today; x86_64 builds from source.
-case "$(uname -m)" in
-  arm64) arch=arm64 ;;
-  *) echo "[flutter_cef] arch $(uname -m) has no prebuilt cef_host — build from source."; exit 0 ;;
-esac
-
 # shellcheck source=cef_host_hash.sh
 . "$HERE/cef_host_hash.sh"
 HASH="$(cef_host_input_hash "$NATIVE")"
+
+# Every "no prebuilt for these sources" exit goes through here: an error when the
+# build requires one, otherwise a note — and in both cases a prebuilt from other
+# sources is dropped so the embed phase can't pick it up.
+no_prebuilt() {
+  if [ -d "$DEST/cef_host.app" ] && [ "$(cat "$DEST/cef_host_input_hash.txt" 2>/dev/null)" != "$HASH" ]; then
+    echo "[flutter_cef] removing the stale prebuilt cef_host (built from other sources)."
+    rm -rf "$DEST/cef_host.app" "$DEST"/cef_host_*.txt "$DEST/cef_version.txt"
+  fi
+  if [ -n "${FLUTTER_CEF_REQUIRE_PREBUILT:-}" ]; then
+    echo "[flutter_cef] ERROR: $1" >&2
+    echo "[flutter_cef] FLUTTER_CEF_REQUIRE_PREBUILT is set: publish cef_host for input hash $HASH (make publish-cef-host in flutter_cef) and re-run pod install." >&2
+    exit 1
+  fi
+  echo "[flutter_cef] $1"
+  echo "[flutter_cef] building from source (dev), or publish it with make publish-cef-host."
+  exit 0
+}
+
+# Escape hatch: co-dev / build-from-source (native/build_cef_host.sh + a make host).
+if [ -n "${FLUTTER_CEF_FROM_SOURCE:-}" ]; then
+  no_prebuilt "FLUTTER_CEF_FROM_SOURCE set — skipping the prebuilt fetch."
+fi
+
+# Only macos-arm64 is published today; x86_64 builds from source.
+case "$(uname -m)" in
+  arm64) arch=arm64 ;;
+  *) no_prebuilt "arch $(uname -m) has no prebuilt cef_host." ;;
+esac
 
 # One release per content hash; override the base to fetch from a fork or mirror.
 BASE="${FLUTTER_CEF_PREBUILT_BASE:-https://github.com/FlutterFlow/flutter_cef/releases/download}"
@@ -69,19 +90,17 @@ sha256_file() {
 # Fail-OPEN if unreachable: no published host for this hash yet (a fresh native
 # change before CI publishes, or offline) -> build from source.
 expected=""
-if ! expected="$(curl -fsSL --retry 3 --retry-delay 1 "$SHA_URL" 2>/dev/null | awk '{print $1}')"; then
-  echo "[flutter_cef] no published cef_host for hash $HASH ($SHA_URL unreachable)."
-  echo "[flutter_cef] building from source (dev), or CI will publish it shortly."
-  exit 0
+if ! expected="$(curl -fsSL --retry 3 --retry-delay 1 "$SHA_URL" 2>/dev/null | awk '{print $1}')" \
+    || [ -z "$expected" ]; then
+  no_prebuilt "no published cef_host for hash $HASH ($SHA_URL unreachable)."
 fi
 
 # (Re)download on cache miss or a stale/corrupt cached tarball.
 if [ ! -f "$tarball" ] || [ "$(sha256_file "$tarball")" != "$expected" ]; then
   echo "[flutter_cef] downloading prebuilt cef_host: $URL"
   if ! curl -fL --retry 3 --retry-delay 1 -o "$tarball.part" "$URL"; then
-    echo "[flutter_cef] download failed — building from source." >&2
     rm -f "$tarball.part"
-    exit 0
+    no_prebuilt "downloading $URL failed."
   fi
   actual="$(sha256_file "$tarball.part")"
   if [ "$actual" != "$expected" ]; then

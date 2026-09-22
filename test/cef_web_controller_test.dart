@@ -995,9 +995,18 @@ void main() {
     expect(log.where((m) => m.method == 'loadTrusted'), isEmpty);
   });
 
+  test('loadHtmlString(baseUrl:) serves at the origin on Windows too', () async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    final c = CefWebController(sessionId: 'auth-win');
+    await c.loadHtmlString('<p>w</p>', baseUrl: 'https://app.example/');
+    expect(log.where((m) => m.method == 'loadAuthored'), hasLength(1));
+    expect(log.where((m) => m.method == 'loadTrusted'), isEmpty);
+  });
+
   test('loadHtmlString(baseUrl:) falls back to data: + <base href> elsewhere',
       () async {
-    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    debugDefaultTargetPlatformOverride = TargetPlatform.linux;
     addTearDown(() => debugDefaultTargetPlatformOverride = null);
     final c = CefWebController(sessionId: 'base');
     await c.loadHtmlString('<html><head><title>t</title></head></html>',
@@ -1023,6 +1032,58 @@ void main() {
     final a = log.firstWhere((m) => m.method == 'create').arguments as Map;
     expect(a['url'], 'https://app.example/');
     expect(a['authoredHtml'], '<p>y</p>');
+  });
+
+  test('create forwards hostGroup only when set', () async {
+    final grouped = CefWebController(sessionId: 'hg', hostGroup: 'editors');
+    await grouped.create(url: 'about:blank', width: 1, height: 1);
+    expect((log.firstWhere((m) => m.method == 'create').arguments
+        as Map)['hostGroup'], 'editors');
+
+    for (final g in [null, '']) {
+      log.clear();
+      final c = CefWebController(sessionId: 'hg-$g', hostGroup: g);
+      await c.create(url: 'about:blank', width: 1, height: 1);
+      expect((log.firstWhere((m) => m.method == 'create').arguments as Map)
+          .containsKey('hostGroup'), isFalse);
+    }
+  });
+
+  test('create forwards document-start scripts and pre-create channels',
+      () async {
+    final c = CefWebController(
+        sessionId: 'ds', documentStartScripts: const ['window.a = 1;']);
+    await c.addJavaScriptChannel('early', onMessageReceived: (_) {});
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    final a = log.firstWhere((m) => m.method == 'create').arguments as Map;
+    expect(a['documentStartScripts'], ['window.a = 1;']);
+    expect(a['channels'], ['early']);
+  });
+
+  test('create omits document-start args when there are none', () async {
+    final c = CefWebController(sessionId: 'ds-none');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    final a = log.firstWhere((m) => m.method == 'create').arguments as Map;
+    expect(a.containsKey('documentStartScripts'), isFalse);
+    expect(a.containsKey('channels'), isFalse);
+  });
+
+  test('onCreateFailed fires for a failed create or a protocol mismatch only',
+      () async {
+    final c = CefWebController(sessionId: 'cf');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    final failures = <Object>[];
+    final gone = <String>[];
+    c.onCreateFailed = failures.add;
+    c.onProcessGone = gone.add;
+
+    await emit('cf', 'processGone', {'reason': 'crashed'});
+    expect(failures, isEmpty, reason: 'a crash after create is not a create failure');
+    await emit('cf', 'processGone', {'reason': 'createFailed'});
+    await emit('cf', 'processGone', {'reason': 'protocolMismatch(host=v3)'});
+    expect(failures, hasLength(2));
+    expect(gone, ['crashed', 'createFailed', 'protocolMismatch(host=v3)'],
+        reason: 'onProcessGone still sees every reason');
   });
 
   test('getScrollPosition falls back to Offset.zero on a non-list result',

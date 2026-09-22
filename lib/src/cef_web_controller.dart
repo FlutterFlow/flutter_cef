@@ -17,8 +17,13 @@ import 'package:flutter_cef_platform_interface/flutter_cef_platform_interface.da
 /// Usually you don't create this directly — [CefWebView] manages one for you.
 /// Use it when you need to script a view.
 class CefWebController {
-  CefWebController({String? sessionId, this.profile})
-      : sessionId = sessionId ?? 'cef-${_counter++}' {
+  CefWebController({
+    String? sessionId,
+    this.profile,
+    this.hostGroup,
+    List<String> documentStartScripts = const <String>[],
+  })  : sessionId = sessionId ?? 'cef-${_counter++}',
+        documentStartScripts = List<String>.unmodifiable(documentStartScripts) {
     // Register + install the host->Dart handler at construction (not in create),
     // so callbacks wired before create() can't miss early events.
     _bySession[this.sessionId] = this;
@@ -52,6 +57,35 @@ class CefWebController {
   /// and that login survives cef_host/host-app relaunch. Null (the default) is
   /// today's behaviour.
   final String? profile;
+
+  /// Views constructed with the same non-null [hostGroup] share ONE ephemeral
+  /// `cef_host` process tree (browser, GPU and network processes; each view
+  /// still gets its own renderer) instead of one tree per view. The shared host
+  /// keeps an in-memory cookie jar and storage that live exactly as long as the
+  /// group has a view, so nothing is written to disk — use it for a family of
+  /// views that don't need a persistent login (editors, previews of
+  /// host-authored pages) to pay the Chromium baseline once. A host crash takes
+  /// down every view in the group. Ignored when [profile] is set (a named
+  /// profile is already one shared host).
+  final String? hostGroup;
+
+  /// Scripts run in the main frame of every document this view loads, at the
+  /// moment its JavaScript context is created — BEFORE any of the page's own
+  /// scripts. JS channels registered (with [addJavaScriptChannel]) before
+  /// [create] are installed at the same point, so the page can call
+  /// `window.<name>.postMessage` from its very first script. Fixed for the
+  /// controller's lifetime; applies to the browser [create] (and [thaw]) make.
+  /// A script that throws is reported to the page console and skipped.
+  final List<String> documentStartScripts;
+
+  /// Called when the native session can't be created — `cef_host` is missing
+  /// or failed to spawn (the [PlatformException] [create] throws), or the
+  /// browser couldn't be dispatched once the host was up (reported as
+  /// [onProcessGone] with reason `"createFailed"` too). Lets a consumer that
+  /// embeds a [CefWebView] fall back to another engine; the view itself shows
+  /// its placeholder and stops retrying. When unset, [CefWebView] reports the
+  /// error through [FlutterError.reportError].
+  void Function(Object error)? onCreateFailed;
 
   /// The registered [Texture] id once [create] has resolved, else null.
   int? textureId;
@@ -337,7 +371,13 @@ class CefWebController {
         // most likely failure) — then let the consumer react (reload / recreate).
         _failPendingEvals('the cef_host process is gone');
         _failPendingCookies('the cef_host process is gone');
-        onProcessGone?.call(a['reason'] as String? ?? 'crashed');
+        final reason = a['reason'] as String? ?? 'crashed';
+        // The browser never came up (dispatch failed, or the host speaks another
+        // wire protocol): the same "can't create" signal create() throws for.
+        if (reason == 'createFailed' || reason.startsWith('protocolMismatch')) {
+          onCreateFailed?.call(StateError('cef_host: $reason'));
+        }
+        onProcessGone?.call(reason);
         break;
       case 'paintStalled':
         // C1: the browser came up but never delivered its first frame even after a
@@ -659,6 +699,13 @@ class CefWebController {
         // byte-identical to today's create args.
         if (agentControl) 'agentControl': true,
         if (profile != null && profile!.isNotEmpty) 'profile': profile,
+        if (hostGroup != null && hostGroup!.isNotEmpty) 'hostGroup': hostGroup,
+        // Installed at JS-context creation, ahead of the page's own scripts.
+        // Channels registered before create ride along so the page can post
+        // from its first script; later registrations take the per-load path.
+        if (documentStartScripts.isNotEmpty)
+          'documentStartScripts': documentStartScripts,
+        if (_channels.isNotEmpty) 'channels': _channels.keys.toList(),
       });
     } finally {
       _scheduleSlotRelease();
@@ -982,10 +1029,12 @@ class CefWebController {
       '${base64Encode(const Utf8Encoder().convert(html))}';
 
   /// Whether an authored document can be served AT [baseUrl] (so it has that
-  /// URL's real origin). http(s) only, and only where the native host implements
-  /// it — macOS today; elsewhere the `data:` fallback below applies.
+  /// URL's real origin). http(s) only, on the hosts that implement it (macOS
+  /// and Windows); elsewhere the `data:` fallback below applies.
   static bool _servesAtOrigin(String? baseUrl) {
-    if (baseUrl == null || defaultTargetPlatform != TargetPlatform.macOS) {
+    if (baseUrl == null ||
+        (defaultTargetPlatform != TargetPlatform.macOS &&
+            defaultTargetPlatform != TargetPlatform.windows)) {
       return false;
     }
     final scheme = Uri.tryParse(baseUrl)?.scheme.toLowerCase();

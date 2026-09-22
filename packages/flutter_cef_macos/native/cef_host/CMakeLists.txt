@@ -118,6 +118,13 @@ foreach(_happ ${_helper_apps})
       "${_happ}" "${APP_DIR}/Contents/Frameworks/${_hname}"
     VERBATIM)
 endforeach()
+# Locales: the framework ships ~220 .lproj locale paks (~50 MB), but CefSettings
+# leaves `locale` empty, which CEF resolves to en-US ("en.lproj") on every
+# system — the rest are never loaded. Keep CEF_HOST_LOCALES (plus their
+# gendered variants) and drop the others before the framework is sealed.
+set(CEF_HOST_LOCALES "en" CACHE STRING
+  "Space-separated Chromium locales (.lproj base names) kept in cef_host.app")
+set(_trim_locales "cd \"$FW/Versions/A/Resources\" && for d in *.lproj; do keep=0; for l in ${CEF_HOST_LOCALES}; do case \"$d\" in \"$l.lproj\"|\"$l\"_FEMININE.lproj|\"$l\"_MASCULINE.lproj|\"$l\"_NEUTER.lproj) keep=1;; esac; done; [ $keep = 1 ] || rm -rf \"$d\"; done; cd - >/dev/null;")
 set(_sign_helpers "")
 if(CEF_MULTI_PROCESS)
   set(_sign_helpers "for h in '${APP_DIR}'/Contents/Frameworks/*Helper*.app; do codesign --force --options runtime --timestamp=none --entitlements '${ENT}' --sign '${CODESIGN_ID}' \"$h\"; done;")
@@ -125,6 +132,7 @@ endif()
 add_custom_command(TARGET cef_host POST_BUILD COMMAND /bin/sh -c
   "set -e; \
    FW='${APP_DIR}/Contents/Frameworks/Chromium Embedded Framework.framework'; \
+   ${_trim_locales} \
    codesign --force --timestamp=none --sign '${CODESIGN_ID}' \"$FW/Versions/A/Libraries/\"*.dylib; \
    codesign --force --timestamp=none --sign '${CODESIGN_ID}' \"$FW/Versions/A\"; \
    ${_sign_helpers} \

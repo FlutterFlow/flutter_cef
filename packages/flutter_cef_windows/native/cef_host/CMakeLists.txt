@@ -73,6 +73,7 @@ endif()
 add_library(cef_host SHARED
   cef_host_win.cc
   cef_host_protocol.h
+  document_start.h
 )
 SET_LIBRARY_TARGET_PROPERTIES(cef_host)
 # NOMINMAX: cef_types_win.h pulls windows.h; without it std::min/max -> C2589

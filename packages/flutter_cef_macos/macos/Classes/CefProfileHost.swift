@@ -31,6 +31,7 @@ final class CefProfileHost {
   static let opCreateFailed: UInt8 = 0x1d     // cef_host -> us: create dispatch failed — drop the session (H7)
   static let opInvalidate: UInt8 = 0x37       // us -> cef_host: force a repaint to re-kick a stalled first frame (C1)
   static let opSetAuthoredHtml: UInt8 = 0x3f  // us -> cef_host: {url}\0{html} served as the main-frame response for url
+  static let opSetDocumentStart: UInt8 = 0x41 // us -> cef_host: document-start scripts + channels, ahead of opCreateBrowser
   static let opSetVisible: UInt8 = 0x35       // us -> cef_host: WasHidden(!visible); peeked to make the C1 watchdog visibility-aware
 
   // Expected kOp wire-protocol version, announced by the host in opReady's payload
@@ -40,7 +41,7 @@ final class CefProfileHost {
   // processGone) instead of silently mis-parsing frames into frozen/blank tiles; the
   // skew vectors are FLUTTER_CEF_HOST overrides, stale from-source builds, and stale
   // embedded copies (the content-hash fetch can't drift on the normal path).
-  static let protocolVersion: UInt8 = 7
+  static let protocolVersion: UInt8 = 8
 
   // Profile identity / config.
   let profileId: String
@@ -550,6 +551,12 @@ final class CefProfileHost {
     // it is in place before the browser's first request can be made.
     if let authored = session.authoredPayload(for: url) {
       frame = frameBytes(id, Self.opSetAuthoredHtml, authored) + frame
+    }
+    // Same for the document-start config: cef_host folds it into the browser's
+    // creation info, which is the only way it reaches the renderer in time for
+    // the FIRST document.
+    if let docStart = session.documentStartPayload() {
+      frame = frameBytes(id, Self.opSetDocumentStart, docStart) + frame
     }
     var ok = true
     if connFd < 0 {

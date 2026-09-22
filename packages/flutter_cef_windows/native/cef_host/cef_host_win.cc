@@ -73,19 +73,24 @@
 #include "include/cef_download_handler.h"
 #include "include/cef_find_handler.h"
 #include "include/cef_jsdialog_handler.h"
+#include "include/cef_keyboard_handler.h"
 #include "include/cef_life_span_handler.h"
 #include "include/cef_permission_handler.h"
 #include "include/cef_render_handler.h"
 #include "include/cef_render_process_handler.h"
 #include "include/cef_request_handler.h"
+#include "include/cef_resource_handler.h"
+#include "include/cef_resource_request_handler.h"
 #include "include/cef_sandbox_win.h"
 #include "include/cef_task.h"
 #include "include/cef_v8.h"
+#include "include/cef_values.h"
 #include "include/wrapper/cef_closure_task.h"
 #include "include/wrapper/cef_helpers.h"
 #include "include/wrapper/cef_message_router.h"
 
 #include "cef_host_protocol.h"
+#include "document_start.h"
 
 // SHGetKnownFolderPath (downloads dir) + CoTaskMemFree live in shell32/ole32.
 // These pragmas keep the TU self-linking without touching CMake.
@@ -129,35 +134,53 @@ std::string g_cdp_io_pipes;
 // CefMessageRouter channel; the renderer half lives in HostApp below).
 std::set<std::string> g_channels;
 
-// A channel name is spliced into the injected shim's source, so it MUST be a
-// plain JS identifier — else a crafted name could break out of the string
-// literal and run arbitrary script on every page load (main.mm:362-375,
-// verbatim). DoAddChannel drops invalid names.
-bool IsValidChannelName(const std::string& n) {
-  if (n.empty() || n.size() > 64) return false;
-  auto isFirst = [](unsigned char c) {
-    return std::isalpha(c) || c == '_' || c == '$';
-  };
-  auto isRest = [](unsigned char c) {
-    return std::isalnum(c) || c == '_' || c == '$';
-  };
-  if (!isFirst(static_cast<unsigned char>(n[0]))) return false;
-  for (size_t i = 1; i < n.size(); ++i) {
-    if (!isRest(static_cast<unsigned char>(n[i]))) return false;
-  }
-  return true;
-}
+// document_start::IsValidChannelName (DoAddChannel drops invalid names).
+using document_start::IsValidChannelName;
 
 // Inject the per-channel page-side shim (window.<name>.postMessage ->
-// window.cefQuery 'ch:<name>:<msg>'). BYTE-for-byte identical to main.mm:
-// 377-384 so a page cannot detect a Windows-vs-macOS divergence.
+// window.cefQuery 'ch:<name>:<msg>'). document_start::ChannelShimJs is the one
+// definition shared with macOS, so a page cannot detect a Windows-vs-macOS
+// divergence.
 void InjectChannelShim(CefRefPtr<CefFrame> frame, const std::string& name) {
   if (!frame) return;
-  std::string js = "window['" + name +
-                   "']={postMessage:function(m){window.cefQuery({request:'ch:" +
-                   name + ":'+String(m),persistent:false,"
-                   "onSuccess:function(){},onFailure:function(){}});}};";
-  frame->ExecuteJavaScript(js, "", 0);
+  frame->ExecuteJavaScript(document_start::ChannelShimJs(name), "", 0);
+}
+
+// Document-start config parked by kOpSetDocumentStart until its browser's
+// DoCreateBrowser takes it. Keyed by wire id and set on the reader thread ahead
+// of the create frame (like g_authored), read on TID_UI — hence the mutex.
+std::mutex g_doc_start_mutex;
+std::map<uint32_t, document_start::Config> g_doc_start;
+
+void SetDocumentStart(uint32_t wire_id, document_start::Config config) {
+  std::lock_guard<std::mutex> lock(g_doc_start_mutex);
+  if (config.empty()) {
+    g_doc_start.erase(wire_id);
+  } else {
+    g_doc_start[wire_id] = std::move(config);
+  }
+}
+
+// The browser's creation info carrying its document-start config to every
+// renderer that hosts it, or null when it has none. Consumes the parked entry.
+CefRefPtr<CefDictionaryValue> TakeDocumentStartExtraInfo(uint32_t wire_id) {
+  document_start::Config config;
+  {
+    std::lock_guard<std::mutex> lock(g_doc_start_mutex);
+    auto it = g_doc_start.find(wire_id);
+    if (it == g_doc_start.end()) return nullptr;
+    config = std::move(it->second);
+    g_doc_start.erase(it);
+  }
+  auto to_list = [](const std::vector<std::string>& v) {
+    CefRefPtr<CefListValue> list = CefListValue::Create();
+    for (size_t i = 0; i < v.size(); ++i) list->SetString(i, v[i]);
+    return list;
+  };
+  CefRefPtr<CefDictionaryValue> info = CefDictionaryValue::Create();
+  info->SetList(document_start::kChannelsKey, to_list(config.channels));
+  info->SetList(document_start::kScriptsKey, to_list(config.scripts));
+  return info;
 }
 
 // The user's Downloads folder (Windows analogue of macOS's native save panel).
@@ -729,12 +752,132 @@ class HostPermissionHandler : public CefPermissionHandler {
   IMPLEMENT_REFCOUNTING(HostPermissionHandler);
 };
 
+// ---- Authored documents at a real origin (loadHtmlString(baseUrl:)) ----
+//
+// A data: URL gives the document an OPAQUE origin (relative URLs don't resolve;
+// every fetch/XHR/worker is cross-origin with `Origin: null`) and Chromium caps
+// it at 2 MB. So the plugin can hand us the HTML plus the URL it should appear
+// to come from, and we answer the MAIN-FRAME request for exactly that URL with
+// the HTML instead of the network. Everything else the page loads goes to the
+// network as normal. Verbatim port of main.mm's g_authored.
+//
+// Keyed by WIRE ID and written on the reader thread, not stored on the Slot: the
+// frame is sent immediately ahead of the create / load it belongs to and must be
+// in place before that op runs — including when the slot doesn't exist yet.
+// Read on the IO thread (GetResourceRequestHandler), hence the mutex. Sticky
+// across reloads; replaced by the next set, cleared by a plain navigate or by
+// dispose.
+struct AuthoredDoc {
+  std::string url;  // normalized (NormalizeAuthoredUrl)
+  std::string html;
+};
+std::mutex g_authored_mutex;
+std::map<uint32_t, AuthoredDoc> g_authored;
+
+// Compare URLs the way the network stack will present them: no fragment, and a
+// bare authority ("https://host") carries the implicit "/" path.
+std::string NormalizeAuthoredUrl(std::string url) {
+  // http(s) only: a data: URL is matched verbatim (its payload may contain "://").
+  if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) return url;
+  const size_t hash = url.find('#');
+  if (hash != std::string::npos) url.resize(hash);
+  const size_t scheme_end = url.find("://");
+  if (scheme_end != std::string::npos &&
+      url.find('/', scheme_end + 3) == std::string::npos) {
+    const size_t q = url.find('?', scheme_end + 3);
+    if (q == std::string::npos) url += '/';
+    else url.insert(q, "/");
+  }
+  return url;
+}
+
+void SetAuthoredDoc(uint32_t wire_id, const std::string& url,
+                    const std::string& html) {
+  std::lock_guard<std::mutex> lock(g_authored_mutex);
+  if (html.empty() || url.empty()) {
+    g_authored.erase(wire_id);
+  } else {
+    g_authored[wire_id] = AuthoredDoc{NormalizeAuthoredUrl(url), html};
+  }
+}
+// Drop the authored doc unless it is for `keep_url` (the load that follows a set
+// targets the same URL and must keep it).
+void ClearAuthoredDocUnless(uint32_t wire_id, const std::string& keep_url) {
+  std::lock_guard<std::mutex> lock(g_authored_mutex);
+  auto it = g_authored.find(wire_id);
+  if (it == g_authored.end()) return;
+  if (keep_url.empty() || it->second.url != NormalizeAuthoredUrl(keep_url))
+    g_authored.erase(it);
+}
+bool LookupAuthoredDoc(uint32_t wire_id, const std::string& url,
+                       std::string* html) {
+  std::lock_guard<std::mutex> lock(g_authored_mutex);
+  auto it = g_authored.find(wire_id);
+  if (it == g_authored.end()) return false;
+  if (it->second.url != NormalizeAuthoredUrl(url)) return false;
+  if (html) *html = it->second.html;
+  return true;
+}
+
+// Serves one authored document. Owns its bytes (the doc can be replaced
+// mid-read).
+class AuthoredResourceHandler : public CefResourceHandler {
+ public:
+  explicit AuthoredResourceHandler(std::string html) : html_(std::move(html)) {}
+  bool Open(CefRefPtr<CefRequest>, bool& handle_request,
+            CefRefPtr<CefCallback>) override {
+    handle_request = true;
+    return true;
+  }
+  void GetResponseHeaders(CefRefPtr<CefResponse> response,
+                          int64_t& response_length, CefString&) override {
+    response->SetStatus(200);
+    response->SetStatusText("OK");
+    response->SetMimeType("text/html");
+    response->SetCharset("utf-8");
+    response->SetHeaderByName("Cache-Control", "no-store", true);
+    response_length = static_cast<int64_t>(html_.size());
+  }
+  bool Read(void* data_out, int bytes_to_read, int& bytes_read,
+            CefRefPtr<CefResourceReadCallback>) override {
+    bytes_read = 0;
+    if (offset_ >= html_.size() || bytes_to_read <= 0) return false;
+    const size_t n = (std::min)(static_cast<size_t>(bytes_to_read),
+                                html_.size() - offset_);
+    memcpy(data_out, html_.data() + offset_, n);
+    offset_ += n;
+    bytes_read = static_cast<int>(n);
+    return true;
+  }
+  void Cancel() override {}
+
+ private:
+  std::string html_;
+  size_t offset_ = 0;
+  IMPLEMENT_REFCOUNTING(AuthoredResourceHandler);
+};
+
+class AuthoredRequestHandler : public CefResourceRequestHandler {
+ public:
+  explicit AuthoredRequestHandler(std::string html) : html_(std::move(html)) {}
+  CefRefPtr<CefResourceHandler> GetResourceHandler(
+      CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>,
+      CefRefPtr<CefRequest>) override {
+    return new AuthoredResourceHandler(html_);
+  }
+
+ private:
+  std::string html_;
+  IMPLEMENT_REFCOUNTING(AuthoredRequestHandler);
+};
+
 class HostClient : public CefClient,
                    public CefLoadHandler,
                    public CefDisplayHandler,
                    public CefLifeSpanHandler,
                    public CefFindHandler,
                    public CefJSDialogHandler,
+                   public CefKeyboardHandler,
                    public CefDownloadHandler,
                    public CefRequestHandler,
                    public CefMessageRouterBrowserSide::Handler {
@@ -763,6 +906,7 @@ class HostClient : public CefClient,
   CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
   CefRefPtr<CefFindHandler> GetFindHandler() override { return this; }
   CefRefPtr<CefJSDialogHandler> GetJSDialogHandler() override { return this; }
+  CefRefPtr<CefKeyboardHandler> GetKeyboardHandler() override { return this; }
   CefRefPtr<CefDownloadHandler> GetDownloadHandler() override { return this; }
   CefRefPtr<CefRequestHandler> GetRequestHandler() override { return this; }
 
@@ -1025,6 +1169,7 @@ class HostClient : public CefClient,
   // racing paint can't re-mint), break the retain cycle.
   void OnBeforeClose(CefRefPtr<CefBrowser> browser) override {
     if (router_) router_->OnBeforeClose(browser);
+    SetAuthoredDoc(slot_->browser_id, "", "");
     {
       std::lock_guard<std::mutex> lock(g_slots_mutex);
       g_slots_by_wire_id.erase(slot_->browser_id);
@@ -1039,6 +1184,49 @@ class HostClient : public CefClient,
       slot_->bridge_h = 0;
     }
     slot_->browser = nullptr;
+  }
+
+  // Ctrl-key editing shortcuts as the FALLBACK they are in a real browser
+  // (main.mm OnKeyEvent). CefWebView sends Ctrl+C/X/V/A/Z/Y to the page as raw
+  // keys, so an editor that owns its undo stack and selection (Monaco) handles
+  // them in its keydown listener; Blink's own key bindings run the edit command
+  // when the page doesn't. OnKeyEvent is called only for a key both left
+  // unhandled, so this can't run a command twice.
+  bool OnKeyEvent(CefRefPtr<CefBrowser> browser, const CefKeyEvent& event,
+                  CefEventHandle) override {
+    if (event.type != KEYEVENT_RAWKEYDOWN) return false;
+    const uint32_t m = event.modifiers;
+    if (!(m & EVENTFLAG_CONTROL_DOWN) ||
+        (m & (EVENTFLAG_ALT_DOWN | EVENTFLAG_COMMAND_DOWN)))
+      return false;
+    CefRefPtr<CefFrame> frame = browser->GetFocusedFrame();
+    if (!frame) return false;
+    const bool shift = (m & EVENTFLAG_SHIFT_DOWN) != 0;
+    switch (event.windows_key_code) {
+      case 'C': if (shift) return false; frame->Copy(); return true;
+      case 'X': if (shift) return false; frame->Cut(); return true;
+      case 'V': if (shift) return false; frame->Paste(); return true;
+      case 'A': if (shift) return false; frame->SelectAll(); return true;
+      case 'Z': if (shift) frame->Redo(); else frame->Undo(); return true;
+      case 'Y': if (shift) return false; frame->Redo(); return true;
+      default: return false;
+    }
+  }
+
+  // IO thread. Answer the main-frame navigation to an authored document's URL
+  // with the document itself (see g_authored); everything else is untouched.
+  CefRefPtr<CefResourceRequestHandler> GetResourceRequestHandler(
+      CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
+      CefRefPtr<CefRequest> request, bool is_navigation, bool is_download,
+      const CefString&, bool&) override {
+    if (!is_navigation || is_download) return nullptr;
+    if (frame && !frame->IsMain()) return nullptr;
+    if (request->GetMethod().ToString() != "GET") return nullptr;
+    std::string html;
+    if (!LookupAuthoredDoc(slot_->browser_id, request->GetURL().ToString(),
+                           &html))
+      return nullptr;
+    return new AuthoredRequestHandler(std::move(html));
   }
 
   // Navigation scheme allowlist (main.mm:1528-1565). Empty allowlist = allow
@@ -1108,10 +1296,58 @@ class HostApp : public CefApp,
     CefMessageRouterConfig config;
     render_router_ = CefMessageRouterRendererSide::Create(config);
   }
+  // Called in THIS renderer for every browser it hosts, with the extra_info the
+  // browser process passed to CreateBrowser (again in each new renderer after a
+  // cross-process navigation) — the browser's document-start config.
+  void OnBrowserCreated(CefRefPtr<CefBrowser> browser,
+                        CefRefPtr<CefDictionaryValue> extra_info) override {
+    if (!extra_info) return;
+    auto read = [&](const char* key, std::vector<std::string>* out) {
+      CefRefPtr<CefListValue> list = extra_info->GetList(key);
+      if (!list) return;
+      for (size_t i = 0; i < list->GetSize(); ++i)
+        out->push_back(list->GetString(i).ToString());
+    };
+    document_start::Config config;
+    read(document_start::kChannelsKey, &config.channels);
+    read(document_start::kScriptsKey, &config.scripts);
+    if (!config.empty()) document_start_[browser->GetIdentifier()] = config;
+  }
+  void OnBrowserDestroyed(CefRefPtr<CefBrowser> browser) override {
+    document_start_.erase(browser->GetIdentifier());
+  }
+  // Every main-frame JavaScript context gets the create-time channel shims and
+  // the document-start scripts synchronously, before the page's own scripts.
   void OnContextCreated(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame,
                         CefRefPtr<CefV8Context> context) override {
+    // window.cefQuery first: the channel shims below post through it.
     if (render_router_) render_router_->OnContextCreated(browser, frame,
                                                          context);
+    if (!frame->IsMain()) return;
+    auto it = document_start_.find(browser->GetIdentifier());
+    if (it == document_start_.end()) return;
+    CefRefPtr<CefV8Value> result;
+    CefRefPtr<CefV8Exception> exception;
+    for (const std::string& name : it->second.channels) {
+      if (!document_start::IsValidChannelName(name)) continue;
+      context->Eval(document_start::ChannelShimJs(name), CefString(), 0, result,
+                    exception);
+    }
+    for (const std::string& script : it->second.scripts) {
+      exception = nullptr;
+      if (context->Eval(script, CefString(), 0, result, exception) ||
+          !exception)
+        continue;
+      // A broken script must not take the page down with it — report it where
+      // the page's own errors go (the console, forwarded to the plugin).
+      CefRefPtr<CefV8Exception> ignored;
+      context->Eval(
+          "console.error(\"[flutter_cef] document-start script failed: \" + " +
+              document_start::JsStringLiteral(
+                  exception->GetMessage().ToString()) +
+              ")",
+          CefString(), 0, result, ignored);
+    }
   }
   void OnContextReleased(CefRefPtr<CefBrowser> browser,
                          CefRefPtr<CefFrame> frame,
@@ -1178,6 +1414,8 @@ class HostApp : public CefApp,
   // Renderer-side message router (render process only; created in
   // OnWebKitInitialized). Null in the browser process.
   CefRefPtr<CefMessageRouterRendererSide> render_router_;
+  // Browser identifier -> its document-start config. Renderer main thread only.
+  std::map<int, document_start::Config> document_start_;
 
   IMPLEMENT_REFCOUNTING(HostApp);
 };
@@ -1233,15 +1471,27 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr,
       (url.rfind("data:", 0) == 0 || url.rfind("file:", 0) == 0)) {
     slot->trusted_pending.insert(url);
   }
+  // Same exemption for a create ON an authored document's URL (the plugin
+  // chose that content), armed normalized: OnBeforeBrowse sees the canonical
+  // request URL.
+  if (!g_allowed_schemes.empty() && url.rfind("data:", 0) != 0 &&
+      url.rfind("file:", 0) != 0 && LookupAuthoredDoc(wire_id, url, nullptr)) {
+    slot->trusted_pending.insert(NormalizeAuthoredUrl(url));
+  }
   CefRefPtr<HostClient> client = new HostClient(slot);
   // H3: ASYNC create (main.mm:1777-1785). OnAfterCreated binds the browser +
   // acks kOpCreated so the plugin's pacer advances by COMPLETION.
-  bool dispatched = CefBrowserHost::CreateBrowser(window_info, client, url,
-                                                  settings, nullptr, nullptr);
+  // Document-start scripts + create-time JS channels ride into the renderer as
+  // the browser's extra_info (see document_start.h) — the only channel that is
+  // in place before the first document's scripts run.
+  bool dispatched = CefBrowserHost::CreateBrowser(
+      window_info, client, url, settings, TakeDocumentStartExtraInfo(wire_id),
+      nullptr);
   if (!dispatched) {
     // H7: reclaim the slot + tell the plugin (main.mm:1786-1805).
     SendLog(wire_id, "createBrowser: CreateBrowser dispatch failed");
     SendFrame(wire_id, kOpCreateFailed, nullptr, 0);
+    SetAuthoredDoc(wire_id, "", "");
     {
       std::lock_guard<std::mutex> lock(g_slots_mutex);
       g_slots_by_wire_id.erase(wire_id);
@@ -1262,7 +1512,12 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr,
 void DoDisposeBrowser(uint32_t wire_id) {
   CEF_REQUIRE_UI_THREAD();
   std::shared_ptr<Slot> slot = LookupWireId(wire_id);
-  if (!slot) return;
+  if (!slot) {
+    // Never created, or already closed: drop whatever was parked for it.
+    SetAuthoredDoc(wire_id, "", "");
+    SetDocumentStart(wire_id, {});
+    return;
+  }
   if (slot->browser) {
     slot->browser->GetHost()->CloseBrowser(true);
   } else {
@@ -1319,7 +1574,10 @@ void DoNavigate(const std::shared_ptr<Slot>& slot, const std::string& url) {
 // (main.mm DoNavigateTrusted:1897-1901).
 void DoNavigateTrusted(const std::shared_ptr<Slot>& slot,
                        const std::string& url) {
-  if (!g_allowed_schemes.empty()) slot->trusted_pending.insert(url);
+  // Normalized: OnBeforeBrowse matches against the CANONICAL request URL, so an
+  // authored load for "https://host" must be armed as "https://host/".
+  if (!g_allowed_schemes.empty())
+    slot->trusted_pending.insert(NormalizeAuthoredUrl(url));
   DoNavigate(slot, url);
 }
 
@@ -1773,8 +2031,24 @@ void IpcReadLoop() {
         break;
       }
       case kOpDisposeBrowser:
-        if (slot)
-          CefPostTask(TID_UI, base::BindOnce(&DoDisposeBrowser, wire_id));
+        // Resolved on TID_UI (FIFO behind a create still queued there) —
+        // requiring the slot here dropped a dispose that raced its own create,
+        // leaking the browser for the host's lifetime (main.mm:3340-3345).
+        CefPostTask(TID_UI, base::BindOnce(&DoDisposeBrowser, wire_id));
+        break;
+      case kOpSetAuthoredHtml: {
+        // Stored HERE, on the reader thread, so it is in place before the
+        // create / load frame right behind it is even dispatched. No slot
+        // needed.
+        std::string s(reinterpret_cast<const char*>(p), plen);
+        const size_t nul = s.find('\0');
+        if (nul == std::string::npos) break;
+        SetAuthoredDoc(wire_id, s.substr(0, nul), s.substr(nul + 1));
+        break;
+      }
+      case kOpSetDocumentStart:
+        // Parked on the reader thread, ahead of the create frame right behind it.
+        SetDocumentStart(wire_id, document_start::ParsePayload(p, plen));
         break;
       case kOpShutdown:
         CefPostTask(TID_UI, base::BindOnce(&DoShutdown));
@@ -1794,12 +2068,15 @@ void IpcReadLoop() {
         // Resolve by wire id on TID_UI: a nav right behind a queued create
         // must not drop (main.mm:2395-2402).
         std::string url(reinterpret_cast<const char*>(p), plen);
+        // A plain navigate means the consumer wants the real site again.
+        ClearAuthoredDocUnless(wire_id, "");
         CefPostTask(TID_UI,
                     base::BindOnce(&DoNavigateByWireId, wire_id, url, false));
         break;
       }
       case kOpLoadTrusted: {
         std::string url(reinterpret_cast<const char*>(p), plen);
+        ClearAuthoredDocUnless(wire_id, url);  // keeps the doc this load is for
         CefPostTask(TID_UI,
                     base::BindOnce(&DoNavigateByWireId, wire_id, url, true));
         break;
