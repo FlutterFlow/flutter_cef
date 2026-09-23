@@ -19,6 +19,8 @@
   `opReady`). The session now re-sends the hide on `opCreated`, and resyncs its
   hidden state there, so a thawed browser that should show is no longer treated
   as hidden.
+* Fix: `setVisible` never replied, so awaiting
+  `CefWebController.setVisible` hung forever.
 
 ## 0.2.0
 
