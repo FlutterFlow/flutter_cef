@@ -598,6 +598,37 @@ void main() {
     });
   }
 
+  // A host whose page viewport is fixed on purpose (a device-frame preview)
+  // turns content zoom off: the keys then go to the page like any shortcut.
+  Future<void> focusedViewWithoutZoom(WidgetTester tester) async {
+    final focus = FocusNode();
+    addTearDown(focus.dispose);
+    await tester.pumpWidget(boxed(CefWebView(
+      url: 'about:blank',
+      focusNode: focus,
+      enableZoomShortcuts: false,
+    )));
+    await tester.pumpAndSettle();
+    focus.requestFocus();
+    await tester.pump();
+  }
+
+  testWidgets('with enableZoomShortcuts off, ⌘= reaches the page, no zoom',
+      (tester) async {
+    await focusedViewWithoutZoom(tester);
+    log.clear();
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.meta);
+    await tester.sendKeyEvent(LogicalKeyboardKey.equal);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.meta);
+    await tester.pump();
+    expect(callsTo('setZoomLevel'), isEmpty);
+    final downs = callsTo('key')
+        .map((c) => c.arguments as Map)
+        .where((a) => a['type'] == 0 && a['nativeKeyCode'] == 24); // kVK_ANSI_Equal
+    expect(downs, hasLength(1));
+    expect((downs.single['modifiers'] as int) & (1 << 7), 1 << 7); // ⌘
+  });
+
   testWidgets('⌘F invokes onFind (host opens its own find bar)', (tester) async {
     var finds = 0;
     final focus = FocusNode();
@@ -682,6 +713,22 @@ void main() {
       final zooms = callsTo('setZoomLevel');
       expect(zooms, hasLength(1));
       expect((zooms.single.arguments as Map)['level'], 0.5);
+    }, variant: onWindows);
+
+    testWidgets('with enableZoomShortcuts off, Ctrl+= reaches the page',
+        (tester) async {
+      await focusedViewWithoutZoom(tester);
+      log.clear();
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.control);
+      await tester.sendKeyEvent(LogicalKeyboardKey.equal);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.control);
+      await tester.pump();
+      expect(callsTo('setZoomLevel'), isEmpty);
+      final downs = callsTo('key')
+          .map((c) => c.arguments as Map)
+          .where((a) => a['type'] == 0 && a['windowsKeyCode'] == 0xBB);
+      expect(downs, hasLength(1)); // VK_OEM_PLUS
+      expect((downs.single['modifiers'] as int) & (1 << 2), 1 << 2); // Ctrl
     }, variant: onWindows);
 
     testWidgets('Ctrl+F invokes onFind', (tester) async {

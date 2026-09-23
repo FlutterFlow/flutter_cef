@@ -66,6 +66,7 @@ class CefWebView extends StatefulWidget {
     this.profile,
     this.renderScale,
     this.onFind,
+    this.enableZoomShortcuts = true,
     this.html,
     this.htmlBaseUrl,
   }) : assert(!(enableCdp && !agentControl && profile != null && profile != ''),
@@ -111,6 +112,13 @@ class CefWebView extends StatefulWidget {
   /// and reads `onFindResult`). When null, ⌘F falls through to the page as an
   /// ordinary key (a page can implement its own find).
   final VoidCallback? onFind;
+
+  /// Whether ⌘+ / ⌘− / ⌘0 (Ctrl on Windows) zoom the page's content, as they do
+  /// in a browser (see [CefWebController.setZoomLevel]). Content zoom resizes the
+  /// page's CSS viewport, so turn it off where that viewport is fixed on purpose —
+  /// a preview that emulates a device's screen, say. The keys then reach the page
+  /// like any other shortcut.
+  final bool enableZoomShortcuts;
 
   /// If non-null, the page may only navigate to URLs whose scheme is in this
   /// set (case-insensitive) — every other navigation, including the initial
@@ -529,7 +537,8 @@ class _CefWebViewState extends State<CefWebView>
     // Standard browser shortcuts. In OSR there's no AppKit responder chain, so a
     // raw ⌘-key event never becomes an editor action or a zoom.
     //   - Zoom (⌘+/-/0) and find (⌘F) are the HOST's: handled here, on key-down
-    //     (zoom also on repeat), and kept off the page.
+    //     (zoom also on repeat), and kept off the page — unless the host turned
+    //     zoom off ([CefWebView.enableZoomShortcuts]) or wired no find bar.
     //   - Editing (⌘C/X/V/A/Z, ⌘⇧Z; Ctrl+C/X/V/A/Z/Y, Ctrl+Shift+Z on Windows)
     //     is the PAGE's first. The raw combo goes to the page like any other
     //     key, and cef_host runs the browser's edit command only if the page left
@@ -546,18 +555,21 @@ class _CefWebViewState extends State<CefWebView>
             !keys.isAltPressed);
     if (isAccelOnly && (event is KeyDownEvent || event is KeyRepeatEvent)) {
       final k = event.logicalKey;
-      // Content zoom (⌘+/-/0). `=`/`+` in, `-` in, `0` reset. Repeat-friendly.
-      if (k == LogicalKeyboardKey.equal || k == LogicalKeyboardKey.add) {
-        _applyZoom((_zoomLevel + _kZoomStep).clamp(_kZoomMin, _kZoomMax));
-        return KeyEventResult.handled;
-      }
-      if (k == LogicalKeyboardKey.minus || k == LogicalKeyboardKey.numpadSubtract) {
-        _applyZoom((_zoomLevel - _kZoomStep).clamp(_kZoomMin, _kZoomMax));
-        return KeyEventResult.handled;
-      }
-      if (k == LogicalKeyboardKey.digit0 || k == LogicalKeyboardKey.numpad0) {
-        _applyZoom(0);
-        return KeyEventResult.handled;
+      // Content zoom (⌘+/-/0). `=`/`+` in, `-` out, `0` reset. Repeat-friendly.
+      if (widget.enableZoomShortcuts) {
+        if (k == LogicalKeyboardKey.equal || k == LogicalKeyboardKey.add) {
+          _applyZoom((_zoomLevel + _kZoomStep).clamp(_kZoomMin, _kZoomMax));
+          return KeyEventResult.handled;
+        }
+        if (k == LogicalKeyboardKey.minus ||
+            k == LogicalKeyboardKey.numpadSubtract) {
+          _applyZoom((_zoomLevel - _kZoomStep).clamp(_kZoomMin, _kZoomMax));
+          return KeyEventResult.handled;
+        }
+        if (k == LogicalKeyboardKey.digit0 || k == LogicalKeyboardKey.numpad0) {
+          _applyZoom(0);
+          return KeyEventResult.handled;
+        }
       }
       // ⌘F opens the host's find bar (if it wired one); else fall through to the
       // page. Key-down only.

@@ -217,6 +217,9 @@ final class CefWebSession: NSObject, FlutterTexture {
   // (F-1) to drive a real present. Guarded by bufferLock like the rest of the buffer state.
   private var hidden = false
   private let bufferLock = NSLock()
+  // The consumer's last setVisible, which a browser bound later must honor (see
+  // browserCreated). Unlike `hidden` a freeze leaves it alone. Main thread only.
+  private var wantsHidden = false
 
   /// The live IOSurface id this session's buffer is backed by, or 0 before
   /// allocation. The host reads this to build the opCreateBrowser payload.
@@ -529,11 +532,30 @@ final class CefWebSession: NSObject, FlutterTexture {
   /// Pause/resume frame production in the cef_host subprocess. `false` calls
   /// CefBrowserHost::WasHidden(true) so an off-screen tile stops rendering; the
   /// session and browser stay alive, so it's a cheap toggle, not a teardown.
+  /// Main thread.
   func setVisible(_ visible: Bool) {
+    wantsHidden = !visible
     bufferLock.lock()
     hidden = !visible
     bufferLock.unlock()
     sendFrame(Self.opSetVisible, [visible ? 1 : 0])
+  }
+
+  /// cef_host has bound browser `bid` (opCreated). cef_host registers a browser's
+  /// slot only as it creates the browser, and drops an opSetVisible that arrives
+  /// before that: a hide sent right after create() returns — or flushed ahead of the
+  /// create on a cold host, where control frames go out at connect and creates at
+  /// opReady — was lost, and the page painted while this side believed it hidden.
+  /// Re-send the consumer's hide now that the slot exists, and resync `hidden` to it
+  /// (a thawed browser comes up shown, whatever the freeze left there). Main thread,
+  /// like setVisible, so a later setVisible's frame always goes out after this one.
+  func browserCreated(_ bid: UInt32) {
+    guard bid == browserId, host != nil else { return }  // frozen or re-homed since
+    bufferLock.lock()
+    let live = textureId != 0  // dispose() zeroes it
+    if live { hidden = wantsHidden }
+    bufferLock.unlock()
+    if live && wantsHidden { sendFrame(Self.opSetVisible, [0]) }
   }
 
   /// Owner opt-in for camera/mic (getUserMedia) on this browser. Deny-default in

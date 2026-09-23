@@ -18,6 +18,13 @@
   `onProcessGone('createFailed')` and `onCreateFailed`, so a consumer falls back
   instead of showing a blank view. On macOS, a host that exited before
   connecting used to go unreported.
+* **A view hidden right after `create()` stays hidden**: a `setVisible(false)`
+  that reached `cef_host` before the browser existed was dropped, so a view
+  mounted out of sight kept painting (on a cold macOS host, always). The plugins
+  now re-send the hide once the host reports the browser created.
+* **`CefWebView(enableZoomShortcuts: false)`**: ⌘+/⌘−/⌘0 (Ctrl on Windows) then
+  reach the page instead of zooming it, for a view whose CSS viewport is fixed on
+  purpose, such as a device-frame preview.
 * **Windows**: `loadHtmlString(baseUrl:)` and create-with-html now serve the
   document at its http(s) origin, as macOS does. This means no `data:` URL and no
   2 MB cap. The Windows wire protocol is now v4.
