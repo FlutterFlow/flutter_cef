@@ -28,4 +28,31 @@ enum LivenessProbePolicy {
     // otherwise keep waiting for the nudge to land a frame.
     return sinceNudgeNs >= nudgeGraceNs ? .declareStalled : .healthy
   }
+
+  enum PingAction: Equatable { case wait, ping, hung }
+
+  /// What to do for a browser [evaluate] left at `.declareStalled`: no present came back
+  /// from the nudge. That is either a healthy static page with nothing to paint, or a hung
+  /// renderer. A renderer that answers a JS ping is alive; one that doesn't answer within
+  /// `hangNs` is hung.
+  /// - pingSentNs: uptime an unanswered ping went out, 0 if none is outstanding.
+  /// - pingRepliedNs: uptime the last ping was answered, 0 if never. A static page is
+  ///   re-pinged once per `pingIntervalNs`, not every sweep.
+  static func pingAction(nowNs: UInt64, pingSentNs: UInt64, pingRepliedNs: UInt64,
+                         pingIntervalNs: UInt64, hangNs: UInt64) -> PingAction {
+    if pingSentNs != 0 { return nowNs &- pingSentNs >= hangNs ? .hung : .wait }
+    if pingRepliedNs != 0 && nowNs &- pingRepliedNs < pingIntervalNs { return .wait }
+    return .ping
+  }
+
+  /// Whether the host's GPU process was replaced after the host first painted. Chromium
+  /// relaunches a GPU process that dies (under memory pressure, say), but off-screen
+  /// rendering never presents again after that: every browser on the host is frozen, with
+  /// JS still answering, so neither the nudge nor the ping sees it. The first frame needed
+  /// the original GPU process, so one that started after it is a replacement.
+  /// - gpuStartedUs: wall-clock start of the current GPU process, 0 if there is none.
+  /// - firstPresentUs: wall-clock time of the host's first frame, 0 if it hasn't painted.
+  static func gpuRestarted(gpuStartedUs: UInt64, firstPresentUs: UInt64) -> Bool {
+    gpuStartedUs != 0 && firstPresentUs != 0 && gpuStartedUs > firstPresentUs
+  }
 }

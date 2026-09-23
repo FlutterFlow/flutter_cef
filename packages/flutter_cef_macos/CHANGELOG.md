@@ -21,6 +21,11 @@
   as hidden.
 * Fix: `setVisible` never replied, so awaiting
   `CefWebController.setVisible` hung forever.
+* Fix: a view whose GPU process was replaced, or whose renderer hung, stayed
+  frozen with no event. The liveness sweep now ends that host (processGone
+  `crashed`): when the host's GPU process started after its first frame, or
+  when a visible browser that stopped painting leaves a JS ping (eval id
+  `UInt32.max`, consumed by the plugin) unanswered for 15 s.
 
 ## 0.2.0
 

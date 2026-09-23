@@ -70,12 +70,41 @@ enum LivenessProbePolicyTests {
     // this policy (stale, nudged, no present within grace) → BOTH reach .declareStalled. The
     // policy CANNOT tell them apart by timing alone; the consumer (CefProfileHost) deliberately
     // does NOT escalate .declareStalled to a recreate (that resurrected the recreate-storm), so a
-    // visible hung renderer is accepted as healthy-static. If a future "should-have-painted"
-    // discriminator is added, THIS is where the divergence must be encoded — update this test.
+    // visible hung renderer would be accepted as healthy-static. The host tells them apart
+    // with a JS ping instead (pingAction below).
     let idleInputs = act(sinceLastPresentNs: 20_000_000_000, nudged: true, sinceNudgeNs: 5_000_000_000)
     let wedgedInputs = act(sinceLastPresentNs: 20_000_000_000, nudged: true, sinceNudgeNs: 5_000_000_000)
     check("static-idle and hung-renderer are INDISTINGUISHABLE here (same Action)",
           idleInputs == wedgedInputs && idleInputs == .declareStalled)
+
+    // …so pingAction tells them apart: a static page answers JS, a hung renderer doesn't.
+    let interval: UInt64 = 10_000_000_000
+    let hang: UInt64 = 15_000_000_000
+    func ping(now: UInt64, sent: UInt64 = 0, replied: UInt64 = 0) -> LivenessProbePolicy.PingAction {
+      LivenessProbePolicy.pingAction(nowNs: now, pingSentNs: sent, pingRepliedNs: replied,
+                                     pingIntervalNs: interval, hangNs: hang)
+    }
+    let t: UInt64 = 100_000_000_000
+    check("stalled, never pinged → ping", ping(now: t) == .ping)
+    check("ping outstanding, under the hang limit → wait",
+          ping(now: t, sent: t - hang + 1) == .wait)
+    check("ping outstanding, at the hang limit → hung", ping(now: t, sent: t - hang) == .hung)
+    check("static page answered recently → wait, no re-ping",
+          ping(now: t, replied: t - interval + 1) == .wait)
+    check("static page answered an interval ago → ping again",
+          ping(now: t, replied: t - interval) == .ping)
+
+    func gpu(started: UInt64, firstPresent: UInt64) -> Bool {
+      LivenessProbePolicy.gpuRestarted(gpuStartedUs: started, firstPresentUs: firstPresent)
+    }
+    check("GPU process older than the first frame → the original",
+          !gpu(started: 1_000, firstPresent: 2_000))
+    check("GPU process started after the first frame → replaced",
+          gpu(started: 3_000, firstPresent: 2_000))
+    check("GPU process restarted before anything painted → not flagged",
+          !gpu(started: 3_000, firstPresent: 0))
+    check("no GPU process (gone, not yet relaunched) → not flagged",
+          !gpu(started: 0, firstPresent: 2_000))
 
     print(failures == 0
       ? "\nALL LivenessProbePolicy TESTS PASSED"

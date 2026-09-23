@@ -25,6 +25,16 @@
 * **`CefWebView(enableZoomShortcuts: false)`**: ⌘+/⌘−/⌘0 (Ctrl on Windows) then
   reach the page instead of zooming it, for a view whose CSS viewport is fixed on
   purpose, such as a device-frame preview.
+* **macOS: a view that can never paint again is reported**: when the GPU
+  process died (it does under memory pressure), Chromium relaunched it but the
+  view stayed frozen for good with no event. A hung renderer was likewise taken
+  for an idle page. The plugin now ends such a host, so its sessions get
+  `onProcessGone('crashed')` and the consumer recreates them the way it
+  recovers from a crash. A GPU process that started after the host's first
+  frame counts as a replacement; a renderer that leaves a JS ping unanswered
+  for 15 s (`FLUTTER_CEF_HANG_MS`) while not painting counts as hung. Idle
+  static pages answer the ping and are left alone. Windows does not have this
+  yet.
 * **Windows**: `loadHtmlString(baseUrl:)` and create-with-html now serve the
   document at its http(s) origin, as macOS does. This means no `data:` URL and no
   2 MB cap. The Windows wire protocol is now v4.

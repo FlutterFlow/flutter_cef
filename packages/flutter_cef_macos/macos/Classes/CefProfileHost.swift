@@ -33,6 +33,12 @@ final class CefProfileHost {
   static let opSetAuthoredHtml: UInt8 = 0x3f  // us -> cef_host: {url}\0{html} served as the main-frame response for url
   static let opSetDocumentStart: UInt8 = 0x41 // us -> cef_host: document-start scripts + channels, ahead of opCreateBrowser
   static let opSetVisible: UInt8 = 0x35       // us -> cef_host: WasHidden(!visible); peeked to make the C1 watchdog visibility-aware
+  static let opEvalResult: UInt8 = 0x16       // cef_host -> us: "id:json"; the liveness ping's reply stops here
+  static let opPageStart: UInt8 = 0x0a        // cef_host -> us: main-frame load started; drops an outstanding liveness ping
+  static let opEvalReturning: UInt8 = 0x2a    // us -> cef_host: {u32 id}{js}; the liveness sweep's renderer-hang ping
+  // Eval id of the liveness ping. Dart's eval ids count up from 0 and never reach it.
+  static let livenessPingId: UInt32 = .max
+  private static let livenessPingReplyPrefix = Array("\(livenessPingId):".utf8)
 
   // Expected kOp wire-protocol version, announced by the host in opReady's payload
   // (byte 1; a 1-byte payload = a host predating the handshake = v0). Must equal
@@ -796,6 +802,17 @@ final class CefProfileHost {
   private let livenessGraceNs: UInt64 = 3_000_000_000  // 3s after the nudge → declare wedged
   private let livenessSweepInterval: TimeInterval = 2.0
   private var livenessSweepStarted = false  // guarded by browsersLock
+  // A stalled browser whose renderer leaves the JS ping unanswered this long is hung.
+  // Chrome's own hang monitor waits about as long before offering to kill a page.
+  private let livenessHangNs: UInt64 = {
+    if let s = ProcessInfo.processInfo.environment["FLUTTER_CEF_HANG_MS"],
+       let ms = Double(s), ms > 0 { return UInt64(ms * 1_000_000) }
+    return 15_000_000_000
+  }()
+  // Wall-clock µs of the first frame any browser on this host presented (0 = none yet),
+  // guarded by browsersLock. A GPU process that started after it is a replacement.
+  private var firstPresentWallUs: UInt64 = 0
+  private var wedgeEnded = false  // sweep-only (one pass at a time, each scheduling the next)
 
   /// Start the periodic liveness sweep once (idempotent). Called after the reader is up.
   private func startLivenessSweep() {
@@ -816,14 +833,24 @@ final class CefProfileHost {
   }
 
   private func livenessSweep() {
+    guard !wedgeEnded else { return }
     let now = DispatchTime.now().uptimeNanoseconds
     // 1) Snapshot ESTABLISHED browsers + their liveness state under browsersLock.
     browsersLock.lock()
-    var cands: [(bid: UInt32, sinceLast: UInt64, nudgedAt: UInt64)] = []
+    var cands: [(bid: UInt32, sinceLast: UInt64, nudgedAt: UInt64,
+                 pingSentAt: UInt64, pingRepliedAt: UInt64)] = []
     for (bid, s) in browsers where s.firstPresentSeen {
-      cands.append((bid, now &- s.lastPresentNs, s.livenessNudgedAt))
+      cands.append((bid, now &- s.lastPresentNs, s.livenessNudgedAt,
+                    s.livenessPingSentAt, s.livenessPingRepliedAt))
     }
+    let firstPresentUs = firstPresentWallUs
     browsersLock.unlock()
+    // A replaced GPU process leaves every browser on this host frozen for good.
+    let gpu = Self.gpuProcess(of: hostPid())
+    if LivenessProbePolicy.gpuRestarted(gpuStartedUs: gpu.startedUs, firstPresentUs: firstPresentUs) {
+      endWedgedHost("GPU process \(gpu.pid) started after the first frame, so it replaced one that died")
+      return
+    }
     if !cands.isEmpty {
       // 2) Exclude hidden (legitimately frameless) + still-first-paint-pending (the first-
       //    paint watchdog owns those). presentLock is taken AFTER releasing browsersLock —
@@ -832,7 +859,21 @@ final class CefProfileHost {
       let hidden = hiddenBrowsers
       let pending = firstPresentPending
       presentLock.unlock()
+      // A ping that went out before a browser was hidden says nothing about it now.
+      browsersLock.lock()
+      for c in cands where c.pingSentAt != 0 && (hidden.contains(c.bid) || pending.contains(c.bid)) {
+        browsers[c.bid]?.livenessPingSentAt = 0
+      }
+      browsersLock.unlock()
       for c in cands where !hidden.contains(c.bid) && !pending.contains(c.bid) {
+        // A renderer that has left the liveness ping unanswered this long is hung. The
+        // nudge can't tell: the browser re-presents its last frame even for a hung renderer.
+        if LivenessProbePolicy.pingAction(
+             nowNs: now, pingSentNs: c.pingSentAt, pingRepliedNs: c.pingRepliedAt,
+             pingIntervalNs: livenessStalenessNs, hangNs: livenessHangNs) == .hung {
+          endWedgedHost("browser \(c.bid)'s renderer left a JS ping unanswered for \(livenessHangNs / 1_000_000_000)s")
+          return
+        }
         let nudged = c.nudgedAt != 0
         let action = LivenessProbePolicy.evaluate(
           sinceLastPresentNs: c.sinceLast, stalenessThresholdNs: livenessStalenessNs,
@@ -850,6 +891,18 @@ final class CefProfileHost {
           // pump simply has nothing to draw). See .declareStalled.
           send(c.bid, Self.opInvalidate, [])
           browsersLock.lock(); browsers[c.bid]?.livenessNudgedAt = now; browsersLock.unlock()
+          // Ping the renderer too, at most once per staleness window: a static page answers
+          // it, a hung renderer doesn't (checked at the top of the loop).
+          if LivenessProbePolicy.pingAction(
+               nowNs: now, pingSentNs: c.pingSentAt, pingRepliedNs: c.pingRepliedAt,
+               pingIntervalNs: livenessStalenessNs, hangNs: livenessHangNs) == .ping {
+            let id = Self.livenessPingId
+            var p: [UInt8] = [UInt8(id >> 24 & 0xff), UInt8(id >> 16 & 0xff),
+                              UInt8(id >> 8 & 0xff), UInt8(id & 0xff)]
+            p.append(contentsOf: Array("1".utf8))
+            browsersLock.lock(); browsers[c.bid]?.livenessPingSentAt = now; browsersLock.unlock()
+            send(c.bid, Self.opEvalReturning, p)
+          }
         case .declareStalled:
           // The nudge above did NOT extract a frame. For an ESTABLISHED (already-painted) tile
           // this means STATIC-IDLE, not wedged — escalating to onPaintStalled here recreate-
@@ -861,14 +914,10 @@ final class CefProfileHost {
           // OnRenderProcessTerminated; eviction-while-hidden by the F-1 un-hide repaint.) Leave
           // nudgedAt set so we don't re-nudge every cycle; a real future repaint clears it.
           //
-          // KNOWN LIMITATION (audited, accepted): a VISIBLE renderer that HANGS post-establishment
-          // (a GPU/JS deadlock that keeps the process alive, so OnRenderProcessTerminated never
-          // fires) is indistinguishable HERE from a healthy static-idle tile — both produce no
-          // present after the nudge — so it is silently accepted. We do NOT escalate, because the
-          // nudge cannot tell "nothing to paint" from "can't paint", and blind escalation
-          // resurrects the recreate-storm above. A proper fix needs a "should-have-painted"
-          // discriminator (e.g. a content/damage probe, or correlating with a pending unsatisfied
-          // resize) — tracked as a fast-follow, not shipped as naive escalation.
+          // A VISIBLE renderer that HANGS post-establishment (a deadlock that keeps the process
+          // alive, so OnRenderProcessTerminated never fires) looks the same here, so it is caught
+          // by the JS ping sent with the nudge instead. A replaced GPU process, which leaves JS
+          // answering but the view frozen, is caught by the GPU check above.
           if ProcessInfo.processInfo.environment["FLUTTER_CEF_DEBUG"] != nil {
             NSLog("[cef] profile '\(profileId)': browser \(c.bid) idle (no frames) — accepting as healthy-static (not recreating)")
           }
@@ -876,6 +925,57 @@ final class CefProfileHost {
       }
     }
     scheduleLivenessSweep()
+  }
+
+  private func hostPid() -> pid_t {
+    writeLock.lock(); defer { writeLock.unlock() }
+    return process?.processIdentifier ?? spawnedPid
+  }
+
+  /// `host`'s GPU process and its wall-clock start in µs, or (0, 0) if it has none. It
+  /// runs as the generic `cef_host Helper`, so it is told apart by `--type=gpu-process`.
+  private static func gpuProcess(of host: pid_t) -> (pid: pid_t, startedUs: UInt64) {
+    guard host > 0 else { return (0, 0) }
+    var pids = [pid_t](repeating: 0, count: 64)
+    let bytes = proc_listpids(UInt32(PROC_PPID_ONLY), UInt32(host), &pids,
+                              Int32(pids.count * MemoryLayout<pid_t>.size))
+    guard bytes > 0 else { return (0, 0) }
+    let marker = "--type=gpu-process"
+    var args = [UInt8](repeating: 0, count: 64 * 1024)
+    for pid in pids.prefix(Int(bytes) / MemoryLayout<pid_t>.size) where pid > 0 {
+      var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+      var size = args.count
+      guard sysctl(&mib, 3, &args, &size, nil, 0) == 0 else { continue }
+      let isGpu = args.withUnsafeBytes { buf in
+        marker.withCString { memmem(buf.baseAddress, size, $0, strlen($0)) != nil }
+      }
+      guard isGpu else { continue }
+      var info = proc_bsdinfo()
+      let n = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size))
+      guard n == Int32(MemoryLayout<proc_bsdinfo>.size) else { return (pid, 0) }
+      return (pid, info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+    }
+    return (0, 0)
+  }
+
+  private static func wallClockUs() -> UInt64 {
+    var tv = timeval()
+    gettimeofday(&tv, nil)
+    return UInt64(tv.tv_sec) * 1_000_000 + UInt64(tv.tv_usec)
+  }
+
+  /// Ends a host whose browsers can't paint again. The plugin then reports
+  /// processGone("crashed") for each of them, and the consumer's recreate path
+  /// starts a fresh host, the same way it recovers from a real crash.
+  private func endWedgedHost(_ why: String) {
+    writeLock.lock()
+    let alive = running && !crashed
+    writeLock.unlock()
+    let pid = hostPid()
+    guard alive, pid > 0, !wedgeEnded else { return }
+    wedgeEnded = true
+    NSLog("[cef] profile '\(profileId)': \(why) — ending cef_host \(pid) so its views are recreated")
+    kill(pid, SIGKILL)
   }
 
   /// Frame `[u32 bodyLen=4+1+payload.count][u32 browserId][op][payload]` and
@@ -1230,6 +1330,15 @@ final class CefProfileHost {
         // CEF-2b: a targetId resolution result — route to the pending completion,
         // not the session.
         handleTargetId(bid, String(bytes: payload, encoding: .utf8))
+      } else if op == Self.opEvalResult,
+                payload.starts(with: Self.livenessPingReplyPrefix) {
+        // The liveness sweep's own ping, not the page's: the renderer answered.
+        browsersLock.lock()
+        if let s = browsers[bid] {
+          s.livenessPingSentAt = 0
+          s.livenessPingRepliedAt = DispatchTime.now().uptimeNanoseconds
+        }
+        browsersLock.unlock()
       } else if op == Self.opCreated {
         // Bind ack — intentionally does NOT advance the pacer anymore. We gate the
         // next create on this browser's first PAINT (firstPresentArrived), not its bind,
@@ -1255,10 +1364,14 @@ final class CefProfileHost {
         if op == Self.opPresent, let s = session {
           s.presentCount += 1
           if s.presentCount == 1 { s.firstPresentSeen = true; firstPaint = true }
+          if firstPresentWallUs == 0 { firstPresentWallUs = Self.wallClockUs() }
           if s.presentCount == estabStableFrames { reachedStableFrames = true }
           // F-6: any present clears the liveness-stall state — the browser is alive.
           s.lastPresentNs = DispatchTime.now().uptimeNanoseconds
           s.livenessNudgedAt = 0
+        } else if op == Self.opPageStart, let s = session {
+          // The ping's reply can be lost with the document it ran in.
+          s.livenessPingSentAt = 0
         }
         browsersLock.unlock()
         if firstPaint {
