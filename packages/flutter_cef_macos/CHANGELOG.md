@@ -13,6 +13,14 @@
   thread stuck in `accept()`.
 * A host that dies before `opReady` is reported as `createFailed`, not
   `crashed` (exit code 2 is still `locked`).
+* Fix: a view hidden right after `create()` kept painting. `cef_host` drops an
+  `opSetVisible` sent before the browser's slot exists, and on a cold host the
+  hide always went out first (control frames flush at connect, creates at
+  `opReady`). The session now re-sends the hide on `opCreated`, and resyncs its
+  hidden state there, so a thawed browser that should show is no longer treated
+  as hidden.
+* Fix: `setVisible` never replied, so awaiting
+  `CefWebController.setVisible` hung forever.
 
 ## 0.2.0
 

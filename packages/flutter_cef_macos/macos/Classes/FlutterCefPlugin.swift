@@ -161,6 +161,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       result(nil)
     case "setVisible":
       withSession(args) { $0.setVisible(args["visible"] as? Bool ?? true) }
+      result(nil)
     case "respondMediaRequest":
       withSession(args) {
         $0.respondMediaRequest(id: args["id"] as? Int ?? 0,

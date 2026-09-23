@@ -13,6 +13,9 @@
   not one fetched from the same CDN, and fails when it doesn't match.
 * A host that dies before `kOpReady` is reported as `createFailed`, not
   `crashed` (exit code 2 is still `locked`).
+* Fix: a view hidden right after `create()` kept painting: `cef_host` drops a
+  `kOpSetVisible` sent before the browser's slot exists. The plugin re-sends
+  the hide on `kOpCreated`.
 * Protocol v4.
 
 # 0.1.0

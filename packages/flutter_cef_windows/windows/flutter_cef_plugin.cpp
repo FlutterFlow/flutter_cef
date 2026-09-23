@@ -1527,7 +1527,13 @@ void FlutterCefPlugin::HandleSessionFrame(
       break;
     case kOpCreated:
       // Browser is up (host-side create signal). Nothing to emit — Dart learns
-      // liveness from loadingState/present.
+      // liveness from loadingState/present. cef_host registers a browser's slot
+      // only as it creates the browser, and drops a kOpSetVisible that arrives
+      // before that: a hide sent right after create (or flushed right behind
+      // it) was lost, and the page painted while hidden. Re-send it now that
+      // the slot exists. Platform thread, like the setVisible verb, so a later
+      // show still goes out after it.
+      if (!s->visible) SendOrQueue(s, kOpSetVisible, {uint8_t{0}});
       break;
     case kOpCreateFailed: {
       // H7: this browser's create failed; the host process is otherwise

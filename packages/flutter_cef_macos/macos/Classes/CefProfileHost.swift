@@ -1231,11 +1231,17 @@ final class CefProfileHost {
         // not the session.
         handleTargetId(bid, String(bytes: payload, encoding: .utf8))
       } else if op == Self.opCreated {
-        // Bind ack only — intentionally does NOT advance the pacer anymore. We gate the
+        // Bind ack — intentionally does NOT advance the pacer anymore. We gate the
         // next create on this browser's first PAINT (firstPresentArrived), not its bind,
         // so establishment is serialized. opCreateFailed / the paint-timeout backstop
-        // still advance for the bound-but-never-painted / failed cases. (No-op here.)
-        _ = bid
+        // still advance for the bound-but-never-painted / failed cases. The session
+        // re-sends a hide the host dropped before this browser's slot existed.
+        browsersLock.lock()
+        let session = browsers[bid]
+        browsersLock.unlock()
+        if let session = session {
+          DispatchQueue.main.async { session.browserCreated(bid) }
+        }
       } else if op == Self.opCreateFailed {
         handleCreateFailed(bid)  // H7
       } else {
