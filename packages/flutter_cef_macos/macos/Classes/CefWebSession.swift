@@ -180,6 +180,10 @@ final class CefWebSession: NSObject, FlutterTexture {
   // watchdog retires at first paint, so post-establishment wedges had no detector).
   var lastPresentNs: UInt64 = 0
   var livenessNudgedAt: UInt64 = 0
+  // The sweep's renderer-hang ping (same lock): uptime an unanswered ping went out
+  // (0 = none), and uptime the last one was answered (0 = never).
+  var livenessPingSentAt: UInt64 = 0
+  var livenessPingRepliedAt: UInt64 = 0
 
   private weak var registry: FlutterTextureRegistry?
   private var width: Int
@@ -280,6 +284,8 @@ final class CefWebSession: NSObject, FlutterTexture {
     presentCount = 0
     lastPresentNs = 0
     livenessNudgedAt = 0
+    livenessPingSentAt = 0
+    livenessPingRepliedAt = 0
   }
 
   // MARK: FlutterTexture
