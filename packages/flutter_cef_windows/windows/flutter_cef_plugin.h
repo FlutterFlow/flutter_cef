@@ -36,9 +36,16 @@
 //  - Teardown is two-tier: dispose ONE browser = kOpDisposeBrowser, host
 //    survives if other sessions remain; last session gone / host death = tear
 //    down the whole Host (reader/watcher/Job/pipe) via a bounded reaper.
-//  - Host death: pipe EOF or process-exit watcher -> processGone with reason
-//    "crashed" / "locked" (exit code 2) for every session on the host.
-//  - Unimplemented/unknown verbs reply success(null) + OutputDebugString.
+//  - Host death: pipe EOF, process-exit watcher, a pipe write that fails or
+//    times out, or a renderer the liveness sweep finds hung -> processGone
+//    with reason "crashed" / "locked" (the host logged "profile-locked") /
+//    "createFailed" (died before kOpReady) for every session on the host.
+//  - Liveness: a first-present watchdog per session until its first frame,
+//    then a periodic sweep (liveness_policy.h) that nudges stale tiles and
+//    pings their renderer with an eval id the page can't reach.
+//  - Verbs Windows can't serve (context menus, media permissions, the auth
+//    window, the emoji picker) reply Error("unsupported"); unknown verbs
+//    reply NotImplemented.
 
 #ifndef FLUTTER_PLUGIN_FLUTTER_CEF_PLUGIN_H_
 #define FLUTTER_PLUGIN_FLUTTER_CEF_PLUGIN_H_
@@ -121,8 +128,11 @@ class FlutterCefPlugin : public flutter::Plugin {
     // %TEMP%\flutter_cef_ephem_* (ephemeral). Recursively deleted by the reaper
     // ONLY when ephemeral (a persistent profile must survive teardown).
     std::wstring profile_dir;
-    bool ready = false;    // kOpReady received + version checked
-    bool closing = false;  // whole-host teardown started
+    bool ready = false;  // kOpReady received + version checked
+    // The host logged "profile-locked" before exiting: another process holds
+    // this profile. Read on death so the pipe EOF, which can beat the exit
+    // code, still reports "locked".
+    bool profile_locked = false;
     uint32_t next_browser_id = 1;  // monotonic wire id allocator (never reused)
     // browser_id -> sessionId (inbound event routing + teardown bookkeeping).
     std::map<uint32_t, std::string> browsers;
@@ -132,8 +142,9 @@ class FlutterCefPlugin : public flutter::Plugin {
     std::unique_ptr<IpcPipe> pipe;
     std::unique_ptr<HostProcess> process;
     std::thread exit_watcher;  // waits on a dup'd process handle
-    // Agent control (P9): set when this host was spawned with the CDP-over-pipe
-    // transport (create arg agentControl:true). `cdp` owns the parent-side pipe
+    // Agent control: set when this host was spawned with the CDP-over-pipe
+    // transport (create arg agentControl:true). Fixed at spawn: a later
+    // agentControl create that joins this host doesn't get it. `cdp` owns the parent-side pipe
     // ends + the lazily-created relay; `cdp_reader` continuously drains the CDP
     // read pipe and delivers to cdp->relay. Both are moved into the reaper on
     // teardown. Null / not-joinable for a non-agent-control host.
@@ -156,24 +167,57 @@ class FlutterCefPlugin : public flutter::Plugin {
     uint32_t expected_ph = 0;
     uint64_t current_handle = 0;  // last promoted bridge handle
     uint32_t gate_misses = 0;     // diagnostics
-    // C1 first-present watchdog (mirror CefProfileHost.swift:641-765). A
-    // per-session WM_TIMER (unique watchdog_id) armed at create: on the first
-    // grace with no kOpPresent we re-kick via kOpInvalidate; on the next grace
-    // still blank we emit 'paintStalled' (repeating). Suspended while hidden,
-    // re-armed on show. Cancelled the instant any present arrives / on
-    // teardown. watchdog_id is a plugin-unique token (NOT the host generation,
-    // which is now shared across sibling sessions).
+    // First-present watchdog (mirrors CefProfileHost.checkFirstPresent). A
+    // per-session WM_TIMER (unique watchdog_id) armed at create: each grace
+    // that ends with no promoted present re-kicks via kOpInvalidate and emits
+    // 'paintStalled' (repeating), as macOS does. Suspended while hidden,
+    // re-armed on show. Cancelled on the first promoted present / on teardown.
+    // watchdog_id is a plugin-unique token (NOT the host generation, which is
+    // shared across sibling sessions).
+    // `painted` = a present has been PROMOTED (passed the size gate); a
+    // rejected frame shows nothing, so it doesn't count.
     bool painted = false;
     bool visible = true;
     UINT_PTR watchdog_id = 0;      // stable per-session WM_TIMER token (!= 0)
     bool watchdog_active = false;  // a timer is currently set
-    int watchdog_phase = 0;        // 0 = armed (pre re-kick), 1 = kicked
+
+    // Pixel liveness (sessionStats + the liveness sweep). Times are
+    // GetTickCount64 ms; 0 = never.
+    uint64_t present_count = 0;    // promoted presents
+    uint64_t last_present_ms = 0;  // last promoted present
+    uint64_t nudged_at_ms = 0;     // sweep sent kOpInvalidate, no present since
+    uint64_t ping_sent_ms = 0;     // unanswered liveness ping
+    uint64_t ping_replied_ms = 0;  // last answered liveness ping
+    int dialogs_open = 0;          // JS dialogs awaiting an answer
+    bool devtools_opened = false;  // its debugger can pause the page
+
+    // What freeze/thaw needs to recreate the browser. The create args, plus
+    // the JS channels added since (they re-register on the new browser) and
+    // the last authored document.
+    struct CreateSpec {
+      std::string url;
+      std::string allowed_schemes;
+      bool agent_control = false;
+      bool named_profile = false;
+      std::string profile;
+      std::string host_group;
+      std::vector<std::string> channels;
+      std::vector<std::string> document_start_scripts;
+    } spec;
+    std::string authored_url;   // the url the authored document is served at
+    std::string authored_html;  // empty = none
+    // Frozen: the browser (and, if it was the last, its host) is gone; the
+    // texture keeps its last frame and host_key is empty until thaw.
+    bool frozen = false;
   };
 
   // Cross-thread event, posted by a Host's reader/watcher threads, drained on
   // the platform thread.
   struct HostEvent {
-    enum class Kind { kFrame, kDisconnect, kExited };
+    // kWriteFailed: a pipe write failed or timed out on the platform thread;
+    // posted rather than handled inline so the sender's Session/Host
+    // pointers stay valid.
+    enum class Kind { kFrame, kDisconnect, kExited, kWriteFailed };
     Kind kind = Kind::kFrame;
     std::string host_key;
     // The generation of the Host that owned the poster. Dropped on drain if it
@@ -213,6 +257,26 @@ class FlutterCefPlugin : public flutter::Plugin {
                            const std::string& allowed_schemes,
                            bool agent_control);
   void DisposeSession(const std::string& session_id);
+  // freezeSession / thawSession (see the .cpp).
+  void FreezeSession(
+      const flutter::EncodableMap& args,
+      std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>& result);
+  void ThawSession(
+      const flutter::EncodableMap& args,
+      std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>& result);
+  // The live host for `key`, or a freshly spawned one for `spec`. nullptr on
+  // failure, with *error_code / *error_message set for the channel reply.
+  Host* AcquireHost(const std::string& key, const Session::CreateSpec& spec,
+                    const std::wstring& host_exe, const char** error_code,
+                    const char** error_message);
+  // Send (or queue before kOpReady) the frames that create `session`'s browser
+  // on `host` at `url`: document-start items, an authored document, the create
+  // at the session's current size, and a hide if it is hidden.
+  void SendCreateFrames(Host* host, Session* session, const std::string& url);
+  // Detach browser `browser_id` from host `host_key`: drop its routing entry
+  // and queued frames, close the browser, and tear the host down if it was
+  // the last.
+  void DetachFromHost(const std::string& host_key, uint32_t browser_id);
 
   // Agent control (P9). enableAgentControl starts (idempotently) the token-gated
   // loopback CDP relay for the session's host and replies
@@ -230,7 +294,7 @@ class FlutterCefPlugin : public flutter::Plugin {
   // thread; touches no MethodChannel state. Static + shared_ptr-scoped so it can
   // outlive a Host erase (joined in the reaper).
   static void CdpReadLoop(std::shared_ptr<CdpTransport> transport);
-  // Tear down a whole Host: mark closing, optionally send kOpShutdown, sweep
+  // Tear down a whole Host: optionally send kOpShutdown, sweep
   // any lingering sessions, and hand pipe/process/watcher to a reaper thread
   // (bounded wait -> kill -> close; deletes an EPHEMERAL profile dir).
   void TeardownHost(const std::string& host_key, bool send_shutdown);
@@ -240,6 +304,10 @@ class FlutterCefPlugin : public flutter::Plugin {
   // Queue until the Host's kOpReady, then send directly.
   void SendOrQueue(Session* session, uint8_t opcode,
                    std::vector<uint8_t> payload);
+  // Write one frame to a ready host. A failed or timed-out write posts a
+  // kWriteFailed event (never fails the host inline: callers hold pointers).
+  void SendToHost(Host* host, uint32_t browser_id, uint8_t opcode,
+                  const std::vector<uint8_t>& payload);
 
   // Cross-thread marshal.
   void PostEvent(HostEvent event);
@@ -249,7 +317,9 @@ class FlutterCefPlugin : public flutter::Plugin {
                        const std::vector<uint8_t>& payload);
   void HandleHostGone(const std::string& host_key, uint64_t generation,
                       bool exit_code_known, unsigned long exit_code);
-  void HandlePresent(Session* session, const std::vector<uint8_t>& payload);
+  // True when the present was promoted (passed the size gate and reached the
+  // texture).
+  bool HandlePresent(Session* session, const std::vector<uint8_t>& payload);
   // Route a per-browser frame to its Session (the big opcode switch).
   void HandleSessionFrame(Session* session, uint8_t opcode,
                           const std::vector<uint8_t>& payload);
@@ -258,6 +328,11 @@ class FlutterCefPlugin : public flutter::Plugin {
   void ArmWatchdog(Session* session);
   void CancelWatchdog(Session* session);
   void OnWatchdogTimer(UINT_PTR timer_id);
+
+  // Steady-state liveness sweep (WM_TIMER kLivenessTimerId), running while
+  // any session exists.
+  void EnsureLivenessTimer();
+  void OnLivenessTimer();
 
   // Emit an event to Dart (platform thread only). `args` need not contain
   // sessionId — it is added here.
@@ -293,6 +368,7 @@ class FlutterCefPlugin : public flutter::Plugin {
   // Monotonic source for Session::watchdog_id (never 0). Distinct from the host
   // generation so sibling sessions on one shared host get distinct WM_TIMER ids.
   UINT_PTR next_timer_id_ = 1;
+  bool liveness_timer_active_ = false;
   // Per-host teardown threads (bounded: wait <=3s then kill). Each carries a
   // `done` flag so finished reapers can be pruned/joined on the next teardown,
   // and all are joined in the destructor so no thread outlives `this`.

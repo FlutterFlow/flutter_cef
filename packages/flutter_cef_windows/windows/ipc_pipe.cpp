@@ -1,7 +1,6 @@
 #include "ipc_pipe.h"
 
 #include <bcrypt.h>
-#include <sddl.h>
 
 #include <atomic>
 #include <cstring>
@@ -10,6 +9,7 @@
 #include <vector>
 
 #include "cef_host_protocol.h"
+#include "current_user_sd.h"
 
 // PLAN §4.2/§7.6 pipe hardening needs a CSPRNG (BCryptGenRandom) and the token/
 // SID/SDDL APIs. Neither bcrypt.lib nor advapi32.lib is on this plugin's CMake
@@ -29,37 +29,6 @@ void PipeLog(const char* msg) {
   s += msg;
   s += "\n";
   OutputDebugStringA(s.c_str());
-}
-
-// Builds a self-relative security descriptor whose DACL is PROTECTED and grants
-// GENERIC_ALL to ONLY the current user's SID (PLAN §7.6). PROTECTED (SDDL "P")
-// blocks inherited ACEs, so nothing a squatter controls can widen access. On
-// success *out_sd is a LocalAlloc'd descriptor the caller must LocalFree.
-bool BuildCurrentUserOnlySD(PSECURITY_DESCRIPTOR* out_sd) {
-  *out_sd = nullptr;
-  HANDLE token = nullptr;
-  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
-  DWORD len = 0;
-  GetTokenInformation(token, TokenUser, nullptr, 0, &len);  // size probe
-  if (len == 0) {
-    CloseHandle(token);
-    return false;
-  }
-  std::vector<uint8_t> buf(len);
-  const bool got =
-      GetTokenInformation(token, TokenUser, buf.data(), len, &len) != FALSE;
-  CloseHandle(token);
-  if (!got) return false;
-  auto* tu = reinterpret_cast<TOKEN_USER*>(buf.data());
-  LPWSTR sid_str = nullptr;
-  if (!ConvertSidToStringSidW(tu->User.Sid, &sid_str)) return false;
-  // D:  DACL present
-  // P   PROTECTED — no ACEs inherited from any parent object
-  // (A;;GA;;;<SID>)  ALLOW GENERIC_ALL to the current user's SID only
-  std::wstring sddl = std::wstring(L"D:P(A;;GA;;;") + sid_str + L")";
-  LocalFree(sid_str);
-  return ConvertStringSecurityDescriptorToSecurityDescriptorW(
-             sddl.c_str(), SDDL_REVISION_1, out_sd, nullptr) != FALSE;
 }
 
 }  // namespace
@@ -106,7 +75,7 @@ bool IpcPipe::Create(const std::wstring& pipe_name) {
   // default named-pipe DACL is broader than we want, and an anonymous descriptor
   // gives no guarantee. Refuse to create an unsecured pipe.
   PSECURITY_DESCRIPTOR sd = nullptr;
-  if (!BuildCurrentUserOnlySD(&sd)) {
+  if (!BuildCurrentUserOnlySD(&sd, /*inheritable=*/false)) {
     PipeLog("failed to build current-user DACL — refusing to create pipe");
     return false;
   }
@@ -247,7 +216,8 @@ bool IpcPipe::ReadFull(void* buf, size_t len) {
 
 bool IpcPipe::SendFrame(uint32_t browser_id, uint8_t opcode,
                         const uint8_t* payload, uint32_t payload_len) {
-  if (pipe_ == INVALID_HANDLE_VALUE || !connected_.load() || closing_.load())
+  if (pipe_ == INVALID_HANDLE_VALUE || !connected_.load() || closing_.load() ||
+      write_failed_.load())
     return false;
   if (payload_len > kMaxBodyLen - 5) return false;
   const uint32_t body_len = 5 + payload_len;
@@ -258,8 +228,10 @@ bool IpcPipe::SendFrame(uint32_t browser_id, uint8_t opcode,
   if (payload_len > 0) memcpy(frame.data() + 9, payload, payload_len);
 
   // One contiguous logical write under the mutex so a partial/interleaved
-  // write can never desync the peer (main.mm:431-445). Overlapped + awaited
-  // to completion — independent of the reader's parked read.
+  // write can never desync the peer. Overlapped, independent of the reader's
+  // parked read, and bounded: this runs on the platform thread, and a host
+  // that stopped reading (hung, or its reader already gone) must not freeze
+  // the UI once the 64 KiB pipe buffer fills.
   std::lock_guard<std::mutex> lock(write_mutex_);
   size_t off = 0;
   while (off < frame.size()) {
@@ -269,10 +241,27 @@ bool IpcPipe::SendFrame(uint32_t browser_id, uint8_t opcode,
     BOOL ok = WriteFile(pipe_, frame.data() + off,
                         static_cast<DWORD>(frame.size() - off),
                         /*lpNumberOfBytesWritten=*/nullptr, &ov);
-    if (!ok && GetLastError() != ERROR_IO_PENDING) return false;
+    if (!ok && GetLastError() != ERROR_IO_PENDING) {
+      write_failed_.store(true);
+      return false;
+    }
+    if (!ok &&
+        WaitForSingleObject(write_event_, kWriteTimeoutMs) != WAIT_OBJECT_0) {
+      // Timed out: cancel the write and drain the IRP, so `frame` (the
+      // write's buffer) outlives it. Part of the frame may already be on the
+      // wire, so the stream can't be trusted again.
+      CancelIoEx(pipe_, &ov);
+      DWORD drained = 0;
+      GetOverlappedResult(pipe_, &ov, &drained, TRUE);
+      PipeLog("write timed out — host not reading, failing the pipe");
+      write_failed_.store(true);
+      return false;
+    }
     DWORD n = 0;
-    if (!GetOverlappedResult(pipe_, &ov, &n, TRUE)) return false;
-    if (n == 0) return false;
+    if (!GetOverlappedResult(pipe_, &ov, &n, TRUE) || n == 0) {
+      write_failed_.store(true);
+      return false;
+    }
     off += n;
   }
   return true;

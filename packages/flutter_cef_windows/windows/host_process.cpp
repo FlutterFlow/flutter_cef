@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <vector>
 
+#include "cef_host_policy.h"
+
 namespace flutter_cef {
 
 namespace {
@@ -38,8 +40,15 @@ bool HostProcess::Spawn(const std::wstring& cef_host_exe,
                      L" \"--profile-dir=" + profile_dir + L"\"";
   if (ephemeral) cmd += L" --ephemeral";
   // Navigation scheme allowlist (csv; enforced host-side in OnBeforeBrowse).
-  // Schemes are [a-z0-9.+-] tokens, never contain spaces — no quoting needed
-  // (mirror CefProfileHost.swift:289-291 --allowed-schemes).
+  // Chromium parses this whole command line, so a value with a space or a
+  // quote would smuggle in its own switches: only RFC 3986 scheme tokens
+  // (ASCII letters, digits, "+", "-", ".") and commas get through, which also
+  // makes the byte-wise widening below exact. The plugin validates first;
+  // this is the last check before the command line is built.
+  if (!policy::IsValidSchemeList(allowed_schemes)) {
+    HostLog("refusing to spawn: allowed_schemes is not a scheme list");
+    return false;
+  }
   if (!allowed_schemes.empty()) {
     std::wstring w(allowed_schemes.begin(), allowed_schemes.end());
     cmd += L" --allowed-schemes=" + w;
@@ -184,6 +193,27 @@ HANDLE HostProcess::DuplicateProcessHandle() const {
     return nullptr;
   }
   return dup;
+}
+
+bool HostProcess::KillTreeAndWait(unsigned long timeout_ms) {
+  if (!job_) {
+    // No job (assignment failed): only the host itself can be ended.
+    if (!process_) return true;
+    TerminateProcess(process_, 9);
+    return WaitForSingleObject(process_, timeout_ms) == WAIT_OBJECT_0;
+  }
+  TerminateJobObject(job_, 9);
+  const ULONGLONG deadline = GetTickCount64() + timeout_ms;
+  for (;;) {
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION info = {};
+    if (!QueryInformationJobObject(job_, JobObjectBasicAccountingInformation,
+                                   &info, sizeof(info), nullptr)) {
+      return false;
+    }
+    if (info.ActiveProcesses == 0) return true;
+    if (GetTickCount64() >= deadline) return false;
+    Sleep(20);
+  }
 }
 
 void HostProcess::Shutdown() {

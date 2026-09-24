@@ -56,8 +56,8 @@ class Op {
 const protocolVersions = {
   // v9: tile surfaces are private and handed over by Mach port (--surface-port).
   Platform.macos: 9,
-  // v4: kOpSetAuthoredHtml + kOpSetDocumentStart.
-  Platform.windows: 4,
+  // v5: kOpSetAudioMuted + kOpSetPumpInterval.
+  Platform.windows: 5,
 };
 
 const _mac = {Platform.macos};
@@ -156,10 +156,9 @@ const ops = <Op>[
   Op(0x39, 'OpenAuthWindow', _down,
       '{utf8 url} open a windowed browser, sharing the tile\'s cookies, for a WebAuthn ceremony the tile can\'t host',
       platforms: _mac),
-  Op(0x3a, 'SetAudioMuted', _down, '{u8 muted}', platforms: _mac),
+  Op(0x3a, 'SetAudioMuted', _down, '{u8 muted}'),
   Op(0x3b, 'SetPumpInterval', _down,
-      '{u16 ms} visible begin-frame cadence, clamped to [8, 250]',
-      platforms: _mac),
+      '{u16 ms} visible begin-frame cadence, clamped to [8, 250]'),
   Op(0x3c, 'MediaResponse', _down,
       '{u32 id}{u8 allow}{u8 remember} answer a kOpMediaRequest; remembered per origin only when remember is set',
       platforms: _mac),

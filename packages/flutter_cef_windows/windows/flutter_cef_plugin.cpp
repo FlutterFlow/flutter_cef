@@ -6,7 +6,6 @@
 #include "flutter_cef_plugin.h"
 
 #include <windows.h>
-#include <sddl.h>
 
 #include <flutter/encodable_value.h>
 
@@ -14,43 +13,66 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
 
+#include "cef_host_policy.h"
 #include "cef_host_protocol.h"
+#include "current_user_sd.h"
 #include "include/flutter_cef_windows/flutter_cef_plugin.h"
-
-// The persistent-profile DACL uses the token/SID/SDDL APIs. advapi32.lib is
-// already pulled in by ipc_pipe.cpp (same target); re-declaring is harmless and
-// keeps this TU self-documenting.
-#pragma comment(lib, "advapi32.lib")
+#include "liveness_policy.h"
 
 namespace flutter_cef {
 namespace {
 
 constexpr wchar_t kMessageWindowClass[] = L"FlutterCefPluginMessageWindow";
 constexpr UINT kDrainMessage = WM_APP + 1;
+// The liveness sweep's WM_TIMER id. Watchdog ids count up from 1, so they
+// never reach it.
+constexpr UINT_PTR kLivenessTimerId = 0x7FFFFFFF;
+constexpr UINT kLivenessSweepMs = 2000;
+// A stale tile nudged this long ago without a present since is idle or hung;
+// the ping tells which.
+constexpr uint64_t kLivenessNudgeGraceMs = 3000;
+// Create/resize bounds, in logical px (the host enforces the same).
+constexpr int64_t kMaxViewDimension = 16384;
 
-// C1 first-present watchdog grace (macOS firstPaintGrace = 10s, env
-// FLUTTER_CEF_FIRSTPAINT_MS; CefProfileHost.swift:649-653).
-UINT WatchdogGraceMs() {
+// A positive millisecond count from env `name`, else `fallback`.
+UINT EnvMs(const wchar_t* name, UINT fallback) {
   wchar_t buf[32] = {};
-  const DWORD n =
-      GetEnvironmentVariableW(L"FLUTTER_CEF_FIRSTPAINT_MS", buf, 32);
+  const DWORD n = GetEnvironmentVariableW(name, buf, 32);
   if (n > 0 && n < 32) {
     const long ms = wcstol(buf, nullptr, 10);
     if (ms > 0) return static_cast<UINT>(ms);
   }
-  return 10000;
+  return fallback;
 }
+
+// First-present watchdog grace (macOS firstPaintGrace = 10s).
+UINT WatchdogGraceMs() { return EnvMs(L"FLUTTER_CEF_FIRSTPAINT_MS", 10000); }
+// How long a painted, visible tile may go without a frame before the sweep
+// nudges it, and how long its renderer may leave a ping unanswered before the
+// host is ended (macOS defaults; Chrome's own hang monitor waits about as long
+// before offering to kill a page).
+UINT LivenessStalenessMs() { return EnvMs(L"FLUTTER_CEF_LIVENESS_MS", 10000); }
+UINT LivenessHangMs() { return EnvMs(L"FLUTTER_CEF_HANG_MS", 15000); }
 
 void Log(const std::string& msg) {
   OutputDebugStringA(("[flutter_cef_windows] " + msg + "\n").c_str());
 }
 
-void WarnStub(const std::string& verb) {
-  Log("verb '" + verb + "' not implemented (slice stub) — replying success");
+// Verbs the macOS plugin serves that Windows has no host support for. They
+// reply Error("unsupported") so a caller can tell "not here" from success.
+bool IsUnsupportedOnWindows(const std::string& method) {
+  static const char* kUnsupported[] = {
+      "chooseContextMenu", "respondMediaRequest", "setMediaSetting",
+      "openAuthWindow",    "showEmojiPicker"};
+  for (const char* v : kUnsupported)
+    if (method == v) return true;
+  return false;
 }
 
 // ---- EncodableMap arg helpers (mirror the tolerant Swift `as?` reads) ----
@@ -210,50 +232,14 @@ std::wstring SanitizeProfileLeaf(const std::string& profile) {
   return out;
 }
 
-// Build a SECURITY_ATTRIBUTES whose DACL is PROTECTED and grants the current
-// user's SID full control only — the same #3 hardening the IPC pipe uses
-// (ipc_pipe.cpp BuildCurrentUserOnlySD). On success *out_sd is a LocalAlloc'd
-// descriptor the caller must LocalFree AFTER the API call that consumed the SA.
-// On Windows the on-disk profile is DPAPI-encrypted (OSCrypt), same-user-
-// readable — so this DACL is defense-in-depth (see MakePersistentProfileDir).
-bool BuildCurrentUserOnlySD(PSECURITY_DESCRIPTOR* out_sd) {
-  *out_sd = nullptr;
-  HANDLE token = nullptr;
-  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
-  DWORD len = 0;
-  GetTokenInformation(token, TokenUser, nullptr, 0, &len);
-  if (len == 0) {
-    CloseHandle(token);
-    return false;
-  }
-  std::vector<uint8_t> buf(len);
-  const bool got =
-      GetTokenInformation(token, TokenUser, buf.data(), len, &len) != FALSE;
-  CloseHandle(token);
-  if (!got) return false;
-  auto* tu = reinterpret_cast<TOKEN_USER*>(buf.data());
-  LPWSTR sid_str = nullptr;
-  if (!ConvertSidToStringSidW(tu->User.Sid, &sid_str)) return false;
-  // OICI = OBJECT_INHERIT | CONTAINER_INHERIT: the ACE must be INHERITABLE, or
-  // files/subdirs Chromium creates under the profile (Default/Network/Cookies,
-  // Local State, …) do NOT inherit the user's access — the owner is left without
-  // FILE_READ_DATA, so a *freshly spawned* cef_host cannot read the on-disk
-  // cookie store it wrote last run and "stay signed in" silently fails (the
-  // marker cookie is written but unreadable across a host restart). The pipe's
-  // SD (ipc_pipe.cpp) is a single non-inheriting kernel object so it omits OICI;
-  // a directory tree must propagate the grant to its children.
-  std::wstring sddl = std::wstring(L"D:P(A;OICI;GA;;;") + sid_str + L")";
-  LocalFree(sid_str);
-  return ConvertStringSecurityDescriptorToSecurityDescriptorW(
-             sddl.c_str(), SDDL_REVISION_1, out_sd, nullptr) != FALSE;
-}
-
-// Create `dir` with a current-user-only protected DACL if we can build one;
-// fall back to a default-DACL create otherwise (never leave the tree
-// uncreated). ok-if-exists.
+// Create `dir` with a current-user-only protected, inheritable DACL if we can
+// build one; fall back to a default-DACL create otherwise (never leave the tree
+// uncreated). ok-if-exists: an existing dir keeps whatever DACL it has. On
+// Windows the on-disk profile is DPAPI-encrypted (OSCrypt), same-user-readable
+// — so this DACL is defense-in-depth (see MakePersistentProfileDir).
 void CreateDirProtected(const std::wstring& dir) {
   PSECURITY_DESCRIPTOR sd = nullptr;
-  if (BuildCurrentUserOnlySD(&sd)) {
+  if (BuildCurrentUserOnlySD(&sd, /*inheritable=*/true)) {
     SECURITY_ATTRIBUTES sa = {};
     sa.nLength = sizeof(sa);
     sa.lpSecurityDescriptor = sd;
@@ -325,6 +311,7 @@ FlutterCefPlugin::~FlutterCefPlugin() {
     if (r.thread.joinable()) r.thread.join();
   }
   if (message_window_) {
+    if (liveness_timer_active_) KillTimer(message_window_, kLivenessTimerId);
     SetWindowLongPtrW(message_window_, GWLP_USERDATA, 0);
     DestroyWindow(message_window_);
     message_window_ = nullptr;
@@ -343,7 +330,14 @@ LRESULT CALLBACK FlutterCefPlugin::MsgWndProc(HWND hwnd, UINT msg,
   if (msg == WM_TIMER) {
     auto* self = reinterpret_cast<FlutterCefPlugin*>(
         GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-    if (self) self->OnWatchdogTimer(static_cast<UINT_PTR>(wparam));
+    if (self) {
+      const UINT_PTR id = static_cast<UINT_PTR>(wparam);
+      if (id == kLivenessTimerId) {
+        self->OnLivenessTimer();
+      } else {
+        self->OnWatchdogTimer(id);
+      }
+    }
     return 0;
   }
   return DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -376,6 +370,16 @@ void FlutterCefPlugin::DrainEvents() {
         HandleHostGone(e.host_key, e.generation, /*exit_code_known=*/true,
                        e.exit_code);
         break;
+      case HostEvent::Kind::kWriteFailed: {
+        auto it = hosts_.find(e.host_key);
+        if (it == hosts_.end() || it->second->generation != e.generation) break;
+        // A write that failed or timed out: the host isn't reading (hung, or
+        // its reader already gone), and part of a frame may be on the wire.
+        // Same outcome as a crash; the reaper ends the process.
+        Log("pipe write to host '" + e.host_key + "' failed — ending it");
+        FailHost(e.host_key, "crashed");
+        break;
+      }
     }
   }
 }
@@ -411,6 +415,14 @@ void FlutterCefPlugin::HandleMethodCall(
     result->Success();
     return;
   }
+  if (method == "freezeSession") {
+    FreezeSession(args, result);
+    return;
+  }
+  if (method == "thawSession") {
+    ThawSession(args, result);
+    return;
+  }
 
   Session* s = FindSession(args);
 
@@ -431,6 +443,10 @@ void FlutterCefPlugin::HandleMethodCall(
     const std::string url = GetString(args, "url");
     const std::string html = GetString(args, "html");
     if (s && !url.empty()) {
+      // Kept for thaw, which re-parks it when it recreates the browser at the
+      // same url.
+      s->authored_url = url;
+      s->authored_html = html;
       SendOrQueue(s, kOpSetAuthoredHtml, AuthoredPayload(url, html));
       std::vector<uint8_t> p;
       AppendUtf8(p, url);
@@ -512,6 +528,11 @@ void FlutterCefPlugin::HandleMethodCall(
       } else if (!s->painted && !s->watchdog_active) {
         ArmWatchdog(s);
       }
+      // A hidden tile presents nothing by design: start its liveness clock
+      // over, so time spent hidden doesn't read as a stall once shown.
+      if (visible && s->painted) s->last_present_ms = GetTickCount64();
+      s->nudged_at_ms = 0;
+      s->ping_sent_ms = 0;
     }
     result->Success();
     return;
@@ -557,6 +578,8 @@ void FlutterCefPlugin::HandleMethodCall(
   }
   if (method == "respondJsDialog") {
     if (s) {
+      // The renderer runs again once its dialog is answered.
+      if (s->dialogs_open > 0) --s->dialogs_open;
       std::vector<uint8_t> p;
       AppendU32(p, static_cast<uint32_t>(GetInt(args, "id", 0)));
       p.push_back(GetBool(args, "ok", true) ? 1 : 0);
@@ -580,6 +603,10 @@ void FlutterCefPlugin::HandleMethodCall(
   if (method == "addJavaScriptChannel") {
     const std::string name = GetString(args, "name");
     if (s && !name.empty()) {
+      // Remembered so a thawed browser registers it again.
+      auto& channels = s->spec.channels;
+      if (std::find(channels.begin(), channels.end(), name) == channels.end())
+        channels.push_back(name);
       std::vector<uint8_t> p;
       AppendUtf8(p, name);
       SendOrQueue(s, kOpAddChannel, std::move(p));
@@ -642,7 +669,13 @@ void FlutterCefPlugin::HandleMethodCall(
     return;
   }
   if (method == "showDevTools") {
-    if (s) SendOrQueue(s, kOpShowDevTools, {});
+    if (s) {
+      // Its debugger can pause the page indefinitely, so the liveness ping
+      // leaves this tile alone from now on.
+      s->devtools_opened = true;
+      s->ping_sent_ms = 0;
+      SendOrQueue(s, kOpShowDevTools, {});
+    }
     result->Success();
     return;
   }
@@ -671,25 +704,69 @@ void FlutterCefPlugin::HandleMethodCall(
     return;
   }
   if (method == "getFrameSurface") {
-    if (s) {
+    uint64_t handle = 0;
+    uint32_t width = 0, height = 0;
+    if (s && texture_bridge_->GetCurrent(s->texture_id, &handle, &width,
+                                         &height)) {
+      // The frame the texture is showing now, not the size last asked for.
       result->Success(flutter::EncodableValue(flutter::EncodableMap{
           {Ev("surfaceId"),
-           flutter::EncodableValue(static_cast<int64_t>(s->current_handle))},
-          {Ev("width"),
-           flutter::EncodableValue(static_cast<int64_t>(s->expected_pw))},
+           flutter::EncodableValue(static_cast<int64_t>(handle))},
+          {Ev("width"), flutter::EncodableValue(static_cast<int64_t>(width))},
           {Ev("height"),
-           flutter::EncodableValue(static_cast<int64_t>(s->expected_ph))},
+           flutter::EncodableValue(static_cast<int64_t>(height))},
       }));
     } else {
       result->Success();
     }
     return;
   }
-
-  // SLICE RULE: every not-yet-implemented verb replies success/null with an
-  // OutputDebugString warning. NEVER an error, NEVER NotImplemented.
-  WarnStub(method);
-  result->Success();
+  if (method == "sessionStats") {
+    // Pixel liveness: presentCount / lastPresentAgoMs count promoted
+    // presents, the frames that actually reached the texture (macOS shape).
+    if (!s) {
+      result->Success();
+      return;
+    }
+    flutter::EncodableValue ago;  // null until the first present
+    if (s->last_present_ms != 0) {
+      ago = flutter::EncodableValue(
+          static_cast<int64_t>(GetTickCount64() - s->last_present_ms));
+    }
+    result->Success(flutter::EncodableValue(flutter::EncodableMap{
+        {Ev("presentCount"),
+         flutter::EncodableValue(static_cast<int64_t>(s->present_count))},
+        {Ev("lastPresentAgoMs"), ago},
+        {Ev("firstPresentSeen"), flutter::EncodableValue(s->painted)},
+        {Ev("frozen"), flutter::EncodableValue(s->frozen)},
+    }));
+    return;
+  }
+  if (method == "setAudioMuted") {
+    if (s) {
+      SendOrQueue(s, kOpSetAudioMuted,
+                  {GetBool(args, "muted", true) ? uint8_t{1} : uint8_t{0}});
+    }
+    result->Success();
+    return;
+  }
+  if (method == "setFrameInterval") {
+    // {u16 ms}; the host clamps to [8, 250] and turns it into a windowless
+    // frame rate.
+    if (s) {
+      const int64_t ms = (std::clamp)(GetInt(args, "ms", 16), int64_t{0},
+                                      int64_t{0xFFFF});
+      SendOrQueue(s, kOpSetPumpInterval,
+                  {static_cast<uint8_t>(ms >> 8), static_cast<uint8_t>(ms)});
+    }
+    result->Success();
+    return;
+  }
+  if (IsUnsupportedOnWindows(method)) {
+    result->Error("unsupported", method + " is not supported on Windows");
+    return;
+  }
+  result->NotImplemented();
 }
 
 // ---- create / resize / dispose ----
@@ -702,21 +779,37 @@ void FlutterCefPlugin::HandleCreate(
     result->Error("bad_args", "missing sessionId");
     return;
   }
-  const int64_t width = (std::max)(int64_t{1}, GetInt(args, "width", 800));
-  const int64_t height = (std::max)(int64_t{1}, GetInt(args, "height", 600));
+  // Same bounds as resize: a texture past 16384 px a side can't be allocated.
+  const int64_t width =
+      (std::clamp)(GetInt(args, "width", 800), int64_t{1}, kMaxViewDimension);
+  const int64_t height =
+      (std::clamp)(GetInt(args, "height", 600), int64_t{1}, kMaxViewDimension);
   double dpr = GetDouble(args, "dpr", 1.0);
-  if (!(dpr > 0.0) || dpr > 8.0) dpr = 1.0;  // main.mm:2364-2376 guard
+  if (!(dpr > 0.0) || dpr > 8.0) dpr = 1.0;  // same guard as the host
   const std::string url = GetString(args, "url", "about:blank");
-  const std::string allowed_schemes = GetString(args, "allowedSchemes");
-  const bool named_profile = HasNamedProfile(args);
-  const std::string profile = GetString(args, "profile");
-  const std::string host_group = GetString(args, "hostGroup");
-  // Agent control (P9): CDP-over-pipe launch. Off by default; when set, the host
-  // is spawned with the two inherited CDP pipes (the S3 recipe). Independent of
-  // enableCdp (TCP) — the pipe path never opens a listening port.
-  const bool agent_control = GetBool(args, "agentControl", false);
 
-  // Re-creating the same id is idempotent (Swift:293-295) — route teardown
+  Session::CreateSpec spec;
+  spec.url = url;
+  spec.allowed_schemes = GetString(args, "allowedSchemes");
+  spec.named_profile = HasNamedProfile(args);
+  spec.profile = GetString(args, "profile");
+  spec.host_group = GetString(args, "hostGroup");
+  // Agent control: CDP-over-pipe launch. Off by default; when set, the host
+  // is spawned with the two inherited CDP pipes (the S3 recipe). Independent
+  // of enableCdp (TCP) — the pipe path never opens a listening port.
+  spec.agent_control = GetBool(args, "agentControl", false);
+  spec.channels = GetStringList(args, "channels");
+  spec.document_start_scripts = GetStringList(args, "documentStartScripts");
+  // The allowlist rides cef_host's command line, which Chromium parses whole:
+  // only scheme tokens may go on it.
+  if (!policy::IsValidSchemeList(spec.allowed_schemes)) {
+    result->Error("bad_args",
+                  "allowedSchemes must be a comma-separated list of URL "
+                  "schemes (letters, digits, '+', '-', '.')");
+    return;
+  }
+
+  // Re-creating the same id is idempotent (as on macOS) — route teardown
   // through its host first.
   DisposeSession(session_id);
 
@@ -733,54 +826,15 @@ void FlutterCefPlugin::HandleCreate(
   // sessions and torn down with the last of them, or without one a host of
   // its own. Profile names starting with "~ephemeral~" / "~group~" are
   // reserved.
-  const bool ephemeral = !named_profile;
-  const std::string key = named_profile        ? profile
-                          : !host_group.empty() ? "~group~" + host_group
-                                                : "~ephemeral~" + session_id;
-
-  // Reuse a live host for this key (a named profile's or group's 2nd+ tile);
-  // only a spawn needs a profile dir.
-  Host* host = nullptr;
-  auto live = hosts_.find(key);
-  if (live != hosts_.end() && !live->second->closing) {
-    host = live->second.get();
-  } else {
-    const std::wstring profile_dir = named_profile
-                                         ? MakePersistentProfileDir(profile)
-                                         : MakeEphemeralProfileDir();
-    if (profile_dir.empty()) {
-      result->Error("spawn_failed", "failed to create persistent profile dir");
-      return;
-    }
-    host = ResolveOrSpawnHost(key, profile_dir, ephemeral, host_exe,
-                              allowed_schemes, agent_control);
-  }
+  const std::string key = spec.named_profile        ? spec.profile
+                          : !spec.host_group.empty() ? "~group~" + spec.host_group
+                                                     : "~ephemeral~" + session_id;
+  const char* error_code = nullptr;
+  const char* error_message = nullptr;
+  Host* host = AcquireHost(key, spec, host_exe, &error_code, &error_message);
   if (!host) {
-    result->Error("spawn_failed", "failed to spawn cef_host");
+    result->Error(error_code, error_message);
     return;
-  }
-
-  // SECURITY (P9 single-tile invariant): the CDP relay is a BROWSER-LEVEL
-  // passthrough (the per-tile CEF-2b Target filter is deferred — PROTOCOL.md
-  // §8.4). So an active agent-control grant must own a host with exactly ONE
-  // tile; otherwise the agent driving this host could Target.getTargets/attach
-  // the new sibling tile. Refuse a second tile joining a host whose grant is
-  // live. (The complementary guard is in EnableAgentControl: no grant on a
-  // multi-tile host.) Co-locate an agent-controlled view on its OWN profile.
-  if (host->agent_control && !host->browsers.empty() && host->cdp) {
-    bool grant_active;
-    {
-      std::lock_guard<std::mutex> lk(host->cdp->relay_mutex);
-      grant_active = host->cdp->relay != nullptr;
-    }
-    if (grant_active) {
-      result->Error(
-          "agent_control_active",
-          "cannot add a tile to a profile whose agent-control grant is active "
-          "(per-tile CDP scoping is not yet implemented on Windows — give the "
-          "agent-controlled view its own profile)");
-      return;
-    }
   }
 
   const int64_t texture_id = texture_bridge_->RegisterSessionTexture();
@@ -792,12 +846,10 @@ void FlutterCefPlugin::HandleCreate(
     return;
   }
 
-  const uint32_t browser_id = host->next_browser_id++;
-
   auto session = std::make_unique<Session>();
   session->id = session_id;
   session->host_key = key;
-  session->browser_id = browser_id;
+  session->browser_id = host->next_browser_id++;
   session->texture_id = texture_id;
   session->width = static_cast<int>(width);
   session->height = static_cast<int>(height);
@@ -807,50 +859,116 @@ void FlutterCefPlugin::HandleCreate(
   session->expected_ph = static_cast<uint32_t>(
       (std::max)(1.0, std::round(static_cast<double>(height) * dpr)));
   session->watchdog_id = next_timer_id_++;
+  // An authored document to create ON (served as `url`'s main-frame response).
+  session->authored_html = GetString(args, "authoredHtml");
+  if (!session->authored_html.empty()) session->authored_url = url;
+  session->spec = std::move(spec);
 
-  // The new browser's frames, in wire order. Send directly on a ready host (2nd+
-  // tile on a shared host), else queue on the host for flush at kOpReady.
-  auto send = [host, browser_id](uint8_t op, std::vector<uint8_t> payload) {
-    if (host->ready) {
-      host->pipe->SendFrame(browser_id, op, payload.data(),
-                            static_cast<uint32_t>(payload.size()));
-    } else {
-      host->pending_frames.push_back(
-          PendingFrame{browser_id, op, std::move(payload)});
-    }
-  };
-  // Parked by the host ahead of the create that uses them: the document-start
-  // scripts + the JS channels registered before create (they ride into the
-  // renderer with the browser, ahead of the page's first script), and an
-  // authored document to create ON (served as `url`'s main-frame response).
-  std::vector<uint8_t> doc_start =
-      DocumentStartPayload(GetStringList(args, "channels"),
-                           GetStringList(args, "documentStartScripts"));
-  if (!doc_start.empty()) send(kOpSetDocumentStart, std::move(doc_start));
-  const std::string authored_html = GetString(args, "authoredHtml");
-  if (!authored_html.empty()) {
-    send(kOpSetAuthoredHtml, AuthoredPayload(url, authored_html));
-  }
-  // kOpCreateBrowser: {u32 w}{u32 h}{f64 dpr}{utf8 url}; frame browserId = the
-  // NEW wire id.
-  std::vector<uint8_t> create;
-  AppendU32(create, static_cast<uint32_t>(width));
-  AppendU32(create, static_cast<uint32_t>(height));
-  AppendF64(create, dpr);
-  AppendUtf8(create, url);
-  send(kOpCreateBrowser, std::move(create));
-
-  host->browsers[browser_id] = session_id;
+  host->browsers[session->browser_id] = session_id;
   Session* raw = session.get();
   sessions_[session_id] = std::move(session);
-  // C1 first-present watchdog: start the first-paint clock now.
+  SendCreateFrames(host, raw, url);
+  // First-present watchdog: start the first-paint clock now.
   ArmWatchdog(raw);
+  EnsureLivenessTimer();
   result->Success(flutter::EncodableValue(flutter::EncodableMap{
       {Ev("textureId"), flutter::EncodableValue(texture_id)},
       {Ev("width"), flutter::EncodableValue(width)},
       {Ev("height"), flutter::EncodableValue(height)},
       {Ev("cdpPort"), flutter::EncodableValue(0)},
   }));
+}
+
+FlutterCefPlugin::Host* FlutterCefPlugin::AcquireHost(
+    const std::string& key, const Session::CreateSpec& spec,
+    const std::wstring& host_exe, const char** error_code,
+    const char** error_message) {
+  // Reuse a live host for this key (a named profile's or group's 2nd+ tile);
+  // only a spawn needs a profile dir.
+  Host* host = nullptr;
+  auto live = hosts_.find(key);
+  if (live != hosts_.end()) {
+    host = live->second.get();
+  } else {
+    const std::wstring profile_dir = spec.named_profile
+                                         ? MakePersistentProfileDir(spec.profile)
+                                         : MakeEphemeralProfileDir();
+    if (profile_dir.empty()) {
+      *error_code = "spawn_failed";
+      *error_message = "failed to create persistent profile dir";
+      return nullptr;
+    }
+    host = ResolveOrSpawnHost(key, profile_dir, !spec.named_profile, host_exe,
+                              spec.allowed_schemes, spec.agent_control);
+    if (!host) {
+      *error_code = "spawn_failed";
+      *error_message = "failed to spawn cef_host";
+      return nullptr;
+    }
+  }
+
+  // SECURITY (single-tile invariant): the CDP relay is a BROWSER-LEVEL
+  // passthrough (the per-tile Target filter isn't implemented on Windows —
+  // PROTOCOL.md §8.4). So an active agent-control grant must own a host with
+  // exactly ONE tile; otherwise the agent driving this host could
+  // Target.getTargets/attach the new sibling tile. Refuse a second tile
+  // joining a host whose grant is live. (The complementary guard is in
+  // EnableAgentControl: no grant on a multi-tile host.) Co-locate an
+  // agent-controlled view on its OWN profile.
+  if (host->agent_control && !host->browsers.empty() && host->cdp) {
+    bool grant_active;
+    {
+      std::lock_guard<std::mutex> lk(host->cdp->relay_mutex);
+      grant_active = host->cdp->relay != nullptr;
+    }
+    if (grant_active) {
+      *error_code = "agent_control_active";
+      *error_message =
+          "cannot add a tile to a profile whose agent-control grant is active "
+          "(per-tile CDP scoping is not yet implemented on Windows — give the "
+          "agent-controlled view its own profile)";
+      return nullptr;
+    }
+  }
+  return host;
+}
+
+void FlutterCefPlugin::SendCreateFrames(Host* host, Session* s,
+                                        const std::string& url) {
+  // The new browser's frames, in wire order. Sent directly on a ready host
+  // (2nd+ tile on a shared host), else queued on the host for flush at
+  // kOpReady — which rewrites the queued create with the session's size as of
+  // the flush.
+  const uint32_t browser_id = s->browser_id;
+  auto send = [this, host, browser_id](uint8_t op,
+                                       std::vector<uint8_t> payload) {
+    if (host->ready) {
+      SendToHost(host, browser_id, op, payload);
+    } else {
+      host->pending_frames.push_back(
+          PendingFrame{browser_id, op, std::move(payload)});
+    }
+  };
+  // Parked by the host ahead of the create that uses them: the document-start
+  // scripts + the JS channels (they ride into the renderer with the browser,
+  // ahead of the page's first script), and an authored document to create ON.
+  std::vector<uint8_t> doc_start =
+      DocumentStartPayload(s->spec.channels, s->spec.document_start_scripts);
+  if (!doc_start.empty()) send(kOpSetDocumentStart, std::move(doc_start));
+  if (!s->authored_html.empty() && s->authored_url == url) {
+    send(kOpSetAuthoredHtml, AuthoredPayload(url, s->authored_html));
+  }
+  // kOpCreateBrowser: {u32 w}{u32 h}{f64 dpr}{utf8 url}; frame browserId = the
+  // NEW wire id.
+  std::vector<uint8_t> create;
+  AppendU32(create, static_cast<uint32_t>(s->width));
+  AppendU32(create, static_cast<uint32_t>(s->height));
+  AppendF64(create, s->dpr);
+  AppendUtf8(create, url);
+  send(kOpCreateBrowser, std::move(create));
+  // The host holds per-browser ops that arrive before the browser exists and
+  // applies them once it binds, so a hide can follow the create at once.
+  if (!s->visible) send(kOpSetVisible, {uint8_t{0}});
 }
 
 void FlutterCefPlugin::HandleResize(
@@ -910,11 +1028,9 @@ FlutterCefPlugin::Host* FlutterCefPlugin::ResolveOrSpawnHost(
     bool agent_control) {
   // Reuse a live host for this key (a shared persistent profile's 2nd+ tile).
   // agent_control (like allowed_schemes) is a process arg fixed at the host's
-  // spawn — a reuse ignores it (macOS parity, CefProfileHost.swift:456-471).
+  // spawn — a reuse ignores it (macOS parity).
   auto existing = hosts_.find(key);
-  if (existing != hosts_.end() && !existing->second->closing) {
-    return existing->second.get();
-  }
+  if (existing != hosts_.end()) return existing->second.get();
 
   // Pipe FIRST (so the child's CreateFileW connects first try), then spawn.
   auto pipe = std::make_unique<IpcPipe>();
@@ -1009,11 +1125,16 @@ void FlutterCefPlugin::DisposeSession(const std::string& session_id) {
     texture_bridge_->Unregister(s->texture_id);
     s->texture_id = -1;
   }
-
-  Host* host = HostForSession(s);
   sessions_.erase(it);
+  // A frozen session has no host to detach from.
+  if (!host_key.empty()) DetachFromHost(host_key, browser_id);
+}
 
-  if (!host) return;
+void FlutterCefPlugin::DetachFromHost(const std::string& host_key,
+                                      uint32_t browser_id) {
+  auto hit = hosts_.find(host_key);
+  if (hit == hosts_.end()) return;
+  Host* host = hit->second.get();
   // Drop this browser's routing entry + any still-queued pre-ready frames.
   host->browsers.erase(browser_id);
   if (!host->pending_frames.empty()) {
@@ -1024,17 +1145,91 @@ void FlutterCefPlugin::DisposeSession(const std::string& session_id) {
                        }),
         host->pending_frames.end());
   }
-  // Close just this browser if the host is live + already ready (the create was
-  // flushed). A not-yet-ready host never created the browser, so nothing to
-  // close on the wire.
-  if (!host->closing && host->ready && host->pipe && host->pipe->connected()) {
-    host->pipe->SendFrame(browser_id, kOpDisposeBrowser, nullptr, 0);
-  }
-  // Last session gone -> tear the whole host down; otherwise keep it serving
-  // the siblings (distinct per-session vs whole-host teardown).
+  // Last browser gone -> tear the whole host down; otherwise close just this
+  // browser and keep the host serving the siblings. A not-yet-ready host
+  // never created the browser, so there is nothing to close on the wire.
   if (host->browsers.empty()) {
     TeardownHost(host_key, /*send_shutdown=*/true);
+  } else if (host->ready) {
+    SendToHost(host, browser_id, kOpDisposeBrowser, {});
   }
+}
+
+// freezeSession: close one session's browser — and, when it was its host's
+// last, the whole cef_host process tree — while KEEPING the session and its
+// texture, which goes on showing the last frame (the texture bridge holds its
+// own reference to the shared surface). thawSession recreates a browser onto
+// the same session. Replies false when there is nothing to freeze: an unknown
+// or already-frozen session, or one whose host already died (processGone
+// handles that).
+void FlutterCefPlugin::FreezeSession(
+    const flutter::EncodableMap& args,
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>& result) {
+  Session* s = FindSession(args);
+  if (!s || s->frozen || !HostForSession(s)) {
+    result->Success(flutter::EncodableValue(false));
+    return;
+  }
+  CancelWatchdog(s);
+  const std::string host_key = s->host_key;
+  const uint32_t browser_id = s->browser_id;
+  s->frozen = true;
+  s->host_key.clear();
+  s->browser_id = 0;
+  s->nudged_at_ms = 0;
+  s->ping_sent_ms = 0;
+  s->dialogs_open = 0;  // closing the browser dismissed them
+  DetachFromHost(host_key, browser_id);
+  result->Success(flutter::EncodableValue(true));
+}
+
+// thawSession: resolve or spawn a host of the ORIGINAL kind (same profile,
+// group, schemes and transport as the create) and recreate a browser onto the
+// SAME session and texture, at the session's current size, with its JS
+// channels and document-start scripts. The frozen frame keeps showing until
+// the new browser's first frame lands. `url` overrides the original create
+// url. Replies null when the session isn't frozen.
+void FlutterCefPlugin::ThawSession(
+    const flutter::EncodableMap& args,
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>& result) {
+  Session* s = FindSession(args);
+  if (!s || !s->frozen) {
+    result->Success();
+    return;
+  }
+  const std::wstring host_exe = ResolveCefHostPath();
+  if (host_exe.empty()) {
+    result->Error("no_cef_host",
+                  "cef_host.exe not found (set FLUTTER_CEF_HOST)");
+    return;
+  }
+  std::string url = GetString(args, "url");
+  if (url.empty()) url = s->spec.url;
+  const std::string key = s->spec.named_profile ? s->spec.profile
+                          : !s->spec.host_group.empty()
+                              ? "~group~" + s->spec.host_group
+                              : "~ephemeral~" + s->id;
+  const char* error_code = nullptr;
+  const char* error_message = nullptr;
+  Host* host = AcquireHost(key, s->spec, host_exe, &error_code, &error_message);
+  if (!host) {
+    result->Error(error_code, error_message);
+    return;
+  }
+  s->frozen = false;
+  s->host_key = key;
+  s->browser_id = host->next_browser_id++;
+  // A fresh establishment: the first-present watchdog runs again. The
+  // texture keeps its current frame until the new browser's first present.
+  s->painted = false;
+  s->devtools_opened = false;
+  host->browsers[s->browser_id] = s->id;
+  SendCreateFrames(host, s, url);
+  ArmWatchdog(s);
+  EnsureLivenessTimer();
+  result->Success(flutter::EncodableValue(flutter::EncodableMap{
+      {Ev("textureId"), flutter::EncodableValue(s->texture_id)},
+  }));
 }
 
 void FlutterCefPlugin::TeardownHost(const std::string& host_key,
@@ -1042,7 +1237,6 @@ void FlutterCefPlugin::TeardownHost(const std::string& host_key,
   auto it = hosts_.find(host_key);
   if (it == hosts_.end()) return;
   Host* h = it->second.get();
-  h->closing = true;
 
   // Defensive: release any session still attached (the FailHost path clears
   // them first, but a direct teardown must not leak textures/timers).
@@ -1060,6 +1254,8 @@ void FlutterCefPlugin::TeardownHost(const std::string& host_key,
   h->browsers.clear();
 
   if (send_shutdown && h->pipe && h->pipe->connected()) {
+    // Best effort: a failed write here needs no report, the reaper ends the
+    // process either way.
     h->pipe->SendFrame(0, kOpShutdown, nullptr, 0);
   }
 
@@ -1072,10 +1268,11 @@ void FlutterCefPlugin::TeardownHost(const std::string& host_key,
       ++rit;
     }
   }
-  // Bounded reaper: give the host time to exit cleanly, then kill. Owns the
-  // pipe (reader join / deliberate leak), the process handles (job close =
-  // kernel-guaranteed kill) and the exit watcher. Deletes an EPHEMERAL profile
-  // dir once the host is confirmed dead — NEVER a persistent one.
+  // Bounded reaper: give the host time to exit cleanly, then end its whole
+  // process tree. Owns the pipe (reader join / deliberate leak), the process
+  // handles (job close = kernel-guaranteed kill) and the exit watcher. Deletes
+  // an EPHEMERAL profile dir once every process of the host is gone — NEVER a
+  // persistent one.
   auto done = std::make_shared<std::atomic<bool>>(false);
   const bool ephemeral = h->ephemeral;
   std::wstring profile_dir = ephemeral ? h->profile_dir : std::wstring();
@@ -1096,9 +1293,15 @@ void FlutterCefPlugin::TeardownHost(const std::string& host_key,
           if (relay) relay->Stop();
         }
         if (process) {
-          if (process->WaitForExit(3000) == HostProcess::kStillRunning) {
-            process->Terminate();
-            process->WaitForExit(1000);
+          process->WaitForExit(3000);  // the graceful kOpShutdown path
+          // Then end the host and every Chromium child in its job, and wait
+          // for them: a child still running holds files in the profile dir
+          // deleted below, and a partial delete leaves a dir the startup
+          // sweep skips (it carries this app's live pid).
+          if (!process->KillTreeAndWait(3000)) {
+            OutputDebugStringA(
+                "[flutter_cef_windows] reaper: host tree still alive after "
+                "3s\n");
           }
         }
         if (pipe && !pipe->Close()) {
@@ -1121,7 +1324,19 @@ void FlutterCefPlugin::TeardownHost(const std::string& host_key,
           if (cdp->write) CloseHandle(cdp->write);
           cdp->read = cdp->write = nullptr;
         }
-        if (!profile_dir.empty()) DeleteDirRecursive(profile_dir);
+        if (!profile_dir.empty()) {
+          // A file can stay locked a moment after its process is gone (AV
+          // scanners, the search indexer): retry briefly.
+          for (int attempt = 0; attempt < 5; ++attempt) {
+            if (attempt > 0) Sleep(200);
+            DeleteDirRecursive(profile_dir);
+            if (GetFileAttributesW(profile_dir.c_str()) ==
+                INVALID_FILE_ATTRIBUTES) {
+              break;
+            }
+          }
+        }
+        if (process) process->Shutdown();
         done->store(true);
       }),
       done});
@@ -1156,14 +1371,37 @@ void FlutterCefPlugin::FailHost(const std::string& host_key,
 void FlutterCefPlugin::SendOrQueue(Session* session, uint8_t opcode,
                                    std::vector<uint8_t> payload) {
   Host* host = HostForSession(session);
-  if (!host) return;
+  if (!host) return;  // no host (frozen, or its host is gone): dropped
   if (!host->ready) {
     host->pending_frames.push_back(
         PendingFrame{session->browser_id, opcode, std::move(payload)});
     return;
   }
-  host->pipe->SendFrame(session->browser_id, opcode, payload.data(),
-                        static_cast<uint32_t>(payload.size()));
+  SendToHost(host, session->browser_id, opcode, payload);
+}
+
+void FlutterCefPlugin::SendToHost(Host* host, uint32_t browser_id,
+                                  uint8_t opcode,
+                                  const std::vector<uint8_t>& payload) {
+  if (!host->pipe) return;
+  if (host->pipe->SendFrame(browser_id, opcode, payload.data(),
+                            static_cast<uint32_t>(payload.size()))) {
+    return;
+  }
+  if (!host->pipe->write_failed()) {
+    // Not a dead pipe: a payload over the frame limit (64 MiB), dropped.
+    Log("dropped an outbound frame the pipe can't carry (opcode " +
+        std::to_string(opcode) + ", " + std::to_string(payload.size()) +
+        " bytes)");
+    return;
+  }
+  // Posted, not handled here: FailHost frees Sessions and the Host, and the
+  // caller may still hold either.
+  HostEvent e;
+  e.kind = HostEvent::Kind::kWriteFailed;
+  e.host_key = host->key;
+  e.generation = host->generation;
+  PostEvent(std::move(e));
 }
 
 // ---- agent control (P9) ----
@@ -1208,6 +1446,18 @@ void FlutterCefPlugin::EnableAgentControl(
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>& result) {
   Session* s = FindSession(args);
   Host* h = HostForSession(s);
+  if (s && s->spec.agent_control && h && !h->agent_control) {
+    // Asked for, but the view joined a profile (or group) whose cef_host was
+    // already running without it: the transport is fixed at spawn.
+    result->Error(
+        "agent_control_unavailable",
+        "this view was created with agentControl: true, but it joined a "
+        "profile whose cef_host was started without agent control (it is "
+        "fixed when the profile's first view starts the host). Give the "
+        "agent-controlled view its own profile, or create the profile's first "
+        "view with agentControl: true.");
+    return;
+  }
   if (!h || !h->agent_control || !h->cdp) {
     // macOS throws a PlatformException when the tile isn't agent-control mode.
     result->Error("no_agent_control",
@@ -1302,22 +1552,25 @@ void FlutterCefPlugin::HandleHostGone(const std::string& host_key,
   auto it = hosts_.find(host_key);
   if (it == hosts_.end()) return;
   Host* h = it->second.get();
-  // C1: a death event from a PRIOR host (posted during the reaper grace of a
-  // same-profile respawn) must not kill the freshly re-created host.
+  // A death event from a PRIOR host (posted during the reaper grace of a
+  // same-profile respawn) must not kill the freshly re-created host. (An
+  // expected death never gets here: TeardownHost erases the host first.)
   if (h->generation != generation) return;
-  if (h->closing) return;  // expected death (teardown in flight)
 
   unsigned long code = exit_code;
   if (!exit_code_known) {
-    // Pipe EOF: the process is (about to be) gone. Poll non-blocking (H18).
+    // Pipe EOF: the process is (about to be) gone. Poll non-blocking.
     code = h->process ? h->process->WaitForExit(0) : HostProcess::kStillRunning;
   }
-  // Exit code 2 after kOpLog "profile-locked" = profile already open elsewhere
-  // (main.mm:2786-2806, Swift:521). A host that died before kOpReady never
-  // created a browser: its sessions' creates failed, so consumers fall back at
-  // once instead of recreating on a host that can't start.
-  const std::string reason =
-      (code == 2) ? "locked" : (h->ready ? "crashed" : "createFailed");
+  // kOpLog "profile-locked" (then exit 2) = the profile is open elsewhere.
+  // The latch decides it: the EOF usually arrives while the process is still
+  // running down, before its exit code exists, and the kExited that follows
+  // finds the host already gone. A host that died before kOpReady otherwise
+  // never created a browser: its sessions' creates failed, so consumers fall
+  // back at once instead of recreating on a host that can't start.
+  const std::string reason = (h->profile_locked || code == 2) ? "locked"
+                             : h->ready                       ? "crashed"
+                                                              : "createFailed";
   Log("host gone for profile '" + host_key + "' (reason=" + reason + ")");
   FailHost(host_key, reason);
 }
@@ -1329,9 +1582,8 @@ void FlutterCefPlugin::HandleHostFrame(const std::string& host_key,
   auto it = hosts_.find(host_key);
   if (it == hosts_.end()) return;
   Host* h = it->second.get();
-  // C1: drop a frame from a PRIOR host of this same profile key.
+  // Drop a frame from a PRIOR host of this same profile key.
   if (h->generation != generation) return;
-  if (h->closing) return;
 
   // ---- process-level frames (browser_id 0) ----
   if (opcode == kOpReady) {
@@ -1351,17 +1603,35 @@ void FlutterCefPlugin::HandleHostFrame(const std::string& host_key,
     }
     h->ready = true;
     // Flush in order — each create's kOpCreateBrowser was queued before any of
-    // its follow-up verbs.
+    // its follow-up verbs. A queued create carries the size its session had
+    // when it was queued; the view may have been laid out again since (the
+    // host takes 1-3 s to start), so send the size it has NOW. The size gate
+    // expects that size, and a create at the old one would paint frames the
+    // gate rejects until the next resize.
     auto pending = std::move(h->pending_frames);
     h->pending_frames.clear();
     for (auto& f : pending) {
-      h->pipe->SendFrame(f.browser_id, f.opcode, f.payload.data(),
-                         static_cast<uint32_t>(f.payload.size()));
+      if (f.opcode == kOpCreateBrowser) {
+        auto bit = h->browsers.find(f.browser_id);
+        auto sit = bit == h->browsers.end() ? sessions_.end()
+                                            : sessions_.find(bit->second);
+        if (sit != sessions_.end()) {
+          const Session* live = sit->second.get();
+          policy::RewriteCreateSize(f.payload,
+                                    static_cast<uint32_t>(live->width),
+                                    static_cast<uint32_t>(live->height),
+                                    live->dpr);
+        }
+      }
+      SendToHost(h, f.browser_id, f.opcode, f.payload);
     }
     return;
   }
   if (opcode == kOpLog) {
-    Log("[cef_host:" + host_key + "] " + PayloadString(payload));
+    const std::string line = PayloadString(payload);
+    // Machine-parseable: the host found the profile locked and is exiting 2.
+    if (line == "profile-locked") h->profile_locked = true;
+    Log("[cef_host:" + host_key + "] " + line);
     return;
   }
 
@@ -1378,13 +1648,18 @@ void FlutterCefPlugin::HandleSessionFrame(
   const std::string& session_id = s->id;
   switch (opcode) {
     case kOpPresent:
-      // C1: any present retires the first-present watchdog (macOS
-      // firstPresentArrived), even a size-gated one.
-      if (!s->painted) {
-        s->painted = true;
-        CancelWatchdog(s);
+      // Only a PROMOTED present counts as painted: a frame the size gate
+      // rejected never reaches the texture, so a tile that only ever gets
+      // rejected frames is still blank, and the watchdog must keep saying so.
+      if (HandlePresent(s, payload)) {
+        ++s->present_count;
+        s->last_present_ms = GetTickCount64();
+        s->nudged_at_ms = 0;
+        if (!s->painted) {
+          s->painted = true;
+          CancelWatchdog(s);
+        }
       }
-      HandlePresent(s, payload);
       break;
     case kOpCursor:
       if (payload.size() >= 4) {
@@ -1437,6 +1712,7 @@ void FlutterCefPlugin::HandleSessionFrame(
       }
       break;
     case kOpPageStart:
+      s->dialogs_open = 0;  // a navigation dismisses the page's dialogs
       EmitEvent("pageStarted", session_id,
                 {{Ev("url"), flutter::EncodableValue(PayloadString(payload))}});
       break;
@@ -1469,6 +1745,10 @@ void FlutterCefPlugin::HandleSessionFrame(
       break;
     case kOpJsDialog: {
       if (payload.size() < 12) break;
+      // The renderer is blocked on this dialog until it is answered, so the
+      // liveness ping must not read it as hung.
+      ++s->dialogs_open;
+      s->ping_sent_ms = 0;
       const uint32_t msg_len = PayloadU32(payload, 8);
       const size_t msg_end =
           (std::min)(static_cast<size_t>(12) + msg_len, payload.size());
@@ -1486,11 +1766,23 @@ void FlutterCefPlugin::HandleSessionFrame(
                  {Ev("defaultText"), flutter::EncodableValue(def)}});
       break;
     }
-    case kOpEvalResult:
+    case kOpEvalResult: {
+      // The liveness sweep's ping ("<kPingId>:..."): proof the renderer runs
+      // script. Consumed here; Dart never issued it.
+      static const std::string kPingPrefix =
+          std::to_string(liveness::kPingId) + ":";
+      if (payload.size() >= kPingPrefix.size() &&
+          std::memcmp(payload.data(), kPingPrefix.data(), kPingPrefix.size()) ==
+              0) {
+        s->ping_replied_ms = GetTickCount64();
+        s->ping_sent_ms = 0;
+        break;
+      }
       EmitEvent("evalResult", session_id,
                 {{Ev("payload"),
                   flutter::EncodableValue(PayloadString(payload))}});
       break;
+    }
     case kOpChannelMsg:
       EmitEvent("channelMessage", session_id,
                 {{Ev("payload"),
@@ -1527,12 +1819,12 @@ void FlutterCefPlugin::HandleSessionFrame(
       break;
     case kOpCreated:
       // Browser is up (host-side create signal). Nothing to emit — Dart learns
-      // liveness from loadingState/present. cef_host registers a browser's slot
-      // only as it creates the browser, and drops a kOpSetVisible that arrives
-      // before that: a hide sent right after create (or flushed right behind
-      // it) was lost, and the page painted while hidden. Re-send it now that
-      // the slot exists. Platform thread, like the setVisible verb, so a later
-      // show still goes out after it.
+      // liveness from loadingState/present. cef_host holds ops that arrive
+      // before the browser binds and applies them in order once it does, so a
+      // hide sent right behind the create is already in effect. Re-sending
+      // the current visibility is harmless and covers a host from before
+      // that. Platform thread, like the setVisible verb, so a later show
+      // still goes out after it.
       if (!s->visible) SendOrQueue(s, kOpSetVisible, {uint8_t{0}});
       break;
     case kOpCreateFailed: {
@@ -1548,7 +1840,9 @@ void FlutterCefPlugin::HandleSessionFrame(
       break;
     }
     case kOpTargetId:
-      Log("kOpTargetId (agent control is post-slice) — dropped");
+      // Per-tile CDP target resolution isn't implemented on Windows (the relay
+      // is a single-tile passthrough), and the host never sends this.
+      Log("kOpTargetId — dropped");
       break;
     default:
       if (std::find(warned_opcodes_.begin(), warned_opcodes_.end(), opcode) ==
@@ -1563,20 +1857,16 @@ void FlutterCefPlugin::HandleSessionFrame(
   }
 }
 
-void FlutterCefPlugin::HandlePresent(Session* s,
+bool FlutterCefPlugin::HandlePresent(Session* s,
                                      const std::vector<uint8_t>& payload) {
   // WINDOWS kOpPresent: {u64 bridgeHandle BE}{u32 srcW BE}{u32 srcH BE} = 16
-  // bytes (PROTOCOL.md §2, LAW 10).
-  if (payload.size() < 16) return;
+  // bytes (PROTOCOL.md §2).
+  if (payload.size() < 16) return false;
   const uint64_t bridge_handle = ReadU64BE(payload.data());
   const uint32_t src_w = PayloadU32(payload, 8);
   const uint32_t src_h = PayloadU32(payload, 12);
 
-  const auto within_one = [](uint32_t a, uint32_t b) {
-    return (a > b ? a - b : b - a) <= 1;
-  };
-  if (!within_one(src_w, s->expected_pw) ||
-      !within_one(src_h, s->expected_ph)) {
+  if (!policy::SizeGatePasses(src_w, src_h, s->expected_pw, s->expected_ph)) {
     if (++s->gate_misses <= 5 || s->gate_misses % 60 == 0) {
       char buf[128];
       _snprintf_s(buf, _TRUNCATE,
@@ -1585,13 +1875,13 @@ void FlutterCefPlugin::HandlePresent(Session* s,
                   s->gate_misses);
       Log(buf);
     }
-    return;
+    return false;
   }
 
   bool handle_changed = false;
   if (!texture_bridge_->Present(s->texture_id, bridge_handle, src_w, src_h,
                                 &handle_changed)) {
-    return;
+    return false;
   }
   if (handle_changed) {
     s->current_handle = bridge_handle;
@@ -1603,6 +1893,7 @@ void FlutterCefPlugin::HandlePresent(Session* s,
                {Ev("height"),
                 flutter::EncodableValue(static_cast<int64_t>(src_h))}});
   }
+  return true;
 }
 
 // ---- host exe / profile dir resolution ----
@@ -1740,14 +2031,13 @@ void FlutterCefPlugin::SweepStaleEphemeralProfiles() {
   FindClose(h);
 }
 
-// ---- C1 first-present watchdog (platform thread) ----
+// ---- first-present watchdog (platform thread) ----
 
 void FlutterCefPlugin::ArmWatchdog(Session* session) {
   if (!session || !message_window_ || session->painted ||
       session->watchdog_active)
     return;
   if (session->watchdog_id == 0) session->watchdog_id = next_timer_id_++;
-  session->watchdog_phase = 0;
   session->watchdog_active = true;
   // Periodic WM_TIMER delivered to MsgWndProc on this (platform) thread; fires
   // every grace until a present arrives or teardown.
@@ -1772,22 +2062,108 @@ void FlutterCefPlugin::OnWatchdogTimer(UINT_PTR timer_id) {
     if (message_window_) KillTimer(message_window_, timer_id);  // orphan
     return;
   }
-  if (s->painted || !s->visible) {
+  if (s->painted || !s->visible || s->frozen) {
     CancelWatchdog(s);
     return;
   }
-  if (s->watchdog_phase == 0) {
-    // First grace elapsed with no present — cheap re-kick, then wait one more
-    // grace before declaring a stall (macOS checkFirstPresent opInvalidate).
-    SendOrQueue(s, kOpInvalidate, {});
-    s->watchdog_phase = 1;
+  // A grace elapsed with no promoted present: a cheap re-kick (harmless if
+  // the page is merely slow) and a paintStalled report — a REPEATING signal,
+  // re-sent every grace until the tile paints, so the consumer owns recovery.
+  // Same cadence as macOS checkFirstPresent. Event shape = {sessionId} only.
+  SendOrQueue(s, kOpInvalidate, {});
+  EmitEvent("paintStalled", s->id, {});
+}
+
+// ---- steady-state liveness sweep (platform thread) ----
+//
+// The first-present watchdog retires at a tile's first frame, so a renderer
+// that hangs later, inside a host whose pipe stays up, froze the tile with no
+// signal. This sweep (a port of CefProfileHost's) covers the steady state.
+// Staleness alone isn't a hang — a static page idles without frames — so a
+// stale tile is nudged with a repaint and its renderer pinged with an eval
+// under liveness::kPingId, an id Dart never issues. A healthy page answers
+// the ping; a renderer that leaves it unanswered for FLUTTER_CEF_HANG_MS is
+// hung, and its host is ended so every tile on it reports processGone
+// ("crashed") and recovers. GPU-process replacement, which macOS also checks,
+// is not detected here.
+
+void FlutterCefPlugin::EnsureLivenessTimer() {
+  if (liveness_timer_active_ || !message_window_) return;
+  SetTimer(message_window_, kLivenessTimerId, kLivenessSweepMs, nullptr);
+  liveness_timer_active_ = true;
+}
+
+void FlutterCefPlugin::OnLivenessTimer() {
+  if (sessions_.empty()) {
+    if (message_window_) KillTimer(message_window_, kLivenessTimerId);
+    liveness_timer_active_ = false;
     return;
   }
-  // Still blank after the re-kick grace: surface paintStalled (a REPEATING
-  // signal; macOS re-arms the same way, CefProfileHost.swift:756-764). Event
-  // shape = {sessionId} only.
-  EmitEvent("paintStalled", s->id, {});
-  SendOrQueue(s, kOpInvalidate, {});
+  const uint64_t now = GetTickCount64();
+  const uint64_t stale_ms = LivenessStalenessMs();
+  const uint64_t hang_ms = LivenessHangMs();
+  const auto ns = [](uint64_t ms) { return ms * 1000000ull; };
+  std::set<std::string> hung_hosts;
+  for (auto& kv : sessions_) {
+    Session* s = kv.second.get();
+    // Frozen tiles have no browser, and the first-present watchdog owns tiles
+    // that haven't painted.
+    if (s->frozen || !s->painted) continue;
+    Host* h = HostForSession(s);
+    if (!h || !h->ready) continue;
+    if (!s->visible) {
+      // Hidden tiles legitimately present nothing; a ping sent before the
+      // hide says nothing about them now.
+      s->ping_sent_ms = 0;
+      continue;
+    }
+    // A CDP client (agent control) can pause the page in its debugger, like
+    // DevTools, so such tiles aren't pinged.
+    const bool may_ping =
+        liveness::MayPing(s->dialogs_open, s->devtools_opened, h->agent_control);
+    if (!may_ping) s->ping_sent_ms = 0;
+    // A renderer that left the ping unanswered this long is hung. The nudge
+    // can't tell: the host re-presents its last frame even for a hung
+    // renderer.
+    if (liveness::Ping(ns(now), ns(s->ping_sent_ms), ns(s->ping_replied_ms),
+                       ns(stale_ms), ns(hang_ms)) == liveness::PingAction::kHung) {
+      hung_hosts.insert(s->host_key);
+      continue;
+    }
+    const bool nudged = s->nudged_at_ms != 0;
+    const liveness::Action action = liveness::Evaluate(
+        ns(now - s->last_present_ms), ns(stale_ms), nudged,
+        nudged ? ns(now - s->nudged_at_ms) : 0, ns(kLivenessNudgeGraceMs));
+    if (action != liveness::Action::kNudge) {
+      // kHealthy, or kDeclareStalled: stale and nudged with no frame since.
+      // For a tile that has painted that is a static page, healthy; a hung
+      // renderer is caught by the ping above instead. Leave the nudge set so
+      // it isn't re-sent every sweep; the next present clears it.
+      continue;
+    }
+    SendOrQueue(s, kOpInvalidate, {});
+    s->nudged_at_ms = now;
+    // Ping at most once per staleness window: a static page answers it.
+    if (may_ping &&
+        liveness::Ping(ns(now), ns(s->ping_sent_ms), ns(s->ping_replied_ms),
+                       ns(stale_ms), ns(hang_ms)) ==
+            liveness::PingAction::kPing) {
+      std::vector<uint8_t> p;
+      AppendU32(p, liveness::kPingId);
+      AppendUtf8(p, "1");
+      s->ping_sent_ms = now;
+      SendOrQueue(s, kOpEvalReturning, std::move(p));
+    }
+  }
+  // Outside the loop: FailHost erases sessions.
+  for (const auto& key : hung_hosts) {
+    auto it = hosts_.find(key);
+    if (it == hosts_.end()) continue;
+    Log("host '" + key + "': a renderer left a liveness ping unanswered for " +
+        std::to_string(hang_ms / 1000) + "s — ending the host");
+    if (it->second->process) it->second->process->Terminate();
+    FailHost(key, "crashed");
+  }
 }
 
 }  // namespace flutter_cef
