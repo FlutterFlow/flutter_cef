@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-constexpr uint8_t kCefHostProtocolVersion = 9;
+constexpr uint8_t kCefHostProtocolVersion = 10;
 
 // ---- cef_host -> plugin ----
 // {u32 iosurfaceId}{u32 srcW}{u32 srcH}: a frame was presented. srcW/srcH are
@@ -66,6 +66,9 @@ constexpr uint8_t kOpMediaState = 0x1f;
 // {u32 id}{utf8 json} right-click: Chromium's menu model and params, for the
 // plugin's consumer to draw; answer with kOpContextMenuCommand
 constexpr uint8_t kOpContextMenu = 0x40;
+// {utf8 reason} this one browser can't continue (its renderer keeps crashing);
+// the process survives and the plugin drops the session
+constexpr uint8_t kOpBrowserGone = 0x42;
 
 // ---- plugin -> cef_host ----
 // {u8 type}{u8 button}{u8 clickCount}{u8 pad}{u32 modifiers}{f64 x}{f64 y}{f64

@@ -150,7 +150,7 @@ Protocol version 5. Payload integers are big-endian.
 | 0x3f | kOpSetAuthoredHtml | {utf8 baseUrl}\0{utf8 html}: store-only; serve html as the main-frame response for exactly baseUrl (empty html clears it). The load is a following kOpCreateBrowser or kOpLoadTrusted for that URL |
 | 0x41 | kOpSetDocumentStart | ({u8 kind}{u32 len}{utf8})*, kind 0 = JS channel name, 1 = script (document_start.h): store-only, for the browser created right behind it |
 
-macOS only, never reuse on Windows: 0x1e kOpMediaRequest, 0x1f kOpMediaState, 0x40 kOpContextMenu, 0x39 kOpOpenAuthWindow, 0x3c kOpMediaResponse, 0x3d kOpSetMediaSetting, 0x3e kOpContextMenuCommand.
+macOS only, never reuse on Windows: 0x1e kOpMediaRequest, 0x1f kOpMediaState, 0x40 kOpContextMenu, 0x42 kOpBrowserGone, 0x39 kOpOpenAuthWindow, 0x3c kOpMediaResponse, 0x3d kOpSetMediaSetting, 0x3e kOpContextMenuCommand.
 
 <!-- END GENERATED OPCODES -->
 

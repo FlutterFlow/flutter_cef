@@ -35,17 +35,53 @@
 * **macOS: a view that can never paint again is reported**: when the GPU
   process died (it does under memory pressure), Chromium relaunched it but the
   view stayed frozen for good with no event. A hung renderer was likewise taken
-  for an idle page. The plugin now ends such a host, so its sessions get
-  `onProcessGone('crashed')` and the consumer recreates them the way it
-  recovers from a crash. A GPU process that started after the host's first
-  frame counts as a replacement; a renderer that leaves a JS ping unanswered
-  for 15 s (`FLUTTER_CEF_HANG_MS`) while not painting counts as hung. Idle
-  static pages answer the ping and are left alone. Windows now has the hung
-  renderer check, but not the GPU-process one.
+  for an idle page. The plugin now reports `onProcessGone('crashed')` and the
+  consumer recreates the view the way it recovers from a crash: to every
+  session on the host for a replaced GPU process, and for a hung renderer to
+  that view's session alone on macOS (on Windows, to every session on its
+  host). A GPU process other than the one that drew the host's first frame
+  counts as a replacement; a renderer that leaves a ping unanswered for 15 s
+  (`FLUTTER_CEF_HANG_MS`) while not painting counts as hung. On macOS the
+  renderer answers the ping itself, so page script can't make it look hung.
+  Idle static pages are left alone. Windows now has the hung renderer check,
+  but not the GPU-process one.
 * **The hang check leaves paused pages alone**: a page waiting on a JS dialog, or
   one that may be paused in a debugger (DevTools opened, CDP or agent control
   enabled), can't answer the ping but isn't hung, and is no longer ended as
   `crashed`.
+* **macOS: one page can't take down the other views on its host**:
+  * a renderer that keeps crashing ends its own view
+    (`onProcessGone('crashed')`); `cef_host` exits only when several views
+    crash-loop at once. One crash-looping page used to end every view on the
+    host.
+  * page-sized data is capped: a JS-channel message or
+    `runJavaScriptReturningResult` result over 16 MB is refused (the result
+    fails with `result too large`), and console, dialog and context-menu text
+    is cut at 1 MB. A page that logged a 64 MB string made the plugin drop the
+    host.
+  * a page can't answer a `runJavaScriptReturningResult` call it didn't run:
+    each call's reply carries a nonce the page never sees.
+* **macOS: sign-in popups close with their view**: a popup stayed open after
+  the view that opened it was disposed, and one closed by its own page
+  (`window.close()`) stayed on screen empty. Nested popups get their own
+  window. The auth window is held to the scheme allowlist and a user gesture.
+* **macOS: a `cef_host` stuck at shutdown exits**, 6 s after shutdown starts
+  (30 s once CEF is tearing down), so its profile lock is released. It now
+  closes every browser before shutting CEF down. A host started without
+  `--ipc`, or that can't connect, exits 1; one that can't open its profile lock
+  reports that and exits 3 instead of claiming the profile is `locked`.
+* **macOS: a view that would join a host with weaker settings is refused**:
+  `create()` and `thaw()` on a named profile or host group whose running host
+  allows schemes the view didn't allow, or has a CDP port the view didn't ask
+  for, fail with `host_config_mismatch` instead of running on the host's
+  settings. Profile names starting with `~` are reserved (`bad_args`).
+* **macOS agent control**: enabling it on a view that is disposed meanwhile no
+  longer leaves a CDP listener behind; command ids stay unique on a host that
+  has created many browsers; and an agent that reconnects no longer gets
+  responses meant for the previous connection.
+* **macOS**: `FLUTTER_CEF_DEBUG`'s Chromium log goes to a per-process file in
+  the user's temp dir, not the shared `/tmp/cef_host_chromium.log`. Wire
+  protocol v10.
 * **macOS: a named profile reopened at once is no longer reported `locked`**:
   closing a profile's last view shuts its host down, and the next host of that
   profile could start before the old one let go of the profile's lock. The

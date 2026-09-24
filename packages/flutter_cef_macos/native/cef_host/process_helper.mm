@@ -27,6 +27,7 @@
 #include <map>
 
 #include "document_start.h"
+#include "renderer_messages.h"
 
 namespace {
 
@@ -104,6 +105,14 @@ class HelperApp : public CefApp, public CefRenderProcessHandler {
                                 CefRefPtr<CefFrame> frame,
                                 CefProcessId source_process,
                                 CefRefPtr<CefProcessMessage> message) override {
+    // The liveness ping: answered from this (the renderer's main) thread, which
+    // a hung page or renderer never gets back to.
+    if (message->GetName().ToString() == renderer_messages::kPing) {
+      if (frame)
+        frame->SendProcessMessage(
+            PID_BROWSER, CefProcessMessage::Create(renderer_messages::kPong));
+      return true;
+    }
     return router_ && router_->OnProcessMessageReceived(browser, frame,
                                                         source_process, message);
   }
