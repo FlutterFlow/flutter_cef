@@ -32,4 +32,10 @@ void ApplyBlankFirstNav(const std::shared_ptr<Slot>& slot);
 // render_handler.mm. UI thread.
 void PumpBeginFrame(uint32_t wire_id);
 
+// Creates and at once closes a browser so that no tile's view gets begin-frame
+// source id 0, which can leave a new tile unpainted (see render_handler.mm).
+// Only the first call does anything; DoCreateBrowser makes it before creating
+// each tile. UI thread.
+void ClaimFirstBeginFrameSource();
+
 }  // namespace cef_host

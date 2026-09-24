@@ -12,8 +12,10 @@
 #include <vector>
 
 #include "include/base/cef_callback.h"
+#include "include/cef_life_span_handler.h"
 #include "include/cef_task.h"
 #include "include/wrapper/cef_closure_task.h"
+#include "include/wrapper/cef_helpers.h"
 #include "ipc.h"
 
 namespace cef_host {
@@ -40,6 +42,71 @@ void PumpBeginFrame(uint32_t wire_id) {
                          " visible=" + std::to_string(slot->visible ? 1 : 0));
   CefPostDelayedTask(TID_UI, base::BindOnce(&PumpBeginFrame, wire_id),
                      slot->visible ? slot->pump_interval_ms : 100);
+}
+
+namespace {
+
+// The browser ClaimFirstBeginFrameSource creates: it only has to exist long
+// enough for CEF to build its view, and it never paints.
+class FirstSourceClaim : public CefClient,
+                         public CefRenderHandler,
+                         public CefLifeSpanHandler {
+ public:
+  CefRefPtr<CefRenderHandler> GetRenderHandler() override { return this; }
+  CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
+  // CEF asks for the view rect as it builds the browser's view, which is when
+  // the view takes its begin-frame source id.
+  void GetViewRect(CefRefPtr<CefBrowser> browser, CefRect& rect) override {
+    view_built = true;
+    rect = CefRect(0, 0, 1, 1);
+  }
+  void OnPaint(CefRefPtr<CefBrowser> browser, PaintElementType type,
+               const RectList& dirty_rects, const void* buffer, int width,
+               int height) override {}
+  void OnBeforeClose(CefRefPtr<CefBrowser> browser) override {
+    NoteBrowserClosed();
+  }
+  bool view_built = false;
+
+ private:
+  IMPLEMENT_REFCOUNTING(FirstSourceClaim);
+};
+
+}  // namespace
+
+// Each off-screen view numbers its begin frames with a source id taken from a
+// process-wide counter, so the first view built in this process gets 0. In viz,
+// a new view's begin-frame source starts out treating 0 as its own id until the
+// view's first SendExternalBeginFrame arrives. Until then it records every frame
+// sink that begins a source-0 frame and waits for each to finish. If the id-0
+// view is producing a frame at the moment the new view's first begin frame
+// lands, the new source switches to its real id, the finish of that frame no
+// longer matches, and the source waits forever. Its first frame never
+// completes, so CEF drops every later SendExternalBeginFrame for that view and
+// it never paints. This happens to some tiles created while the first tile on
+// the host animates. A browser created here, before the first tile, takes id 0
+// and is closed at once, so no pumped view has it.
+void ClaimFirstBeginFrameSource() {
+  CEF_REQUIRE_UI_THREAD();
+  static bool claimed = false;
+  if (claimed) return;
+  claimed = true;
+  CefWindowInfo window_info;
+  window_info.SetAsWindowless(0);
+  // Never pumped, so it never produces a frame.
+  window_info.external_begin_frame_enabled = true;
+  CefRefPtr<FirstSourceClaim> claim = new FirstSourceClaim();
+  CefRefPtr<CefBrowser> browser = CefBrowserHost::CreateBrowserSync(
+      window_info, claim, "about:blank", CefBrowserSettings(), nullptr,
+      nullptr);
+  if (!browser) {
+    SendLog(0, "could not create the begin-frame placeholder browser");
+    return;
+  }
+  ++g_open_browsers;  // until its OnBeforeClose
+  if (!claim->view_built)
+    SendLog(0, "begin-frame placeholder browser has no view yet");
+  browser->GetHost()->CloseBrowser(true);
 }
 
 void ApplyBlankFirstNav(const std::shared_ptr<Slot>& slot) {

@@ -207,6 +207,10 @@
   returns false and `setAudioMuted` / `setFrameInterval` do nothing there;
   `sessionStats()` throws rather than answering null, which means "no such
   session".
+* **A new view on a warm macOS host paints**: up to one view in five created
+  while the host's first view was animating never painted, because of a race
+  in Chromium's begin-frame handling. `cef_host` now avoids it (see
+  `packages/flutter_cef_macos/CHANGELOG.md`).
 * Docs: cookies live in the host's jar, shared per profile or host group (not
   a process-wide store), and `clearCookies` signs out every view on it.
 

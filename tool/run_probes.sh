@@ -50,6 +50,7 @@ PROBES=(
   "relay_isolation|relay_isolation_probe|180|default|-|an agent can't reach a sibling tile over CDP"
   "samesite|samesite_probe|120|default|-|setCookie stores Secure / HttpOnly / SameSite"
   "surface_handoff|surface_handoff_probe|120|default|-|frames arrive over a Mach port, not a global IOSurface"
+  "warm_host_paint|warm_host_paint_probe|240|default|-|a second view on a warm shared host paints"
   "wedge_recovery|wedge_recovery_probe|400|default|-|a wedged renderer is recovered without killing healthy tiles"
   "host_robustness|host_robustness_probe|480|default|-|one page can't take down the other tiles on its host"
   "alert|alert_probe|90|default|-|answering a JS alert unblocks the page"
