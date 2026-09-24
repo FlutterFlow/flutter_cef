@@ -87,7 +87,7 @@ bool NoteCrashBurstAndCheckHostLoop(uint32_t wire_id,
 struct Slot {
   uint32_t browser_id = 0;  // Swift-assigned wire id (>=1); NOT GetIdentifier().
   CefRefPtr<CefBrowser> browser;
-  // H3 async-create dispose-loss guard: a dispose arriving while the async
+  // Async-create dispose-loss guard: a dispose arriving while the async
   // CreateBrowser is still in flight (browser == null) can't CloseBrowser yet, so it
   // records intent here and OnAfterCreated honors it the instant the browser binds —
   // otherwise that browser is a live orphan (renderer + IOSurface) nothing reclaims
@@ -178,11 +178,11 @@ struct Slot {
   std::map<uint32_t, CefRefPtr<CefJSDialogCallback>> dialogs;
   uint32_t dialog_next = 1;
 
-  // CEF-2b: registration for the DevTools message observer used to resolve this
+  // Registration for the DevTools message observer used to resolve this
   // browser's CDP targetId (Target.getTargetInfo). Kept alive for the slot's life;
   // UI-thread only. Lazily set on the first kOpResolveTargetId.
   CefRefPtr<CefRegistration> devtools_reg;
-  // CEF-2b: the DevTools message id of the LAST Target.getTargetInfo probe on this
+  // The DevTools message id of the LAST Target.getTargetInfo probe on this
   // browser. A FRESH, monotonically-increasing id per probe (seeded to
   // kTargetInfoMsgId) — Chromium's DevTools session requires increasing command ids,
   // so reusing a fixed id silently drops the 2nd+ probe, which hung a re-enable of
@@ -203,7 +203,7 @@ struct Slot {
   // consumer can drop an unengaged tile to ~30fps without touching hidden
   // gating. UI-thread only, like `visible`.
   int pump_interval_ms = 16;
-  // F-1/F-2: a dpr/screen-info change that lands while the slot is HIDDEN is deferred —
+  // A dpr/screen-info change that lands while the slot is HIDDEN is deferred —
   // the begin-frame pump is gated off while hidden, so notifying + painting now would
   // composite into a surface nothing displays and mislead the Swift resize watchdog into
   // promoting a never-painted buffer. DoResize sets this while hidden; DoSetVisible's

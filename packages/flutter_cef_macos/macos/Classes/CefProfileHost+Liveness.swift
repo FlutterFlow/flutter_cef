@@ -4,7 +4,7 @@
 import Foundation
 
 extension CefProfileHost {
-  // ── F-6: steady-state liveness watchdog ─────────────────────────────────────────────
+  // ── Steady-state liveness watchdog ──────────────────────────────────────────────────
   // The first-paint watchdog RETIRES at first paint (firstPresentArrived), so a
   // browser that painted ≥1 frame then WEDGES (renderer/GPU stall inside a shared host
   // that keeps the pipe alive, so no processGone) had NO detector — silent blank until
@@ -135,7 +135,7 @@ extension CefProfileHost {
           // in one session). A converged idle tile is healthy by definition; we keep serving its
           // last good frame. Do NOT recreate. (Never-painted tiles are owned by the separate
           // first-paint watchdog via firstPresentPending; genuine renderer death is caught by
-          // OnRenderProcessTerminated; eviction-while-hidden by the F-1 un-hide repaint.) Leave
+          // OnRenderProcessTerminated; eviction-while-hidden by the native un-hide repaint.) Leave
           // nudgedAt set so we don't re-nudge every cycle; a real future repaint clears it.
           //
           // A VISIBLE renderer that HANGS post-establishment (a deadlock that keeps the process

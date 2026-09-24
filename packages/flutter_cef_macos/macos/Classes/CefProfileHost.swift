@@ -74,7 +74,7 @@ final class CefProfileHost {
   // (HostConfigPolicy). Set in spawn() on the main thread, read there too.
   var allowedSchemes = ""
 
-  // Agent-control / pipe mode (CEF-1). When true, cef_host was launched via
+  // Agent-control / pipe mode. When true, cef_host was launched via
   // posix_spawn so it inherits two CDP pipes (child reads CDP on fd 3, writes on
   // fd 4) and was passed --cdp-pipe; the Chromium "remote-debugging-pipe" switch
   // makes it speak NUL-delimited JSON over those fds instead of a TCP port. Off
@@ -94,9 +94,9 @@ final class CefProfileHost {
   let cdpReaderDone = DispatchSemaphore(value: 0)
   // Invoked (off the CDP reader thread) for each complete CDP message (one
   // NUL-delimited UTF-8 JSON line, NUL stripped). Set by the plugin/relay; the
-  // CEF-1 validation hook installs a temporary one to prove the round-trip.
+  // debug validation hook installs a temporary one to prove the round-trip.
   var onCdpMessage: ((String) -> Void)?
-  // CEF-2a/b: the token-gated localhost CDP relays (created lazily by
+  // The token-gated localhost CDP relays (created lazily by
   // enableAgentControl()). Each bridges a CDP client's WebSocket ⇄ this host's pipe
   // and is scoped to ONE browser's CDP target. Keyed by the wire browserId so N
   // tiles in the same shared cef_host can be agent-controlled concurrently — they
@@ -113,9 +113,9 @@ final class CefProfileHost {
   var cdpClosed = false
   // The CDP command ids every relay on this host's pipe uses.
   let cdpPipeIds = CdpPipeIds()
-  // Guards onCdpMessage and cdpRelays. CEF-2a/b mutates onCdpMessage LIVE (enable/
+  // Guards onCdpMessage and cdpRelays. Agent control mutates onCdpMessage LIVE (enable/
   // disable on the main thread) while the CDP reader thread reads it per message,
-  // so — unlike CEF-1, which only set it before the reader started — both must be
+  // so — unlike the debug validation hook, set before the reader starts — both must be
   // synchronized. A plain closure property is a fat (ptr+context) value; a concurrent
   // read during a write can tear it and call into freed context.
   let cdpHandlerLock = NSLock()
@@ -149,7 +149,7 @@ final class CefProfileHost {
   let writeLock = NSLock()
   var pendingFrames: [[UInt8]] = []  // queued until the pipe connects
   var running = false
-  // C1: set true (under writeLock) when the host dies unexpectedly — reader EOF
+  // Set true (under writeLock) when the host dies unexpectedly — reader EOF
   // while running, or a writeAll to a dead pipe. Distinct from `running=false`
   // (clean shutdown()): `crashed` stops the pacer, the sweeps and agent control
   // on a dead host.
@@ -165,7 +165,7 @@ final class CefProfileHost {
   var browsers: [UInt32: CefWebSession] = [:]
   var nextBrowserId: UInt32 = 1
   var ready = false
-  // The host refused its named profile at kOpReady (ad-hoc build, see F.5): it
+  // The host refused its named profile at kOpReady (ad-hoc build): it
   // never becomes ready, so a create that lands before the plugin moves the
   // sessions off it stays queued instead of loading the profile.
   var refused = false
@@ -205,13 +205,13 @@ final class CefProfileHost {
               // heavy real site that's slow to composite isn't de-serialized prematurely.
   }()
 
-  // C1 first-present watchdog (guarded by presentLock). browserIds awaiting their FIRST
+  // First-present watchdog (guarded by presentLock). browserIds awaiting their FIRST
   // kOpPresent: if none arrives within the deadline we re-kick via kOpInvalidate, then (if
   // still blank) surface paintStalled to Dart — converting a silent never-painted tile
   // into self-healing-or-signalled.
   let presentLock = NSLock()
   var firstPresentPending: Set<UInt32> = []
-  // C1: browsers the host has hidden (WasHidden(true) via kOpSetVisible). A hidden CEF
+  // Browsers the host has hidden (WasHidden(true) via kOpSetVisible). A hidden CEF
   // browser stops producing frames entirely, so it legitimately never sends kOpPresent —
   // the watchdog must NOT treat that as a stall (work_canvas creates tiles already
   // off-screen as a normal lazy-spawn pattern). Guarded by presentLock.
@@ -257,7 +257,7 @@ final class CefProfileHost {
     return 0.4
   }()
 
-  // F-6 steady-state liveness sweep (CefProfileHost+Liveness.swift).
+  // Steady-state liveness sweep (CefProfileHost+Liveness.swift).
   let livenessStalenessNs: UInt64 = {
     if let s = ProcessInfo.processInfo.environment["FLUTTER_CEF_LIVENESS_MS"],
        let ms = Double(s), ms > 0 { return UInt64(ms * 1_000_000) }
@@ -289,7 +289,7 @@ final class CefProfileHost {
   // racing a read on another thread can tear it.
   //
   // Invoked (off the reader thread) when an ad-hoc host refuses to load a named
-  // profile (no creds were written — see F.5). The plugin tears this host down
+  // profile (no creds were written). The plugin tears this host down
   // and moves every session on it to an ephemeral host of its own.
   var onInsecureProfileRefused: (() -> Void)?
 
@@ -301,19 +301,19 @@ final class CefProfileHost {
   // mismatched binary and loop.
   var onProtocolMismatch: ((UInt8) -> Void)?
 
-  // C1: invoked ON THE MAIN THREAD when the reader loop exits UNEXPECTEDLY
+  // Invoked ON THE MAIN THREAD when the reader loop exits UNEXPECTEDLY
   // (cef_host died: EOF/ECONNRESET while running, or a writeAll to a dead pipe)
   // — NOT on a clean shutdown(). Carries the process exit status so the plugin
-  // can distinguish a cache-lock loss (status 2 — see the C2 cross-group
-  // contract) from a generic crash, emit `processGone` to Dart, and drop the
+  // can distinguish a cache-lock loss (status 2: another process holds the
+  // profile) from a generic crash, emit `processGone` to Dart, and drop the
   // host so the profile_in_use guard unblocks. Fires at most once per host.
   var onHostDied: ((Int32) -> Void)?
   var diedFired = false  // guarded by writeLock; one onHostDied per host
 
   // One browser can't continue while the host is otherwise fine — its create
   // failed ("createFailed"), its renderer kept crashing or hung ("crashed") — so
-  // the plugin drops that one session and emits processGone(reason) for it. C1: a
-  // browser never painted its first frame despite a re-kick — the plugin surfaces
+  // the plugin drops that one session and emits processGone(reason) for it. If a
+  // browser never painted its first frame despite a re-kick, the plugin surfaces
   // paintStalled so the consumer can recover (e.g. recreate the view) instead of
   // staring at a silent blank tile. Both carry the wire browserId; invoked off the
   // reader / a timer thread.
@@ -332,7 +332,7 @@ final class CefProfileHost {
   /// the current geometry, so replaying the resize could reference a since-freed
   /// IOSurface id.
   func send(_ browserId: UInt32, _ op: UInt8, _ payload: [UInt8]) {
-    // C1: peek visibility so the first-present watchdog doesn't flag an intentionally
+    // Peek visibility so the first-present watchdog doesn't flag an intentionally
     // hidden (WasHidden) browser as stalled — it produces no frames by design.
     if op == CefOp.setVisible, let v = payload.first {
       noteVisibility(browserId, visible: v != 0)
@@ -350,7 +350,7 @@ final class CefProfileHost {
     }
     let ok = frame.withUnsafeBytes { writeAll(connFd, $0.baseAddress!, frame.count) }
     writeLock.unlock()
-    // H2: a failed write means the pipe is dead — until now the return was
+    // A failed write means the pipe is dead — until now the return was
     // discarded and a dead pipe was indistinguishable from success. Surface it
     // (unlocked first: handleHostDeath re-takes writeLock).
     if !ok { handleHostDeath() }
@@ -367,7 +367,7 @@ final class CefProfileHost {
   /// Close ONE browser (kOpDisposeBrowser) and unregister it under lock. Returns
   /// the number of browsers still registered on this host afterward.
   func removeBrowser(_ browserId: UInt32) -> Int {
-    // CEF-2b: if this tile was agent-controlled, tear down ITS relay (its scoped
+    // If this tile was agent-controlled, tear down ITS relay (its scoped
     // targetId is now dead) BEFORE disposing the browser — disableAgentControl is
     // a no-op when there's no relay for this id. Does its own locking + stops the
     // relay outside cdpHandlerLock.
@@ -387,7 +387,7 @@ final class CefProfileHost {
     writeLock.lock()
     createEnqueued.remove(browserId)
     writeLock.unlock()
-    // C1: drop any watchdog/visibility bookkeeping for the gone browser so the sets
+    // Drop any watchdog/visibility bookkeeping for the gone browser so the sets
     // don't grow across a long session of tile churn.
     presentLock.lock()
     firstPresentPending.remove(browserId)
@@ -416,10 +416,10 @@ final class CefProfileHost {
     // fds): this is a CLEAN teardown, so neither the reader's read-EOF nor a
     // failed kOpShutdown write should be mistaken for a crash — handleHostDeath()
     // guards on `running`, so flipping it false here keeps onHostDied from firing
-    // on the shutdown path (C1).
+    // on the shutdown path.
     writeLock.lock()
     running = false
-    // H6: abandon any paced creates so a stuck pacer can't wedge a reused host and
+    // Abandon any paced creates so a stuck pacer can't wedge a reused host and
     // queued-never-sent sessions don't linger. The browsers map still holds them, so
     // disposeSession/onHostDied path cleans them up.
     createSendQueue.removeAll()
@@ -428,7 +428,7 @@ final class CefProfileHost {
     // kOpReady tears down all THREE create-state queues symmetrically.
     pendingCreates.removeAll()
     writeLock.unlock()
-    // CEF-2a/b: drop ALL relays (each a listener + any client) before tearing down
+    // Drop ALL relays (each a listener + any client) before tearing down
     // the pipe, so none keeps bridging into a closing fd. Snapshot under the lock,
     // clear the dict + onCdpMessage, then stop each OUTSIDE the lock (stop() may
     // block briefly on a stuck client and takes the relay's own locks).
@@ -447,7 +447,7 @@ final class CefProfileHost {
     // which Swift would otherwise resolve this unqualified call to. Not the
     // listening socket: on Darwin that fails with ENOTCONN and wakes nothing.
     if c >= 0 { Darwin.shutdown(c, SHUT_RDWR) }
-    // H1: gate the join on `readerStarted` ALONE (not the old `wasRunning`). The
+    // Gate the join on `readerStarted` ALONE (not the old `wasRunning`). The
     // semaphore is level-triggered — if the reader already exited (e.g. it drove the
     // crash path and signalled readerDone before this runs), wait() returns at once.
     // Gating on `wasRunning` could SKIP the join while the reader is still blocked in
@@ -486,7 +486,7 @@ final class CefProfileHost {
         try? FileManager.default.removeItem(atPath: dir)
       }
     }
-    // H1: same discipline for the CDP reader — gate on cdpReaderStarted alone, and
+    // Same discipline for the CDP reader — gate on cdpReaderStarted alone, and
     // never close the read fd on a join timeout (the reader is still in read() on it).
     let cdpJoined = !cdpReaderStarted || cdpReaderDone.wait(timeout: .now() + 2) == .success
     if cdpReadFd >= 0 { if cdpJoined { close(cdpReadFd) }; cdpReadFd = -1 }
@@ -496,7 +496,7 @@ final class CefProfileHost {
   /// paths: `process` (Foundation.Process, default) and `spawnedPid` (posix_spawn,
   /// agent-control). Idempotent — clears whichever handle it used.
   private func terminateProcess() {
-    // H5: take BOTH handles atomically under writeLock so this is the sole owner of
+    // Take BOTH handles atomically under writeLock so this is the sole owner of
     // its terminate/waitpid — handleHostDeath's reaper can't be reaping the same pid
     // concurrently (it took ownership the same way, or handed it back to us).
     writeLock.lock()

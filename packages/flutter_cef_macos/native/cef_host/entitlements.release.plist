@@ -31,10 +31,12 @@
   <!-- Bluetooth is load-bearing: caBLE / hybrid passkeys (WebAuthn cross-device)
        reach Web Bluetooth, so this stays even in the minimal release set. -->
   <key>com.apple.security.device.bluetooth</key><true/>
-  <!-- NOTE (auth spike): the on-device-passkey keychain-access-group lives in the
-       SEPARATE entitlements.browser.plist and is applied ONLY to the top-level
-       cef_host (browser) process at re-sign time. Helpers (renderer/GPU/utility)
-       do NOT do keychain work, so keeping the group out of this shared file means
-       they need no provisioning profile and won't be AMFI-killed. -->
+  <!-- No keychain-access-groups here. This one file signs cef_host AND every
+       helper (the post-build codesign in CMakeLists.txt, and
+       tool/bundle_cef_host.sh with a real identity), and a helper carrying that
+       group without a provisioning profile is AMFI-killed. Nothing in this repo
+       adds the on-device-passkey group: an app that needs it re-signs only its
+       bundled cef_host with its own entitlements and provisioning profile (see
+       build-cef-from-source.sh). -->
 </dict>
 </plist>

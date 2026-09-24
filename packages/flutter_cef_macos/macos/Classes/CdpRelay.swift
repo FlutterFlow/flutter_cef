@@ -2,10 +2,10 @@ import Foundation
 import CryptoKit
 import Security
 
-/// The token-gated, per-tile-scoped localhost CDP relay (CEF-2a transport + CEF-2b
-/// isolation). It re-exposes the CEF-1 CDP-over-pipe to a standard CDP client
-/// (`agent-browser`) as a loopback HTTP+WebSocket endpoint, confined (when scoped) to
-/// a single tile's CDP target — see the per-tile-isolation note below.
+/// The token-gated, per-tile-scoped localhost CDP relay. It re-exposes cef_host's
+/// CDP-over-pipe to a standard CDP client (`agent-browser`) as a loopback
+/// HTTP+WebSocket endpoint, confined (when scoped) to a single tile's CDP target —
+/// see the per-tile-isolation note below.
 ///
 /// Why a hand-rolled server (no SwiftNIO/Starscream): the security review demanded
 /// a minimal supply-chain surface, and the codebase already speaks raw BSD sockets
@@ -34,11 +34,11 @@ import Security
 /// Strictly better than raw Chrome's fixed, always-open, multi-client
 /// `--remote-debugging-port`.
 ///
-/// Per-tile isolation (CEF-2b): the CDP pipe is browser-wide, so when constructed
+/// Per-tile isolation: the CDP pipe is browser-wide, so when constructed
 /// with a `scopeTargetId` the relay applies a Target-domain filter that exposes the
 /// client ONLY that tile's target (and its sub-targets) — sibling tiles in the same
 /// shared-profile process are hidden and unreachable. Constructed without a scope it
-/// is a raw browser-level passthrough (CEF-2a; dev/test only).
+/// is a raw browser-level passthrough (dev/test only).
 final class CdpRelay {
   /// Forwards a CDP message (one JSON line) to cef_host over the pipe. Captures the
   /// host weakly so the host↔relay ownership (host strongly holds the relay) is not
@@ -54,7 +54,7 @@ final class CdpRelay {
   private var running = false
   private let stateLock = NSLock()
 
-  /// The single active ws client (CEF-2a supports one connection per relay; a
+  /// The single active ws client (one connection per relay; a
   /// second upgrade is rejected, avoiding any fd-replacement double-close race).
   /// Guarded by `clientLock`, which also serializes writes to it.
   private var clientFd: Int32 = -1
@@ -78,10 +78,10 @@ final class CdpRelay {
   /// or buggy client must not be able to make us allocate unbounded.
   private static let maxFrame = 64 << 20
 
-  // CEF-2b: per-tile isolation filter. When `scopeTargetId` is set, the relay
+  // Per-tile isolation filter. When `scopeTargetId` is set, the relay
   // exposes the client ONLY this CDP target (the opted-in tile) and its descendant
   // sub-targets — sibling tiles in the same shared-profile process are hidden. When
-  // nil, the relay is a raw browser-level passthrough (CEF-2a; dev-only). The CDP
+  // nil, the relay is a raw browser-level passthrough (dev-only). The CDP
   // pipe is browser-wide, so this filter is the per-tile security boundary.
   private let scopeTargetId: String?
   private var ourSessionId: String?            // learned from our target's attachedToTarget
@@ -92,7 +92,7 @@ final class CdpRelay {
   private var ourBrowserContextId: String?
   private let filterLock = NSLock()
 
-  // CEF-2b multiplex: N relays share ONE browser-wide pipe with ONE CDP id space.
+  // Multiplex: N relays share ONE browser-wide pipe with ONE CDP id space.
   // Session-routed traffic is demuxed by sessionId, but BROWSER-LEVEL commands
   // (no sessionId — Playwright's connect handshake) would collide. We rewrite
   // EVERY outgoing command id to a pipe id taken from the host's shared
@@ -103,7 +103,7 @@ final class CdpRelay {
   private let pipeIds: CdpPipeIds
   private var pipeIdToClientId: [Int: Int] = [:]
   private let multiplexLock = NSLock()
-  // H2: this relay's OWN Target.attachToTarget pipe id (used to learn our page's CDP
+  // This relay's OWN Target.attachToTarget pipe id (used to learn our page's CDP
   // session order-independently, instead of passively witnessing a fire-once
   // browser-wide attachedToTarget event we may register too late to see), plus the
   // client setAutoAttach ids to ack once we've attached. multiplexLock.
@@ -279,7 +279,7 @@ final class CdpRelay {
       close(fd); return
     }
 
-    // CEF-2a: one active client per relay. Reject a second concurrent upgrade
+    // One active client per relay. Reject a second concurrent upgrade
     // (avoids any fd-replacement double-close race); the slot frees on disconnect.
     clientLock.lock()
     if clientFd >= 0 {
@@ -311,7 +311,7 @@ final class CdpRelay {
     if owned { clientFd = -1 }
     clientLock.unlock()
     if owned { close(fd) }
-    // H2: the relay persists past this client — drop the in-flight attach so a late
+    // The relay persists past this client — drop the in-flight attach so a late
     // self-attach response isn't delivered to the next client (a stale ack / spurious
     // attachedToTarget), and its id mappings. A client that connected in the meantime
     // already reset them (noteClientConnected) and may have state of its own, so this
@@ -477,7 +477,7 @@ final class CdpRelay {
         assembling = !fin
         if fin {
           if assemblingText, let s = String(bytes: msg, encoding: .utf8) {
-            if let out = filterClientToPipe(s) { sendToPipe(rewriteOutgoingId(out)) }  // CEF-2b scope filter + id remap
+            if let out = filterClientToPipe(s) { sendToPipe(rewriteOutgoingId(out)) }  // scope filter + id remap
           }
           msg.removeAll(keepingCapacity: true)
           assemblingText = false
@@ -495,7 +495,7 @@ final class CdpRelay {
     }
   }
 
-  /// Deliver a CDP message from the pipe to the connected client. Applies the CEF-2b
+  /// Deliver a CDP message from the pipe to the connected client. Applies the
   /// multiplex demux + scope filter (drops sibling-tile traffic) before writing.
   /// Called off the CDP reader thread.
   func deliverToClient(_ json: String) {
@@ -503,18 +503,18 @@ final class CdpRelay {
     sendRawToClient(out)
   }
 
-  /// CEF-2b pure decision seam (no socket IO — unit-testable): map one inbound pipe
+  /// Pure decision seam (no socket IO — unit-testable): map one inbound pipe
   /// message to the bytes this relay should hand its client, or nil to DROP it.
   ///
   /// Multiplex demux (scoped relays only): a pipe message with a top-level id and NO
   /// method is a command RESPONSE, owned by exactly the relay that issued that unique
   /// pipe id. Restore the client's original id, or drop if it's a sibling relay's
-  /// response. Events (method present) + the CEF-2a passthrough fall through to the
+  /// response. Events (method present) + the unscoped passthrough fall through to the
   /// scope filter unchanged.
   func demuxPipeToClient(_ json: String) -> String? {
     if scopeTargetId != nil, let m = parseJson(json), m["method"] == nil,
        let pipeId = m["id"] as? Int {
-      // H2: our OWN Target.attachToTarget response — learn the page session + hand the
+      // Our OWN Target.attachToTarget response — learn the page session + hand the
       // client the synthesized attachedToTarget; never forward the raw response.
       multiplexLock.lock(); let isSelfAttach = (pipeId == selfAttachPipeId); multiplexLock.unlock()
       if isSelfAttach { handleSelfAttachResponse(m); return nil }
@@ -523,7 +523,7 @@ final class CdpRelay {
       var restored = m; restored["id"] = clientId
       return jsonString(restored)
     }
-    return filterPipeToClient(json)  // events / browser-level / CEF-2a passthrough
+    return filterPipeToClient(json)  // events / browser-level / unscoped passthrough
   }
 
   /// Write a raw (already-filtered / self-originated) JSON text frame to the client.
@@ -572,7 +572,7 @@ final class CdpRelay {
     }
   }
 
-  // MARK: CEF-2b — per-tile Target-domain filter (deny-by-default, fail-closed)
+  // MARK: Per-tile Target-domain filter (deny-by-default, fail-closed)
   //
   // The CDP pipe is browser-wide, so this filter is THE per-tile security boundary —
   // built to be safe against a hostile client, not just to support Playwright:
@@ -601,7 +601,7 @@ final class CdpRelay {
   // page work routed by that top-level sessionId (+ nested sub-target sessions).
 
   /// pipe → client. Returns the JSON to forward, or nil to drop. nil scope =
-  /// passthrough (CEF-2a, dev only). (Internal, not private, so the standalone
+  /// passthrough (dev only). (Internal, not private, so the standalone
   /// filter unit test — CdpRelayFilterTests.swift — can exercise it directly.)
   func filterPipeToClient(_ json: String) -> String? {
     guard let tid = scopeTargetId else { return json }
@@ -618,7 +618,7 @@ final class CdpRelay {
       let childSession = params?["sessionId"] as? String
       if sid == nil {  // browser-level attach of a top-level target (a tile)
         guard attachedTid == tid else { return nil }  // sibling tile — hide
-        // H2: our active Target.attachToTarget (beginPageAttach) triggers THIS real
+        // Our active Target.attachToTarget (beginPageAttach) triggers THIS real
         // browser-level event for our page. FORWARD it as-is — it carries the genuine
         // targetInfo (incl. a non-empty browserContextId that Playwright's
         // CRBrowser._onAttachedToTarget asserts on; a synthesized empty one crashes the
@@ -690,7 +690,7 @@ final class CdpRelay {
     }
 
     // Session-routed command (flatten): allow only for our (allowed) sessions. The
-    // brief lock is released before any error IO (H4).
+    // brief lock is released before any error IO.
     if let s = sid {
       filterLock.lock()
       let allowed = allowedSessions.contains(s)
@@ -736,7 +736,7 @@ final class CdpRelay {
         guard (params?["flatten"] as? Bool) == true else {
           sendClientError(id, "non-flatten setAutoAttach is not permitted"); return nil
         }
-        // H2: a BROWSER-LEVEL setAutoAttach (no sessionId — reached here because the
+        // A BROWSER-LEVEL setAutoAttach (no sessionId — reached here because the
         // sessionId branch above didn't claim it) is browser-context-wide. Forwarding
         // it (a) lets us change a SIBLING tile's auto-attach params (cross-tile control
         // leak) and (b) relies on a fire-once attachedToTarget storm we'll miss if we
@@ -804,7 +804,7 @@ final class CdpRelay {
     sendClientJson(["id": id, "result": ["targetInfos": [info]]])
   }
 
-  /// H2: ensure this relay knows its page's CDP session, then hand the client the page's
+  /// Ensure this relay knows its page's CDP session, then hand the client the page's
   /// Target.attachedToTarget directly — independent of the browser-wide auto-attach
   /// storm (fire-once, and which we must not forward: it would change sibling tiles'
   /// auto-attach). If we already learned our session, synthesize now; otherwise issue
@@ -834,7 +834,7 @@ final class CdpRelay {
     if let s = jsonString(cmd) { sendToPipe(s) }
   }
 
-  /// H2: our scoped attachToTarget came back — record the page session and (if the
+  /// Our scoped attachToTarget came back — record the page session and (if the
   /// client that issued it is still attached) ack every queued setAutoAttach. The page's
   /// attachedToTarget is delivered by FORWARDING the real browser-level event (see the
   /// filter), not synthesized here — so the client gets the genuine targetInfo. If the
@@ -855,7 +855,7 @@ final class CdpRelay {
     for ack in acks { synthesizeOk(ack) }
   }
 
-  /// H2: fabricate the page's Target.attachedToTarget for the client (flatten mode) so
+  /// Fabricate the page's Target.attachedToTarget for the client (flatten mode) so
   /// Playwright/connectOverCDP discovers our page without us forwarding the browser-wide
   /// auto-attach — mirrors synthesizeGetTargets' single-tile view.
   private func synthesizeAttachedToTarget(sessionId: String) {
@@ -910,7 +910,7 @@ final class CdpRelay {
   }
 
   // Rewrite an outgoing command's top-level id to a globally-unique pipe id and
-  // record the mapping. No-op for the CEF-2a passthrough (nil scope) and for
+  // record the mapping. No-op for the unscoped passthrough (nil scope) and for
   // messages without a top-level Int id (none, in practice clients only send
   // commands). Called for client->pipe traffic only. Internal (not private) so the
   // standalone filter tests can drive the rewrite↔demux round-trip directly.

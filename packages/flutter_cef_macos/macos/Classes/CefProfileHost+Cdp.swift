@@ -25,7 +25,7 @@ extension CefProfileHost {
     cdpWriteLock.unlock()
   }
 
-  /// CEF-2b: deliver one CDP pipe message to EVERY live relay. Snapshot the relays
+  /// Deliver one CDP pipe message to EVERY live relay. Snapshot the relays
   /// under cdpHandlerLock, then call deliverToClient OUTSIDE the lock on each —
   /// deliverToClient does blocking IO and takes the relay's own locks, so holding
   /// cdpHandlerLock across it would invert the lock order (and could deadlock /
@@ -38,7 +38,7 @@ extension CefProfileHost {
     for r in relays { r.deliverToClient(msg) }
   }
 
-  /// CEF-2b: start (lazily) a token-gated CDP relay SCOPED to `browserId`'s tile and
+  /// Start (lazily) a token-gated CDP relay SCOPED to `browserId`'s tile and
   /// return the brokered endpoint Campus hands an agent. Async: first resolves the
   /// browser's CDP targetId (round-trip to cef_host), then creates a relay whose
   /// Target-domain filter exposes only that tile, then starts it (so no client ever
@@ -84,7 +84,7 @@ extension CefProfileHost {
                            scopeTargetId: tid, pipeIds: self.cdpPipeIds)
       guard relay.start() else { self.cdpHandlerLock.unlock(); completion(nil); return }
       // Install the fan-out pipe → relays handler ONCE, when the first relay appears,
-      // CHAINING any prior handler (preserves the debug CEF-1 validation probe) rather
+      // CHAINING any prior handler (preserves the debug pipe-validation probe) rather
       // than clobbering it. Subsequent relays just join cdpRelays; deliverCdpToRelays
       // snapshots the dict per message, so it picks them up automatically.
       if self.cdpRelays.isEmpty {
@@ -103,7 +103,7 @@ extension CefProfileHost {
     ("ws://127.0.0.1:\(r.port)/devtools/browser?token=\(r.token)", r.token, Int(r.port))
   }
 
-  /// CEF-2b: resolve `browserId`'s CDP targetId via cef_host (Target.getTargetInfo).
+  /// Resolve `browserId`'s CDP targetId via cef_host (Target.getTargetInfo).
   /// All waiters for that browserId fire exactly once — on the response or a 5s
   /// timeout, whichever removes the entry first. Concurrent calls for the SAME
   /// browserId COALESCE onto one in-flight resolve (a second call appends its waiter
@@ -171,7 +171,7 @@ extension CefProfileHost {
     waiters.forEach { $0(nil) }
   }
 
-  /// CEF-2a/b: tear down `browserId`'s relay (closes the listener + any client,
+  /// Tear down `browserId`'s relay (closes the listener + any client,
   /// invalidates the token). Idempotent — a no-op if that tile has no relay. When
   /// the LAST relay goes, drop the fan-out onCdpMessage too. The pipe itself stays
   /// up (the tile keeps running). The relay is stopped OUTSIDE the lock: stop() may
@@ -223,7 +223,7 @@ extension CefProfileHost {
     }
   }
 
-  /// CEF-1 validation gate: prove the pipe round-trips end to end. Only when
+  /// Debug validation gate: prove the CDP pipe round-trips end to end. Only when
   /// agent-control AND FLUTTER_CEF_DEBUG is set, install a temporary CDP handler
   /// and send {"id":1,"method":"Browser.getVersion"}; the first response line is
   /// NSLogged. Behind the debug env so it never runs in normal flow, and it

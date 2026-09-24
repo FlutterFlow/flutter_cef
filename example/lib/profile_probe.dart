@@ -19,7 +19,7 @@
 //                 (Each run's dispose() sends kOpShutdown -> host flushes the
 //                 on-disk SQLite cookie store; persist_session_cookies=1.)
 //
-// Results are written to  C:\dev\flutter_cef_spikes\profile_evidence\  as a JSON
+// Results are written to  %TEMP%\flutter_cef_profile_evidence\  as a JSON
 // transcript (authoritative) and rendered on screen (for the screenshot), and a
 // `CEF_PROBE_RESULT …` line is printed to stdout.
 //

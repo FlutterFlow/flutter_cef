@@ -1,4 +1,4 @@
-// Pure decision policy for the STEADY-STATE liveness watchdog (F-6 / audit C-3): the
+// Pure decision policy for the STEADY-STATE liveness watchdog: the
 // backstop that catches a browser which painted at least once and then WEDGED (blank /
 // frozen) with no other detector — the first-present watchdog retires at first paint, so
 // post-establishment wedges were previously silent until relaunch.

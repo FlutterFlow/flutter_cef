@@ -97,7 +97,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   // Without this the addChannel op would go out with browserId=0 and the host
   // couldn't bind it to this browser, so the window.<name> shim was never injected.
   private var channels: Set<String> = []
-  // C1: set once when this browser delivers its first present frame. Owned/guarded by
+  // Set once when this browser delivers its first present frame. Owned/guarded by
   // CefProfileHost under its browsersLock (the reader flips it there) — a cheap per-frame
   // first-paint check that avoids a second lock on the hot paint path.
   var firstPresentSeen = false
@@ -107,7 +107,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   // first frame — so the next create's first-frame GPU allocation can't knock a barely-
   // established browser back out.
   var presentCount = 0
-  // F-6 steady-state liveness watchdog (guarded by CefProfileHost.browsersLock, like
+  // Steady-state liveness watchdog (guarded by CefProfileHost.browsersLock, like
   // presentCount). `lastPresentNs` = the most recent present's uptime; `livenessNudgedAt`
   // = uptime of an outstanding discriminating kOpInvalidate (0 = none). The host's periodic
   // sweep reads these to catch a browser that painted ≥1 frame then WEDGED (the first-paint
@@ -156,10 +156,10 @@ final class CefWebSession: NSObject, FlutterTexture {
   // has since gone out — so during a smoothly-advancing drag the watchdog is a no-op, and it
   // only acts when a resize wedges (generation stops advancing because no present came).
   private var resizeGen: UInt64 = 0
-  // F-4: mirrors the cef_host slot's hidden state (set by setVisible). While hidden the
+  // Mirrors the cef_host slot's hidden state (set by setVisible). While hidden the
   // begin-frame pump is gated off so no present can land — the resize watchdog must NOT
   // force-promote a never-painted (blank) buffer; it waits for the native un-hide repaint
-  // (F-1) to drive a real present. Guarded by bufferLock like the rest of the buffer state.
+  // to drive a real present. Guarded by bufferLock like the rest of the buffer state.
   private var hidden = false
   private let bufferLock = NSLock()
   // The consumer's last setVisible, which a browser bound later must honor (see
@@ -350,7 +350,7 @@ final class CefWebSession: NSObject, FlutterTexture {
     // scaled to the tile (momentarily soft if the box grew) — never blank, never frozen-wrong.
     guard active else { return }
     // While hidden the pump is gated off, so kOpInvalidate can't paint — skip the nudge but keep
-    // the watchdog alive; the native un-hide repaint (F-1) drives a real present that promotes.
+    // the watchdog alive; the native un-hide repaint drives a real present that promotes.
     if !isHidden { sendFrame(CefOp.invalidate, []) }
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
       self?.resizeWatchdog(gen)
@@ -707,7 +707,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   }
 
   /// WebRTC frame export: notify any consumer that the live surface (re)allocated, so it
-  /// can IOSurfaceLookup the new id and re-point its capture (R2). Call OUTSIDE bufferLock
+  /// can IOSurfaceLookup the new id and re-point its capture. Call OUTSIDE bufferLock
   /// so the callback can read session accessors without self-deadlock. Reports PHYSICAL
   /// (Retina) pixel dims = logical * dpr.
   private func notifySurface(_ sid: UInt32, _ logicalW: Int, _ logicalH: Int) {
@@ -796,7 +796,7 @@ final class CefWebSession: NSObject, FlutterTexture {
         && diagPresentCount % 120 == 0 {
         NSLog("[cefdiag] present bid=\(browserId) tex=\(tid) count=\(diagPresentCount)")
       }
-      // R2: a resized surface just went live — tell WebRTC consumers to re-point their
+      // A resized surface just went live — tell WebRTC consumers to re-point their
       // IOSurface capture at the new id (this is the "fires on each resize" half).
       if promotedSid != 0 { notifySurface(promotedSid, promotedW, promotedH) }
       if tid != 0 {

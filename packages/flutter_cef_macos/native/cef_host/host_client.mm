@@ -463,13 +463,13 @@ class HostClient : public CefClient,
       // Report the new page's remembered camera/mic decision so the URL bar can
       // show a "blocked" indicator for a site Chromium will silently refuse.
       SendMediaState(slot_);
-      // C1 + RENDER FLOOR: force a repaint when the main frame finishes. Invalidate(PET_VIEW)
+      // RENDER FLOOR: force a repaint when the main frame finishes. Invalidate(PET_VIEW)
       // ALONE is coalesce-able — the scheduler can drop it, which on a shared GPU/Viz process
       // under a multi-browser establishment burst is exactly when the real-content first frame
       // gets lost, leaving a permanently blank tile though the page loaded. Mirror the proven
       // DoSetVisible visibility-edge kick: re-assert size + damage + a NON-coalesce-able
       // SendExternalBeginFrame, which deterministically drives one renderer frame the scheduler
-      // cannot swallow. (slot_->visible gate: a hidden tile must stay paused — F-2.)
+      // cannot swallow. (slot_->visible gate: a hidden tile must stay paused.)
       if (browser && browser->GetHost() && slot_->visible) {
         auto h = browser->GetHost();
         h->WasResized();
@@ -513,7 +513,7 @@ class HostClient : public CefClient,
     SendFrame(slot_->browser_id, kOpProgress, p, 4);
   }
 
-  // H3: async create completes here on the CEF UI thread. Bind the browser to its slot
+  // Async create completes here on the CEF UI thread. Bind the browser to its slot
   // (DoCreateBrowser no longer does — it dropped the blocking CreateBrowserSync) and ack
   // the host so its create-pacer sends the NEXT create: creates serialize by COMPLETION
   // (each browser's render + GPU/Viz accelerated-surface handshake done before the next
@@ -521,7 +521,7 @@ class HostClient : public CefClient,
   void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
     slot_->browser = browser;
     SendFrame(slot_->browser_id, kOpCreated, nullptr, 0);
-    // H3: a dispose arrived during the async-create window and recorded intent — honor
+    // A dispose arrived during the async-create window and recorded intent — honor
     // it now (OnBeforeClose then does the normal map-erase + surface release + retain-
     // cycle break) so we don't leak a live orphan browser the Swift side already forgot.
     if (slot_->close_requested || g_shutting_down) {
@@ -535,7 +535,7 @@ class HostClient : public CefClient,
       slot_->nav_after_create.clear();
       if (auto frame = browser->GetMainFrame()) frame->LoadURL(nav);
     }
-    // F-3: reconcile a visibility intent that arrived before the browser bound. A
+    // Reconcile a visibility intent that arrived before the browser bound. A
     // setVisible(false) on a still-creating slot ran DoSetVisible with browser==null
     // (WasHidden skipped), so slot_->visible is already false but CEF never heard it —
     // the slot would establish VISIBLE and pump at 60fps off-screen until the next flip.

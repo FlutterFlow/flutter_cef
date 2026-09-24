@@ -325,7 +325,7 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
   // browser creation on demand via kOpCreateBrowser (one per CefWebView sharing
   // this profile). Nothing loads — and nothing is written to the profile cache —
   // until the first kOpCreateBrowser, which is the safety window the host uses to
-  // refuse a persistent profile under a mock-keychain (ad-hoc) build (F.5). The
+  // refuse a persistent profile under a mock-keychain (ad-hoc) build. The
   // payload is [readyFlags (bit0 = ad-hoc build), protocolVersion] — the version
   // byte lets the host refuse a protocol-skewed binary at the handshake instead of
   // silently mis-parsing every later frame.
@@ -520,7 +520,7 @@ int main(int argc, char* argv[]) {
 #ifdef CEF_HOST_ADHOC
   // Ad-hoc / mock-keychain build: secrets at rest aren't really encrypted, so a
   // persistent (named) profile here is insecure. Swift downgrades named profiles
-  // to ephemeral on an ad-hoc host (F.5); this is an advisory log only, and only
+  // to ephemeral on an ad-hoc host; this is an advisory log only, and only
   // for a real persistent profile (an ephemeral throwaway dir is never at risk).
   if (!profile_dir.empty() && !is_ephemeral &&
       !std::getenv("FLUTTER_CEF_ALLOW_INSECURE_PROFILE")) {
@@ -528,7 +528,7 @@ int main(int argc, char* argv[]) {
   }
 #endif
 
-  // Cross-process single-writer lock on a PERSISTENT profile dir (C2). Swift's
+  // Cross-process single-writer lock on a PERSISTENT profile dir. Swift's
   // in-memory dedup only covers one plugin instance; two app instances (or two
   // FlutterEngines in one process) would resolve the same root_cache_path and
   // spawn two cef_host on it. Chromium's own profile singleton then fails the
@@ -671,7 +671,7 @@ int main(int argc, char* argv[]) {
     // (no concurrent SendFrame) and clear the fd so any late write is a no-op.
     {
       std::lock_guard<std::mutex> lock(g_ipc_write_mutex);
-      // C3: store -1 FIRST (atomic exchange), THEN close — so a SendFrame that snapshots
+      // Store -1 FIRST (atomic exchange), THEN close — so a SendFrame that snapshots
       // the fd under this lock never holds a value that's already closed/recycled. The
       // GPU/compositor threads that call SendFrame aren't joined until CefShutdown below,
       // so this ordering (not close-then-clear) is what makes a late paint write a safe

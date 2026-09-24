@@ -45,9 +45,9 @@ option(CEF_HOST_ADHOC "Compile in dev/ad-hoc-only Chromium security shortcuts" O
 # Codesign entitlements: dev/ad-hoc carries get-task-allow (local debugging); a
 # signed release (CEF_HOST_ADHOC=OFF) uses a stripped variant without it
 # (notarization hard-fails with get-task-allow, and it's a local task-port
-# privilege-escalation vector). Both keep allow-jit / allow-unsigned-executable-
-# memory / disable-library-validation, which the JIT renderer + dlopen'd
-# framework need.
+# privilege-escalation vector). The dev set also relaxes allow-unsigned-
+# executable-memory / disable-library-validation; the release set keeps only
+# allow-jit, which the JIT renderer needs (see entitlements.release.plist).
 if(CEF_HOST_ADHOC)
   set(ENT "${CMAKE_CURRENT_SOURCE_DIR}/entitlements.plist")
 else()

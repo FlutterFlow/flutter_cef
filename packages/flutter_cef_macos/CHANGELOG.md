@@ -1,5 +1,7 @@
 ## Unreleased
 
+* Removed the unused `native/cef_host/entitlements.browser.plist`, which
+  changes the `cef_host` input hash.
 * Document-start scripts and create-time JS channels, sent in the browser's
   `extra_info` and installed by the renderer in `OnContextCreated`.
 * `hostGroup`: ephemeral sessions in one group share a `cef_host`.

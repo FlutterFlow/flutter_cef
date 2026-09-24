@@ -25,7 +25,7 @@ void IpcReadLoop() {
     if (!ReadAll(g_ipc_fd, hdr, 4)) break;
     uint32_t body_len = ReadU32BE(hdr);
     // Minimum valid body is 5 bytes (4 browserId + 1 op + 0 payload).
-    // H9: a malformed/oversized length is a wire desync and tears down EVERY browser in
+    // A malformed/oversized length is a wire desync and tears down EVERY browser in
     // this process — log it first so it isn't a silent, breadcrumb-less all-tiles exit
     // (the IPC peer is trusted, so this only fires on a genuine framing bug).
     if (body_len < 5 || body_len > (64u << 20)) {

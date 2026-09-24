@@ -10,7 +10,6 @@
 # prefix EMPTY (".org.chromium.Chromium.webauthn"), which no valid entitlement can
 # match. The prebuilt CEF exposes no API/switch for it, so the only fix is a
 # from-source rebuild with native/patches/campus_webauthn_keychain.patch.
-# Full write-up: work_canvas specs/cef-passkey/PLAN.md.
 #
 # This is Tier-2 (build libcef from source), NOT a Chromium fork -- fold it into
 # the same from-source build you stand up for proprietary codecs.
@@ -85,7 +84,7 @@ fi
 #        BENIGN red herring -- present in the working build too; don't chase it.
 #    proprietary_codecs + ffmpeg_branding="Chrome" add H.264/AAC. These are
 #    ROYALTY-BEARING (MPEG-LA / Via-LA) -- gate *distribution* (prod release-tag)
-#    on legal sign-off. See work_canvas specs/cef-passkey/PLAN.md.
+#    on legal sign-off.
 echo "[cef-src] build (Release arm64, official + H.264/AAC) -- multi-hour first compile"
 GN_DEFINES='is_official_build=true proprietary_codecs=true ffmpeg_branding="Chrome"' \
   python3 "$AUTOMATE" \
@@ -114,7 +113,7 @@ echo "  FLUTTER_CEF_CACHE=/tmp/cef_cache CEF_HOST_ADHOC=OFF \\"
 echo "    CODESIGN_ID='Developer ID Application: FlutterFlow, Inc. (KLAJ5X6PJP)' \\"
 echo "    '$HERE/build_cef_host.sh'"
 echo
-echo "cef_host then needs (see specs/cef-passkey/PLAN.md): the keychain-access-group"
+echo "cef_host then needs: the keychain-access-group"
 echo "entitlement on the BROWSER process only + an embedded Developer-ID"
 echo "provisioning profile authorizing that group. Release Campus.app is already"
 echo "signed+notarized, so the validation-category condition is satisfied there."

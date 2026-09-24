@@ -1,6 +1,6 @@
 // Pure decision policy for the resize watchdog (CefWebSession.resizeWatchdog) — the
 // hidden/in-flight/elapsed gating, with NO dependency on Flutter, CEF, IOSurface, or the
-// host IPC. Extracted so the gating that prevents the visibility/resize WEDGE (F-4: never
+// host IPC. Extracted so the gating that prevents the visibility/resize WEDGE (never
 // force-promote a never-painted surface for a HIDDEN browser) is unit-testable standalone
 // — compiles + runs with `swiftc` alone, exactly like CdpRelay's filter tests:
 //
@@ -16,16 +16,16 @@ enum ResizeWatchdogPolicy {
   /// but the present was dropped/mis-tagged.
   ///
   /// - `inFlight` / `gen` / `currentGen`: a newer resize (gen advanced) cancels this one.
-  /// - `hidden`: **the F-4 fix** — while hidden the begin-frame pump is gated off, so the
+  /// - `hidden`: **the wedge guard** — while hidden the begin-frame pump is gated off, so the
   ///   pending surface is zero-filled (never painted); promoting it wedges the texture
   ///   permanently blank. Must NOT promote while hidden — wait for the native un-hide
-  ///   repaint (F-1) to drive a real present that promotes through the normal path.
+  ///   repaint to drive a real present that promotes through the normal path.
   /// - `elapsedNs` / `thresholdNs`: only after the grace window with no present.
   static func shouldForcePromote(inFlight: Bool, gen: UInt64, currentGen: UInt64,
                                  hidden: Bool, elapsedNs: UInt64,
                                  thresholdNs: UInt64) -> Bool {
     guard inFlight, gen == currentGen else { return false } // superseded / already promoted
-    if hidden { return false }                               // F-4: never promote a hidden (blank) surface
+    if hidden { return false }                               // never promote a hidden (blank) surface
     return elapsedNs > thresholdNs
   }
 
