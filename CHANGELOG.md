@@ -118,6 +118,18 @@
   Before, four hand-kept copies had drifted: Windows still documented 0x1e as
   reserved, while macOS uses it. `test/protocol_parity_test.dart` checks the
   copies and that no opcode is defined anywhere else.
+* **`CefWebController.state`**: a `ValueListenable<CefSessionState>` —
+  `idle`, `creating`, `live`, `frozen`, `gone` (the host died or the browser
+  never came up), `disposed` — replacing the separate disposed / frozen /
+  texture flags the controller kept. `isCreated`, `isFrozen` and `textureId`
+  are derived from it and read as before.
+* **Fix**: a session that ended while `create()` was still waiting for its
+  reply was adopted anyway, leaving the controller "created" on a texture with
+  no browser, and every later `create()` returned that dead texture. `create()`
+  now returns null and the controller stays `gone`.
+* The controller talks to the platform through `FlutterCefPlatform`'s typed
+  methods instead of ~45 raw method-channel strings; the wire calls are
+  unchanged and pinned by `test/platform_wire_test.dart`.
 
 ## 0.2.0
 

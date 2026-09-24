@@ -24,5 +24,5 @@ export 'package:flutter_cef_platform_interface/flutter_cef_platform_interface.da
         CefMediaSetting,
         CefMediaState,
         CefSurfaceInfo;
-export 'src/cef_web_controller.dart' show CefWebController;
+export 'src/cef_web_controller.dart' show CefSessionState, CefWebController;
 export 'src/cef_web_view.dart' show CefWebView;

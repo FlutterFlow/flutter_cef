@@ -85,6 +85,42 @@ void main() {
     expect(find.text('loading'), findsOneWidget);
   });
 
+  testWidgets('a session that ends during create is not respawned per layout',
+      (tester) async {
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      log.add(call);
+      if (call.method == 'create') {
+        // The host dies before create's reply reaches Dart.
+        await messenger.handlePlatformMessage(
+          'flutter_cef',
+          const StandardMethodCodec().encodeMethodCall(const MethodCall(
+              'processGone', {'sessionId': 'race', 'reason': 'createFailed'})),
+          (_) {},
+        );
+        return <String, dynamic>{'textureId': 7};
+      }
+      return null;
+    });
+    final gone = <String>[];
+    final controller = CefWebController(sessionId: 'race')
+      ..onProcessGone = gone.add;
+    Widget view({double w = 320}) => boxed(
+        CefWebView(
+          url: 'about:blank',
+          controller: controller,
+          placeholder: const Text('loading'),
+        ),
+        w: w);
+    await tester.pumpWidget(view());
+    await tester.pumpAndSettle();
+    await tester.pumpWidget(view(w: 300));
+    await tester.pumpAndSettle();
+    expect(callsTo('create'), hasLength(1));
+    expect(gone, ['createFailed']);
+    expect(controller.state.value, CefSessionState.gone);
+    expect(find.text('loading'), findsOneWidget);
+  });
+
   testWidgets('creates exactly one session sized to the layout',
       (tester) async {
     await tester.pumpWidget(boxed(const CefWebView(url: 'https://a.test')));

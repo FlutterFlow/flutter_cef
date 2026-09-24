@@ -1432,4 +1432,103 @@ void main() {
         .cast<String, dynamic>();
     expect(args['commandId'], 0);
   });
+
+  group('session state', () {
+    test('create moves idle -> creating -> live', () async {
+      final c = CefWebController(sessionId: 'st-live');
+      final seen = <CefSessionState>[];
+      c.state.addListener(() => seen.add(c.state.value));
+      expect(c.state.value, CefSessionState.idle);
+      final pending = c.create(url: 'about:blank', width: 1, height: 1);
+      expect(c.state.value, CefSessionState.creating);
+      await pending;
+      expect(seen, [CefSessionState.creating, CefSessionState.live]);
+      expect(c.isCreated, isTrue);
+      await c.dispose();
+      expect(c.state.value, CefSessionState.disposed);
+      expect(c.textureId, isNull);
+    });
+
+    test('processGone moves live -> gone; create starts a new session',
+        () async {
+      final c = CefWebController(sessionId: 'st-gone');
+      await c.create(url: 'about:blank', width: 1, height: 1);
+      await emit('st-gone', 'processGone', {'reason': 'crashed'});
+      expect(c.state.value, CefSessionState.gone);
+      expect(c.isCreated, isFalse);
+      await expectLater(
+          c.runJavaScriptReturningResult('1'), throwsA(isA<StateError>()));
+      await c.create(url: 'about:blank', width: 1, height: 1);
+      expect(c.state.value, CefSessionState.live);
+      await c.dispose();
+    });
+
+    test('a session that ends while it is created is not adopted', () async {
+      // processGone reaching Dart before create's reply used to leave the
+      // controller "created" on a texture with no browser behind it, and every
+      // later create() returned that dead texture.
+      final reply = Completer<Map<String, dynamic>>();
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        log.add(call);
+        if (call.method == 'create') return reply.future;
+        return null;
+      });
+      final c = CefWebController(sessionId: 'st-race');
+      final created = c.create(url: 'about:blank', width: 1, height: 1);
+      await Future<void>.delayed(Duration.zero);
+      await emit('st-race', 'processGone', {'reason': 'createFailed'});
+      expect(c.state.value, CefSessionState.gone);
+      reply.complete({'textureId': 9});
+      expect(await created, isNull);
+      expect(c.isCreated, isFalse);
+      expect(c.state.value, CefSessionState.gone);
+      await c.dispose();
+    });
+
+    test('a create that throws returns to idle', () async {
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        if (call.method == 'create') {
+          throw PlatformException(code: 'spawn', message: 'no cef_host');
+        }
+        return null;
+      });
+      final c = CefWebController(sessionId: 'st-throw');
+      await expectLater(c.create(url: 'about:blank', width: 1, height: 1),
+          throwsA(isA<PlatformException>()));
+      expect(c.state.value, CefSessionState.idle);
+      await c.dispose();
+    });
+
+    test('freeze and thaw move live <-> frozen', () async {
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        log.add(call);
+        return switch (call.method) {
+          'create' => <String, dynamic>{'textureId': 7},
+          'freezeSession' => true,
+          'thawSession' => <String, dynamic>{'textureId': 7},
+          _ => null,
+        };
+      });
+      final c = CefWebController(sessionId: 'st-freeze');
+      expect(await c.freeze(), isFalse, reason: 'nothing to freeze yet');
+      await c.create(url: 'about:blank', width: 1, height: 1);
+      expect(await c.freeze(), isTrue);
+      expect(c.state.value, CefSessionState.frozen);
+      expect(c.isFrozen, isTrue);
+      expect(c.textureId, 7, reason: 'the texture keeps its last frame');
+      expect(await c.freeze(), isFalse);
+      expect(await c.thaw(), isTrue);
+      expect(c.state.value, CefSessionState.live);
+      await c.dispose();
+    });
+
+    test('a disposed controller does not create', () async {
+      final c = CefWebController(sessionId: 'st-disposed');
+      await c.dispose();
+      log.clear();
+      expect(await c.create(url: 'about:blank', width: 1, height: 1), isNull);
+      expect(log.where((m) => m.method == 'create'), isEmpty);
+      expect(c.state.value, CefSessionState.disposed);
+    });
+  });
 }

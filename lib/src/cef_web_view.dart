@@ -295,6 +295,12 @@ class _CefWebViewState extends State<CefWebView>
         // we can't assume the live surface is `size`. Leaving `_lastSize` null
         // makes the resize branch below reconcile to the real laid-out size on
         // the next frame (a no-op resize when create() did size to `size`).
+        // The session ended before create() returned (onProcessGone has run):
+        // like a create that throws, keep the placeholder rather than spawn
+        // again on every layout.
+        if (id == null && _controller.state.value == CefSessionState.gone) {
+          _createFailed = true;
+        }
         if (mounted) setState(() => _textureId = id);
       } catch (e, st) {
         // No cef_host, or it failed to spawn. Retrying on every rebuild would
