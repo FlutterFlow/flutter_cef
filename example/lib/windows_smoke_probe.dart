@@ -8,7 +8,8 @@
 //     CI runs the probe twice, the second time with
 //     FLUTTER_CEF_SOFTWARE_COMPOSITING=1, so the software paint path is
 //     covered too;
-//   * runJavaScriptReturningResult and a JS channel round-trip;
+//   * the page finishes loading, then runJavaScriptReturningResult and a JS
+//     channel round-trip;
 //   * a resize is followed by frames at the new size;
 //   * setAudioMuted / setFrameInterval are accepted, and a verb Windows can't
 //     serve fails with PlatformException('unsupported');
@@ -90,6 +91,13 @@ class _ProbeAppState extends State<ProbeApp> {
     final c = CefWebController();
     var gone = '';
     c.onProcessGone = (reason) => gone = reason;
+    // The browser paints a blank frame before the document's load starts (on
+    // the software path it often does), and a load that starts under an
+    // in-flight eval fails that eval. So evals wait for the page to finish.
+    final loaded = Completer<bool>();
+    c.onPageFinished = (_) {
+      if (!loaded.isCompleted) loaded.complete(true);
+    };
     try {
       final received = Completer<String>();
       await c.addJavaScriptChannel(
@@ -117,6 +125,13 @@ class _ProbeAppState extends State<ProbeApp> {
         'sessionStats reports the first present',
         stats != null && stats.firstPresentSeen && !stats.frozen,
         stats,
+      );
+      _check(
+        'the page finishes loading',
+        await loaded.future.timeout(
+          const Duration(seconds: 60),
+          onTimeout: () => false,
+        ),
       );
 
       final two = await c
