@@ -80,10 +80,9 @@ class _S extends State<AlertProbe> {
       'alert_fired': _alertFired,
       'titles': _titles,
     };
-    try {
-      File('/tmp/cef_alert_probe.json').writeAsStringSync(jsonEncode(out));
-    } catch (_) {}
-    print('ALERT_PROBE_RESULT ${jsonEncode(out)}');
+    print('CEF_PROBE_DETAIL ${jsonEncode(out)}');
+    print('CEF_PROBE_RESULT ${ok ? "PASS" : "FAIL"}');
+    Future<void>.delayed(const Duration(milliseconds: 300), () => exit(ok ? 0 : 1));
   }
 
   @override

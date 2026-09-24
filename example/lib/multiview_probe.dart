@@ -4,8 +4,8 @@
 // named profile (an isolated 'p2probe' — deliberately NOT Campus's real 'campus-web'
 // so it can't touch a running Campus's profile/cookie jar) with agentControl, then —
 // with no user interaction — enables agent-control on BOTH and drives a real CDP
-// isolation check over the two brokered relays. Results are written to
-// /tmp/cef_multiview_probe.json and printed as a `CEF_PROBE_RESULT …` line.
+// isolation check over the two brokered relays. Prints the checks as a
+// `CEF_PROBE_DETAIL {json}` line, then `CEF_PROBE_RESULT PASS|FAIL`.
 //
 // Run (cef_host must be built; CEF cached):
 //   FLUTTER_CEF_HOST=<.../cef_host.app/Contents/MacOS/cef_host> \
@@ -37,7 +37,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter_cef/flutter_cef.dart';
 
 const _profile = 'p2probe'; // isolated; NOT Campus's real 'campus-web' profile
-const _resultPath = '/tmp/cef_multiview_probe.json';
 
 void main() => runApp(const ProbeApp());
 
@@ -213,15 +212,16 @@ class _ProbeAppState extends State<ProbeApp> {
     out['checks'] = _checks;
     final pass = _checks.isNotEmpty && _checks.values.every((v) => v);
     out['pass'] = pass;
-    try {
-      File(_resultPath).writeAsStringSync(const JsonEncoder.withIndent('  ').convert(out));
-    } catch (_) {}
     // ignore: avoid_print
-    print('CEF_PROBE_RESULT ${jsonEncode(out)}');
+    print('CEF_PROBE_DETAIL ${jsonEncode(out)}');
+    // ignore: avoid_print
+    print('CEF_PROBE_RESULT ${pass ? "PASS" : "FAIL"}');
+    Future<void>.delayed(
+        const Duration(milliseconds: 300), () => exit(pass ? 0 : 1));
     if (mounted) {
       setState(() => _status = pass
-          ? 'ALL PASS (${_checks.length} checks) — results at $_resultPath'
-          : 'FAIL — see $_resultPath');
+          ? 'ALL PASS (${_checks.length} checks)'
+          : 'FAIL — see the CEF_PROBE_DETAIL line');
     }
   }
 
