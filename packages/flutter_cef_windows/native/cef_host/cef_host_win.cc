@@ -991,15 +991,28 @@ class HostRenderHandler : public CefRenderHandler {
   IMPLEMENT_REFCOUNTING(HostRenderHandler);
 };
 
-// Renderer crash-loop detector (see policy::CrashLoopDetector). Process-wide:
-// a host whose children can't start fails for all its browsers at once, which
-// is exactly what should add up.
+// Renderer crash loops, per browser (see policy::RendererCrashPolicy). CEF
+// calls OnRenderProcessTerminated and OnBeforeClose on the UI thread; the lock
+// only keeps that from being load-bearing.
 std::mutex g_renderer_crash_mutex;
-policy::CrashLoopDetector g_renderer_crashes;
+policy::RendererCrashPolicy g_renderer_crashes;
 
-bool NoteRendererCrashAndCheckLoop() {
+policy::RendererCrashPolicy::Action NoteRendererTerminated(
+    uint32_t browser_id) {
   std::lock_guard<std::mutex> lock(g_renderer_crash_mutex);
-  return g_renderer_crashes.Note(std::chrono::steady_clock::now());
+  return g_renderer_crashes.OnRendererTerminated(
+      browser_id, std::chrono::steady_clock::now());
+}
+
+void ForgetRendererCrashes(uint32_t browser_id) {
+  std::lock_guard<std::mutex> lock(g_renderer_crash_mutex);
+  g_renderer_crashes.Forget(browser_id);
+}
+
+std::string CrashBurstText() {
+  return std::to_string(policy::RendererCrashPolicy::kBurstLimit) +
+         " renderer crashes in " +
+         std::to_string(policy::RendererCrashPolicy::kWindow.count()) + "s";
 }
 
 void DoShutdown();  // defined below; the crash-loop exit reuses it
@@ -1255,27 +1268,36 @@ class HostClient : public CefClient,
     slot_->dialogs.clear();
   }
 
-  // Renderer crash: reload rather than show a dead page, unless the crashes
-  // come as a burst (see policy::CrashLoopDetector), in which case end the host
-  // so the plugin reports processGone and the embedder recreates it.
+  // Renderer crash: reload rather than show a dead page. A renderer that keeps
+  // crashing ends only this browser: the plugin reports processGone for its
+  // tile and the host's other browsers carry on. Several browsers doing it at
+  // once end the host (see policy::RendererCrashPolicy).
   void OnRenderProcessTerminated(CefRefPtr<CefBrowser> browser,
                                  TerminationStatus status, int,
                                  const CefString&) override {
-    SendLog(slot_->browser_id, "renderer terminated (status " +
-                                   std::to_string(status) + ") — reloading");
     if (router_) router_->OnRenderProcessTerminated(browser);
-    if (NoteRendererCrashAndCheckLoop()) {
-      SendLog(0, "renderer crash loop (" +
-                     std::to_string(policy::CrashLoopDetector::kBurstLimit) +
-                     " in " +
-                     std::to_string(
-                         policy::CrashLoopDetector::kWindow.count()) +
-                     "s): children cannot start; exiting so the host is "
-                     "respawned");
-      DoShutdown();
-      return;
+    using Crash = policy::RendererCrashPolicy::Action;
+    switch (NoteRendererTerminated(slot_->browser_id)) {
+      case Crash::kIgnore:
+        return;  // already reported; left alone
+      case Crash::kReload:
+        SendLog(slot_->browser_id, "renderer terminated (status " +
+                                       std::to_string(status) +
+                                       ") — reloading");
+        if (browser) browser->ReloadIgnoreCache();
+        return;
+      case Crash::kBrowserGone:
+        SendLog(slot_->browser_id,
+                CrashBurstText() + " — giving up on this browser");
+        SendUtf8(slot_->browser_id, kOpBrowserGone, "crashed");
+        return;
+      case Crash::kHostExit:
+        SendLog(0, CrashBurstText() +
+                       " on several browsers — children cannot start; "
+                       "exiting so the host is respawned");
+        DoShutdown();
+        return;
     }
-    if (browser) browser->ReloadIgnoreCache();
   }
 
   // CefMessageRouter wiring (main.mm:1468-1501). The renderer half (HostApp
@@ -1494,6 +1516,7 @@ class HostClient : public CefClient,
   void OnBeforeClose(CefRefPtr<CefBrowser> browser) override {
     if (router_) router_->OnBeforeClose(browser);
     SetAuthoredDoc(slot_->browser_id, "", "");
+    ForgetRendererCrashes(slot_->browser_id);
     EraseSlot(slot_->browser_id);
     slot_->deferred.clear();
     {

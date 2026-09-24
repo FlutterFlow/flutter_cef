@@ -80,7 +80,7 @@ kOpPresent (a D3D bridge handle instead of an IOSurface id) and kOpShowDevTools
 
 <!-- BEGIN GENERATED OPCODES (tool/protocol/generate.dart) -->
 
-Protocol version 5. Payload integers are big-endian.
+Protocol version 6. Payload integers are big-endian.
 
 ### cef_host -> plugin
 
@@ -109,6 +109,7 @@ Protocol version 5. Payload integers are big-endian.
 | 0x1b | kOpTargetId | {utf8 targetId} this browser's CDP targetId, reply to kOpResolveTargetId |
 | 0x1c | kOpCreated | {} OnAfterCreated: the browser is up; the plugin paces the next create on it |
 | 0x1d | kOpCreateFailed | {} the async CreateBrowser dispatch failed; the plugin drops the session |
+| 0x42 | kOpBrowserGone | {utf8 reason} this one browser can't continue (its renderer keeps crashing); the process survives and the plugin drops the session |
 
 ### plugin -> cef_host
 
@@ -150,7 +151,7 @@ Protocol version 5. Payload integers are big-endian.
 | 0x3f | kOpSetAuthoredHtml | {utf8 baseUrl}\0{utf8 html}: store-only; serve html as the main-frame response for exactly baseUrl (empty html clears it). The load is a following kOpCreateBrowser or kOpLoadTrusted for that URL |
 | 0x41 | kOpSetDocumentStart | ({u8 kind}{u32 len}{utf8})*, kind 0 = JS channel name, 1 = script (document_start.h): store-only, for the browser created right behind it |
 
-macOS only, never reuse on Windows: 0x1e kOpMediaRequest, 0x1f kOpMediaState, 0x40 kOpContextMenu, 0x42 kOpBrowserGone, 0x39 kOpOpenAuthWindow, 0x3c kOpMediaResponse, 0x3d kOpSetMediaSetting, 0x3e kOpContextMenuCommand.
+macOS only, never reuse on Windows: 0x1e kOpMediaRequest, 0x1f kOpMediaState, 0x40 kOpContextMenu, 0x39 kOpOpenAuthWindow, 0x3c kOpMediaResponse, 0x3d kOpSetMediaSetting, 0x3e kOpContextMenuCommand.
 
 <!-- END GENERATED OPCODES -->
 
@@ -236,7 +237,7 @@ thread (marshal from the reader thread).
 | imeCompositionBounds | x:int, y:int, w:int, h:int | 0x19 | Swift:417-421 |
 | cookies | id:int, json:String | 0x1a | Swift:422-424 |
 | onSurface | surfaceId:int, width:int, height:int (physical px) — Windows: surfaceId = the bridge-handle token as int64 | 0x01 (on surface (re)alloc) | Swift:425-433 |
-| processGone | reason:String — "crashed" (host death, a failed/timed-out pipe write, or a renderer the liveness sweep found hung) \| "locked" (the host logged "profile-locked") \| "createFailed" (0x1d, or the host died before kOpReady) \| "respawnFailed" \| "protocolMismatch(host=vN)" | host death / 0x1d / handshake | Swift:490, 521, 531, 541, 601 |
+| processGone | reason:String — "crashed" (host death, a failed/timed-out pipe write, a renderer the liveness sweep found hung, or 0x42 for one crash-looping browser) \| "locked" (the host logged "profile-locked") \| "createFailed" (0x1d, or the host died before kOpReady) \| "respawnFailed" \| "protocolMismatch(host=vN)" | host death / 0x1d / 0x42 / handshake | Swift:490, 521, 531, 541, 601 |
 | paintStalled | — | first-present watchdog: every grace (10 s, `FLUTTER_CEF_FIRSTPAINT_MS`) that ends with no promoted 0x01, with a 0x37 re-kick — the macOS cadence | Swift:554-558 |
 
 ## 5. Handshake + lifecycle rules (carry-over)
@@ -269,8 +270,13 @@ thread (marshal from the reader thread).
   ends its host. Tiles blocked on a JS dialog, with DevTools opened, or on an
   agent-control host are not pinged. macOS also detects a replaced GPU
   process; Windows doesn't.
-- The host exits (so the plugin reports `processGone`) when renderers crash 4
-  times within 10 s, instead of reloading a page that can't start forever.
+- Renderer crash loops are counted per browser, as on macOS. A crash reloads
+  the page; 4 crashes of one browser within 10 s end only that browser
+  (kOpBrowserGone "crashed", no more reloads): the plugin emits
+  `processGone("crashed")` for its session and disposes it, and the host's
+  other browsers carry on. When two different browsers burst within 10 s of
+  each other the host's children can't start, so the host exits and every
+  session gets `processGone("crashed")`.
 - Bridge-handle identity (LAW 3): the host-minted legacy handle is the
   identity Flutter sees; never key anything on CEF's per-callback
   `shared_texture_handle` values (SPIKES.md S4).

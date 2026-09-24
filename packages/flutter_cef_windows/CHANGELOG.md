@@ -32,10 +32,14 @@
   Writes time out after 3 s and end the host (`processGone('crashed')`).
 * Fix: the reaper deleted an ephemeral profile dir while Chromium children
   still held files in it; it now ends the whole process tree first.
-* A renderer that crashes 4 times within 10 s ends the host instead of
-  reloading forever, and a liveness sweep ends a host whose renderer leaves a
-  JS ping unanswered for 15 s (as on macOS; GPU-process replacement isn't
-  detected). `paintStalled` now repeats every grace, the macOS cadence.
+* A renderer that crashes 4 times within 10 s ends only its own tile
+  (`processGone('crashed')`, via the new upstream `kOpBrowserGone` 0x42)
+  instead of reloading forever; the other tiles on its host carry on. The host
+  exits only when two tiles crash-loop within 10 s of each other, which means
+  its children can't start. Same design as macOS.
+* A liveness sweep ends a host whose renderer leaves a JS ping unanswered for
+  15 s (GPU-process replacement isn't detected). `paintStalled` now repeats
+  every grace, the macOS cadence.
 * `sessionStats`, `setAudioMuted`, `setFrameInterval`, `freezeSession` and
   `thawSession` are implemented. `chooseContextMenu`, `respondMediaRequest`,
   `setMediaSetting`, `openAuthWindow` and `showEmojiPicker` reply
@@ -54,7 +58,8 @@
   forces the software path.
 * CI builds and runs `pipe_probe` and a runtime smoke test of the example app,
   each with and without software compositing.
-* Protocol v5 (`kOpSetAudioMuted` and `kOpSetPumpInterval` on Windows).
+* Protocol v6 (`kOpSetAudioMuted`, `kOpSetPumpInterval` and `kOpBrowserGone`
+  on Windows).
 
 # 0.1.0
 

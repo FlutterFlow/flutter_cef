@@ -53,7 +53,7 @@
   * a renderer that keeps crashing ends its own view
     (`onProcessGone('crashed')`); `cef_host` exits only when several views
     crash-loop at once. One crash-looping page used to end every view on the
-    host.
+    host. Windows does the same.
   * page-sized data is capped: a JS-channel message or
     `runJavaScriptReturningResult` result over 16 MB is refused (the result
     fails with `result too large`), and console, dialog and context-menu text

@@ -60,7 +60,7 @@ PROBES=(
   "stress|stress_probe|0|default|manual|many animating tiles on one host (tunable with dart-defines)"
   "recreate_soak|recreate_soak_probe|0|default|manual|create/dispose churn"
   "profile|profile_probe|0|default|manual|Windows: named profile and cookies end to end"
-  "windows_smoke|windows_smoke_probe|0|default|manual|Windows: paint, eval, channel, resize, freeze/thaw (run by the windows-build CI job)"
+  "windows_smoke|windows_smoke_probe|0|default|manual|Windows: paint, eval, channel, resize, freeze/thaw, a crash loop ends one tile (run by the windows-build CI job)"
   "agentcontrol|agentcontrol_probe|0|default|manual|Windows agent-control smoke"
   "jsbridge_smoke|jsbridge_smoke|0|default|manual|Windows JS bridge smoke"
   "conformance|conformance_harness|0|default|manual|rendering conformance against Chrome (example/run_conformance_oracle.sh)"

@@ -28,10 +28,16 @@ Windows serves the same channel verbs as macOS, with these exceptions:
   composition bounds).
 - Only the `en-US` locale pak ships.
 
-Liveness matches macOS except for one check: the plugin reports
-`paintStalled` for a tile that never paints, and ends a host whose renderer
-leaves a JS ping unanswered for 15 s (`FLUTTER_CEF_HANG_MS`), but it does not
-detect a replaced GPU process.
+Renderer crashes are handled as on macOS. A crash reloads the page. A
+renderer that crashes 4 times within 10 s ends only its own tile
+(`processGone('crashed')`), and the other tiles on its host carry on. When two
+tiles crash-loop within 10 s of each other, the host's child processes can't
+start, so the host exits and every tile on it gets `processGone('crashed')`.
+
+The plugin reports `paintStalled` for a tile that never paints. Liveness
+differs from macOS in two ways: a renderer that leaves a JS ping unanswered
+for 15 s (`FLUTTER_CEF_HANG_MS`) ends the whole host rather than just its
+tile, and a replaced GPU process isn't detected.
 
 ## Sandbox
 
