@@ -10,7 +10,7 @@
 // Run:
 //   FLUTTER_CEF_HOST=<.../cef_host.app/Contents/MacOS/cef_host> \
 //     flutter run -d macos -t lib/channel_probe_shared.dart
-// Result: `CEF_SHARED_PROBE_RESULT …` + /tmp/cef_channel_probe_shared.json.
+// Result: `CEF_PROBE_DETAIL {json}` and `CEF_PROBE_RESULT PASS|FAIL` on stdout.
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -19,7 +19,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter_cef/flutter_cef.dart';
 
 const _profile = 'chprobe';
-const _resultPath = '/tmp/cef_channel_probe_shared.json';
 
 String _html(String tag) => '''<!doctype html><meta charset="utf-8">
 <body style="font:18px system-ui;margin:20px"><h3>session $tag</h3><div id=log></div>
@@ -106,13 +105,12 @@ class _SharedProbeAppState extends State<SharedProbeApp> {
       'a_ok': aOk,
       'b_ok': bOk,
     };
-    try {
-      File(_resultPath).writeAsStringSync(
-        const JsonEncoder.withIndent('  ').convert(out),
-      );
-    } catch (_) {}
     // ignore: avoid_print
-    print('CEF_SHARED_PROBE_RESULT ${jsonEncode(out)}');
+    print('CEF_PROBE_DETAIL ${jsonEncode(out)}');
+    // ignore: avoid_print
+    print('CEF_PROBE_RESULT ${aOk && bOk ? "PASS" : "FAIL"}');
+    Future<void>.delayed(
+        const Duration(milliseconds: 300), () => exit(aOk && bOk ? 0 : 1));
     if (mounted) {
       setState(() => _status = (aOk && bOk)
           ? 'PASS — both sessions routed correctly'

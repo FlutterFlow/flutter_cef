@@ -13,7 +13,7 @@
 // Run (cef_host must be built; CEF cached):
 //   FLUTTER_CEF_HOST=<.../cef_host.app/Contents/MacOS/cef_host> \
 //     flutter run -d macos -t lib/channel_probe.dart
-// Result: `CEF_CHANNEL_PROBE_RESULT …` stdout + /tmp/cef_channel_probe.json.
+// Result: `CEF_PROBE_DETAIL {json}` and `CEF_PROBE_RESULT PASS|FAIL` on stdout.
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -21,7 +21,6 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_cef/flutter_cef.dart';
 
-const _resultPath = '/tmp/cef_channel_probe.json';
 
 const _probeHtml = r'''<!doctype html><meta charset="utf-8">
 <body style="font:20px system-ui;margin:24px;color:#111;background:#fff">
@@ -111,13 +110,12 @@ class _ProbeAppState extends State<ProbeApp> {
       'received_count': _received.length,
       'received': _received.take(5).toList(),
     };
-    try {
-      File(_resultPath).writeAsStringSync(
-        const JsonEncoder.withIndent('  ').convert(out),
-      );
-    } catch (_) {}
     // ignore: avoid_print
-    print('CEF_CHANNEL_PROBE_RESULT ${jsonEncode(out)}');
+    print('CEF_PROBE_DETAIL ${jsonEncode(out)}');
+    // ignore: avoid_print
+    print('CEF_PROBE_RESULT ${_hostGot ? "PASS" : "FAIL"}');
+    Future<void>.delayed(
+        const Duration(milliseconds: 300), () => exit(_hostGot ? 0 : 1));
     if (mounted) {
       setState(() => _status = _hostGot
           ? 'PASS — host received ${_received.length} message(s)'

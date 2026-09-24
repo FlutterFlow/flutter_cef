@@ -169,10 +169,11 @@ tool/run_probes.sh --list          # what each probe checks, including manual on
 ```
 
 It tests the host at `$FLUTTER_CEF_HOST`, or the one `build_cef_host.sh` built.
-Probes that open a named profile need a signed host and are skipped on an
-ad-hoc one. Run the probes that cover the code you touched, and the whole set
-for any native change. A new probe prints `CEF_PROBE_RESULT PASS|FAIL` and gets
-a row in the script's table.
+Probes that open a named profile run with `FLUTTER_CEF_ALLOW_INSECURE_PROFILE=1`,
+so an ad-hoc host keeps the profile instead of downgrading it. Run the probes
+that cover the code you touched, and the whole set for any native change. A new
+probe prints `CEF_PROBE_RESULT PASS|FAIL` on stdout, then exits, and gets a row
+in the script's table.
 
 Longer gates for the rendering pipeline, run by hand after changing surface or
 pacing code: `test/run_cascade_probe.sh` (many tiles created at once all
