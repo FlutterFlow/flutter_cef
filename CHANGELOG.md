@@ -51,6 +51,12 @@
   `create()` starts a new session, and `isLoading`/`mediaState` reset. A
   throwing `onCreateFailed` no longer keeps `onProcessGone` from running, and an
   error thrown by any event callback is reported instead of breaking the channel.
+* **macOS: tile surfaces are private to the app**: they were created global, so
+  any local process could look a tile's IOSurface up by id and read the page
+  (without Screen Recording permission). `cef_host` now hands each surface to
+  the plugin by Mach port, accepted only from the host the plugin spawned.
+  `CefSurfaceInfo.surfaceId` still resolves with `IOSurfaceLookup` inside the
+  app's own process. Wire protocol v9: a v8 `cef_host` is refused at connect.
 * **macOS: answering a JS dialog no longer crashes `cef_host`**: every
   `alert()`/`confirm()`/`prompt()` answer took down the host and every tile on
   it (`processGone('crashed')`), because `Continue()` re-entered

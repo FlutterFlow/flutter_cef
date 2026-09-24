@@ -38,6 +38,11 @@
   pid has exited; older unnamed dirs are swept after a day untouched.
 * An ephemeral profile dir is removed after its host has exited, not while the
   host may still be writing to it.
+* Security: tile IOSurfaces are no longer `IOSurfaceIsGlobal`. `cef_host`
+  sends each new surface as a Mach port right to the plugin's `SurfacePort`
+  (bootstrap name in `--surface-port`) before the present that names it; the
+  plugin accepts messages only from the spawned host's pid (audit trailer).
+  Protocol v9.
 * Fix: answering a JS dialog crashed `cef_host` (`DoJsDialogResp` erased
   through an iterator `Continue()` had invalidated via `OnResetDialogState`).
 * Security: the CDP relay allowlists `Target.*` on the agent's page session
