@@ -97,15 +97,15 @@ abstract class FlutterCefPlatform extends PlatformInterface {
   }) =>
       _callMap('create', sessionId, {
         'url': url,
-        if (authoredHtml != null) 'authoredHtml': authoredHtml,
+        'authoredHtml': ?authoredHtml,
         'width': width,
         'height': height,
         'dpr': dpr,
-        if (allowedSchemes != null) 'allowedSchemes': allowedSchemes,
+        'allowedSchemes': ?allowedSchemes,
         if (enableCdp) 'enableCdp': true,
         if (agentControl) 'agentControl': true,
-        if (profile != null) 'profile': profile,
-        if (hostGroup != null) 'hostGroup': hostGroup,
+        'profile': ?profile,
+        'hostGroup': ?hostGroup,
         if (documentStartScripts.isNotEmpty)
           'documentStartScripts': documentStartScripts,
         if (channels.isNotEmpty) 'channels': channels,
@@ -124,7 +124,7 @@ abstract class FlutterCefPlatform extends PlatformInterface {
   /// Recreate a frozen session's browser on the same texture, loading [url]
   /// (the original create URL when null). Null when it wasn't frozen.
   Future<Map<String, dynamic>?> thawSession(String sessionId, {String? url}) =>
-      _callMap('thawSession', sessionId, {if (url != null) 'url': url});
+      _callMap('thawSession', sessionId, {'url': ?url});
 
   /// Pause (`false`) or resume frame production.
   Future<void> setVisible(String sessionId, bool visible) =>
@@ -210,8 +210,8 @@ abstract class FlutterCefPlatform extends PlatformInterface {
 
   Future<void> showDevTools(String sessionId, {int? inspectX, int? inspectY}) =>
       _call('showDevTools', sessionId, {
-        if (inspectX != null) 'inspectX': inspectX,
-        if (inspectY != null) 'inspectY': inspectY,
+        'inspectX': ?inspectX,
+        'inspectY': ?inspectY,
       });
 
   // ── JavaScript ──────────────────────────────────────────────────────────
