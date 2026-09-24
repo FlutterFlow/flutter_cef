@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -25,32 +26,67 @@ namespace policy {
 // ---- Renderer crash loop ----------------------------------------------------
 //
 // A renderer that dies is normally recoverable: the host reloads and a fresh
-// child takes over. But when children can't start at all, the reload
-// re-crashes at once and loops forever while the pipe stays up, so the
-// embedder never hears about it. Past a burst the host exits instead, which
-// the plugin reports as processGone and the embedder's recreate path handles.
-// Same thresholds as the macOS host.
-class CrashLoopDetector {
+// child takes over. But a page that crashes its renderer on every load, or a
+// child that can't start at all, re-crashes at once and loops forever while
+// the pipe stays up, so the embedder never hears about it.
+//
+// Counted per browser, as on macOS. One browser crash-looping ends only that
+// browser (kOpBrowserGone; it isn't reloaded again) and its neighbours on the
+// host carry on. Bursts on several browsers at once mean the host's children
+// can't start, so the host exits instead and every tile is recreated.
+class RendererCrashPolicy {
  public:
   using Clock = std::chrono::steady_clock;
+  // Deaths of one browser's renderer within kWindow that make a burst.
   static constexpr int kBurstLimit = 4;
   static constexpr std::chrono::seconds kWindow{10};
+  // Browsers whose bursts fall within kWindow of each other before the host
+  // gives up on its children.
+  static constexpr size_t kHostLoopBrowsers = 2;
 
-  // Records a renderer death at `now`. True once the deaths arrive as a burst.
-  bool Note(Clock::time_point now) {
-    if (count_ == 0 || now - window_start_ > kWindow) {
-      // The first death, or the previous burst aged out: one-off crashes over a
-      // long session never add up.
-      window_start_ = now;
-      count_ = 1;
-      return false;
+  enum class Action {
+    kReload,       // a one-off crash: reload the page
+    kIgnore,       // this browser was already given up on
+    kBrowserGone,  // this browser's renderer keeps crashing: end only it
+    kHostExit,     // several browsers crash-loop at once: end the host
+  };
+
+  // Records that `browser_id`'s renderer terminated at `now`.
+  Action OnRendererTerminated(uint32_t browser_id, Clock::time_point now) {
+    Browser& b = browsers_[browser_id];
+    if (b.given_up) return Action::kIgnore;
+    if (b.count == 0 || now - b.window_start > kWindow) {
+      // The first death, or the previous ones aged out: one-off crashes over
+      // a long session never add up.
+      b.window_start = now;
+      b.count = 1;
+      return Action::kReload;
     }
-    return ++count_ >= kBurstLimit;
+    if (++b.count < kBurstLimit) return Action::kReload;
+    b.given_up = true;
+    bursts_[browser_id] = now;
+    for (auto it = bursts_.begin(); it != bursts_.end();) {
+      if (now - it->second > kWindow)
+        it = bursts_.erase(it);
+      else
+        ++it;
+    }
+    return bursts_.size() >= kHostLoopBrowsers ? Action::kHostExit
+                                               : Action::kBrowserGone;
   }
 
+  // The browser closed. Its counter goes; a burst it had keeps counting
+  // toward kHostLoopBrowsers until it ages out.
+  void Forget(uint32_t browser_id) { browsers_.erase(browser_id); }
+
  private:
-  int count_ = 0;
-  Clock::time_point window_start_;
+  struct Browser {
+    int count = 0;
+    Clock::time_point window_start;
+    bool given_up = false;
+  };
+  std::map<uint32_t, Browser> browsers_;
+  std::map<uint32_t, Clock::time_point> bursts_;  // by wire id
 };
 
 // ---- Page-sourced payloads --------------------------------------------------

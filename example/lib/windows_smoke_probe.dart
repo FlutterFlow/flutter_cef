@@ -14,7 +14,10 @@
 //   * setAudioMuted / setFrameInterval are accepted, and a verb Windows can't
 //     serve fails with PlatformException('unsupported');
 //   * freeze() then thaw() brings frames back on the same texture;
-//   * dispose.
+//   * dispose;
+//   * a tile whose renderer keeps crashing ends alone: two tiles share a host,
+//     one is sent to chrome://kill until the host gives up on it, and it gets
+//     processGone('crashed') while the other keeps painting and answering.
 //
 // The result is a `CEF_PROBE_RESULT PASS|FAIL` line on stdout and, because a
 // Windows GUI app's stdout isn't reliably captured, also in the file named by
@@ -39,6 +42,12 @@ const _html = '''<!doctype html><meta charset="utf-8">
   @keyframes spin { to { transform: rotate(360deg); } }
 </style>
 <div id="s"></div>''';
+
+// The crash-loop case's two tiles are served at different sites, so site
+// isolation gives each its own renderer process and killing one can't take
+// the other with it.
+const _sentinelUrl = 'https://flutter-cef-sentinel.test/';
+const _victimUrl = 'https://flutter-cef-victim.test/';
 
 void main() => runApp(const MaterialApp(home: ProbeApp()));
 
@@ -200,7 +209,96 @@ class _ProbeAppState extends State<ProbeApp> {
       _check('probe ran to completion', false, '$e\n$st');
     }
     await c.dispose();
+    await _crashLoop();
     _finish();
+  }
+
+  /// A tile whose renderer keeps crashing ends alone; its neighbour on the
+  /// same host carries on.
+  Future<void> _crashLoop() async {
+    const group = 'windows-smoke-crash-loop';
+    final sentinel = CefWebController(hostGroup: group);
+    final victim = CefWebController(hostGroup: group);
+    String? sentinelGone;
+    final victimGone = Completer<String>();
+    final sentinelLoaded = Completer<void>();
+    final victimLoaded = Completer<void>();
+    sentinel.onProcessGone = (r) => sentinelGone ??= r;
+    victim.onProcessGone = (r) {
+      if (!victimGone.isCompleted) victimGone.complete(r);
+    };
+    sentinel.onPageFinished = (_) {
+      if (!sentinelLoaded.isCompleted) sentinelLoaded.complete();
+    };
+    victim.onPageFinished = (_) {
+      if (!victimLoaded.isCompleted) victimLoaded.complete();
+    };
+    var victimLoads = 0;
+    victim.onPageStarted = (_) => victimLoads++;
+    try {
+      await sentinel.create(
+        url: _sentinelUrl,
+        html: _html,
+        htmlBaseUrl: _sentinelUrl,
+        width: 320,
+        height: 240,
+      );
+      await victim.create(
+        url: _victimUrl,
+        html: _html,
+        htmlBaseUrl: _victimUrl,
+        width: 320,
+        height: 240,
+      );
+      final loaded =
+          await Future.wait([sentinelLoaded.future, victimLoaded.future])
+              .then((_) => true)
+              .timeout(const Duration(seconds: 60), onTimeout: () => false);
+      _check('crash loop: both tiles load', loaded);
+
+      // chrome://kill is a renderer debug URL: Chromium ends the tile's
+      // renderer (exit code 1, no crash dump) and cef_host reloads the page.
+      // Four deaths within 10 s and the host gives up on the tile.
+      for (var i = 0; i < 8 && !victimGone.isCompleted; i++) {
+        await victim.navigate('chrome://kill');
+        await victimGone.future
+            .then((_) {})
+            .timeout(const Duration(seconds: 1), onTimeout: () {});
+      }
+      final gone = await victimGone.future.timeout(
+        const Duration(seconds: 15),
+        onTimeout: () => '<none; the victim loaded $victimLoads times>',
+      );
+      _check(
+        'crash loop: the crash-looping tile gets processGone(crashed)',
+        gone == 'crashed',
+        gone,
+      );
+
+      final before = await _presents(sentinel);
+      _check(
+        'crash loop: the other tile on the host keeps painting',
+        await _presentsPast(
+          sentinel,
+          before,
+          within: const Duration(seconds: 10),
+        ),
+        await sentinel.sessionStats(),
+      );
+      final four = await sentinel
+          .runJavaScriptReturningResult('2 + 2')
+          .timeout(const Duration(seconds: 10));
+      _check('crash loop: the other tile answers evals', '$four' == '4', four);
+      _check(
+        'crash loop: the other tile gets no processGone',
+        sentinelGone == null,
+        sentinelGone,
+      );
+    } catch (e, st) {
+      _check('crash loop case ran to completion', false, '$e\n$st');
+    }
+    await sentinel.dispose();
+    await victim.dispose();
   }
 
   void _finish() {

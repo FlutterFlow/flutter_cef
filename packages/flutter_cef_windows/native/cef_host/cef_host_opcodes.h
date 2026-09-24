@@ -8,7 +8,7 @@
 
 namespace flutter_cef {
 
-constexpr uint8_t kCefHostProtocolVersion = 5;
+constexpr uint8_t kCefHostProtocolVersion = 6;
 
 // ---- cef_host -> plugin ----
 // {u64 bridgeHandle}{u32 srcW}{u32 srcH}: bridgeHandle is the DXGI legacy
@@ -59,6 +59,9 @@ constexpr uint8_t kOpTargetId = 0x1b;
 constexpr uint8_t kOpCreated = 0x1c;
 // {} the async CreateBrowser dispatch failed; the plugin drops the session
 constexpr uint8_t kOpCreateFailed = 0x1d;
+// {utf8 reason} this one browser can't continue (its renderer keeps crashing);
+// the process survives and the plugin drops the session
+constexpr uint8_t kOpBrowserGone = 0x42;
 
 // ---- plugin -> cef_host ----
 // {u8 type}{u8 button}{u8 clickCount}{u8 pad}{u32 modifiers}{f64 x}{f64 y}{f64

@@ -56,8 +56,8 @@ class Op {
 const protocolVersions = {
   // v10: kOpBrowserGone (one browser's renderer keeps crashing).
   Platform.macos: 10,
-  // v5: kOpSetAudioMuted + kOpSetPumpInterval.
-  Platform.windows: 5,
+  // v6: kOpBrowserGone (one browser's renderer keeps crashing).
+  Platform.windows: 6,
 };
 
 const _mac = {Platform.macos};
@@ -108,8 +108,7 @@ const ops = <Op>[
       '{u32 id}{utf8 json} right-click: Chromium\'s menu model and params, for the plugin\'s consumer to draw; answer with kOpContextMenuCommand',
       platforms: _mac),
   Op(0x42, 'BrowserGone', _up,
-      '{utf8 reason} this one browser can\'t continue (its renderer keeps crashing); the process survives and the plugin drops the session',
-      platforms: _mac),
+      '{utf8 reason} this one browser can\'t continue (its renderer keeps crashing); the process survives and the plugin drops the session'),
 
   // ---- plugin -> cef_host ----
   Op(0x10, 'Pointer', _down,

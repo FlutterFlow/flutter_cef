@@ -27,29 +27,105 @@ void Check(bool ok, const char* what, int line) {
 #define CHECK(x) Check((x), #x, __LINE__)
 
 using namespace flutter_cef;
-using Clock = policy::CrashLoopDetector::Clock;
+using Clock = policy::RendererCrashPolicy::Clock;
+using Crash = policy::RendererCrashPolicy::Action;
 
-void TestCrashLoop() {
-  policy::CrashLoopDetector d;
+Clock::time_point At(Clock::time_point t0, int seconds) {
+  return t0 + std::chrono::seconds(seconds);
+}
+
+// Four deaths of `browser` one second apart, starting at `start` seconds; the
+// last one's action.
+Crash Burst(policy::RendererCrashPolicy& p, uint32_t browser,
+            Clock::time_point t0, int start) {
+  Crash last = Crash::kReload;
+  for (int i = 0; i < policy::RendererCrashPolicy::kBurstLimit; ++i)
+    last = p.OnRendererTerminated(browser, At(t0, start + i));
+  return last;
+}
+
+void TestCrashLoopOneBrowser() {
   const Clock::time_point t0 = Clock::now();
-  // Three quick deaths are recoverable; the fourth inside 10 s is a loop.
-  CHECK(!d.Note(t0));
-  CHECK(!d.Note(t0 + std::chrono::seconds(1)));
-  CHECK(!d.Note(t0 + std::chrono::seconds(2)));
-  CHECK(d.Note(t0 + std::chrono::seconds(3)));
+  policy::RendererCrashPolicy p;
+  // Three quick deaths reload; the fourth inside 10 s ends only that browser.
+  CHECK(p.OnRendererTerminated(1, At(t0, 0)) == Crash::kReload);
+  CHECK(p.OnRendererTerminated(1, At(t0, 1)) == Crash::kReload);
+  CHECK(p.OnRendererTerminated(1, At(t0, 2)) == Crash::kReload);
+  CHECK(p.OnRendererTerminated(1, At(t0, 3)) == Crash::kBrowserGone);
+  // After that it is left alone: no reload and no second report.
+  CHECK(p.OnRendererTerminated(1, At(t0, 4)) == Crash::kIgnore);
+  // Its neighbours on the host still reload as usual.
+  CHECK(p.OnRendererTerminated(2, At(t0, 4)) == Crash::kReload);
+  CHECK(p.OnRendererTerminated(2, At(t0, 5)) == Crash::kReload);
+
+  // Crashes are counted per browser: three each on three browsers, all
+  // interleaved inside one window, is no burst.
+  policy::RendererCrashPolicy q;
+  bool all_reload = true;
+  for (int i = 0; i < 3; ++i) {
+    for (uint32_t b = 1; b <= 3; ++b) {
+      all_reload = all_reload &&
+                   q.OnRendererTerminated(b, At(t0, i)) == Crash::kReload;
+    }
+  }
+  CHECK(all_reload);
 
   // Deaths spread over a long session never add up.
-  policy::CrashLoopDetector slow;
-  for (int i = 0; i < 20; ++i)
-    CHECK(!slow.Note(t0 + std::chrono::seconds(11 * i)));
+  policy::RendererCrashPolicy slow;
+  bool slow_reload = true;
+  for (int i = 0; i < 20; ++i) {
+    const Crash a = slow.OnRendererTerminated(1, At(t0, 11 * i));
+    slow_reload = slow_reload && a == Crash::kReload;
+  }
+  CHECK(slow_reload);
 
-  // A burst that ages out starts a fresh window.
-  policy::CrashLoopDetector aged;
-  CHECK(!aged.Note(t0));
-  CHECK(!aged.Note(t0 + std::chrono::seconds(1)));
-  CHECK(!aged.Note(t0 + std::chrono::seconds(2)));
-  CHECK(!aged.Note(t0 + std::chrono::seconds(15)));
-  CHECK(!aged.Note(t0 + std::chrono::seconds(16)));
+  // Deaths that age out start a fresh window.
+  policy::RendererCrashPolicy aged;
+  CHECK(aged.OnRendererTerminated(1, At(t0, 0)) == Crash::kReload);
+  CHECK(aged.OnRendererTerminated(1, At(t0, 1)) == Crash::kReload);
+  CHECK(aged.OnRendererTerminated(1, At(t0, 2)) == Crash::kReload);
+  CHECK(aged.OnRendererTerminated(1, At(t0, 15)) == Crash::kReload);
+  CHECK(aged.OnRendererTerminated(1, At(t0, 16)) == Crash::kReload);
+}
+
+void TestCrashLoopSeveralBrowsers() {
+  const Clock::time_point t0 = Clock::now();
+  // A second browser bursting within 10 s of the first: the host's children
+  // can't start, so the host exits.
+  policy::RendererCrashPolicy p;
+  CHECK(Burst(p, 1, t0, 0) == Crash::kBrowserGone);  // burst at 3 s
+  CHECK(Burst(p, 2, t0, 4) == Crash::kHostExit);     // burst at 7 s
+
+  // The first browser has closed by then (the plugin disposes it on
+  // kOpBrowserGone); its burst still counts.
+  policy::RendererCrashPolicy closed;
+  CHECK(Burst(closed, 1, t0, 0) == Crash::kBrowserGone);
+  closed.Forget(1);
+  CHECK(Burst(closed, 2, t0, 4) == Crash::kHostExit);
+
+  // Exactly 10 s apart is still within the window (as on macOS).
+  policy::RendererCrashPolicy edge;
+  CHECK(Burst(edge, 1, t0, 0) == Crash::kBrowserGone);   // burst at 3 s
+  CHECK(Burst(edge, 2, t0, 10) == Crash::kHostExit);     // burst at 13 s
+}
+
+void TestCrashLoopBurstsAgeOut() {
+  const Clock::time_point t0 = Clock::now();
+  // Bursts more than 10 s apart are separate pages crash-looping, not a host
+  // that can't start children: each ends only its own browser.
+  policy::RendererCrashPolicy p;
+  CHECK(Burst(p, 1, t0, 0) == Crash::kBrowserGone);   // burst at 3 s
+  CHECK(Burst(p, 2, t0, 11) == Crash::kBrowserGone);  // burst at 14 s
+  // A third burst 4 s after the second is two within 10 s again.
+  CHECK(Burst(p, 3, t0, 15) == Crash::kHostExit);     // burst at 18 s
+
+  // Forgetting a closed browser drops its crash count.
+  policy::RendererCrashPolicy f;
+  CHECK(f.OnRendererTerminated(1, At(t0, 0)) == Crash::kReload);
+  CHECK(f.OnRendererTerminated(1, At(t0, 1)) == Crash::kReload);
+  CHECK(f.OnRendererTerminated(1, At(t0, 2)) == Crash::kReload);
+  f.Forget(1);
+  CHECK(f.OnRendererTerminated(1, At(t0, 3)) == Crash::kReload);
 }
 
 void TestPayloadCaps() {
@@ -225,7 +301,9 @@ void TestLiveness() {
 }  // namespace
 
 int main() {
-  TestCrashLoop();
+  TestCrashLoopOneBrowser();
+  TestCrashLoopSeveralBrowsers();
+  TestCrashLoopBurstsAgeOut();
   TestPayloadCaps();
   TestSchemes();
   TestFrameRate();

@@ -1839,6 +1839,19 @@ void FlutterCefPlugin::HandleSessionFrame(
       DisposeSession(sid);
       break;
     }
+    case kOpBrowserGone: {
+      // cef_host gave up on this browser (its renderer keeps crashing). The
+      // host and its other browsers are fine: drop just this session, as for
+      // a failed create. Disposing it shuts the host down when it was the
+      // host's last browser.
+      const std::string sid = session_id;
+      std::string reason = PayloadString(payload);
+      if (reason.empty()) reason = "crashed";
+      EmitEvent("processGone", sid,
+                {{Ev("reason"), flutter::EncodableValue(reason)}});
+      DisposeSession(sid);
+      break;
+    }
     case kOpTargetId:
       // Per-tile CDP target resolution isn't implemented on Windows (the relay
       // is a single-tile passthrough), and the host never sends this.
