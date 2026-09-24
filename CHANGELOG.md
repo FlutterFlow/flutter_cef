@@ -130,12 +130,6 @@
 * The controller talks to the platform through `FlutterCefPlatform`'s typed
   methods instead of ~45 raw method-channel strings; the wire calls are
   unchanged and pinned by `test/platform_wire_test.dart`.
-* **Behavior change — JS dialogs fail closed**: with no
-  `onJavaScriptConfirmDialog`, a page's `confirm()` now returns false (it
-  returned true), and with no `onJavaScriptTextInputDialog`, `prompt()` returns
-  null (it returned its default). A page's "Delete everything?" is no longer
-  accepted with no human asked. This matches a throwing handler and the
-  camera/mic deny-by-default. Set the handlers to keep the old answers.
 * **`CefWebView` follows its controller**:
   * a new `controller` (or, for the view's own controller, a new `profile`) is
     adopted; it used to be ignored, and consumers re-keyed the view instead;

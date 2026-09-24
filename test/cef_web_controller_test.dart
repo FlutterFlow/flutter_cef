@@ -1578,18 +1578,22 @@ void main() {
       await c.dispose();
     });
 
-    test('with no handler, confirm and prompt are cancelled', () async {
+    test('with no handler, confirm is OK and prompt returns its default',
+        () async {
+      // An app that shows no dialog UI must not silently cancel every
+      // confirm-gated action a user starts in the page.
       final c = CefWebController(sessionId: 'rb-dlg');
       await c.create(url: 'about:blank', width: 1, height: 1);
       await emit('rb-dlg', 'jsDialog',
-          {'id': 1, 'type': 1, 'message': 'Delete everything?'});
+          {'id': 1, 'type': 1, 'message': 'Discard changes?'});
       await emit('rb-dlg', 'jsDialog',
           {'id': 2, 'type': 2, 'message': 'name?', 'defaultText': 'x'});
       await emit('rb-dlg', 'jsDialog', {'id': 3, 'type': 0, 'message': 'hi'});
       await pumpEventQueue();
       final byId = {for (final a in argsOf('respondJsDialog')) a['id']: a};
-      expect(byId[1]!['ok'], false, reason: 'confirm() must not auto-accept');
-      expect(byId[2]!['ok'], false, reason: 'prompt() must not auto-answer');
+      expect(byId[1]!['ok'], true);
+      expect(byId[2]!['ok'], true);
+      expect(byId[2]!['text'], 'x');
       expect(byId[3]!['ok'], true, reason: 'an alert is just dismissed');
       await c.dispose();
     });

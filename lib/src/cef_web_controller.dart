@@ -269,15 +269,16 @@ class CefWebController {
 
   /// Handle a page `confirm(...)`. Return true for OK, false for Cancel.
   ///
-  /// **If unset, confirms are cancelled** (`confirm()` returns false): with no
-  /// handler there is no human to ask, and a page's "Delete everything?" must
-  /// not be accepted on nobody's behalf. This matches a handler that throws,
-  /// and [onMediaPermissionRequest]'s deny-by-default.
+  /// If unset, confirms default to OK, so a page that asks before acting (a
+  /// "Discard changes?" behind the user's own click) still works in an app
+  /// that shows no dialog UI. Set a handler to show the question to the user.
+  /// This is not a permission gate: the page asking `confirm()` is the page
+  /// that acts on the answer. A handler that throws answers Cancel.
   Future<bool> Function(CefJsDialogRequest request)? onJavaScriptConfirmDialog;
 
   /// Handle a page `prompt(...)`. Return the entered text, or null to cancel.
-  /// **If unset, prompts are cancelled** (`prompt()` returns null), for the
-  /// same reason as [onJavaScriptConfirmDialog].
+  /// If unset, prompts return their default value, for the same reason as
+  /// [onJavaScriptConfirmDialog]. A handler that throws cancels.
   Future<String?> Function(CefJsDialogRequest request)?
       onJavaScriptTextInputDialog;
 
@@ -563,11 +564,13 @@ class CefWebController {
     try {
       switch (a['type'] as int? ?? 0) {
         case 1:
-          // No handler, no human to ask: Cancel (see onJavaScriptConfirmDialog).
-          ok = (await onJavaScriptConfirmDialog?.call(req)) ?? false;
+          // No handler: OK (see onJavaScriptConfirmDialog).
+          ok = (await onJavaScriptConfirmDialog?.call(req)) ?? true;
           break;
         case 2:
-          final r = await onJavaScriptTextInputDialog?.call(req);
+          final r = onJavaScriptTextInputDialog == null
+              ? req.defaultText
+              : await onJavaScriptTextInputDialog!(req);
           ok = r != null;
           text = r ?? '';
           break;
