@@ -1,23 +1,12 @@
-// flutter_cef Windows — wire protocol constants + big-endian codecs.
+// flutter_cef Windows — wire framing constants + big-endian codecs.
 //
 // Shared by the cef_host process (native/cef_host/cef_host_win.cc) and the
 // Flutter plugin (windows/ipc_pipe.cpp): plain C++/Win32, no CEF includes, so
-// both builds can consume it.
-//
-// THE CONTRACT IS PROTOCOL.md (this directory) — transcribed from the macOS
-// reference `packages/flutter_cef_macos/native/cef_host/main.mm:111-164`.
-// Opcode numbers are copied VERBATIM from main.mm. Framing:
+// both builds can consume it. The opcodes and the protocol version are in
+// cef_host_opcodes.h, generated from tool/protocol/spec.dart. Framing:
 //   [u32 bodyLen BE][u32 browserId BE][u8 opcode][payload]
 // bodyLen = 4 + 1 + payloadLen; guard 5 <= bodyLen <= 64 MiB; browserId 0 =
 // process-level (kOpReady, process-level kOpLog, inbound kOpShutdown).
-//
-// ONE payload difference vs macOS (LAW 10): kOpPresent on Windows carries
-//   {u64 bridgeHandle BE}{u32 srcW BE}{u32 srcH BE}   (16 bytes)
-// instead of macOS's {u32 iosurfaceId}{u32 srcW}{u32 srcH} (12 bytes).
-// bridgeHandle is the DXGI LEGACY shared handle (IDXGIResource::
-// GetSharedHandle) of the host-minted D3D11_RESOURCE_MISC_SHARED bridge
-// texture — the identity Flutter sees (LAW 3). srcW/srcH are the PHYSICAL
-// pixel dims of the frame actually composited (the size-gate signal, LAW 4).
 
 #ifndef FLUTTER_CEF_WINDOWS_NATIVE_CEF_HOST_CEF_HOST_PROTOCOL_H_
 #define FLUTTER_CEF_WINDOWS_NATIVE_CEF_HOST_CEF_HOST_PROTOCOL_H_
@@ -25,87 +14,13 @@
 #include <cstdint>
 #include <cstring>
 
-namespace flutter_cef {
+#include "cef_host_opcodes.h"
 
-// ---- Wire protocol version ----
-// Announced in kOpReady's payload byte 1 (byte 0 is the ready-flags byte).
-// Versioned per platform: this header is shared by the Windows host and the
-// Windows plugin, which must agree; macOS (main.mm / CefProfileHost.swift)
-// counts separately. Bump on any change the other side can't ignore — a
-// mismatch fails every session with processGone("protocolMismatch(host=vN)").
-//   4: kOpSetAuthoredHtml (0x3f) + kOpSetDocumentStart (0x41).
-constexpr uint8_t kCefHostProtocolVersion = 4;
+namespace flutter_cef {
 
 // Framing guard (main.mm:2347): minimum body = 4 (browserId) + 1 (op).
 constexpr uint32_t kMinBodyLen = 5;
 constexpr uint32_t kMaxBodyLen = 64u << 20;  // 64 MiB
-
-// ---- Opcodes: cef_host -> plugin (main.mm:111-133) ----
-constexpr uint8_t kOpPresent = 0x01;    // WINDOWS: {u64 bridgeHandle}{u32 srcW}{u32 srcH}
-constexpr uint8_t kOpReady = 0x02;      // {u8 readyFlags}{u8 protocolVersion} browserId 0
-constexpr uint8_t kOpCursor = 0x03;     // {u32 cef_cursor_type_t}
-constexpr uint8_t kOpLog = 0x04;        // {utf8}
-constexpr uint8_t kOpLoadState = 0x05;  // {loading,back,forward : u8}
-constexpr uint8_t kOpTitle = 0x06;      // {utf8}
-constexpr uint8_t kOpUrl = 0x07;        // {utf8} main-frame address
-constexpr uint8_t kOpLoadErr = 0x08;    // {code:u32}{utf8 "url\ntext"}
-constexpr uint8_t kOpConsole = 0x09;    // {level:u32}{utf8 "source:line\tmsg"}
-constexpr uint8_t kOpPageStart = 0x0a;  // {utf8 url} main frame load started
-constexpr uint8_t kOpPageFinish = 0x0b; // {utf8 url} main frame load finished
-constexpr uint8_t kOpProgress = 0x0c;   // {u32 percent 0-100}
-constexpr uint8_t kOpNewWindow = 0x0d;  // {utf8 url} popup / target=_blank
-constexpr uint8_t kOpFindResult = 0x0e; // {u32 count}{u32 activeOrdinal}{u8 final}
-constexpr uint8_t kOpJsDialog = 0x0f;   // {u32 id}{u32 type}{u32 msgLen}{msg}{default}
-constexpr uint8_t kOpEvalResult = 0x16; // {utf8 "id:json"} runJavaScriptReturningResult
-constexpr uint8_t kOpChannelMsg = 0x17; // {utf8 "name:message"} JS channel -> host
-constexpr uint8_t kOpDownload = 0x18;   // {utf8 suggestedName} a download started
-constexpr uint8_t kOpImeBounds = 0x19;  // {u32 x}{u32 y}{u32 w}{u32 h} caret rect (DIP)
-constexpr uint8_t kOpCookies = 0x1a;    // {u32 id}{utf8 json-array} visitAllCookies result
-constexpr uint8_t kOpTargetId = 0x1b;   // {utf8 targetId} this browser's CDP targetId
-constexpr uint8_t kOpCreated = 0x1c;    // {} OnAfterCreated — browser is up
-constexpr uint8_t kOpCreateFailed = 0x1d; // {} async CreateBrowser dispatch failed
-
-// ---- Opcodes: plugin -> cef_host (main.mm:134-164) ----
-constexpr uint8_t kOpPointer = 0x10;        // {u8 type}{u8 btn}{u8 clicks}{u8 pad}{u32 mods}{f64 x}{f64 y}{f64 dx}{f64 dy}
-constexpr uint8_t kOpResize = 0x11;         // {u32 w}{u32 h}{f64 dpr} — producer-allocates: no sid
-constexpr uint8_t kOpKey = 0x12;            // {u8 type}{pad*3}{u32 mods}{u32 wkc}{u32 nkc}{u32 char}
-constexpr uint8_t kOpCreateBrowser = 0x13;  // {u32 w}{u32 h}{f64 dpr}{utf8 url}; frame browserId = NEW id
-constexpr uint8_t kOpShutdown = 0x14;       // {} tear down the whole PROCESS; frame browserId 0
-constexpr uint8_t kOpDisposeBrowser = 0x15; // {} close ONE browser; process survives
-constexpr uint8_t kOpNavigate = 0x20;       // {utf8 url}
-constexpr uint8_t kOpReload = 0x21;
-constexpr uint8_t kOpStop = 0x22;
-constexpr uint8_t kOpBack = 0x23;
-constexpr uint8_t kOpForward = 0x24;
-constexpr uint8_t kOpExecuteJs = 0x25;  // {utf8 code}
-constexpr uint8_t kOpSetZoom = 0x26;    // {f64 level} (factor = 1.2^level)
-constexpr uint8_t kOpFind = 0x27;       // {u8 fwd}{u8 matchCase}{u8 findNext}{utf8}
-constexpr uint8_t kOpStopFind = 0x28;   // {u8 clearSelection}
-constexpr uint8_t kOpJsDialogResp = 0x29;   // {u32 id}{u8 ok}{utf8 text}
-constexpr uint8_t kOpEvalReturning = 0x2a;  // {u32 id}{utf8 code}
-constexpr uint8_t kOpAddChannel = 0x2b;     // {utf8 name} register a JS channel
-constexpr uint8_t kOpSetCookie = 0x2c;      // {utf8 url\0name\0value\0domain\0path[\0secure(0|1)\0httpOnly(0|1)\0sameSite(unspecified|none|lax|strict)]}
-constexpr uint8_t kOpClearCookies = 0x2d;   // {} delete all cookies
-constexpr uint8_t kOpVisitCookies = 0x2e;   // {u32 id}{utf8 url} enumerate (url empty = all)
-constexpr uint8_t kOpDeleteCookie = 0x2f;   // {utf8 url\0name} delete one
-constexpr uint8_t kOpImeSetComp = 0x30;     // {utf8 text} IME composition update
-constexpr uint8_t kOpImeCommit = 0x31;      // {utf8 text} commit composed text
-constexpr uint8_t kOpImeCancel = 0x32;      // {} cancel composition
-constexpr uint8_t kOpShowDevTools = 0x33;   // {} open DevTools in a window
-constexpr uint8_t kOpLoadTrusted = 0x34;    // {utf8 url} host content-load, exempt from allowlist
-constexpr uint8_t kOpSetVisible = 0x35;     // {u8 visible} -> CefBrowserHost::WasHidden(!visible)
-constexpr uint8_t kOpResolveTargetId = 0x36;// {} resolve CDP targetId -> kOpTargetId
-constexpr uint8_t kOpInvalidate = 0x37;     // {} force a repaint (re-kick a stalled first frame)
-constexpr uint8_t kOpEditCommand = 0x38;    // {u8 cmd} 0=copy 1=cut 2=paste 3=selectAll 4=undo 5=redo
-// {utf8 baseUrl}\0{utf8 html}: an AUTHORED document served as the main-frame
-// response for exactly baseUrl (empty html clears it). Store-only — the load
-// is a following kOpCreateBrowser / kOpLoadTrusted for that URL.
-constexpr uint8_t kOpSetAuthoredHtml = 0x3f;
-// Document-start scripts + JS channel names for the browser created right
-// behind it (payload: document_start.h). Store-only, like kOpSetAuthoredHtml.
-constexpr uint8_t kOpSetDocumentStart = 0x41;
-
-// 0x1e is RESERVED (PLAN §4.3's kOpPresentV2 earmark) — do not assign.
 
 // ---- Big-endian codecs (mirror main.mm ReadU32BE/WriteU32BE/ReadF64BE) ----
 

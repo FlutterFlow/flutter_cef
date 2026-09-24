@@ -426,14 +426,14 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     }
 
     // F.5 dev safety-rail: an ad-hoc (mock-keychain) host refuses a named
-    // persistent profile at opReady (nothing's been written, so no creds leak).
+    // persistent profile at kOpReady (nothing's been written, so no creds leak).
     // When that fires, tear the host down and respawn an EPHEMERAL host for this
     // same session, then re-issue createBrowser. Wired only for named profiles;
     // an already-ephemeral host never refuses.
     if effectiveNamed {
       // C2: re-home the WHOLE shared host's sessions onto ephemeral hosts on refusal —
       // not just this one. The closure captures the host, not a single sessionId, so a
-      // burst of tiles that all attached before opReady are all rescued.
+      // burst of tiles that all attached before kOpReady are all rescued.
       host.onInsecureProfileRefused = { [weak self, weak host] in
         DispatchQueue.main.async {
           guard let self = self, let host = host, let prof = profile else { return }
@@ -537,7 +537,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     // The session's init publish fired onSurface before the callback above existed, so
     // deliver the current surface now (no-op until the first surface is allocated).
     session.emitCurrentSurface()
-    // Allocate the wire browserId + (when ready) issue opCreateBrowser. The
+    // Allocate the wire browserId + (when ready) issue kOpCreateBrowser. The
     // process arg --allowed-schemes is shared by every browser in the profile;
     // it's taken from the first browser that triggered the spawn.
     if let html = a["authoredHtml"] as? String, !html.isEmpty {
@@ -638,7 +638,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       // C2 cross-group contract: cef_host exits 2 (after SendLog "profile-locked")
       // when it loses the cache singleton lock to another process. Surface that as
       // a distinct reason so the widget can say "already open elsewhere" instead of
-      // a generic crash. A host that died before opReady never created a browser:
+      // a generic crash. A host that died before kOpReady never created a browser:
       // its sessions' creates failed, so consumers fall back at once instead of
       // recreating on a host that can't start.
       if status == 2, let key = self.profiles.first(where: { $0.value === host })?.key,
@@ -659,7 +659,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       self.failHost(host, reason: reason)
     }
     // Protocol handshake refusal: the host announced a wire-protocol version this
-    // plugin doesn't speak (see CefProfileHost.protocolVersion). Nothing was flushed
+    // plugin doesn't speak (see CefHostProtocol.version). Nothing was flushed
     // to it, so nothing mis-parsed — fail its sessions with a distinct reason and
     // tear it down. Deliberately NO auto-respawn (a respawn would re-resolve the
     // same mismatched binary and loop); the consumer's bounded recovery surfaces it.
@@ -755,7 +755,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   }
 
   /// C2/F.5: a running cef_host turned out to be an ad-hoc (mock-keychain) build and
-  /// refused its named profile (at opReady, BEFORE any browser was created — so nothing
+  /// refused its named profile (at kOpReady, BEFORE any browser was created — so nothing
   /// rendered or leaked). Re-home EVERY session that was on that shared host onto its
   /// own ephemeral host, preserving each session's url/schemes/agent-control, and
   /// remember the profile so later creates skip the doomed shared host. This replaces
