@@ -1,4 +1,4 @@
-// Agent-control (P9) end-to-end probe — drives the Windows token-gated loopback
+// Agent-control end-to-end probe — drives the Windows token-gated loopback
 // CDP relay through a real CDP WebSocket client, entirely in-process (no
 // Playwright / node / python needed: dart:io's WebSocket does the RFC-6455
 // handshake and forwards a custom Authorization header).

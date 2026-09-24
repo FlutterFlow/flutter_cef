@@ -4,8 +4,8 @@
 // constants header ../native/cef_host/cef_host_protocol.h.
 //
 //  - Name: \\.\pipe\flutter_cef_<128-bit CSPRNG hex> (NextPipeName()). The
-//    unguessable name + FILE_FLAG_FIRST_PIPE_INSTANCE close the squat race
-//    (PLAN §4.2/§7.6): a predictable pid_counter name let a same-user process
+//    unguessable name + FILE_FLAG_FIRST_PIPE_INSTANCE close the squat race:
+//    a predictable pid_counter name let a same-user process
 //    pre-create the pipe before cef_host connected.
 //  - Server: CreateNamedPipeW(PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED |
 //    FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE |
@@ -25,13 +25,14 @@
 //  - Framing: [u32 bodyLen BE][u32 browserId BE][u8 op][payload], bodyLen =
 //    4+1+payloadLen, guard 5..64 MiB (kMinBodyLen/kMaxBodyLen). Outbound
 //    frames are assembled contiguously and written whole under a write mutex
-//    (as main.mm's SendFrame does), with a bounded wait (kWriteTimeoutMs).
+//    (as SendFrame in the macOS host's ipc.mm does), with a bounded wait
+//    (kWriteTimeoutMs).
 //  - The FrameHandler/DisconnectHandler run on the READER thread; the caller
 //    must marshal to the platform thread before touching the MethodChannel.
 //  - Teardown (Close): signal the stop event + CancelIoEx, bounded join. If
 //    the reader will not stop, Close returns false and the caller must LEAK
 //    this object (unique_ptr::release) — never free state a blocked reader
-//    may still touch (CefProfileHost.swift:999-1002 rule).
+//    may still touch (the rule CefProfileHost.shutdown follows on macOS).
 //
 // NOTE: deliberately flutter-free (windows.h + protocol header only) so it
 // can be exercised by a standalone harness without an engine.

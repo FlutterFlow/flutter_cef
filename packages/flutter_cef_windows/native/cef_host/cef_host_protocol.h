@@ -18,11 +18,11 @@
 
 namespace flutter_cef {
 
-// Framing guard (main.mm:2347): minimum body = 4 (browserId) + 1 (op).
+// Framing guard, as on macOS: minimum body = 4 (browserId) + 1 (op).
 constexpr uint32_t kMinBodyLen = 5;
 constexpr uint32_t kMaxBodyLen = 64u << 20;  // 64 MiB
 
-// ---- Big-endian codecs (mirror main.mm ReadU32BE/WriteU32BE/ReadF64BE) ----
+// ---- Big-endian codecs (mirror the macOS host's ipc.h) ----
 
 inline uint32_t ReadU32BE(const uint8_t* p) {
   return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) |

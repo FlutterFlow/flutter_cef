@@ -36,8 +36,8 @@ struct TextureBridge::Entry {
   uint64_t handle = 0;  // host-minted legacy shared handle — the identity
   uint32_t width = 0;
   uint32_t height = 0;
-  // LAW 6 / S1 belt-1: opened D3D11 reference on the CURRENT bridge handle,
-  // held for as long as it is fed to Flutter.
+  // Our own opened D3D11 reference on the CURRENT bridge handle, held for as
+  // long as it is fed to Flutter, so the texture outlives the host's release.
   Microsoft::WRL::ComPtr<ID3D11Texture2D> keepalive;
   std::unique_ptr<flutter::TextureVariant> variant;
 };
@@ -51,7 +51,7 @@ bool TextureBridge::EnsureDevice() {
   if (device_) return true;
   // Any D3D11 device can open + hold a legacy MISC_SHARED handle; the engine
   // opens the handle on ITS device via the descriptor. Ours only pins the
-  // resource alive (LAW 6). Default adapter matches the spike-proven setup.
+  // resource alive. The default adapter is the setup the port was tested on.
   UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
   HRESULT hr = D3D11CreateDevice(
       nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, nullptr, 0,
@@ -91,7 +91,7 @@ int64_t TextureBridge::RegisterSessionTexture() {
             raw->desc.height = raw->height;
             raw->desc.visible_width = raw->width;
             raw->desc.visible_height = raw->height;
-            raw->desc.format = kFlutterDesktopPixelFormatNone;  // LAW 5
+            raw->desc.format = kFlutterDesktopPixelFormatNone;
             raw->desc.release_context = nullptr;
             raw->desc.release_callback = [](void*) {};
             return &raw->desc;
@@ -125,8 +125,8 @@ bool TextureBridge::Present(int64_t texture_id, uint64_t bridge_handle,
     changed = (entry->handle != bridge_handle);
   }
 
-  // `previous` keeps the old opened ref alive until AFTER the swap (LAW 6:
-  // release the previous only once the new one is being served).
+  // `previous` keeps the old opened ref alive until AFTER the swap: release
+  // the previous only once the new one is being served.
   Microsoft::WRL::ComPtr<ID3D11Texture2D> previous;
   if (changed) {
     if (!EnsureDevice()) return false;
@@ -135,7 +135,7 @@ bool TextureBridge::Present(int64_t texture_id, uint64_t bridge_handle,
         reinterpret_cast<HANDLE>(static_cast<uintptr_t>(bridge_handle)),
         IID_PPV_ARGS(opened.GetAddressOf()));
     if (FAILED(hr)) {
-      // #9: on device loss (removed/reset) the cached device is dead and every
+      // On device loss (removed/reset) the cached device is dead and every
       // OpenSharedResource on it keeps failing — drop it (+ this slot's opened
       // keepalive) so the next present re-creates the device via EnsureDevice
       // and reopens the host-re-minted handle fresh. A plain bad-handle miss
@@ -193,7 +193,7 @@ void TextureBridge::Unregister(int64_t texture_id) {
     entry = std::move(it->second);
     entries_.erase(it);
   }
-  // Async unregister (PLAN §2 #7): the engine may still sample the texture /
+  // Async unregister: the engine may still sample the texture /
   // call the descriptor callback until the completion callback fires. The
   // captured shared_ptr keeps the entry (variant + descriptor + keep-alive
   // ComPtr) alive exactly until the engine runs or destroys the callback —

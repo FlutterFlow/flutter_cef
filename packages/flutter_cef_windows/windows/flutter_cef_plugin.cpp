@@ -126,7 +126,7 @@ std::vector<std::string> GetStringList(const flutter::EncodableMap& m,
   return out;
 }
 
-// A `profile` arg is "named" only when present AND non-empty (Swift:288-289).
+// A `profile` arg is "named" only when present AND non-empty (as on macOS).
 bool HasNamedProfile(const flutter::EncodableMap& m) {
   auto it = m.find(flutter::EncodableValue(std::string("profile")));
   if (it == m.end()) return false;
@@ -197,10 +197,10 @@ flutter::EncodableValue Ev(const char* s) {
 }
 
 // Sanitize a profile name to a filesystem-safe leaf: anything outside
-// [A-Za-z0-9._-] -> '_' (macOS resolveProfileDir, FlutterCefPlugin.swift:
-// 710-717). A leaf of all dots ("."/".."/"...") would resolve to the
-// profiles/ container or its PARENT — a one-level containment escape whose
-// protected-DACL apply would clobber a shared ancestor — so neutralize it.
+// [A-Za-z0-9._-] -> '_' (as macOS resolveProfileDir does). A leaf of all dots
+// ("."/".."/"...") would resolve to the profiles/ container or its PARENT — a
+// one-level containment escape whose protected-DACL apply would clobber a
+// shared ancestor — so neutralize it.
 std::wstring SanitizeProfileLeaf(const std::string& profile) {
   std::wstring out;
   out.reserve(profile.size());
@@ -265,8 +265,8 @@ void FlutterCefPlugin::RegisterWithRegistrar(
 FlutterCefPlugin::FlutterCefPlugin(flutter::PluginRegistrarWindows* registrar)
     : registrar_(registrar) {
   // Reclaim ephemeral profile dirs orphaned by a previous crash/kill before we
-  // start minting new ones (macOS sweepStaleEphemeralProfiles at plugin init,
-  // FlutterCefPlugin.swift:97-109). No host is live yet.
+  // start minting new ones (as macOS sweepStaleEphemeralProfiles does at plugin
+  // init). No host is live yet.
   SweepStaleEphemeralProfiles();
   channel_ = std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
       registrar->messenger(), "flutter_cef",
@@ -479,7 +479,7 @@ void FlutterCefPlugin::HandleMethodCall(
   }
   if (method == "pointer") {
     // {u8 type}{u8 button}{u8 clickCount}{u8 pad}{u32 modifiers}
-    // {f64 x}{f64 y}{f64 dx}{f64 dy} = 40 bytes (main.mm:2560-2570).
+    // {f64 x}{f64 y}{f64 dx}{f64 dy} = 40 bytes.
     if (s) {
       std::vector<uint8_t> p;
       p.reserve(40);
@@ -519,9 +519,9 @@ void FlutterCefPlugin::HandleMethodCall(
     if (s) {
       const bool visible = GetBool(args, "visible", true);
       SendOrQueue(s, kOpSetVisible, {visible ? uint8_t{1} : uint8_t{0}});
-      // C1 watchdog: a hidden CEF browser produces no frames by design, so
-      // suspend the first-present watchdog while hidden and re-arm it on show
-      // if still blank (macOS noteVisibility, CefProfileHost.swift:706-729).
+      // First-present watchdog: a hidden CEF browser produces no frames by
+      // design, so suspend the watchdog while hidden and re-arm it on show if
+      // still blank (as macOS CefProfileHost.noteVisibility does).
       s->visible = visible;
       if (!visible) {
         CancelWatchdog(s);
@@ -614,7 +614,7 @@ void FlutterCefPlugin::HandleMethodCall(
     result->Success();
     return;
   }
-  // ---- Cookies (shared per-profile jar; verbs match main.mm byte-for-byte).
+  // ---- Cookies (shared per-profile jar; verbs match the macOS host exactly).
   // The four verbs operate on the process-wide CefCookieManager inside the
   // host, so on a shared persistent profile every session sees one jar (macOS
   // parity). getCookies (Dart) rides the visitCookies verb, correlated back by
@@ -622,7 +622,7 @@ void FlutterCefPlugin::HandleMethodCall(
   if (method == "setCookie") {
     if (s) {
       // {utf8 url\0name\0value\0domain\0path\0secure\0httpOnly\0sameSite}
-      // (main.mm kOpSetCookie). Hosts older than the attribute fields read
+      // (kOpSetCookie). Hosts older than the attribute fields read
       // only the first five.
       const std::string payload = GetString(args, "url") + '\0' +
                                   GetString(args, "name") + '\0' +
@@ -648,7 +648,7 @@ void FlutterCefPlugin::HandleMethodCall(
   }
   if (method == "visitCookies") {
     if (s) {
-      // {u32 id}{utf8 url} — url empty = all (main.mm kOpVisitCookies:154).
+      // {u32 id}{utf8 url} — url empty = all.
       std::vector<uint8_t> p;
       AppendU32(p, static_cast<uint32_t>(GetInt(args, "id", 0)));
       AppendUtf8(p, GetString(args, "url"));
@@ -659,7 +659,7 @@ void FlutterCefPlugin::HandleMethodCall(
   }
   if (method == "deleteCookie") {
     if (s) {
-      // {utf8 url\0name} (main.mm kOpDeleteCookie:155).
+      // {utf8 url\0name}.
       const std::string payload =
           GetString(args, "url") + '\0' + GetString(args, "name");
       std::vector<uint8_t> p(payload.begin(), payload.end());
@@ -795,7 +795,7 @@ void FlutterCefPlugin::HandleCreate(
   spec.profile = GetString(args, "profile");
   spec.host_group = GetString(args, "hostGroup");
   // Agent control: CDP-over-pipe launch. Off by default; when set, the host
-  // is spawned with the two inherited CDP pipes (the S3 recipe). Independent
+  // is spawned with the two inherited CDP pipes. Independent
   // of enableCdp (TCP) — the pipe path never opens a listening port.
   spec.agent_control = GetBool(args, "agentControl", false);
   spec.channels = GetStringList(args, "channels");
@@ -1069,7 +1069,7 @@ FlutterCefPlugin::Host* FlutterCefPlugin::ResolveOrSpawnHost(
   const uint64_t gen = host->generation;
   // Reader thread: frames + EOF, posted to the platform thread. host_key + gen
   // are captured by value so a stale OLD-host event posted during the reaper
-  // grace of a same-profile respawn is dropped on drain (C1).
+  // grace of a same-profile respawn is dropped on drain.
   host->pipe->StartReader(
       [this, host_key, gen](uint32_t browser_id, uint8_t opcode,
                             std::vector<uint8_t> payload) {
@@ -1404,7 +1404,7 @@ void FlutterCefPlugin::SendToHost(Host* host, uint32_t browser_id,
   PostEvent(std::move(e));
 }
 
-// ---- agent control (P9) ----
+// ---- agent control ----
 
 // static
 void FlutterCefPlugin::CdpReadLoop(std::shared_ptr<CdpTransport> transport) {
@@ -1465,7 +1465,7 @@ void FlutterCefPlugin::EnableAgentControl(
                   "agentControl: true");
     return;
   }
-  // SECURITY (P9 single-tile invariant, see HandleCreate): the browser-level
+  // SECURITY (single-tile invariant, see HandleCreate): the browser-level
   // relay would expose every sibling tile on this host to the agent. Until the
   // per-tile Target filter lands, refuse a grant while the host serves >1 tile.
   if (h->browsers.size() > 1) {
@@ -1593,8 +1593,8 @@ void FlutterCefPlugin::HandleHostFrame(const std::string& host_key,
     const uint8_t host_version = payload.size() >= 2 ? payload[1] : 0;
     if (host_version != kCefHostProtocolVersion) {
       // Nothing flushed yet, so nothing mis-parsed. No auto-respawn (it would
-      // re-resolve the same binary and loop) — fail every session (Swift:
-      // 528-533).
+      // re-resolve the same binary and loop) — fail every session, as macOS
+      // does in its onProtocolMismatch handler.
       std::ostringstream reason;
       reason << "protocolMismatch(host=v" << static_cast<int>(host_version)
              << ")";
@@ -1687,7 +1687,7 @@ void FlutterCefPlugin::HandleSessionFrame(
       break;
     case kOpLoadErr: {
       if (payload.size() < 4) break;
-      // {u32 code}{utf8 "url\ntext"} — split at the FIRST '\n' (Swift:374-378).
+      // {u32 code}{utf8 "url\ntext"} — split at the FIRST '\n', as on macOS.
       const std::string combined = PayloadString(payload, 4);
       const size_t nl = combined.find('\n');
       const std::string err_url =
@@ -1808,7 +1808,7 @@ void FlutterCefPlugin::HandleSessionFrame(
       break;
     case kOpCookies:
       // {u32 id}{utf8 json-array} — correlated back to the Dart getCookies
-      // Future by request id (main.mm kOpCookies:130; Swift onCookies:422-424).
+      // Future by request id (macOS: CefWebSession.onCookies).
       if (payload.size() >= 4) {
         EmitEvent("cookies", session_id,
                   {{Ev("id"), flutter::EncodableValue(static_cast<int64_t>(
@@ -1828,9 +1828,9 @@ void FlutterCefPlugin::HandleSessionFrame(
       if (!s->visible) SendOrQueue(s, kOpSetVisible, {uint8_t{0}});
       break;
     case kOpCreateFailed: {
-      // H7: this browser's create failed; the host process is otherwise
-      // healthy — drop just this ONE session (emit processGone, close its
-      // browser, keep the host for its siblings; Swift:537-549). Copy the id
+      // This browser's create failed; the host process is otherwise healthy —
+      // drop just this ONE session (emit processGone, close its browser, keep
+      // the host for its siblings, as macOS onBrowserGone does). Copy the id
       // first: DisposeSession frees `s`, dangling session_id (an alias of
       // s->id).
       const std::string sid = session_id;
@@ -1948,11 +1948,11 @@ std::wstring FlutterCefPlugin::MakeEphemeralProfileDir() {
 std::wstring FlutterCefPlugin::MakePersistentProfileDir(
     const std::string& profile) {
   // %LOCALAPPDATA%\flutter_cef\profiles\<sanitize(name)>, created with a
-  // current-user-SID protected DACL (the #3 pipe hardening pattern applied to
-  // the profile tree). Mirrors macOS resolveProfileDir's stable 0700 dir under
-  // Application Support (FlutterCefPlugin.swift:702-728).
+  // current-user-SID protected DACL (the IPC pipe's hardening pattern applied
+  // to the profile tree). Mirrors macOS resolveProfileDir's stable 0700 dir
+  // under Application Support.
   //
-  // AT-REST NOTE (SPIKES.md S2 / §7): unlike macOS — where an ad-hoc (unsigned)
+  // AT-REST NOTE: unlike macOS — where an ad-hoc (unsigned)
   // build has no real Keychain, so OSCrypt falls back to a MOCK key and named
   // profiles are downgraded to ephemeral — Windows OSCrypt uses DPAPI, which is
   // ALWAYS available and signing-INDEPENDENT. So a named profile just persists

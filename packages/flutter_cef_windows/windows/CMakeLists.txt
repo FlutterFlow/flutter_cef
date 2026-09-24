@@ -1,6 +1,6 @@
 # flutter_cef_windows plugin build.
 #
-# S6a/S6b findings baked in (specs/windows-port/SPIKES.md):
+# Toolchain findings from the Windows port, baked in:
 #  - keep apply_standard_settings (CEF headers are NOT linked here — the
 #    plugin talks to cef_host over IPC; CEF lives only in native/cef_host);
 #  - NOMINMAX per target (any TU that ever includes cef_types_win.h needs it,
@@ -49,7 +49,7 @@ apply_standard_settings(${PLUGIN_NAME})
 set_target_properties(${PLUGIN_NAME} PROPERTIES
   CXX_VISIBILITY_PRESET hidden)
 target_compile_definitions(${PLUGIN_NAME} PRIVATE FLUTTER_PLUGIN_IMPL)
-# S6a: NOMINMAX everywhere windows.h is reachable.
+# NOMINMAX everywhere windows.h is reachable.
 target_compile_definitions(${PLUGIN_NAME} PRIVATE NOMINMAX)
 
 target_include_directories(${PLUGIN_NAME} INTERFACE
@@ -62,7 +62,7 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
   flutter_wrapper_plugin
   d3d11
   dxgi
-  # Agent-control CDP relay (P9): winsock (loopback HTTP+WS server) + bcrypt
+  # Agent-control CDP relay: winsock (loopback HTTP+WS server) + bcrypt
   # (SHA-1 Sec-WebSocket-Accept + BCryptGenRandom token). cdp_relay.cpp.
   ws2_32
   bcrypt
@@ -121,7 +121,7 @@ add_dependencies(${PLUGIN_NAME} flutter_cef_windows_host)
 
 # Files the app needs beside its exe: the host pair + the CEF runtime.
 # (Flat CEF layout on Windows; libcef.dll etc. resolve from the exe dir.
-# Set from what cef_leg (S1) needed to run windowless+GPU.)
+# The set a windowless, GPU-composited CEF needs at run time.)
 set(flutter_cef_windows_bundled_libraries
   "${CEF_HOST_DIST_DIR}/cef_host.exe"
   "${CEF_HOST_DIST_DIR}/cef_host.dll"
@@ -149,8 +149,8 @@ set(flutter_cef_windows_bundled_libraries
 # DESTINATION would resolve against CMAKE_INSTALL_PREFIX, whose genex is
 # NOT re-evaluated inside this subdirectory's install script). BINARY_NAME
 # is set by the app-level CMakeLists before generated_plugins.cmake runs.
-# TODO(builder-plugin): ship the full locale set (or make it configurable)
-# once the slice is green — en-US is the required minimum.
+# TODO(builder-plugin): ship the full locale set (or make it configurable);
+# en-US is the required minimum.
 install(FILES "${FLUTTER_CEF_CEF_ROOT}/Resources/locales/en-US.pak"
         DESTINATION "$<TARGET_FILE_DIR:${BINARY_NAME}>/locales"
         COMPONENT Runtime)

@@ -8,7 +8,7 @@
 # %LOCALAPPDATA%/flutter_cef/<dist>. If neither exists, download the pinned
 # tarball from cef-builds.spotifycdn.com, verify it against the SHA-256 pinned
 # in cef_pin.txt (fail closed), extract with native tar.exe (bsdtar handles
-# .tar.bz2, docs/history/windows-port/SPIKES.md S6), and cache it under
+# .tar.bz2), and cache it under
 # %LOCALAPPDATA%/flutter_cef for later builds. The CMake side checks the
 # resolved tree's include/cef_version.h against the same pin.
 
@@ -78,8 +78,7 @@ Info "fetch_cef: extracting"
 # Use the Windows system bsdtar by FULL PATH. A bare `tar` on a CI runner
 # resolves to Git's bundled MSYS GNU tar, which reads "C:\...tarball" as a
 # host:path remote spec ("Cannot connect to C:"). System32\tar.exe is libarchive
-# (bsdtar), handles .tar.bz2 and drive-letter paths natively
-# (docs/history/windows-port/SPIKES.md S6).
+# (bsdtar), handles .tar.bz2 and drive-letter paths natively.
 $SystemTar = Join-Path $env:SystemRoot 'System32\tar.exe'
 if (-not (Test-Path $SystemTar)) { $SystemTar = 'tar.exe' }
 & $SystemTar -xf $tarball -C $tmp

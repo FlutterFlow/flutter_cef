@@ -1,4 +1,4 @@
-// Windows profile + cookie END-TO-END probe (P6 foundation + P11 profile slice).
+// Windows profile + cookie END-TO-END probe (shared hosts, named profiles, cookies).
 //
 // Auto-running, no-interaction self-test that drives the REAL integrated stack —
 // the public Dart API (CefWebController) -> the method channel -> the Windows
@@ -34,7 +34,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_cef/flutter_cef.dart';
 
 // A dev probe artifact — write evidence under the OS temp dir, not a
-// maintainer-specific absolute path (PLAN P1: probe outputs -> systemTemp).
+// maintainer-specific absolute path.
 final _evidenceDir =
     '${Directory.systemTemp.path}${Platform.pathSeparator}flutter_cef_profile_evidence';
 const _sharedProfile = 'evi_shared';

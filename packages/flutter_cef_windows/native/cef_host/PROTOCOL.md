@@ -2,15 +2,14 @@
 
 The opcodes and protocol versions of both platforms are defined once, in
 `tool/protocol/spec.dart`, and generated into each package (§2). The rest of
-this document was transcribed from the macOS implementation (line numbers are
-from branch `feat/windows-port-p0` and have drifted):
+this document was transcribed from the macOS implementation:
 
-- `packages/flutter_cef_macos/native/cef_host/main.mm` — framing and read-loop
-  payload decoding.
+- `packages/flutter_cef_macos/native/cef_host/` — framing (`ipc.mm`), read-loop
+  payload decoding (`ipc_reader.mm`), and the per-browser handlers
+  (`host_client.mm`, `browser_ops.mm`).
 - `packages/flutter_cef_macos/macos/Classes/FlutterCefPlugin.swift` — channel
   verb dispatch (`handle`) and native->Dart events (`emit` sites).
-- `lib/src/cef_web_controller.dart` — the exact channel-arg maps Dart sends
-  (cited per verb below).
+- `lib/src/cef_web_controller.dart` — the exact channel-arg maps Dart sends.
 
 The Windows host + plugin speak the macOS protocol with two payload
 differences, `kOpPresent` and `kOpShowDevTools` (§2), and their own protocol
@@ -20,8 +19,8 @@ version.
 
 ## 1. IPC framing (byte stream over the named pipe)
 
-Identical to macOS (main.mm:40-45, SendFrame main.mm:416-446, reader
-main.mm:2338-2357):
+Identical to macOS (`SendFrame` in `ipc.mm`, `IpcReadLoop` in
+`ipc_reader.mm`):
 
 ```
 [u32 bodyLen BE][u32 browserId BE][u8 opcode][payload...]
@@ -30,15 +29,14 @@ main.mm:2338-2357):
 - `bodyLen` = 4 (browserId) + 1 (opcode) + payloadLen — counts every byte
   after the length prefix.
 - Guard on read: `5 <= bodyLen <= 64 MiB`, else the stream is desynced —
-  log + tear down the whole process (main.mm:2343-2351).
+  log + tear down the whole process.
 - `browserId` is the PLUGIN-assigned wire id (>= 1). `browserId 0` =
   process/profile level (`kOpReady`, process-level `kOpLog`, inbound
-  `kOpShutdown`) (main.mm:41-43).
+  `kOpShutdown`).
 - ALL multi-byte integers are BIG-ENDIAN, including `f64` (IEEE-754 double,
-  BE byte order — `ReadF64BE`/`WriteF64BE`, see main.mm ReadU32BE:476).
+  BE byte order — `ReadF64BE`/`WriteF64BE`, as in macOS `ipc.h`).
 - Writes are assembled into one contiguous frame and written atomically
-  under a write mutex, so a partial write never desyncs the peer
-  (main.mm:431-445).
+  under a write mutex, so a partial write never desyncs the peer.
 - Transport on Windows: named pipe `\\.\pipe\flutter_cef_<128-bit random
   hex>` (an unguessable name, so a same-user process can't squat it),
   `PIPE_TYPE_BYTE | PIPE_READMODE_BYTE`, single instance; plugin is the
@@ -59,7 +57,7 @@ main.mm:2338-2357):
   `FILE_FLAG_OVERLAPPED`. A Unix socket fd is full-duplex, so the macOS
   reference never encounters this.
 - Unknown opcode at either end: log ONCE per opcode value and drop the
-  frame — never kill the stream (main.mm:2583-2598).
+  frame — never kill the stream.
 - Plugin writes run on the platform thread and wait at most 3 s for the host
   to take a frame. A write that fails or times out ends the host (every
   session gets `processGone("crashed")`): the host isn't reading, and part of
@@ -157,56 +155,54 @@ macOS only, never reuse on Windows: 0x1e kOpMediaRequest, 0x1f kOpMediaState, 0x
 
 ## 3. Method-channel verbs (Dart -> plugin), channel `flutter_cef`
 
-Verb names + arg keys verbatim from FlutterCefPlugin.swift:113-241 and
+Verb names + arg keys verbatim from FlutterCefPlugin.swift (`handle`) and
 cef_web_controller.dart (invokeMethod sites). Every arg map carries
-`sessionId` (String). SLICE = functional since the P1–P4 vertical slice;
-P6 = functional since the profiles/cookies slice; P7 = functional since the
-JS-bridge/dialogs/find/zoom/downloads slice (see §7); IMPL\* = native
-implementation present but not yet verified on Windows OSR; PARITY = added
-with the macOS-parity pass; UNSUPPORTED = replies
+`sessionId` (String). `showDevTools` and the three `ime*` verbs are
+implemented natively but not yet verified on Windows OSR. Verbs listed as
+returning Error `unsupported` reply
 `Error("unsupported", "<verb> is not supported on Windows")`.
 
-| Verb | Args (beyond sessionId) | Returns | Maps to | Slice? | Source |
-|---|---|---|---|---|---|
-| create | url:String, width:int (clamped to 1..16384), height:int (clamped to 1..16384), dpr:double, allowedSchemes:String? (csv of URL schemes, omit-when-empty; anything else is `bad_args`), enableCdp:bool? (omit-when-false), agentControl:bool? (omit-when-false), profile:String? (omit-when-empty), hostGroup:String? (omit-when-empty), authoredHtml:String? (serve as `url`), documentStartScripts:List<String>?, channels:List<String>? (JS channels registered before create) | `{textureId:int, width:int, height:int, cdpPort:int}` | spawn host (if needed) + [kOpSetDocumentStart 0x41] + [kOpSetAuthoredHtml 0x3f] + kOpCreateBrowser 0x13 | SLICE | Swift:255-446, controller:506-523 |
-| navigate | url:String | null | 0x20 | SLICE | Swift:617-622, controller:566 |
-| loadTrusted | url:String | null | 0x34 | SLICE (stub-ok) | Swift:626-631, controller:634 |
-| loadAuthored | url:String, html:String | null | 0x3f then 0x34 | SLICE | Swift loadAuthored, controller loadHtmlString |
-| resize | width:int, height:int, dpr:double | `{textureId:int}` (or null if unknown session) | 0x11 | SLICE | Swift:633-641, controller:874 |
-| getFrameSurface | — | `{surfaceId:int, width:int, height:int}` (physical px) of the frame the texture is showing, or null before the first | plugin-local | SLICE | Swift:649-658 |
-| dispose | — | null | 0x15 (last browser: 0x14 + host teardown) | SLICE | Swift:660-663, controller:530/948 |
-| freezeSession | — | bool (false: unknown, already frozen, or host gone) | 0x15 (last browser: 0x14 + host teardown); the session and texture stay | PARITY | Swift freezeSession |
-| thawSession | url:String? (default: the create url) | `{textureId:int}` or null when not frozen | host resolve/spawn + [0x41] + [0x3f] + 0x13 at the current size | PARITY | Swift thawSession |
-| sessionStats | — | `{presentCount:int, lastPresentAgoMs:int?, firstPresentSeen:bool, frozen:bool}` (promoted presents only) or null | plugin-local | PARITY | Swift sessionStats |
-| setAudioMuted | muted:bool | null | 0x3a | PARITY | Swift setAudioMuted |
-| setFrameInterval | ms:int | null | 0x3b `{u16 ms}`; host clamps to [8, 250] and sets the windowless frame rate | PARITY | Swift setFrameInterval |
-| chooseContextMenu, respondMediaRequest, setMediaSetting, openAuthWindow | — | Error `unsupported` | — | UNSUPPORTED | Swift |
-| pointer | type:int, button:int, clickCount:int, modifiers:int, x:double, y:double, dx:double, dy:double | null | 0x10 | SLICE | Swift:730-740, controller:895 |
-| key | type:int, modifiers:int, windowsKeyCode:int, nativeKeyCode:int, character:int | null | 0x12 | SLICE | Swift:742-752, controller:919 |
-| reload | — | null | 0x21 | SLICE | Swift:122 |
-| stop | — | null | 0x22 | SLICE | Swift:123 |
-| goBack | — | null | 0x23 | SLICE | Swift:124 |
-| goForward | — | null | 0x24 | SLICE | Swift:125 |
-| executeJavaScript | code:String | null | 0x25 | SLICE | Swift:126-130 |
-| setZoomLevel | level:double | null | 0x26 | P7 | Swift:131-133 |
-| editCommand | command:int | null | 0x38 | SLICE | Swift:134-136 |
-| setVisible | visible:bool | null | 0x35 | SLICE | Swift:137-139 |
-| find | text:String, forward:bool, matchCase:bool, findNext:bool | null | 0x27 | P7 | Swift:140-148 |
-| stopFind | clearSelection:bool | null | 0x28 | P7 | Swift:149-151 |
-| respondJsDialog | id:int, ok:bool, text:String | null | 0x29 | P7 | Swift:152-158 |
-| evalReturning | id:int, code:String | null | 0x2a | P7 | Swift:159-165 |
-| addJavaScriptChannel | name:String | null | 0x2b | P7 | Swift:166-170 |
-| setCookie | url, name, value, domain, path, sameSite : String; secure, httpOnly : bool | null | 0x2c | P6 | Swift:171-179 |
-| clearCookies | — | null | 0x2d | P6 | Swift:180-182 |
-| visitCookies | id:int, url:String | null | 0x2e | P6 | Swift:183-188 |
-| deleteCookie | url:String, name:String | null | 0x2f | P6 | Swift:189-194 |
-| showDevTools | — | null | 0x33 | IMPL\* | Swift:195-197 |
-| enableAgentControl | — | `{wsUrl:String, token:String, port:int}` or FlutterError (`no_agent_control` when the session wasn't created with `agentControl:true`; `agent_control_unavailable` when it was, but joined a profile whose host started without it) | CDP relay (§8) | P9 | Swift:198-217, controller:595-605 |
-| disableAgentControl | — | null | CDP relay (§8) | P9 | Swift:218-225, controller:609-610 |
-| showEmojiPicker | — | Error `unsupported` | macOS-only (Character Palette) | UNSUPPORTED | Swift:226-230 |
-| imeSetComposition | text:String | null | 0x30 | IMPL\* | Swift:231-233 |
-| imeCommitText | text:String | null | 0x31 | IMPL\* | Swift:234-236 |
-| imeCancelComposition | — | null | 0x32 | IMPL\* | Swift:237-239 |
+| Verb | Args (beyond sessionId) | Returns | Maps to |
+|---|---|---|---|
+| create | url:String, width:int (clamped to 1..16384), height:int (clamped to 1..16384), dpr:double, allowedSchemes:String? (csv of URL schemes, omit-when-empty; anything else is `bad_args`), enableCdp:bool? (omit-when-false), agentControl:bool? (omit-when-false), profile:String? (omit-when-empty), hostGroup:String? (omit-when-empty), authoredHtml:String? (serve as `url`), documentStartScripts:List<String>?, channels:List<String>? (JS channels registered before create) | `{textureId:int, width:int, height:int, cdpPort:int}` | spawn host (if needed) + [kOpSetDocumentStart 0x41] + [kOpSetAuthoredHtml 0x3f] + kOpCreateBrowser 0x13 |
+| navigate | url:String | null | 0x20 |
+| loadTrusted | url:String | null | 0x34 |
+| loadAuthored | url:String, html:String | null | 0x3f then 0x34 |
+| resize | width:int, height:int, dpr:double | `{textureId:int}` (or null if unknown session) | 0x11 |
+| getFrameSurface | — | `{surfaceId:int, width:int, height:int}` (physical px) of the frame the texture is showing, or null before the first | plugin-local |
+| dispose | — | null | 0x15 (last browser: 0x14 + host teardown) |
+| freezeSession | — | bool (false: unknown, already frozen, or host gone) | 0x15 (last browser: 0x14 + host teardown); the session and texture stay |
+| thawSession | url:String? (default: the create url) | `{textureId:int}` or null when not frozen | host resolve/spawn + [0x41] + [0x3f] + 0x13 at the current size |
+| sessionStats | — | `{presentCount:int, lastPresentAgoMs:int?, firstPresentSeen:bool, frozen:bool}` (promoted presents only) or null | plugin-local |
+| setAudioMuted | muted:bool | null | 0x3a |
+| setFrameInterval | ms:int | null | 0x3b `{u16 ms}`; host clamps to [8, 250] and sets the windowless frame rate |
+| chooseContextMenu, respondMediaRequest, setMediaSetting, openAuthWindow | — | Error `unsupported` | — |
+| pointer | type:int, button:int, clickCount:int, modifiers:int, x:double, y:double, dx:double, dy:double | null | 0x10 |
+| key | type:int, modifiers:int, windowsKeyCode:int, nativeKeyCode:int, character:int | null | 0x12 |
+| reload | — | null | 0x21 |
+| stop | — | null | 0x22 |
+| goBack | — | null | 0x23 |
+| goForward | — | null | 0x24 |
+| executeJavaScript | code:String | null | 0x25 |
+| setZoomLevel | level:double | null | 0x26 |
+| editCommand | command:int | null | 0x38 |
+| setVisible | visible:bool | null | 0x35 |
+| find | text:String, forward:bool, matchCase:bool, findNext:bool | null | 0x27 |
+| stopFind | clearSelection:bool | null | 0x28 |
+| respondJsDialog | id:int, ok:bool, text:String | null | 0x29 |
+| evalReturning | id:int, code:String | null | 0x2a |
+| addJavaScriptChannel | name:String | null | 0x2b |
+| setCookie | url, name, value, domain, path, sameSite : String; secure, httpOnly : bool | null | 0x2c |
+| clearCookies | — | null | 0x2d |
+| visitCookies | id:int, url:String | null | 0x2e |
+| deleteCookie | url:String, name:String | null | 0x2f |
+| showDevTools | — | null | 0x33 |
+| enableAgentControl | — | `{wsUrl:String, token:String, port:int}` or FlutterError (`no_agent_control` when the session wasn't created with `agentControl:true`; `agent_control_unavailable` when it was, but joined a profile whose host started without it) | CDP relay (§8) |
+| disableAgentControl | — | null | CDP relay (§8) |
+| showEmojiPicker | — | Error `unsupported` | macOS-only (Character Palette) |
+| imeSetComposition | text:String | null | 0x30 |
+| imeCommitText | text:String | null | 0x31 |
+| imeCancelComposition | — | null | 0x32 |
 
 Unknown verbs reply `NotImplemented` (a `MissingPluginException` in Dart), as
 on macOS.
@@ -217,34 +213,35 @@ Method names + payload keys verbatim from the Swift `emit` sites. Every
 payload carries `sessionId:String`. `invokeMethod` MUST run on the platform
 thread (marshal from the reader thread).
 
-| Method | Payload (beyond sessionId) | From opcode | Source |
-|---|---|---|---|
-| cursor | cursor:int (cef_cursor_type_t) | 0x03 | Swift:359-361 |
-| loadingState | isLoading:bool, canGoBack:bool, canGoForward:bool | 0x05 | Swift:362-367 |
-| title | title:String | 0x06 | Swift:368-370 |
-| url | url:String | 0x07 | Swift:371-373 |
-| loadError | code:int, url:String, text:String (split payload at first '\n') | 0x08 | Swift:374-378 |
-| consoleMessage | level:int, message:String | 0x09 | Swift:379-383 |
-| pageStarted | url:String | 0x0a | Swift:384-386 |
-| pageFinished | url:String | 0x0b | Swift:387-389 |
-| progress | progress:int | 0x0c | Swift:390-392 |
-| newWindow | url:String | 0x0d | Swift:393-395 |
-| findResult | count:int, activeMatchOrdinal:int, isFinal:bool | 0x0e | Swift:396-401 |
-| jsDialog | id:int, type:int, message:String, defaultText:String | 0x0f | Swift:402-407 |
-| evalResult | payload:String ("id:json") | 0x16 | Swift:408-410 |
-| channelMessage | payload:String ("name:message") | 0x17 | Swift:411-413 |
-| download | suggestedName:String | 0x18 | Swift:414-416 |
-| imeCompositionBounds | x:int, y:int, w:int, h:int | 0x19 | Swift:417-421 |
-| cookies | id:int, json:String | 0x1a | Swift:422-424 |
-| onSurface | surfaceId:int, width:int, height:int (physical px) — Windows: surfaceId = the bridge-handle token as int64 | 0x01 (on surface (re)alloc) | Swift:425-433 |
-| processGone | reason:String — "crashed" (host death, a failed/timed-out pipe write, a renderer the liveness sweep found hung, or 0x42 for one crash-looping browser) \| "locked" (the host logged "profile-locked") \| "createFailed" (0x1d, or the host died before kOpReady) \| "respawnFailed" \| "protocolMismatch(host=vN)" | host death / 0x1d / 0x42 / handshake | Swift:490, 521, 531, 541, 601 |
-| paintStalled | — | first-present watchdog: every grace (10 s, `FLUTTER_CEF_FIRSTPAINT_MS`) that ends with no promoted 0x01, with a 0x37 re-kick — the macOS cadence | Swift:554-558 |
+| Method | Payload (beyond sessionId) | From opcode |
+|---|---|---|
+| cursor | cursor:int (cef_cursor_type_t) | 0x03 |
+| loadingState | isLoading:bool, canGoBack:bool, canGoForward:bool | 0x05 |
+| title | title:String | 0x06 |
+| url | url:String | 0x07 |
+| loadError | code:int, url:String, text:String (split payload at first '\n') | 0x08 |
+| consoleMessage | level:int, message:String | 0x09 |
+| pageStarted | url:String | 0x0a |
+| pageFinished | url:String | 0x0b |
+| progress | progress:int | 0x0c |
+| newWindow | url:String | 0x0d |
+| findResult | count:int, activeMatchOrdinal:int, isFinal:bool | 0x0e |
+| jsDialog | id:int, type:int, message:String, defaultText:String | 0x0f |
+| evalResult | payload:String ("id:json") | 0x16 |
+| channelMessage | payload:String ("name:message") | 0x17 |
+| download | suggestedName:String | 0x18 |
+| imeCompositionBounds | x:int, y:int, w:int, h:int | 0x19 |
+| cookies | id:int, json:String | 0x1a |
+| onSurface | surfaceId:int, width:int, height:int (physical px) — Windows: surfaceId = the bridge-handle token as int64 | 0x01 (on surface (re)alloc) |
+| processGone | reason:String — "crashed" (host death, a failed/timed-out pipe write, a renderer the liveness sweep found hung, or 0x42 for one crash-looping browser) \| "locked" (the host logged "profile-locked") \| "createFailed" (0x1d, or the host died before kOpReady) \| "respawnFailed" \| "protocolMismatch(host=vN)" | host death / 0x1d / 0x42 / handshake |
+| paintStalled | — | first-present watchdog: every grace (10 s, `FLUTTER_CEF_FIRSTPAINT_MS`) that ends with no promoted 0x01, with a 0x37 re-kick — the macOS cadence |
 
 ## 5. Handshake + lifecycle rules (carry-over)
 
 - Plugin sends NOTHING until it receives `kOpReady`; it then checks
   `protocolVersion == kCefHostProtocolVersion` (§2) and refuses (teardown +
-  `processGone protocolMismatch`) on skew (main.mm:100-108, Swift:528-533).
+  `processGone protocolMismatch`) on skew (macOS: the `CefOp.ready` case in
+  `CefProfileHost+Ipc.swift`).
   Frames queued before ready flush in order, and a queued `kOpCreateBrowser`
   is rewritten with its view's size as of the flush: the host takes seconds to
   start, and the view may have been laid out again meanwhile.
@@ -254,10 +251,12 @@ thread (marshal from the reader thread).
 - `kOpLog "profile-locked"` (then exit code 2) = profile already open
   elsewhere -> `processGone reason:"locked"`. The plugin latches the log line:
   the pipe EOF usually arrives before the exit code exists.
-- Present size-gate (LAW 4): the plugin promotes a presented bridge
-  handle to the Flutter texture ONLY when `{srcW,srcH}` matches the expected
-  `round(logical*dpr)` for the current size (±1 px); until then it keeps
-  serving the previous texture (main.mm:640-665 rationale). Only a promoted
+- Present size-gate: every `WasResized` discards CEF's frame pool, and frames
+  at the old size or scale still arrive after it. So the plugin promotes a
+  presented bridge handle to the Flutter texture ONLY when `{srcW,srcH}`
+  matches the expected `round(logical*dpr)` for the current size (±1 px);
+  until then it keeps serving the previous texture (the rationale is on
+  `SendPresentLocked` in the macOS `render_handler.mm`). Only a promoted
   present counts as painted (it ends the first-present watchdog and feeds
   `sessionStats`); a rejected one shows nothing.
 - No create pacer on Windows: the plugin sends every create at once and does
@@ -277,18 +276,21 @@ thread (marshal from the reader thread).
   other browsers carry on. When two different browsers burst within 10 s of
   each other the host's children can't start, so the host exits and every
   session gets `processGone("crashed")`.
-- Bridge-handle identity (LAW 3): the host-minted legacy handle is the
-  identity Flutter sees; never key anything on CEF's per-callback
-  `shared_texture_handle` values (SPIKES.md S4).
+- Bridge-handle identity: the host-minted legacy handle is the identity
+  Flutter sees; never key anything on CEF's per-callback
+  `shared_texture_handle` values, which are fresh every callback and alias
+  across sizes and browsers.
 - The plugin holds an opened `ID3D11Texture2D` ComPtr on the current bridge
-  handle for as long as it feeds it to Flutter (LAW 6 / S1 belt-1).
+  handle for as long as it feeds it to Flutter, so the texture stays alive
+  even after the host releases the bridge.
 - cef_host args: `--ipc=<pipe name>` `--profile-dir=<abs path>` `--ephemeral`
   `--allowed-schemes=<csv>` (§6) and — for agent control (§8) — `--cdp-io-pipes=
-  <read>,<write>` (cf. macOS args main.mm:32-38; `--cdp-port` TCP CDP is still
-  post-slice — the Dart-side `enableCdp`+named-profile assert already blocks the
-  unsafe combination, so `cdpPort` stays 0 on Windows).
+  <read>,<write>` (cf. the macOS args in the `main.mm` header; `--cdp-port` TCP
+  CDP is not implemented on Windows — the Dart-side `enableCdp`+named-profile
+  assert already blocks the unsafe combination, so `cdpPort` stays 0 on
+  Windows).
 
-## 6. Profile model (P6 foundation + P11 profile slice)
+## 6. Profile model
 
 The plugin owns ONE `cef_host` process per **profile key** and multiplexes N
 browsers over it (one wire browserId each) — the macOS
@@ -298,27 +300,28 @@ ephemeral session in a host group, or `"~ephemeral~"+sessionId` for the default
 (throwaway) case, so an ungrouped ephemeral session gets its own host, a group's
 sessions share one throwaway host (torn down with the last of them), and every
 view with the same non-null `profile` shares one host → one cookie jar → one
-login (macOS: FlutterCefPlugin.swift ephemeralKey, CefProfileHost.swift:1-12).
+login (macOS: `ephemeralKey` in FlutterCefPlugin.swift, and the
+`CefProfileHost` class comment).
 
 ### 6.1 Profile-dir resolution (plugin side)
 
 The `create` verb's `profile` arg (String, omit-when-empty — §3) selects the
 mode. The plugin resolves an on-disk cache dir and always passes it as
-`--profile-dir=<abs path>` (macOS `resolveProfileDir`,
-FlutterCefPlugin.swift:697-728):
+`--profile-dir=<abs path>` (macOS `resolveProfileDir` in
+FlutterCefPlugin.swift):
 
 - **Ephemeral** (`profile` absent/empty): a unique throwaway dir
   `%TEMP%\flutter_cef_ephem_<pid>_<tick>_<counter>`, created + removed once the
   host's whole process tree is gone (a startup sweep reclaims dirs whose owning
   pid is dead), and the
   host is launched WITH `--ephemeral` (macOS uses `flutter_cef_ephem_<uuid>` +
-  `--ephemeral=1`, FlutterCefPlugin.swift:704-708 / CefProfileHost.swift:286-288).
+  `--ephemeral=1`).
 - **Named / persistent** (`profile` non-empty): a stable dir
   `%LOCALAPPDATA%\flutter_cef\profiles\<sanitized-name>`, launched WITHOUT
   `--ephemeral`. Sanitize the name to `[A-Za-z0-9._-]` (every other char → `_`),
   and neutralize an all-dots leaf (`.`/`..`/`...`) to `_` so it can't escape the
-  `profiles\` container (macOS FlutterCefPlugin.swift:710-717 — mirror this
-  exactly, including the all-dots guard).
+  `profiles\` container (macOS `resolveProfileDir` — mirror this exactly,
+  including the all-dots guard).
 
   NOTE — Windows path root differs from macOS DELIBERATELY: macOS uses
   `<Application Support>/<bundleId>/flutter_cef/profiles/<name>`; Windows uses
@@ -331,8 +334,8 @@ FlutterCefPlugin.swift:697-728):
 
 - **DACL**: create the named-profile dir (and its `profiles\` ancestor) with a
   current-user-SID-protected DACL — the same pattern `ipc_pipe.cpp` uses for the
-  pipe (audit fix #3). This is the Windows analogue of macOS's `0700`
-  owner-only chmod (FlutterCefPlugin.swift:706/722/726). The ACE is inheritable
+  pipe. This is the Windows analogue of macOS's `0700` owner-only chmod in
+  `resolveProfileDir`. The ACE is inheritable
   (OICI) so the files Chromium creates inside inherit it. Unlike macOS, which
   re-chmods an existing leaf, Windows applies the DACL only when it creates the
   dir: a dir from a prior run keeps whatever DACL it has.
@@ -340,25 +343,25 @@ FlutterCefPlugin.swift:697-728):
 ### 6.2 Host side (`--profile-dir` → `root_cache_path`)
 
 `cef_host` maps `--profile-dir` to `CefSettings.root_cache_path` and sets
-`settings.persist_session_cookies = true` (macOS main.mm:2854-2869). One
+`settings.persist_session_cookies = true` (as macOS `main.mm` does). One
 `root_cache_path` is shared by every browser in the process — that is what makes
 the login shared. `persist_session_cookies` keeps session cookies across relaunch
 (harmless for ephemeral, required for "stay signed in" on a named profile). The
-`--ephemeral` flag (main.mm:2726, `is_ephemeral`) marks the throwaway case so the
-host's guards (CDP-on-named-profile refusal, and on macOS the mock-keychain
+`--ephemeral` flag (`is_ephemeral` in macOS `main.mm`) marks the throwaway case
+so the host's guards (CDP-on-named-profile refusal, and on macOS the mock-keychain
 downgrade) fire only for a REAL persistent profile — `--profile-dir` is set for
 both.
 
 ### 6.3 At-rest encryption — Windows DPAPI (NO macOS-style downgrade)
 
-**KEY Windows security fact (SPIKES.md S2):** OSCrypt on Windows encrypts the
+**KEY Windows security fact:** OSCrypt on Windows encrypts the
 cookie store with **DPAPI**, which is **always available and
 signing-independent**. So the macOS rule "ad-hoc build → mock keychain → downgrade
 a named profile to ephemeral (unless `FLUTTER_CEF_ALLOW_INSECURE_PROFILE=1`)"
 has **NO Windows analogue** — there is no mock-keystore state and no downgrade.
 A named profile on Windows simply persists, encrypted at rest, regardless of code
 signing. Concretely: `kOpReady`'s `readyFlags` bit0 (ad-hoc/mock-keychain build)
-is **macOS-only; the Windows host always sends 0** (§2, main.mm:1664-1682), and
+is **macOS-only; the Windows host always sends 0** (§2), and
 there is no `onInsecureProfileRefused` / re-home-to-ephemeral path on Windows.
 
 **Caveat (state it, do not hide it):** DPAPI's user-tier protection is
@@ -373,28 +376,28 @@ platforms (FileVault/BitLocker is the backstop).
 
 Cookies act on the profile's ONE process-wide `CefCookieManager` (the shared
 jar §6.1), so a write/clear is visible to every browser in the host. The four
-command opcodes and the one result event are fully specified in §2 (byte layouts,
-with main.mm cites) and reached from Dart via the verbs in §3/§4 — summarized here:
+command opcodes and the one result event are fully specified in §2 (byte layouts)
+and reached from Dart via the verbs in §3/§4 — summarized here:
 
-| Dart (controller) | Verb (§3) | Opcode (§2) | main.mm |
-|---|---|---|---|
-| `setCookie(url,name,value,domain,path,secure,httpOnly,sameSite)` | `setCookie` | 0x2c `{utf8 url\0name\0value\0domain\0path\0secure\0httpOnly\0sameSite}` (pad to 8) | 2495-2510 |
-| `clearCookies()` | `clearCookies` | 0x2d `{}` | 2511-2514 |
-| `getCookies({url})` → `List<CefCookie>` | `visitCookies` | 0x2e `{u32 id}{utf8 url}` (empty = all) → **0x1a** `{u32 id}{utf8 json-array}` event | 2515-2522 |
-| `deleteCookie(url,name)` | `deleteCookie` | 0x2f `{utf8 url\0name}` | 2523-2531 |
+| Dart (controller) | Verb (§3) | Opcode (§2) |
+|---|---|---|
+| `setCookie(url,name,value,domain,path,secure,httpOnly,sameSite)` | `setCookie` | 0x2c `{utf8 url\0name\0value\0domain\0path\0secure\0httpOnly\0sameSite}` (pad to 8) |
+| `clearCookies()` | `clearCookies` | 0x2d `{}` |
+| `getCookies({url})` → `List<CefCookie>` | `visitCookies` | 0x2e `{u32 id}{utf8 url}` (empty = all) → **0x1a** `{u32 id}{utf8 json-array}` event |
+| `deleteCookie(url,name)` | `deleteCookie` | 0x2f `{utf8 url\0name}` |
 
 `getCookies` is the only round-trip: the plugin assigns `id`, sends `visitCookies`,
 and resolves the Dart `Future` when the `cookies` event (from opcode 0x1a — §4)
 arrives carrying the same `id` and a JSON array (`CefCookie.fromJson` per element,
-cef_web_controller.dart:741-767). The JSON array shape MUST match macOS
-byte-for-byte (main.mm's `DoVisitCookies` serializer) so a page cannot detect a
+in `_handleCookies`). The JSON array shape MUST match macOS byte-for-byte (the
+`DoVisitCookies` serializer in macOS `browser_ops.mm`) so a page cannot detect a
 Windows-vs-macOS divergence.
 
-## 7. JS bridge, JS dialogs, find, zoom, downloads (P7 verb parity)
+## 7. JS bridge, JS dialogs, find, zoom, downloads
 
 All opcode numbers and byte layouts are in §2; this section documents the
-**string packings** and the **per-session message-router routing** that the P7
-verbs depend on, transcribed from main.mm with line cites. The Dart side
+**string packings** and the **per-session message-router routing** that these
+verbs depend on, transcribed from the macOS host. The Dart side
 (cef_web_controller.dart, cross-platform, unchanged for Windows) parses exactly
 these shapes; the Windows host MUST reproduce them byte-for-byte so a page cannot
 detect a Windows-vs-macOS divergence.
@@ -406,9 +409,9 @@ The JS bridge (channels + `runJavaScriptReturningResult`) rides one
 (`window.cefQuery` / `window.cefQueryCancel`). Browser-side and renderer-side
 MUST use the SAME config or queries never route.
 
-- **macOS reference:** browser-side router lives in the `Handler` (main.mm —
-  `router_->OnProcessMessageReceived`, main.mm:1495-1501; `OnQuery`,
-  main.mm:1472-1494). The renderer half is a SEPARATE process
+- **macOS reference:** browser-side router lives in `HostClient`
+  (`host_client.mm` — `router_->OnProcessMessageReceived` and `OnQuery`).
+  The renderer half is a SEPARATE process
   (`process_helper.mm`): `CefMessageRouterRendererSide` with the default config,
   wired in `OnContextCreated` / `OnContextReleased` / `OnProcessMessageReceived`.
 - **Windows:** there is no separate helper exe — the SAME `cef_host.exe` is
@@ -423,15 +426,14 @@ Page → host. The shim is injected NATIVELY (there is no Dart-injected shim):
 
 - `addJavaScriptChannel(name)` → verb `addJavaScriptChannel` → **0x2b
   kOpAddChannel** `{utf8 name}` (§2). The host validates `name` is a JS
-  identifier (`IsValidChannelName`, main.mm:362-375; ≤64 chars,
+  identifier (`IsValidChannelName`; ≤64 chars,
   `[A-Za-z_$][A-Za-z0-9_$]*`) and registers it process-globally in `g_channels`
-  (`DoAddChannel`, main.mm:2019-2035). Invalid names are dropped + logged, never
-  fatal. Dart pre-validates with the same regex (cef_web_controller.dart:165,
-  669-671) and re-registers every channel on `create()`
-  (cef_web_controller.dart:541-544) so add-before-mount works.
-- **Shim injection** (`InjectChannelShim`, main.mm:377-384) — injected into the
-  **MAIN frame ONLY** on every `OnLoadStart` (main.mm:1337-1343) and into the
-  current frame at registration time (main.mm:2034). The injected source is
+  (`DoAddChannel`). Invalid names are dropped + logged, never
+  fatal. Dart pre-validates with the same regex (`_channelNameRe`) and
+  re-registers every channel on `create()` so add-before-mount works.
+- **Shim injection** (`InjectChannelShim`) — injected into the
+  **MAIN frame ONLY** on every `OnLoadStart` and into the
+  current frame at registration time (`DoAddChannel`). The injected source is
   exactly:
   ```js
   window['<name>']={postMessage:function(m){window.cefQuery({request:'ch:<name>:'+String(m),
@@ -439,19 +441,19 @@ Page → host. The shim is injected NATIVELY (there is no Dart-injected shim):
   ```
 - **Page → host delivery.** `window.<name>.postMessage(m)` calls
   `window.cefQuery` with `request = "ch:<name>:<m>"`. `OnQuery`
-  (main.mm:1487-1492) refuses subframe queries (privileged bridge; 403), strips
+  refuses subframe queries (privileged bridge; 403), strips
   the `"ch:"` prefix (3 bytes), and sends **0x17 kOpChannelMsg** `{utf8
-  "name:message"}` (main.mm:1489). The plugin emits `channelMessage
+  "name:message"}`. The plugin emits `channelMessage
   {payload:"name:message"}` (§4); Dart splits at the FIRST `:` and dispatches to
-  the registered handler (`_handleChannelMessage`, cef_web_controller.dart:336-340)
+  the registered handler (`_handleChannelMessage`)
   — colons in the message body are preserved.
 - **Per-session routing (mandatory — channel_probe_shared).** `OnQuery` stamps
-  `slot_->browser_id` (the originating browser) on kOpChannelMsg
-  (main.mm:1489), and the plugin fans the event to only that session's Dart
+  `slot_->browser_id` (the originating browser) on kOpChannelMsg,
+  and the plugin fans the event to only that session's Dart
   channel handler. A message from tile A's page reaches A's handler, never B's,
   even on a shared host. This is an information-sharing boundary (the channel
   NAME is process-global), not a message-spoofing one.
-- `removeJavaScriptChannel(name)` is **Dart-local** (cef_web_controller.dart:683-685):
+- `removeJavaScriptChannel(name)` is **Dart-local**:
   it stops delivery to the handler but does NOT tear down the page-side shim
   (which is process-global on a shared profile), so the page may still post — those
   messages are dropped. No opcode.
@@ -459,75 +461,69 @@ Page → host. The shim is injected NATIVELY (there is no Dart-injected shim):
 ### 7.3 `runJavaScriptReturningResult` — the eval round-trip
 
 - `runJavaScriptReturningResult(code)` assigns an `id` and sends verb
-  `evalReturning` → **0x2a kOpEvalReturning** `{u32 id}{utf8 code}` (§2,
-  cef_web_controller.dart:655-662). The host (`DoEvalReturning`,
-  main.mm:2001-2018) SPLICES `code` into a `window.cefQuery` call (not `eval()`,
-  so it survives a strict page CSP) that JSON-stringifies
+  `evalReturning` → **0x2a kOpEvalReturning** `{u32 id}{utf8 code}` (§2).
+  The host (`DoEvalReturning`) SPLICES `code` into a `window.cefQuery` call
+  (not `eval()`, so it survives a strict page CSP) that JSON-stringifies
   `{ok:true,v:(<code>)}` on success or `{ok:false,v:String(e)}` on throw, with
   `request = "eval:<id>:<json>"`.
-- `OnQuery` (main.mm:1481-1486) refuses subframe queries (403), strips the
+- `OnQuery` refuses subframe queries (403), strips the
   `"eval:"` prefix (5 bytes), and sends **0x16 kOpEvalResult** `{utf8
-  "id:json"}` (main.mm:1483). The plugin emits `evalResult
+  "id:json"}`. The plugin emits `evalResult
   {payload:"id:json"}` (§4); Dart splits at the FIRST `:`, matches the pending
   completer by `id`, and JSON-decodes the tail: `ok:true` completes with `v`,
-  `ok:false` completes with an `Exception('<v>')` (`_handleEvalResult`,
-  cef_web_controller.dart:297-313).
-- In-flight evals are failed (never leaked) on `pageStarted`
-  (cef_web_controller.dart:224-228), `processGone`, and `dispose`
-  (cef_web_controller.dart:317-324).
+  `ok:false` completes with an `Exception('<v>')` (`_handleEvalResult`).
+- In-flight evals are failed (never leaked) on `pageStarted`, `processGone`,
+  and `dispose` (`_failPendingEvals`).
 - `executeJavaScript(code)` is the fire-and-forget sibling → **0x25
   kOpExecuteJs** `{utf8 code}` (§2), no result event.
 
 ### 7.4 JS dialogs — alert / confirm / prompt
 
-- Host → page request: `CefJSDialogHandler::OnJSDialog` (main.mm:1279-1303)
+- Host → page request: `CefJSDialogHandler::OnJSDialog`
   assigns a per-slot `id`, stashes the `CefJSDialogCallback`, and sends **0x0f
-  kOpJsDialog** `{u32 id}{u32 type}{u32 msgLen}{msg utf8}{defaultText utf8}`
-  (main.mm:1291-1301). `type`: 0=alert, 1=confirm, 2=prompt (main.mm:1286-1288).
+  kOpJsDialog** `{u32 id}{u32 type}{u32 msgLen}{msg utf8}{defaultText utf8}`.
+  `type`: 0=alert, 1=confirm, 2=prompt.
   The plugin emits `jsDialog {id,type,message,defaultText}` (§4).
-- Dart (`_handleJsDialog`, cef_web_controller.dart:345-382) routes by `type` to
+- Dart (`_handleJsDialog`) routes by `type` to
   `onJavaScriptAlertDialog` / `onJavaScriptConfirmDialog` /
   `onJavaScriptTextInputDialog`, then replies verb `respondJsDialog
   {id, ok, text}` → **0x29 kOpJsDialogResp** `{u32 id}{u8 ok}{utf8 text}` (§2).
   Unset handlers fall closed to sensible defaults (alert dismissed, confirm→OK,
   prompt→defaultText). A throwing handler fails closed (`ok=false`) but is
   reported via `FlutterError.reportError` (not silently swallowed).
-- Host applies the answer: `DoJsDialogResp` (main.mm:1994-2000) looks up the
+- Host applies the answer: `DoJsDialogResp` looks up the
   stashed callback by `id` and calls `Continue(ok, text)`, which returns the
   page's `alert`/`confirm`/`prompt`. `OnBeforeUnloadDialog` always allows
-  navigation (main.mm:1304-1309).
+  navigation.
 
 ### 7.5 Find-in-page
 
 - `find(text, forward, matchCase, findNext)` → verb `find` → **0x27 kOpFind**
-  `{u8 fwd}{u8 matchCase}{u8 findNext}{utf8 text}` (§2,
-  cef_web_controller.dart:858-868; host read main.mm:2452-2459 → `DoFind`).
+  `{u8 fwd}{u8 matchCase}{u8 findNext}{utf8 text}` (§2; host → `DoFind`).
 - `stopFind(clearSelection)` → verb `stopFind` → **0x28 kOpStopFind** `{u8
-  clearSelection}` (absent = 1) (§2, cef_web_controller.dart:871-872; host
-  main.mm:2460-2465 → `DoStopFind`, main.mm:1991-1993).
-- Result event: `CefFindHandler::OnFindResult` (main.mm:1260-1275) sends **0x0e
-  kOpFindResult** `{u32 count}{u32 activeOrdinal}{u8 final}` = 9 bytes
-  (main.mm:1265-1274). The plugin emits `findResult
+  clearSelection}` (absent = 1) (§2; host → `DoStopFind`).
+- Result event: `CefFindHandler::OnFindResult` sends **0x0e
+  kOpFindResult** `{u32 count}{u32 activeOrdinal}{u8 final}` = 9 bytes.
+  The plugin emits `findResult
   {count, activeMatchOrdinal, isFinal}` (§4); Dart delivers a `CefFindResult`
-  to `onFindResult` (cef_web_controller.dart:239-245). ⌘F/Ctrl+F is surfaced to
-  the host via `CefWebView.onFind` (cef_web_view.dart:571-579) — the widget has
+  to `onFindResult`. ⌘F/Ctrl+F is surfaced to
+  the host via `CefWebView.onFind` — the widget has
   no find bar of its own.
 
 ### 7.6 Content zoom
 
 - `setZoomLevel(level)` → verb `setZoomLevel` → **0x26 kOpSetZoom** `{f64
-  level}` (§2, cef_web_controller.dart:822-823; host read main.mm:2434-2438 →
-  `DoSetZoom`). `level` is a Chromium zoom LEVEL; the factor is `1.2^level`
-  (0 = 100%). The view wires Ctrl/⌘ +/-/0 to step it (cef_web_view.dart:559-570).
+  level}` (§2; host → `DoSetZoom`). `level` is a Chromium zoom LEVEL; the
+  factor is `1.2^level` (0 = 100%). The view wires Ctrl/⌘ +/-/0 to step it.
   No result event.
 
 ### 7.7 Downloads
 
-- `CefDownloadHandler::OnBeforeDownload` (main.mm:1251-1257) allows the download
+- `CefDownloadHandler::OnBeforeDownload` allows the download
   (CEF blocks downloads without a handler) and sends **0x18 kOpDownload** `{utf8
-  suggestedName}` (main.mm:1254). The plugin emits `download {suggestedName}`
-  (§4); Dart invokes `onDownload(suggestedName)`
-  (cef_web_controller.dart:255-257). Informational only (no reply verb).
+  suggestedName}`. The plugin emits `download {suggestedName}`
+  (§4); Dart invokes `onDownload(suggestedName)`.
+  Informational only (no reply verb).
 - Windows continues with `show_dialog=true`, like macOS's Save panel, so
   nothing is written without the user's say. The dialog opens on
   `%USERPROFILE%\Downloads\<leaf>`, where the leaf is the page's suggested name
@@ -535,7 +531,7 @@ Page → host. The shim is injected NATIVELY (there is no Dart-injected shim):
   dots/spaces and DOS device names neutralized) and given a ` (n)` suffix when
   that file exists.
 
-## 8. Agent control — CDP-over-pipe + the token-gated loopback relay (P9)
+## 8. Agent control — CDP-over-pipe + the token-gated loopback relay
 
 An external CDP client (Playwright via `connectOverCDP`, agent-browser) drives a
 live, logged-in tile **without** an open debug port: Chromium speaks CDP over an
@@ -543,14 +539,14 @@ inherited pipe (`--remote-debugging-pipe` + `--remote-debugging-io-pipes`,
 NUL-framed JSON), and a small token-gated LOOPBACK HTTP+WebSocket relay bridges a
 standard CDP client to that pipe. Transcribed from the macOS reference
 `CdpRelay.swift` (the canonical relay) + `CefProfileHost.swift`
-(launchViaPosixSpawn / readCdpLoop / enableAgentControl); the Windows spawn is
-the S3 recipe (`flutter_cef_spikes/s3`). **SINGLE-TILE scope:** one relay per
-host (raw browser-level passthrough — the pipe carries exactly one page target);
-the per-tile Target-domain filter + N-relay CDP-id multiplex (CEF-2b,
-`CdpRelay.swift:560-884`) is a documented follow-up (the `scope_target_id` seam
-in `windows/cdp_relay.h`).
+(launchViaPosixSpawn / readCdpLoop / enableAgentControl); the Windows spawn
+hands Chromium two inherited anonymous pipes instead of fds. **SINGLE-TILE
+scope:** one relay per host (raw browser-level passthrough — the pipe carries
+exactly one page target); the per-tile Target-domain filter + N-relay CDP-id
+multiplex (the `scopeTargetId` machinery in `CdpRelay.swift`) is a documented
+follow-up (the `scope_target_id` seam in `windows/cdp_relay.h`).
 
-### 8.1 Launch — the CDP pipe (S3 recipe)
+### 8.1 Launch — the CDP pipe
 
 The `create` arg `agentControl:true` (§3) switches the host launch mechanism.
 `HostProcess::Spawn(agent_control=true)` (windows/host_process.cpp):
@@ -563,14 +559,14 @@ The `create` arg `agentControl:true` (§3) switches the host launch mechanism.
   inherits nothing: the IPC pipe is connected by NAME (`CreateFileW`) and the Job
   Object is assigned post-spawn — neither is an inherited handle. `bInheritHandles
   = TRUE` + `EXTENDED_STARTUPINFO_PRESENT` are added only on this path; the
-  non-agent spawn stays byte-identical (S2/S3 confirm bootstrap preserves the
-  handle list).
+  non-agent spawn stays byte-identical (the renamed bootstrap exe passes the
+  inherited handles through to the host DLL unchanged).
 - The child gets `--cdp-io-pipes=<childRead>,<childWrite>` (decimal HANDLE
   values). cef_host's `OnBeforeCommandLineProcessing` (browser process only)
   translates it into Chromium's `--remote-debugging-pipe` +
-  `--remote-debugging-io-pipes=<childRead>,<childWrite>`. Mirrors macOS main.mm's
-  `--cdp-pipe` → `remote-debugging-pipe` injection (fds 3/4 there; explicit HANDLE
-  values here).
+  `--remote-debugging-io-pipes=<childRead>,<childWrite>`. Mirrors the macOS
+  `main.mm` `--cdp-pipe` → `remote-debugging-pipe` injection (fds 3/4 there;
+  explicit HANDLE values here).
 - The plugin keeps the two PARENT-side ends (`CdpTransport::read`/`write`) and
   runs an always-on `CdpReadLoop` that splits the NUL-framed CDP stream and fans
   each message to the current relay (mirrors `CefProfileHost.readCdpLoop` +
@@ -615,10 +611,10 @@ multi-client `--remote-debugging-port`.
 
 ### 8.4 Deferred (N-tile Target multiplex)
 
-Not implemented in the slice (single-tile is passthrough): `Target.getTargetInfo`
+Not implemented on Windows (single-tile is passthrough): `Target.getTargetInfo`
 targetId resolution (`kOpResolveTargetId 0x36` → `kOpTargetId 0x1b`, still a
 logged drop host-side), the deny-by-default / fail-closed / flatten-only
 Target-domain filter, and the per-relay CDP-id rewrite/demux that lets N relays
-share one browser-wide pipe. See `CdpRelay.swift:560-884` +
-`CefProfileHost.swift:1460-1596` and the filter test vectors
-`packages/flutter_cef_macos/macos/Classes/test/CdpRelayFilterTests.swift`.
+share one browser-wide pipe. See `CdpRelay.swift` + `CefProfileHost+Cdp.swift`
+and the filter test vectors
+`packages/flutter_cef_macos/test/CdpRelayFilterTests.swift`.

@@ -2,8 +2,8 @@
 // transitions that used to wedge it permanently blank (only relaunch recovered):
 //   * setVisible(false) → resize while hidden → setVisible(true)
 //   * setVisible(false) → setVisible(true) after the off-screen frame is evicted
-// The native fix (F-1): DoSetVisible(true) forces a full repaint on the hidden→visible
-// edge; (F-2) DoResize defers its paint while hidden; (F-4) the resize watchdog never
+// The native fix: DoSetVisible(true) forces a full repaint on the hidden→visible
+// edge; DoResize defers its paint while hidden; the resize watchdog never
 // force-promotes a hidden (never-painted) surface. Without these, the page below stays
 // BLANK after "Wedge cycle"; with them it reappears (gradient + the ticking clock proves
 // the frame is FRESH, not a stale cached one).
@@ -55,7 +55,7 @@ class _WedgeAppState extends State<WedgeApp> {
     _controller.onPageStarted = (_) => _controller.loadHtmlString(_html);
     // Self-driving evidence run: a few seconds after first paint, run several wedge
     // cycles back-to-back then settle SHOWN, so a screenshot of the final state proves the
-    // page repainted (F-1) rather than wedged blank — no clicking needed.
+    // page repainted on show rather than wedged blank — no clicking needed.
     Future<void>.delayed(const Duration(seconds: 4), _runAutoCycles);
   }
 

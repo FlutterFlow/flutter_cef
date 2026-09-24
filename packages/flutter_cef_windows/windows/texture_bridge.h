@@ -1,24 +1,25 @@
 // TextureBridge — owns the Flutter GPU texture a session presents into.
 //
-// The real bridge, per PROTOCOL.md §5 and the LAWS:
+// The real bridge, per PROTOCOL.md §5:
 //  - Each session gets a flutter::GpuSurfaceTexture
 //    (kFlutterDesktopGpuSurfaceTypeDxgiSharedHandle) whose descriptor callback
-//    serves the CURRENT host-minted bridge handle under a mutex
-//    (validated by the P0 S1 spike — see specs/windows-port/SPIKES.md).
+//    serves the CURRENT host-minted bridge handle under a mutex.
 //  - Descriptor: struct_size SET, width/height AND visible_width/height,
-//    format = kFlutterDesktopPixelFormatNone (LAW 5). Returns nullptr before
+//    format = kFlutterDesktopPixelFormatNone. Returns nullptr before
 //    the first present — the engine skips the frame (PopulateTexture checks
 //    descriptor/handle for null and bails).
 //  - Present() holds an opened ID3D11Texture2D ComPtr on the CURRENT bridge
 //    handle for as long as it is fed to Flutter, releasing the previous one
-//    only AFTER the swap (LAW 6, S1 belt-1).
+//    only AFTER the swap, so the texture stays alive even once the host
+//    releases its bridge.
 //  - Identity is the host-minted bridge handle value we are handed — never
-//    CEF's per-callback shared_texture_handle (LAW 3). The size-gate (LAW 4)
-//    is the CALLER's job (the plugin compares srcW/srcH against the expected
-//    round(logical*dpr) before calling Present).
+//    CEF's per-callback shared_texture_handle (those values alias across sizes
+//    and browsers). The size-gate is the CALLER's job (the plugin compares
+//    srcW/srcH against the expected round(logical*dpr) before calling
+//    Present).
 //  - UnregisterTexture is ASYNC on Windows: the entry (variant + descriptor +
 //    keep-alive ComPtr) is captured by the completion callback and freed when
-//    the engine releases it (PLAN §2 #7) — no graveyard, no leak-to-teardown.
+//    the engine releases it — no graveyard, no leak-to-teardown.
 
 #ifndef FLUTTER_PLUGIN_FLUTTER_CEF_TEXTURE_BRIDGE_H_
 #define FLUTTER_PLUGIN_FLUTTER_CEF_TEXTURE_BRIDGE_H_
@@ -51,7 +52,8 @@ class TextureBridge {
   // the texture's backing surface and marks a frame available.
   // width/height are the frame's physical px (already size-gated by the
   // caller). On a handle change, opens the handle on our D3D11 device and
-  // holds the ComPtr (LAW 6), releasing the previous ref AFTER the swap.
+  // holds the ComPtr to keep the texture alive, releasing the previous ref
+  // AFTER the swap.
   // Returns false if the entry is unknown or the handle could not be opened
   // (previous texture keeps serving). *handle_changed reports whether the
   // backing surface identity changed (drives the onSurface event).

@@ -54,7 +54,7 @@ bool HostProcess::Spawn(const std::wstring& cef_host_exe,
     cmd += L" --allowed-schemes=" + w;
   }
 
-  // ---- Agent control (P9): CDP-over-pipe plumbing (the S3 recipe) ----
+  // ---- Agent control: CDP-over-pipe plumbing ----
   // Two anonymous pipes; ONLY the child-side ends are inheritable and land in
   // the STARTUPINFOEX handle list, so this composes cleanly with the existing
   // spawn (which inherits nothing). cmd_pipe: parent writes CDP -> child reads.
@@ -78,8 +78,8 @@ bool HostProcess::Spawn(const std::wstring& cef_host_exe,
     // Child argv: --remote-debugging-io-pipes wants <read>,<write> where read is
     // the handle the browser READS commands from (cmd_read) and write is the one
     // it WRITES responses to (out_write). Decimal HANDLE values, cast to
-    // unsigned 32-bit (S3: `(unsigned)(uintptr_t)` — handle values fit in 32
-    // bits for Chromium's int-parsing of the switch).
+    // unsigned 32-bit (`(unsigned)(uintptr_t)`: handle values fit in 32 bits
+    // for Chromium's int-parsing of the switch).
     cmd += L" --cdp-io-pipes=" +
            std::to_wstring(static_cast<unsigned>(
                reinterpret_cast<uintptr_t>(cmd_read))) +

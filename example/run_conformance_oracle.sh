@@ -10,7 +10,7 @@
 #   • NO-RENDER   : the harness never established / never adopted a surface
 #
 # This turns the manual "read the logs" check into a repeatable gate. Run after any change to
-# CefWebSession.swift / CefProfileHost.swift / cef_host/main.mm.
+# CefWebSession.swift / CefProfileHost*.swift / cef_host/*.mm.
 #
 #   FLUTTER_CEF_HOST=/path/to/cef_host.app/Contents/MacOS/cef_host ./run_conformance_oracle.sh
 #

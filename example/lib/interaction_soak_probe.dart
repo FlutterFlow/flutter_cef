@@ -82,7 +82,7 @@ class _AppState extends State<App> {
           t.controller.setVisible(false);
         case 2: // logical resize WHILE the tile may be hidden
           t.big = !t.big;
-        case 3: // un-cull (show) — F-1 must repaint, size-gate must promote
+        case 3: // un-cull (show) — show must repaint, size-gate must promote
           t.visible = true;
           t.controller.setVisible(true);
       }
