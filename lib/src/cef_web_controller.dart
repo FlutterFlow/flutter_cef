@@ -47,7 +47,6 @@ class CefWebController {
   bool _lastVisible = true;
   bool _visibilityExplicitlySet = false;
 
-
   /// Stable id for this session, echoed in every host message.
   final String sessionId;
 
@@ -149,13 +148,16 @@ class CefWebController {
   void Function(String suggestedName)? onDownload;
 
   /// Called when the backing `cef_host` process is gone — it died unexpectedly
-  /// (crash) or lost the profile's cross-process cache lock. The texture is
-  /// frozen on its last frame and the session is no longer usable; recreate the
-  /// view (or controller) to recover. [reason] is `"locked"` when the profile is
-  /// already open in another process (show "already open elsewhere"),
-  /// `"createFailed"` when the browser never came up (including a `cef_host`
-  /// that exited before it was ready; [onCreateFailed] is called too), or
-  /// `"crashed"` for a generic process death.
+  /// (crash), stopped being able to paint, or lost the profile's cross-process
+  /// cache lock. The session and its texture are gone: [isCreated] turns false,
+  /// calls answered by the page fail, and a later [create] (or a new view on
+  /// this controller) starts a new session. [reason] is `"locked"` when the
+  /// profile is already open in another process (show "already open
+  /// elsewhere"), `"createFailed"` when the browser never came up (including a
+  /// `cef_host` that exited before it was ready; [onCreateFailed] is called
+  /// too), `"protocolMismatch(host=vN)"` when `cef_host` speaks another wire
+  /// protocol, `"respawnFailed"` when moving the session to a new host failed,
+  /// or `"crashed"` otherwise.
   void Function(String reason)? onProcessGone;
 
   /// The browser was created but still hasn't painted its first frame after the
@@ -233,7 +235,6 @@ class CefWebController {
   final ValueNotifier<CefMediaState> mediaState =
       ValueNotifier<CefMediaState>(const CefMediaState());
 
-
   static final Map<String, CefWebController> _bySession =
       <String, CefWebController>{};
   static bool _handlerInstalled = false;
@@ -260,7 +261,19 @@ class CefWebController {
     _channel.setMethodCallHandler((call) async {
       final a = (call.arguments as Map?)?.cast<String, dynamic>();
       final id = a?['sessionId'] as String?;
-      if (id != null) _bySession[id]?._onEvent(call.method, a!);
+      if (id == null) return null;
+      try {
+        _bySession[id]?._onEvent(call.method, a!);
+      } catch (e, st) {
+        // A consumer callback threw. Report it: thrown from here it would only
+        // reach the platform side, which ignores the reply.
+        FlutterError.reportError(FlutterErrorDetails(
+          exception: e,
+          stack: st,
+          library: 'flutter_cef',
+          context: ErrorDescription('while handling the ${call.method} event'),
+        ));
+      }
       return null;
     });
   }
@@ -373,13 +386,24 @@ class CefWebController {
         // most likely failure) — then let the consumer react (reload / recreate).
         _failPendingEvals('the cef_host process is gone');
         _failPendingCookies('the cef_host process is gone');
+        // The native session and its texture are gone: this controller is no
+        // longer created, and a later create() starts a new session.
+        textureId = null;
+        _frozen = false;
+        isLoading.value = false;
+        mediaState.value = const CefMediaState();
         final reason = a['reason'] as String? ?? 'crashed';
         // The browser never came up (dispatch failed, or the host speaks another
         // wire protocol): the same "can't create" signal create() throws for.
-        if (reason == 'createFailed' || reason.startsWith('protocolMismatch')) {
-          onCreateFailed?.call(StateError('cef_host: $reason'));
+        // A throwing onCreateFailed must not keep onProcessGone from running.
+        try {
+          if (reason == 'createFailed' ||
+              reason.startsWith('protocolMismatch')) {
+            onCreateFailed?.call(StateError('cef_host: $reason'));
+          }
+        } finally {
+          onProcessGone?.call(reason);
         }
-        onProcessGone?.call(reason);
         break;
       case 'paintStalled':
         // C1: the browser came up but never delivered its first frame even after a
@@ -534,8 +558,8 @@ class CefWebController {
         exception: e,
         stack: st,
         library: 'flutter_cef',
-        context:
-            ErrorDescription('handling a camera/microphone request from a page'),
+        context: ErrorDescription(
+            'handling a camera/microphone request from a page'),
       ));
     }
     // Torn down mid-prompt: drop it. cef_host cancels every pending request on
@@ -639,7 +663,8 @@ class CefWebController {
     // Agent-control (pipe) mode is exempt: CDP rides cef_host's inherited fds 3/4
     // (no listening socket), so it's allowed on a named profile — the gate only
     // covers the plain-TCP case.
-    assert(!(enableCdp && !agentControl && profile != null && profile!.isNotEmpty),
+    assert(
+        !(enableCdp && !agentControl && profile != null && profile!.isNotEmpty),
         'enableCdp cannot be combined with a named profile (CDP-over-TCP is an '
         'unauthenticated localhost port that could read the shared cookie jar). '
         'Use agentControl for a private CDP-over-pipe channel instead.');
@@ -863,12 +888,30 @@ class CefWebController {
   /// so primitives, lists and maps all round-trip). Completes with an error if
   /// the script throws.
   Future<Object?> runJavaScriptReturningResult(String code) {
+    final unavailable = _sessionUnavailable;
+    if (unavailable != null) return Future.error(StateError(unavailable));
     final id = _evalNextId++;
     final completer = Completer<Object?>();
     _evalPending[id] = completer;
-    _channel.invokeMethod(
-        'evalReturning', {'sessionId': sessionId, 'id': id, 'code': code});
+    _channel.invokeMethod('evalReturning', {
+      'sessionId': sessionId,
+      'id': id,
+      'code': code
+    }).catchError((Object e) {
+      final c = _evalPending.remove(id);
+      if (c != null && !c.isCompleted) c.completeError(e);
+    });
     return completer.future;
+  }
+
+  /// Why a call answered by the page can't be made now, or null if it can. The
+  /// answer would never come: the platform side drops calls for a session it
+  /// doesn't have.
+  String? get _sessionUnavailable {
+    if (_disposed) return 'the controller is disposed';
+    if (textureId == null) return 'the session is not created';
+    if (_frozen) return 'the session is frozen';
+    return null;
   }
 
   /// Register a JavaScript channel: the page can call `window.<name>.postMessage`
@@ -962,11 +1005,19 @@ class CefWebController {
   /// with a [url], only the cookies that would be sent to it. Includes
   /// `httpOnly` cookies (not reachable from page JavaScript).
   Future<List<CefCookie>> getCookies({String? url}) {
+    final unavailable = _sessionUnavailable;
+    if (unavailable != null) return Future.error(StateError(unavailable));
     final id = _cookieNextId++;
     final completer = Completer<List<CefCookie>>();
     _cookiePending[id] = completer;
-    _channel.invokeMethod(
-        'visitCookies', {'sessionId': sessionId, 'id': id, 'url': url ?? ''});
+    _channel.invokeMethod('visitCookies', {
+      'sessionId': sessionId,
+      'id': id,
+      'url': url ?? '',
+    }).catchError((Object e) {
+      final c = _cookiePending.remove(id);
+      if (c != null && !c.isCompleted) c.completeError(e);
+    });
     return completer.future;
   }
 
@@ -1047,7 +1098,8 @@ class CefWebController {
   /// `<base href>`, but the document's ORIGIN stays opaque.
   static String _withBaseHref(String html, String? baseUrl) {
     if (baseUrl == null || baseUrl.isEmpty) return html;
-    final tag = '<base href="${const HtmlEscape(HtmlEscapeMode.attribute).convert(baseUrl)}">';
+    final tag =
+        '<base href="${const HtmlEscape(HtmlEscapeMode.attribute).convert(baseUrl)}">';
     final head = RegExp(r'<head[^>]*>', caseSensitive: false).firstMatch(html);
     return head == null
         ? '$tag$html'
@@ -1143,7 +1195,6 @@ class CefWebController {
     });
   }
 
-
   /// Read this session's pixel-liveness counters (see [CefSessionStats]).
   ///
   /// Returns null when the platform has no such session (never created, or
@@ -1217,8 +1268,7 @@ class CefWebController {
   Future<bool> thaw({String? url, String? html}) async {
     if (_disposed || !_frozen) return false;
     final thawUrl = html != null ? _htmlDataUrl(html) : url;
-    final res = await _channel.invokeMapMethod<String, dynamic>(
-        'thawSession',
+    final res = await _channel.invokeMapMethod<String, dynamic>('thawSession',
         {'sessionId': sessionId, if (thawUrl != null) 'url': thawUrl});
     if (res == null) return false;
     _frozen = false;

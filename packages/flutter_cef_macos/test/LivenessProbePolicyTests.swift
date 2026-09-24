@@ -94,6 +94,15 @@ enum LivenessProbePolicyTests {
     check("static page answered an interval ago → ping again",
           ping(now: t, replied: t - interval) == .ping)
 
+    func may(_ dialogs: Int = 0, devTools: Bool = false, cdp: Bool = false) -> Bool {
+      LivenessProbePolicy.mayPing(dialogsOpen: dialogs, devToolsOpened: devTools,
+                                  cdpClientsCanPause: cdp)
+    }
+    check("nothing holding the renderer → ping", may())
+    check("a JS dialog open → no ping (the renderer waits on it)", !may(1))
+    check("DevTools opened → no ping (its debugger can pause the page)", !may(devTools: true))
+    check("a CDP client can attach → no ping", !may(cdp: true))
+
     func gpu(started: UInt64, firstPresent: UInt64) -> Bool {
       LivenessProbePolicy.gpuRestarted(gpuStartedUs: started, firstPresentUs: firstPresent)
     }

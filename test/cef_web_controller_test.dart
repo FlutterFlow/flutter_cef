@@ -2,7 +2,11 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart'
-    show FlutterError, TargetPlatform, debugDefaultTargetPlatformOverride;
+    show
+        FlutterError,
+        FlutterErrorDetails,
+        TargetPlatform,
+        debugDefaultTargetPlatformOverride;
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_cef/flutter_cef.dart';
@@ -82,7 +86,8 @@ void main() {
           m.method == 'setVisible' &&
           (m.arguments as Map)['sessionId'] == 'vis-never'),
       isEmpty,
-      reason: 'a never-set visibility must not be re-asserted (off-screen guard)',
+      reason:
+          'a never-set visibility must not be re-asserted (off-screen guard)',
     );
   });
 
@@ -151,8 +156,7 @@ void main() {
     // is a debug assert; it only fires in debug builds.
     final c = CefWebController(sessionId: 's-cdp-prof', profile: 'work');
     expect(
-      () => c.create(
-          url: 'about:blank', width: 1, height: 1, enableCdp: true),
+      () => c.create(url: 'about:blank', width: 1, height: 1, enableCdp: true),
       throwsA(isA<AssertionError>()),
     );
   });
@@ -160,8 +164,7 @@ void main() {
   test('create() allows enableCdp with no profile (ephemeral)', () async {
     // The assert must NOT fire for the common ephemeral + CDP case.
     final c = CefWebController(sessionId: 's-cdp-noprof');
-    await c.create(
-        url: 'about:blank', width: 1, height: 1, enableCdp: true);
+    await c.create(url: 'about:blank', width: 1, height: 1, enableCdp: true);
     final args = (log.firstWhere((m) => m.method == 'create').arguments as Map)
         .cast<String, dynamic>();
     expect(args['enableCdp'], true);
@@ -286,10 +289,10 @@ void main() {
     expect(seen?.origin, 'https://meet.google.com');
     expect(seen?.camera, isTrue);
     expect(seen?.microphone, isTrue);
-    final args =
-        (log.firstWhere((m) => m.method == 'respondMediaRequest').arguments
-                as Map)
-            .cast<String, dynamic>();
+    final args = (log
+            .firstWhere((m) => m.method == 'respondMediaRequest')
+            .arguments as Map)
+        .cast<String, dynamic>();
     expect(args['sessionId'], 'm1');
     expect(args['id'], 42);
     expect(args['allow'], isTrue);
@@ -319,10 +322,10 @@ void main() {
     );
     await Future<void>.delayed(Duration.zero);
 
-    final args =
-        (log.firstWhere((m) => m.method == 'respondMediaRequest').arguments
-                as Map)
-            .cast<String, dynamic>();
+    final args = (log
+            .firstWhere((m) => m.method == 'respondMediaRequest')
+            .arguments as Map)
+        .cast<String, dynamic>();
     expect(args['allow'], isFalse);
     expect(args['remember'], isFalse);
   });
@@ -346,10 +349,10 @@ void main() {
     );
     await Future<void>.delayed(Duration.zero);
 
-    final args =
-        (log.firstWhere((m) => m.method == 'respondMediaRequest').arguments
-                as Map)
-            .cast<String, dynamic>();
+    final args = (log
+            .firstWhere((m) => m.method == 'respondMediaRequest')
+            .arguments as Map)
+        .cast<String, dynamic>();
     expect(args['allow'], isFalse);
     expect(args['remember'], isTrue);
   });
@@ -376,10 +379,10 @@ void main() {
     );
     await Future<void>.delayed(Duration.zero);
 
-    final args =
-        (log.firstWhere((m) => m.method == 'respondMediaRequest').arguments
-                as Map)
-            .cast<String, dynamic>();
+    final args = (log
+            .firstWhere((m) => m.method == 'respondMediaRequest')
+            .arguments as Map)
+        .cast<String, dynamic>();
     expect(args['allow'], isFalse);
     expect(args['remember'], isFalse);
   });
@@ -407,10 +410,10 @@ void main() {
     );
     await Future<void>.delayed(Duration.zero);
 
-    final args =
-        (log.firstWhere((m) => m.method == 'respondMediaRequest').arguments
-                as Map)
-            .cast<String, dynamic>();
+    final args = (log
+            .firstWhere((m) => m.method == 'respondMediaRequest')
+            .arguments as Map)
+        .cast<String, dynamic>();
     expect(args['allow'], isFalse);
     // A handler that blew up is not a human choosing "block".
     expect(args['remember'], isFalse);
@@ -705,8 +708,10 @@ void main() {
     expect(got, 'hello world');
   });
 
-  test('a channel added BEFORE create() is re-registered on create() '
-      '(call-order independence — the shared-host channel regression)', () async {
+  test(
+      'a channel added BEFORE create() is re-registered on create() '
+      '(call-order independence — the shared-host channel regression)',
+      () async {
     // On a SHARED host the session attaches LATE (createBrowser is queued), so an
     // addJavaScriptChannel issued before the widget mounts reaches the host before
     // the browser exists. The controller must re-register every channel on
@@ -722,7 +727,8 @@ void main() {
         m.method == 'addJavaScriptChannel' &&
         (m.arguments as Map)['name'] == 'Early');
     expect(reSent, isNotEmpty,
-        reason: 'a channel registered before create() must be re-sent on create()');
+        reason:
+            'a channel registered before create() must be re-sent on create()');
   });
 
   test('scroll + storage conveniences forward as JavaScript', () async {
@@ -866,6 +872,61 @@ void main() {
     expect(reason, 'locked');
   });
 
+  test('evals and cookies fail at once when there is no session to answer',
+      () async {
+    // The platform side drops calls for a session it doesn't have, so the
+    // answer would never come: fail now instead of hanging.
+    final notCreated = CefWebController(sessionId: 'nc');
+    await expectLater(
+        notCreated.runJavaScriptReturningResult('1'), throwsStateError);
+    await expectLater(
+        notCreated.getCookies(url: 'https://x.test/'), throwsStateError);
+
+    final disposed = CefWebController(sessionId: 'dsp');
+    await disposed.create(url: 'about:blank', width: 1, height: 1);
+    await disposed.dispose();
+    await expectLater(
+        disposed.runJavaScriptReturningResult('1'), throwsStateError);
+    await expectLater(
+        disposed.getCookies(url: 'https://x.test/'), throwsStateError);
+    expect(log.where((m) => m.method == 'evalReturning'), isEmpty);
+  });
+
+  test('processGone ends the session; a later create starts a new one',
+      () async {
+    final c = CefWebController(sessionId: 'pgn');
+    c.onProcessGone = (_) {};
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    await emit('pgn', 'processGone', {'reason': 'crashed'});
+    expect(c.textureId, isNull);
+    expect(c.isCreated, false);
+    await expectLater(c.runJavaScriptReturningResult('1'), throwsStateError);
+
+    log.clear();
+    expect(await c.create(url: 'about:blank', width: 1, height: 1), 7);
+    expect(log.where((m) => m.method == 'create'), hasLength(1),
+        reason: 'create after processGone must reach the host again');
+  });
+
+  test('a throwing onCreateFailed still runs onProcessGone', () async {
+    final c = CefWebController(sessionId: 'pgt');
+    await c.create(url: 'about:blank', width: 1, height: 1);
+    String? reason;
+    c.onCreateFailed = (_) => throw StateError('consumer bug');
+    c.onProcessGone = (r) => reason = r;
+    final errors = <FlutterErrorDetails>[];
+    final prev = FlutterError.onError;
+    FlutterError.onError = errors.add;
+    try {
+      await emit('pgt', 'processGone', {'reason': 'createFailed'});
+    } finally {
+      FlutterError.onError = prev;
+    }
+    expect(reason, 'createFailed');
+    expect(errors, hasLength(1),
+        reason: 'the consumer error is reported, not swallowed');
+  });
+
   test('paintStalled event invokes onPaintStalled', () async {
     final c = CefWebController(sessionId: 'pstall');
     await c.create(url: 'about:blank', width: 1, height: 1);
@@ -995,7 +1056,8 @@ void main() {
     expect(log.where((m) => m.method == 'loadTrusted'), isEmpty);
   });
 
-  test('loadHtmlString(baseUrl:) serves at the origin on Windows too', () async {
+  test('loadHtmlString(baseUrl:) serves at the origin on Windows too',
+      () async {
     debugDefaultTargetPlatformOverride = TargetPlatform.windows;
     addTearDown(() => debugDefaultTargetPlatformOverride = null);
     final c = CefWebController(sessionId: 'auth-win');
@@ -1037,15 +1099,19 @@ void main() {
   test('create forwards hostGroup only when set', () async {
     final grouped = CefWebController(sessionId: 'hg', hostGroup: 'editors');
     await grouped.create(url: 'about:blank', width: 1, height: 1);
-    expect((log.firstWhere((m) => m.method == 'create').arguments
-        as Map)['hostGroup'], 'editors');
+    expect(
+        (log.firstWhere((m) => m.method == 'create').arguments
+            as Map)['hostGroup'],
+        'editors');
 
     for (final g in [null, '']) {
       log.clear();
       final c = CefWebController(sessionId: 'hg-$g', hostGroup: g);
       await c.create(url: 'about:blank', width: 1, height: 1);
-      expect((log.firstWhere((m) => m.method == 'create').arguments as Map)
-          .containsKey('hostGroup'), isFalse);
+      expect(
+          (log.firstWhere((m) => m.method == 'create').arguments as Map)
+              .containsKey('hostGroup'),
+          isFalse);
     }
   });
 
@@ -1078,7 +1144,8 @@ void main() {
     c.onProcessGone = gone.add;
 
     await emit('cf', 'processGone', {'reason': 'crashed'});
-    expect(failures, isEmpty, reason: 'a crash after create is not a create failure');
+    expect(failures, isEmpty,
+        reason: 'a crash after create is not a create failure');
     await emit('cf', 'processGone', {'reason': 'createFailed'});
     await emit('cf', 'processGone', {'reason': 'protocolMismatch(host=v3)'});
     expect(failures, hasLength(2));
@@ -1113,8 +1180,7 @@ void main() {
     await expectLater(emit('ghost', 'title', {'title': 'x'}), completes);
   });
 
-  test('channel message body keeps colons after the first separator',
-      () async {
+  test('channel message body keeps colons after the first separator', () async {
     final c = CefWebController(sessionId: 'chc');
     await c.create(url: 'about:blank', width: 1, height: 1);
     String? got;
@@ -1124,7 +1190,8 @@ void main() {
         reason: 'split-once on ":" — a split-all would truncate to "ts=12"');
   });
 
-  test('create() throttles concurrent spawns to maxConcurrentCreates', () async {
+  test('create() throttles concurrent spawns to maxConcurrentCreates',
+      () async {
     CefWebController.maxConcurrentCreates = 1;
     CefWebController.spawnSpacing = Duration.zero; // deterministic: no spacing
     addTearDown(() {
@@ -1141,10 +1208,10 @@ void main() {
       }
       return null;
     });
-    final f1 =
-        CefWebController(sessionId: 'a').create(url: 'about:blank', width: 1, height: 1);
-    final f2 =
-        CefWebController(sessionId: 'b').create(url: 'about:blank', width: 1, height: 1);
+    final f1 = CefWebController(sessionId: 'a')
+        .create(url: 'about:blank', width: 1, height: 1);
+    final f2 = CefWebController(sessionId: 'b')
+        .create(url: 'about:blank', width: 1, height: 1);
     await pumpEventQueue();
     expect(creates, 1, reason: 'the 2nd spawn waits behind the 1st (cap = 1)');
     gate.complete();
@@ -1179,18 +1246,20 @@ void main() {
     ]);
     expect(starts, hasLength(2));
     expect(starts[1] - starts[0], greaterThanOrEqualTo(70),
-        reason: 'the 2nd spawn is spaced (~80ms) after the 1st, not back-to-back');
+        reason:
+            'the 2nd spawn is spaced (~80ms) after the 1st, not back-to-back');
   });
 
   test('a lone create() (no contention) is never delayed by spacing', () async {
     CefWebController.spawnSpacing = const Duration(seconds: 5); // huge, but…
-    addTearDown(
-        () => CefWebController.spawnSpacing = const Duration(milliseconds: 120));
+    addTearDown(() =>
+        CefWebController.spawnSpacing = const Duration(milliseconds: 120));
     final sw = Stopwatch()..start();
     await CefWebController(sessionId: 'solo')
         .create(url: 'about:blank', width: 1, height: 1);
     expect(sw.elapsedMilliseconds, lessThan(1000),
-        reason: 'spacing only applies under contention — a single spawn returns '
+        reason:
+            'spacing only applies under contention — a single spawn returns '
             'immediately and never waits the gap');
   });
 

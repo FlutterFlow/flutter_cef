@@ -12,6 +12,8 @@
 //
 // Cases, each on its own ephemeral host:
 //   * an idle static page is left alone (no processGone in 35s);
+//   * a page waiting on an open alert() is left alone (its renderer can't answer
+//     the liveness ping, but it isn't hung);
 //   * killing the GPU process reports processGone("crashed") within 10s;
 //   * stopping the renderer (SIGSTOP) reports processGone("crashed") within 45s.
 //
@@ -35,6 +37,10 @@ const _animated = '''<!doctype html><meta charset="utf-8">
 <div id="s"></div>''';
 
 const _static = '<!doctype html><body style="background:#123"><h1>static</h1>';
+
+const _alerting =
+    '<!doctype html><body style="background:#321"><h1>alert</h1>'
+    '<script>setTimeout(() => alert("open"), 300)</script>';
 
 void main() => runApp(const MaterialApp(home: ProbeApp()));
 
@@ -81,8 +87,11 @@ class _ProbeAppState extends State<ProbeApp> {
 
   /// Creates a view on [html], waits for it to paint, and returns it with a
   /// future that completes with the first processGone reason.
-  Future<(CefWebController, Future<String>)> _open(String html) async {
-    final c = CefWebController();
+  Future<(CefWebController, Future<String>)> _open(
+    String html, {
+    Future<void> Function(CefJsDialogRequest)? onAlert,
+  }) async {
+    final c = CefWebController()..onJavaScriptAlertDialog = onAlert;
     final gone = Completer<String>();
     c.onProcessGone = (reason) {
       if (!gone.isCompleted) gone.complete(reason);
@@ -107,6 +116,28 @@ class _ProbeAppState extends State<ProbeApp> {
       var (c, gone) = await _open(_static);
       final idle = await _goneWithin(gone, const Duration(seconds: 35));
       _check('an idle static page is left alone', idle == null, idle);
+      await c.dispose();
+
+      final alertOpen = Completer<void>();
+      final answer = Completer<void>();
+      (c, gone) = await _open(
+        _alerting,
+        onAlert: (_) {
+          if (!alertOpen.isCompleted) alertOpen.complete();
+          return answer.future;
+        },
+      );
+      await alertOpen.future.timeout(
+        const Duration(seconds: 10),
+        onTimeout: () => _check('the alert opened', false),
+      );
+      final waiting = await _goneWithin(gone, const Duration(seconds: 35));
+      _check(
+        'a page waiting on an alert is left alone',
+        waiting == null,
+        waiting,
+      );
+      answer.complete();
       await c.dispose();
 
       (c, gone) = await _open(_animated);

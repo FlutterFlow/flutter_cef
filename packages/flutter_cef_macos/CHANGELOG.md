@@ -26,6 +26,18 @@
   `crashed`): when the host's GPU process started after its first frame, or
   when a visible browser that stopped painting leaves a JS ping (eval id
   `UInt32.max`, consumed by the plugin) unanswered for 15 s.
+* The hang ping skips a browser with a JS dialog open, one whose DevTools were
+  opened, and every browser of a host started with CDP or agent control: each
+  can be paused without being hung.
+* Fix: reopening a named profile right after closing its last view reported
+  `locked`, because the old host still held the profile lock. A host that exits
+  `locked` within 10 s of this plugin shutting down that profile's previous host
+  now waits for that host to exit (3 s max) and is started again.
+* Fix: the startup sweep deleted other running apps' ephemeral profile dirs.
+  Dirs are now named `flutter_cef_ephem_<pid>_<uuid>` and swept only once that
+  pid has exited; older unnamed dirs are swept after a day untouched.
+* An ephemeral profile dir is removed after its host has exited, not while the
+  host may still be writing to it.
 
 ## 0.2.0
 

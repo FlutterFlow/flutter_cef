@@ -45,6 +45,13 @@ enum LivenessProbePolicy {
     return .ping
   }
 
+  /// Whether an unanswered ping would mean a hung renderer. A renderer waiting on a JS
+  /// dialog, or paused in a debugger (DevTools, or a CDP client such as an agent), is
+  /// alive but can't answer, so such a browser isn't pinged.
+  static func mayPing(dialogsOpen: Int, devToolsOpened: Bool, cdpClientsCanPause: Bool) -> Bool {
+    dialogsOpen == 0 && !devToolsOpened && !cdpClientsCanPause
+  }
+
   /// Whether the host's GPU process was replaced after the host first painted. Chromium
   /// relaunches a GPU process that dies (under memory pressure, say), but off-screen
   /// rendering never presents again after that: every browser on the host is frozen, with

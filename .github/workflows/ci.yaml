@@ -31,11 +31,16 @@ jobs:
           (cd example && flutter pub get && flutter analyze)
       - name: Test
         run: flutter test
-      - name: CDP isolation filter tests (security boundary)
-        # The CDP per-tile isolation filter is the security keystone; this standalone
-        # swiftc suite runs without Xcode/CocoaPods. (A regression here previously went
-        # unnoticed precisely because CI did not run it.)
-        run: ./packages/flutter_cef_macos/test/run_filter_tests.sh
+      - name: Swift policy suites (CDP isolation filter, liveness, resize)
+        # Standalone swiftc suites that run without Xcode/CocoaPods. The CDP per-tile
+        # isolation filter is the security keystone; the rest cover the watchdogs.
+        # Every run_*.sh runs, so a new suite can't be left out.
+        run: |
+          set -e
+          for t in packages/flutter_cef_macos/test/run_*.sh; do
+            echo "== $t"
+            "$t"
+          done
 
   # Windows: analyze the endorsed windows implementation + build the example so
   # the ~5.5k lines of native plugin/cef_host/CDP-relay code (profiles, cookies,

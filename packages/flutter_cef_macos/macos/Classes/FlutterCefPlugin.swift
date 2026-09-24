@@ -34,6 +34,10 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   // C2: named profiles a running ad-hoc host already refused — future creates for them
   // go straight to ephemeral instead of racing onto a doomed shared host.
   private var adhocBlockedProfiles: Set<String> = []
+  // Named-profile hosts this plugin shut down, by profile, with when: a host of the
+  // same profile started right after can find the old one still exiting and holding
+  // the profile's lock. Main-thread only.
+  private var exitingNamedHosts: [String: (pid: pid_t, at: Date)] = [:]
 
   /// Raise the soft open-file limit toward the hard cap (best-effort, once at plugin
   /// registration). Each cef_host costs several fds (IPC + CDP pipes + per-relay
@@ -104,16 +108,40 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
 
   /// Reclaim ephemeral (throwaway) profile temp dirs orphaned by a previous crash/
   /// SIGKILL — they're normally removed on clean shutdown(), but a hard exit leaves
-  /// `flutter_cef_ephem_*` (a throwaway cookie jar) behind. At plugin init no host is
-  /// live yet, so sweeping every match is safe. Same-UID, 0700; this bounds disk
-  /// growth and stale at-rest session data.
+  /// `flutter_cef_ephem_*` (a throwaway cookie jar) behind. `$TMPDIR` is shared by
+  /// every app of this user, and other apps (or engines) using flutter_cef may be
+  /// running, so a dir is swept only when the app that made it has exited: its pid
+  /// is in the name. A dir named before that (`flutter_cef_ephem_<uuid>`) is swept
+  /// once it has gone a day untouched.
   private static func sweepStaleEphemeralProfiles() {
     let tmp = NSTemporaryDirectory()
     let fm = FileManager.default
     guard let entries = try? fm.contentsOfDirectory(atPath: tmp) else { return }
-    for name in entries where name.hasPrefix("flutter_cef_ephem_") {
-      try? fm.removeItem(atPath: tmp + name)
+    let dayAgo = Date().addingTimeInterval(-24 * 60 * 60)
+    for name in entries where name.hasPrefix(ephemeralPrefix) {
+      let path = tmp + name
+      if let owner = ephemeralOwner(name) {
+        if owner == getpid() || isAlive(owner) { continue }
+      } else {
+        let modified = (try? fm.attributesOfItem(atPath: path))?[.modificationDate] as? Date
+        if let modified = modified, modified > dayAgo { continue }
+      }
+      try? fm.removeItem(atPath: path)
     }
+  }
+
+  private static let ephemeralPrefix = "flutter_cef_ephem_"
+
+  /// The pid of the app that made ephemeral profile dir `name`
+  /// (`flutter_cef_ephem_<pid>_<uuid>`), or nil for an older name without one.
+  static func ephemeralOwner(_ name: String) -> pid_t? {
+    let rest = name.dropFirst(ephemeralPrefix.count)
+    guard let sep = rest.firstIndex(of: "_") else { return nil }
+    return pid_t(rest[..<sep])
+  }
+
+  private static func isAlive(_ pid: pid_t) -> Bool {
+    kill(pid, 0) == 0 || errno == EPERM
   }
 
   public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -613,6 +641,20 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       // a generic crash. A host that died before opReady never created a browser:
       // its sessions' creates failed, so consumers fall back at once instead of
       // recreating on a host that can't start.
+      if status == 2, let key = self.profiles.first(where: { $0.value === host })?.key,
+         let prev = self.exitingNamedHosts.removeValue(forKey: key),
+         Date().timeIntervalSince(prev.at) < 10 {
+        // The lock is probably held by our own previous host of this profile, still
+        // exiting: start this one again once that has gone, rather than report
+        // "locked" for a profile no other app has open.
+        DispatchQueue.global().async {
+          CefProfileHost.waitForExit(prev.pid, timeout: 3)
+          DispatchQueue.main.async { [weak self] in
+            self?.respawnNamedHost(host, key: key)
+          }
+        }
+        return
+      }
       let reason = status == 2 ? "locked" : (host.everReady ? "crashed" : "createFailed")
       self.failHost(host, reason: reason)
     }
@@ -662,6 +704,54 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       return sid
     }
     return nil
+  }
+
+  /// Remembers `host`, about to be shut down, if it holds a named profile; see
+  /// [exitingNamedHosts].
+  private func noteShuttingDown(_ host: CefProfileHost, key: String?) {
+    guard let key = key, !key.hasPrefix("~") else { return }
+    exitingNamedHosts[key] = (host.hostPid(), Date())
+  }
+
+  /// A named-profile host exited "locked" while this plugin's previous host of that
+  /// profile was still exiting; that one has gone now. Start the profile's host
+  /// again and move `oldHost`'s sessions onto it. Main-thread only.
+  private func respawnNamedHost(_ oldHost: CefProfileHost, key: String) {
+    dispatchPrecondition(condition: .onQueue(.main))
+    let victims = sessionHost.compactMap { $0.value === oldHost ? $0.key : nil }
+    guard let first = victims.first, let args = sessionCreateArgs[first],
+          let cefHost = resolveCefHostPath() else {
+      failHost(oldHost, reason: "locked")
+      return
+    }
+    if profiles[key] === oldHost { profiles[key] = nil }
+    oldHost.shutdown()
+    guard let host = resolveOrSpawnHost(
+      key: key, namedProfile: key, cefHostPath: cefHost, enableCdp: args.enableCdp,
+      allowedSchemes: args.allowedSchemes, agentControl: args.agentControl)
+    else {
+      for sid in victims {
+        emit("processGone", ["sessionId": sid, "reason": "locked"])
+        sessions[sid]?.dispose()
+        sessions[sid] = nil
+        sessionHost[sid] = nil
+        sessionKey[sid] = nil
+        sessionCreateArgs[sid] = nil
+      }
+      return
+    }
+    host.onInsecureProfileRefused = { [weak self, weak host] in
+      DispatchQueue.main.async {
+        guard let self = self, let host = host else { return }
+        self.respawnHostEphemeral(host, refusedProfile: key)
+      }
+    }
+    for sid in victims {
+      guard let session = sessions[sid], let a = sessionCreateArgs[sid] else { continue }
+      _ = host.createBrowser(session, url: a.url, allowedSchemes: a.allowedSchemes)
+      sessionHost[sid] = host
+      sessionKey[sid] = key
+    }
   }
 
   /// C2/F.5: a running cef_host turned out to be an ad-hoc (mock-keychain) build and
@@ -803,6 +893,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     }
     let remaining = host.removeBrowser(session.browserId)
     if remaining == 0 {
+      noteShuttingDown(host, key: key)
       host.shutdown()
       session.dispose()
       if let key = key { profiles[key] = nil }
@@ -832,6 +923,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     // establishment counters are reset in detachForFreeze.
     let remaining = host.removeBrowser(session.browserId)
     if remaining == 0 {
+      noteShuttingDown(host, key: key)
       host.shutdown()
       if let key = key { profiles[key] = nil }
     }
@@ -915,7 +1007,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   private func resolveProfileDir(_ profile: String?) -> (dir: String, ephemeral: Bool) {
     let fm = FileManager.default
     guard let profile = profile, !profile.isEmpty else {
-      let dir = NSTemporaryDirectory() + "flutter_cef_ephem_" + UUID().uuidString
+      let dir = NSTemporaryDirectory() + Self.ephemeralPrefix + "\(getpid())_" + UUID().uuidString
       try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true,
                               attributes: [.posixPermissions: 0o700])
       return (dir, true)

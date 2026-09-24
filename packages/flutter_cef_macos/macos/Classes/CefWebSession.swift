@@ -184,6 +184,10 @@ final class CefWebSession: NSObject, FlutterTexture {
   // (0 = none), and uptime the last one was answered (0 = never).
   var livenessPingSentAt: UInt64 = 0
   var livenessPingRepliedAt: UInt64 = 0
+  // What stops the renderer answering the ping without it being hung (same lock): JS
+  // dialogs the page is blocked on, and DevTools, whose debugger can pause it.
+  var livenessDialogsOpen = 0
+  var livenessDevToolsOpened = false
 
   private weak var registry: FlutterTextureRegistry?
   private var width: Int
@@ -286,6 +290,8 @@ final class CefWebSession: NSObject, FlutterTexture {
     livenessNudgedAt = 0
     livenessPingSentAt = 0
     livenessPingRepliedAt = 0
+    livenessDialogsOpen = 0
+    livenessDevToolsOpened = false
   }
 
   // MARK: FlutterTexture
@@ -627,6 +633,7 @@ final class CefWebSession: NSObject, FlutterTexture {
     p.append(ok ? 1 : 0)
     p.append(contentsOf: Array(text.utf8))
     sendFrame(Self.opJsDialogResp, p)
+    host?.noteDialogAnswered(browserId)
   }
 
   func evalReturning(id: Int, code: String) {
@@ -669,6 +676,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   /// Open DevTools. With a point (page DIP coords) it opens INSPECTING the
   /// element there — the right-click "Inspect" path.
   func showDevTools(inspectAt: (x: Int, y: Int)? = nil) {
+    host?.noteDevToolsOpened(browserId)
     guard let at = inspectAt else {
       sendFrame(Self.opShowDevTools)
       return
