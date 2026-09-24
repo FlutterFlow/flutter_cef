@@ -1,5 +1,5 @@
-// Document-start scripts + JS channels, shared by the browser process (main.mm)
-// and the renderer (process_helper.mm).
+// Document-start scripts + JS channels, shared by the browser process
+// (authored_content.mm, host_client.mm) and the renderer (process_helper.mm).
 //
 // A consumer's document-start scripts, and the JS channels it registered before
 // create, have to exist BEFORE the page's own scripts run. The browser process

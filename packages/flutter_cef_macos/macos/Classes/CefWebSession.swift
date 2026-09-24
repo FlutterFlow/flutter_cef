@@ -13,8 +13,8 @@
 // and the per-view verbs. The process/socket/reader layer (one subprocess per
 // `profile:`, multiplexing N of these by browserId) lives on CefProfileHost.
 // sendFrame delegates to host.send(browserId, ...); the host routes inbound
-// frames back via handleFrame(). See native/cef_host/main.mm for the renderer and
-// the IPC opcode definitions.
+// frames back via handleFrame(). See native/cef_host/ for the renderer, and
+// CefHostOpcodes.swift for the IPC opcode definitions.
 
 import Cocoa
 import CoreVideo

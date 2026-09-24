@@ -9,7 +9,7 @@
 // holds a surface, `IOSurfaceLookup` by id works inside it again (consumers that
 // resolve `onSurface` ids in the app process keep working).
 //
-// Wire format of one message (must match SendSurface in main.mm): a complex
+// Wire format of one message (must match SendSurface in render_handler.mm): a complex
 // message with one port descriptor (the surface's send right), then
 // {u32 wire browser id, u32 IOSurface id}.
 import Foundation

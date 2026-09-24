@@ -10,7 +10,7 @@
 // The render process also hosts the renderer half of CefMessageRouter, which
 // injects window.cefQuery into every frame so the page can talk to the browser
 // process (powers JS channels + runJavaScriptReturningResult). The browser half
-// lives in main.mm; both must use the same (default) CefMessageRouterConfig.
+// lives in host_client.mm; both must use the same (default) CefMessageRouterConfig.
 //
 // It also installs each browser's document-start config (document_start.h): the
 // JS channels registered before create and the consumer's document-start

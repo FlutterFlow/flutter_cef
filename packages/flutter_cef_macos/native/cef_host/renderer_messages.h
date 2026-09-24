@@ -1,4 +1,4 @@
-// Process messages between the browser process (main.mm) and the renderer
+// Process messages between the browser process and the renderer
 // (process_helper.mm) that the page can't see or answer.
 #pragma once
 

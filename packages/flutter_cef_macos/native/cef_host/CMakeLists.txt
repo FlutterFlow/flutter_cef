@@ -56,7 +56,16 @@ endif()
 
 # cef_host: the BROWSER process. A .app bundle (CEF needs a real bundle). The CEF
 # framework (and, in multi-process, the helper apps) live in Contents/Frameworks.
-add_executable(cef_host MACOSX_BUNDLE main.mm)
+add_executable(cef_host MACOSX_BUNDLE
+  main.mm
+  authored_content.mm
+  browser_ops.mm
+  host_client.mm
+  host_state.mm
+  ipc.mm
+  ipc_reader.mm
+  popups.mm
+  render_handler.mm)
 SET_EXECUTABLE_TARGET_PROPERTIES(cef_host)
 set_target_properties(cef_host PROPERTIES
   MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/Info.plist")
