@@ -154,4 +154,4 @@ The gap deep-dive on **CEF #2483 / #3427 (FrameEvictionManager)** is the closest
 ---
 
 ### Files referenced
-- `/Users/wenkaifan/Dev/flutter_cef/packages/flutter_cef_macos/native/cef_host/main.mm` — the un-hide path (`DoSetVisible`, missing force-resize kick), the correct resize path (`WasResized()` + `SendExternalBeginFrame`), the begin-frame pump (`PumpBeginFrame`, no in-flight/OnFrameComplete gate), and the load-time self-heal (`OnLoadEnd`→`Invalidate`, `kOpInvalidate`/`DoInvalidate`) are the concrete code sites to harden before adding multi-process/take-turns.
+- `packages/flutter_cef_macos/native/cef_host/main.mm` — the un-hide path (`DoSetVisible`, missing force-resize kick), the correct resize path (`WasResized()` + `SendExternalBeginFrame`), the begin-frame pump (`PumpBeginFrame`, no in-flight/OnFrameComplete gate), and the load-time self-heal (`OnLoadEnd`→`Invalidate`, `kOpInvalidate`/`DoInvalidate`) are the concrete code sites to harden before adding multi-process/take-turns.

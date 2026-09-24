@@ -17,7 +17,7 @@
 
 ---
 
-**Subject:** `feat/persistent-profiles` @ `/Users/wenkaifan/Dev/flutter_cef` (macOS Flutter plugin embedding CEF via windowless OSR; one `cef_host` process per profile multiplexing N CefBrowsers over one Unix socket).
+**Subject:** `feat/persistent-profiles` (macOS Flutter plugin embedding CEF via windowless OSR; one `cef_host` process per profile multiplexing N CefBrowsers over one Unix socket).
 **Method:** four prior-art research threads (CEF core, JCEF/CefSharp, Electron/Chromium, macOS security) + five adversarial code reviews (process model, IPC/untrusted input, concurrency, security posture), with the highest-leverage claims re-verified directly against source. Verdict-level confidence; research rests on WebSearch extracts (WebFetch was unavailable), code findings are confirmed at file:line.
 
 ---
@@ -158,4 +158,4 @@ Dedup is `profiles[key]` in memory only (`FlutterCefPlugin.swift:311`); **no `fl
 
 **Net:** the architecture is *implementing CEF's own rules* on the two structural decisions (per-profile process for the cache lock; many-browsers-per-process), and the OSR + concurrency engineering is genuinely careful. The gap between "works" and "shippable" is concentrated in **failure surfacing** (C1/C2/H1/H2 — a subprocess crash currently bricks a profile silently) and **security posture honesty** (shared keychain item + false ACL claim; device entitlements without a permission gate; gratuitous release entitlements). Fix items 1-7 before shipping persistent profiles; 8-13 before claiming multi-tile robustness or "secure like a browser."
 
-Key files: `/Users/wenkaifan/Dev/flutter_cef/packages/flutter_cef_macos/macos/Classes/CefProfileHost.swift` (`:235`, `:263`, `:348-368`), `/Users/wenkaifan/Dev/flutter_cef/packages/flutter_cef_macos/macos/Classes/FlutterCefPlugin.swift` (`:188`, `:311`, `:327-352`), `/Users/wenkaifan/Dev/flutter_cef/packages/flutter_cef_macos/native/cef_host/main.mm` (`:294`, `:692-698`, `:933`, `:1690`, `:1755`), `/Users/wenkaifan/Dev/flutter_cef/packages/flutter_cef_macos/native/cef_host/entitlements.release.plist` (`:16`, `:20-22`), `/Users/wenkaifan/Dev/flutter_cef/README.md:202`.
+Key files: `packages/flutter_cef_macos/macos/Classes/CefProfileHost.swift` (`:235`, `:263`, `:348-368`), `packages/flutter_cef_macos/macos/Classes/FlutterCefPlugin.swift` (`:188`, `:311`, `:327-352`), `packages/flutter_cef_macos/native/cef_host/main.mm` (`:294`, `:692-698`, `:933`, `:1690`, `:1755`), `packages/flutter_cef_macos/native/cef_host/entitlements.release.plist` (`:16`, `:20-22`), `README.md:202`.

@@ -47,7 +47,6 @@ echo ">> building stress probe…"
     -t lib/stress_probe.dart ) || { echo "!! example build failed"; exit 2; }
 
 LOG="/tmp/cef_cascade_$$.log"; : > "$LOG"
-pkill -9 -f flutter_cef_example 2>/dev/null; pkill -9 -f "MacOS/cef_host" 2>/dev/null; sleep 1
 # Ad-hoc host downgrades named profiles to ephemeral unless allowed — the probe
 # uses a shared named profile (CEF_POOL=1), so keep it on the real shared host.
 FLUTTER_CEF_DEBUG=1 FLUTTER_CEF_ALLOW_INSECURE_PROFILE=1 \
@@ -55,7 +54,9 @@ FLUTTER_CEF_DEBUG=1 FLUTTER_CEF_ALLOW_INSECURE_PROFILE=1 \
   nohup "$APP" > "$LOG" 2>&1 &
 APP_PID=$!
 for _ in $(seq 1 "$SECS"); do sleep 1; done
-pkill -9 -f flutter_cef_example 2>/dev/null; pkill -9 -f "MacOS/cef_host" 2>/dev/null
+# Stop only the app this script started; its cef_host exits when the app's
+# socket closes. Never kill cef_host by name: other apps on the machine run one.
+kill "$APP_PID" 2>/dev/null; wait "$APP_PID" 2>/dev/null
 
 # Count distinct browsers that reached a first accelerated frame (paints>0).
 EST=$(python3 - "$LOG" <<'PY'

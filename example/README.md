@@ -7,20 +7,32 @@ input path (typing, CJK composition, ⌃⌘Space, trackpad scrolling).
 
 ## Run it
 
-CEF (~200 MB) is fetched, not vendored — build the renderer once, point the
-plugin at it, then run:
+```sh
+flutter run -d macos     # or: flutter run -d windows
+```
+
+On macOS, `pod install` fetches the prebuilt `cef_host.app` published for this
+checkout's native sources. If none is published (you changed the native code,
+or main is ahead of the last release), build the renderer yourself and point
+the plugin at it:
 
 ```sh
-cd ../packages/flutter_cef_macos          # the macOS implementation package
-native/build_cef_host.sh                  # fetches CEF + builds cef_host.app (one-time)
+cd ../packages/flutter_cef_macos
+FLUTTER_CEF_STOCK_FRAMEWORK=1 native/build_cef_host.sh   # fetches CEF + builds cef_host.app
 export FLUTTER_CEF_HOST="$PWD/native/cef_host/build/cef_host.app/Contents/MacOS/cef_host"
 cd ../../example && flutter run -d macos
 ```
 
-Without `FLUTTER_CEF_HOST` (or a bundled `cef_host.app` — see the root
-README's "Bundling into a distributable app"), the view stays on its
-placeholder: the plugin has no renderer to spawn.
+Without a `cef_host`, the view stays on its placeholder. On Windows, `flutter
+build windows` fetches CEF and builds `cef_host` itself.
 
-macOS only. The Runner is not App-Sandboxed and carries the CEF-required
-entitlements (`disable-library-validation`, JIT) — see
+The macOS Runner is not App-Sandboxed and carries the CEF-required
+entitlements (`disable-library-validation`, JIT); see
 `macos/Runner/*.entitlements` for the reference set.
+
+## Probes
+
+`lib/*_probe.dart` are self-running regression checks against a real
+`cef_host`. Each is built as the app's entry point and prints
+`CEF_PROBE_RESULT PASS|FAIL`; see [CONTRIBUTING](../CONTRIBUTING.md) for how
+to run them.
