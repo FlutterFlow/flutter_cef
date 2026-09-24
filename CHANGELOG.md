@@ -1,4 +1,4 @@
-## Unreleased
+## 0.3.0
 
 * **Windows catches up with macOS**: `sessionStats`, `setAudioMuted`,
   `setFrameInterval` and `freeze`/`thaw` work; verbs Windows can't serve

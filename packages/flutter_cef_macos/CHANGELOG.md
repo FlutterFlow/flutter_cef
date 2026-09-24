@@ -1,4 +1,4 @@
-## Unreleased
+## 0.3.0
 
 * Removed the unused `native/cef_host/entitlements.browser.plist`, which
   changes the `cef_host` input hash.
