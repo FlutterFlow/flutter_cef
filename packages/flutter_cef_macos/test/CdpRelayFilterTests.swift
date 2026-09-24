@@ -1,4 +1,4 @@
-// Standalone unit tests for the CEF-2b per-tile CDP isolation filter — THE security
+// Standalone unit tests for the per-tile CDP isolation filter — THE security
 // boundary. CdpRelay.swift depends only on system frameworks (Foundation/CryptoKit/
 // Security), so this compiles + runs without Xcode or the Flutter/pod harness:
 //
@@ -75,7 +75,7 @@ enum CdpRelayFilterTests {
     drop("Target.getTargets (synthesized, not forwarded)", #"{"id":1,"method":"Target.getTargets"}"#)
     drop("Target.setAutoAttach non-flatten", #"{"id":1,"method":"Target.setAutoAttach","params":{"flatten":false}}"#)
     // Browser-level setAutoAttach(flatten) is INTERCEPTED, not forwarded: the relay
-    // self-attaches to our target + synthesizes attachedToTarget (H2), so a client
+    // self-attaches to our target + synthesizes attachedToTarget, so a client
     // can't change a sibling tile's auto-attach. Forwarding would be a cross-tile
     // control leak — this is the per-tile isolation boundary, so it must return nil.
     drop("Target.setAutoAttach flatten (self-attached + synthesized, not forwarded)",
@@ -134,7 +134,7 @@ enum CdpRelayFilterTests {
     tokNo("Authorization: Bearer (empty)", "/devtools/browser", ["authorization": "Bearer "])
     tokOK("?token=<token> query fallback", "/devtools/browser?token=\(tok)", [:])
     tokNo("?token=<wrong> query", "/devtools/browser?token=deadbeef", [:])
-    // header/query precedence + parsing edges (audit-driven)
+    // header/query precedence + parsing edges
     tokOK("non-bearer header falls through to a valid query", "/devtools/browser?token=\(tok)", ["authorization": "Basic \(tok)"])
     tokNo("wrong Bearer header does NOT consult the query", "/devtools/browser?token=\(tok)", ["authorization": "Bearer deadbeef"])
     tokOK("empty 'Bearer ' header falls through to a valid query", "/devtools/browser?token=\(tok)", ["authorization": "Bearer "])
@@ -147,9 +147,9 @@ enum CdpRelayFilterTests {
     tokNo("lookalike key ?tokenx=", "/devtools/browser?tokenx=\(tok)", [:])
     tokNo("tab (not SP) between scheme and token", "/devtools/browser", ["authorization": "Bearer\t\(tok)"])
 
-    // ════ CEF-2b MULTIPLEX (P2-step2): N relays share ONE browser-wide pipe ════
-    // Two scoped relays on one host share its pipe-id allocator. This is PLAN
-    // Test I: feed each relay traffic for both tiles and assert ZERO cross-leak.
+    // ════ MULTIPLEX: N relays share ONE browser-wide pipe ════
+    // Two scoped relays on one host share its pipe-id allocator. Feed each relay
+    // traffic for both tiles and assert ZERO cross-leak.
     let hostIds = CdpPipeIds()
     let relayA = CdpRelay(sendToPipe: { _ in }, scopeTargetId: "TILE-A", pipeIds: hostIds)
     let relayB = CdpRelay(sendToPipe: { _ in }, scopeTargetId: "TILE-B", pipeIds: hostIds)
@@ -171,7 +171,7 @@ enum CdpRelayFilterTests {
     check("mux: relayA demux RESTORES its own client id (42)", topId(relayA.demuxPipeToClient(aResp)) == 42)
     check("mux: a consumed response is not re-delivered (no double-send)", relayA.demuxPipeToClient(aResp) == nil)
 
-    // ── THE §3.2 fix: a browser-level response (NO sessionId) must not fan to siblings.
+    // ── The id-rewrite fix: a browser-level response (NO sessionId) must not fan to siblings.
     // Without the id-rewrite, filterPipeToClient forwards no-sid responses to EVERY
     // relay (see the single-relay "browser-level response (no sid)" PASS above) — i.e.
     // both clients would see both. The rewrite makes it route to exactly one. ──

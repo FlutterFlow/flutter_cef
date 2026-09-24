@@ -1,5 +1,5 @@
 #!/bin/bash
-# Compile + run the standalone CdpRelay filter unit tests (CEF-2b security boundary).
+# Compile + run the standalone CdpRelay filter unit tests (the per-tile security boundary).
 # CdpRelay.swift uses only system frameworks, so no Xcode/pod harness is needed.
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")/.." && pwd)"

@@ -1,5 +1,5 @@
 // Standalone unit tests for ResizeWatchdogPolicy — the resize-watchdog force-promote
-// gating, and specifically the F-4 fix: NEVER force-promote a pending surface while the
+// gating, and specifically the wedge guard: NEVER force-promote a pending surface while the
 // browser is HIDDEN (the gated begin-frame pump never painted it, so promoting it wedges
 // the texture permanently blank). ResizeWatchdogPolicy depends only on the Swift stdlib,
 // so this compiles + runs without Xcode or the Flutter/pod harness:
@@ -28,7 +28,7 @@ enum ResizeWatchdogPolicyTests {
   }
 
   static func main() {
-    // ── The F-4 fix: HIDDEN must never force-promote, no matter how long it's been ──
+    // ── The wedge guard: HIDDEN must never force-promote, no matter how long it's been ──
     check("hidden + timed-out → NO promote (the wedge guard)",
           promote(hidden: true, elapsedNs: pastGrace) == false)
     check("hidden + way past grace → still NO promote",

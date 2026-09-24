@@ -17,7 +17,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   private var profiles: [String: CefProfileHost] = [:]   // key: profile name OR "~ephemeral~"+sessionId
   private var sessions: [String: SessionRecord] = [:]     // sessionId -> its record
 
-  /// How a session was created. C2: when a shared host turns out to be ad-hoc and
+  /// How a session was created. When a shared host turns out to be ad-hoc and
   /// refuses its named profile, EVERY session on it is re-homed onto an ephemeral
   /// host with its own url + schemes + agent-control transport. Also the
   /// freeze/thaw recipe: thaw respawns a host of the ORIGINAL kind (profile /
@@ -27,7 +27,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
                                   agentControl: Bool, profile: String?,
                                   enableCdp: Bool, hostGroup: String?)
 
-  /// Everything the plugin keeps for one session. Main-thread only (H3), like the
+  /// Everything the plugin keeps for one session. Main-thread only, like the
   /// rest of these maps.
   private struct SessionRecord {
     let session: CefWebSession
@@ -40,7 +40,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     var key: String?
     var frozen: Bool { host == nil }
   }
-  // C2: named profiles a running ad-hoc host already refused — future creates for them
+  // Named profiles a running ad-hoc host already refused — future creates for them
   // go straight to ephemeral instead of racing onto a doomed shared host.
   private var adhocBlockedProfiles: Set<String> = []
   // Named-profile hosts this plugin shut down, by profile, with when: a host of the
@@ -97,7 +97,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   /// Shut down EVERY live cef_host (SIGTERM+SIGKILL escalation + reap, via the host's
   /// own shutdown()) so app termination leaves no orphaned subprocess holding a
   /// profile's Chromium SingletonLock. Main-thread confined like the other map
-  /// accessors (H3); the willTerminate observer is queued on .main. Idempotent: clears
+  /// accessors; the willTerminate observer is queued on .main. Idempotent: clears
   /// the maps so a stray second call (or a later normal teardown) is a no-op, and
   /// drops the self-observer.
   private func shutdownAllHosts() {
@@ -291,7 +291,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       }
       result(nil)
     case "enableAgentControl":
-      // CEF-2b: broker a token-gated CDP endpoint scoped to THIS tile's CDP target.
+      // Broker a token-gated CDP endpoint scoped to THIS tile's CDP target.
       // Async (resolves the targetId via cef_host first). Requires the session to
       // have been created with agentControl (pipe) mode.
       guard let sid = args["sessionId"] as? String, let rec = sessions[sid],
@@ -311,7 +311,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
         }
       }
     case "disableAgentControl":
-      // CEF-2b: route by this session's browserId (mirrors enableAgentControl) so
+      // Route by this session's browserId (mirrors enableAgentControl) so
       // only THIS tile's relay is torn down — siblings on the same shared host stay
       // agent-controlled.
       if let sid = args["sessionId"] as? String, let rec = sessions[sid] {
@@ -349,7 +349,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
 
   private func create(_ a: [String: Any], _ result: @escaping FlutterResult) {
     // The session/profile dictionaries below are unlocked and rely on being
-    // touched only from the main thread (H3) — the method-channel handler always
+    // touched only from the main thread — the method-channel handler always
     // runs here. Assert it so a future off-main caller fails loudly, not silently
     // corrupting the maps.
     dispatchPrecondition(condition: .onQueue(.main))
@@ -371,7 +371,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     let dpr = (a["dpr"] as? Double).map { CGFloat($0) } ?? 1.0
     let allowedSchemes = a["allowedSchemes"] as? String ?? ""
     let enableCdp = a["enableCdp"] as? Bool ?? false
-    // Agent-control / pipe mode (CEF-1): CDP rides cef_host's inherited fds 3/4
+    // Agent-control / pipe mode: CDP rides cef_host's inherited fds 3/4
     // (a private, NUL-framed pipe) instead of a TCP port. Because there's no
     // listening socket, the open-port cookie-exfil rationale doesn't apply, so
     // (unlike TCP enableCdp) it's permitted on a named profile — see below. Omit-
@@ -418,15 +418,14 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
         details: nil))
       return
     }
-    // P2-step1: the single-view guard is lifted — multiple views on a named
-    // profile now share ONE cef_host (resolveOrSpawnHost de-dups by key), so
-    // every web tile renders and shares one cookie jar (sign-in persists across
-    // tiles + relaunch). P2-step2: agent-control is now multi-tile — N tiles on
-    // one shared host can be agent-controlled concurrently, each via its own
-    // per-target CDP relay (one relay per browserId, demuxed over the shared pipe
-    // by the per-relay CDP-id rewrite — see CdpRelay's multiplex note).
+    // Multiple views on a named profile share ONE cef_host (resolveOrSpawnHost
+    // de-dups by key), so every web tile renders and shares one cookie jar
+    // (sign-in persists across tiles + relaunch). Agent control is multi-tile
+    // too — N tiles on one shared host can be agent-controlled concurrently, each
+    // via its own per-target CDP relay (one relay per browserId, demuxed over the
+    // shared pipe by the per-relay CDP-id rewrite — see CdpRelay's multiplex note).
 
-    // C2: if a running ad-hoc host already refused this named profile, don't race onto
+    // If a running ad-hoc host already refused this named profile, don't race onto
     // a doomed shared host — go ephemeral directly.
     let effectiveNamed = namedProfile && !adhocBlockedProfiles.contains(profile ?? "")
     let key = effectiveNamed
@@ -570,8 +569,8 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   /// Resolve an existing host for `key`, or spawn a fresh one. Returns nil if the
   /// spawn fails. `agentControl` switches the launch to posix_spawn (CDP over
   /// inherited fds 3/4) — see CefProfileHost.spawn. Only meaningful when this call
-  /// actually spawns; an EXISTING host keeps its original transport. Since P2,
-  /// a named profile is MULTI-view (N tiles share one host), so an agent-control
+  /// actually spawns; an EXISTING host keeps its original transport. A named
+  /// profile is MULTI-view (N tiles share one host), so an agent-control
   /// create() resolving to a pre-existing host is the normal path for the 2nd+
   /// tile — the host was already spawned in agent-control mode by the first, and
   /// each tile gets its own per-target CDP relay (see CefProfileHost.enableAgentControl).
@@ -612,7 +611,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
 
   /// Fail every session attached to `host` (emit processGone with `reason` + dispose),
   /// drop the host from the profile registry, and reap it. Main-thread only (the maps
-  /// are main-thread confined — H3). Shared by the host-death and protocol-mismatch
+  /// are main-thread confined). Shared by the host-death and protocol-mismatch
   /// paths, which differ only in the reason string.
   private func failHost(_ host: CefProfileHost, reason: String) {
     dispatchPrecondition(condition: .onQueue(.main))
@@ -621,7 +620,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     let goneSessions = sessions.compactMap { $0.value.host === host ? $0.key : nil }
     for sid in goneSessions {
       emit("processGone", ["sessionId": sid, "reason": reason])
-      // F-5: dispose the session BEFORE dropping its record. dispose() is the only caller
+      // Dispose the session BEFORE dropping its record. dispose() is the only caller
       // of registry.unregisterTexture (+ frees the CVPixelBuffer / IOSurface / any pending
       // buffer). If we just nil sessions[sid], the later Dart controller.dispose ->
       // disposeSession early-returns on the now-missing session, so the texture + surfaces
@@ -642,13 +641,13 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
 
   /// Install every callback `host` makes. Called once per host, before spawn(): the
   /// host invokes them from its own threads, and a closure reassigned while another
-  /// thread reads it can tear. `namedProfile` wires the F.5 refusal, which only a
+  /// thread reads it can tear. `namedProfile` wires the ad-hoc-build refusal, which only a
   /// named-profile host can raise.
   private func wireHost(_ host: CefProfileHost, namedProfile: String?) {
     host.onHostDied = { [weak self, weak host] status in
       dispatchPrecondition(condition: .onQueue(.main))
       guard let self = self, let host = host else { return }
-      // C2 cross-group contract: cef_host exits 2 (after SendLog "profile-locked")
+      // cef_host exits 2 (after SendLog "profile-locked")
       // when it loses the cache singleton lock to another process. Surface that as
       // a distinct reason so the widget can say "already open elsewhere" instead of
       // a generic crash. A host that died before kOpReady never created a browser:
@@ -695,7 +694,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
         self.disposeSession(sid)
       }
     }
-    // C1: a browser never painted its first frame despite a re-kick — surface
+    // A browser never painted its first frame despite a re-kick — surface
     // paintStalled so Dart/the consumer can recover (e.g. recreate the view) instead of
     // a silent, unrecoverable blank tile. The browser stays alive (it may yet paint).
     host.onPaintStalled = { [weak self, weak host] browserId in
@@ -705,8 +704,8 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
         self.emit("paintStalled", ["sessionId": sid])
       }
     }
-    // F.5 dev safety-rail: an ad-hoc (mock-keychain) host refuses a named persistent
-    // profile at kOpReady (nothing's been written, so no creds leak). C2: re-home the
+    // Dev safety rail: an ad-hoc (mock-keychain) host refuses a named persistent
+    // profile at kOpReady (nothing's been written, so no creds leak). Re-home the
     // WHOLE shared host's sessions onto ephemeral hosts — not just the one that
     // spawned it — so a burst of tiles that all attached before kOpReady are all
     // rescued.
@@ -767,7 +766,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     }
   }
 
-  /// C2/F.5: a running cef_host turned out to be an ad-hoc (mock-keychain) build and
+  /// A running cef_host turned out to be an ad-hoc (mock-keychain) build and
   /// refused its named profile (at kOpReady, BEFORE any browser was created — so nothing
   /// rendered or leaked). Re-home EVERY session that was on that shared host onto its
   /// own ephemeral host, preserving each session's url/schemes/agent-control, and
@@ -775,7 +774,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   /// the old per-session respawn that shut the whole shared host down — which stranded
   /// every sibling tile blank-and-dead with no error.
   private func respawnHostEphemeral(_ oldHost: CefProfileHost, refusedProfile: String) {
-    // The unlocked session/profile dictionaries are confined to the main thread (H3);
+    // The unlocked session/profile dictionaries are confined to the main thread;
     // reached from onInsecureProfileRefused via DispatchQueue.main.
     dispatchPrecondition(condition: .onQueue(.main))
     guard let cefHost = resolveCefHostPath() else { return }
@@ -798,7 +797,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
         // The old host is already shut down, so a bare `continue` would strand this
         // session bound to a dead host: blank tile, no signal, leaked session+texture.
         // Fail it explicitly instead — processGone lets the consumer recreate.
-        NSLog("[cef] C2 respawn ephemeral host failed for \(sid)")
+        NSLog("[cef] ephemeral respawn failed for \(sid)")
         emit("processGone", ["sessionId": sid, "reason": "respawnFailed"])
         sessions[sid] = nil
         session.dispose()
@@ -879,13 +878,13 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   }
 
   /// Tear down one session: close its browser on the shared host, then dispose
-  /// the session. ORDERING (binding, F.3): if this was the host's last browser,
+  /// the session. ORDERING (binding): if this was the host's last browser,
   /// `host.shutdown()` (which joins the reader, so no more inbound) runs BEFORE
   /// `session.dispose()` and the profile is dropped. Otherwise `removeBrowser`
   /// has already unregistered this browser under lock, so `session.dispose()`
   /// runs safely while the shared reader keeps serving the siblings.
   private func disposeSession(_ id: String) {
-    // Unlocked session/profile dictionaries — main-thread confined (H3). Reached
+    // Unlocked session/profile dictionaries — main-thread confined. Reached
     // from create()/destroy() (channel handler, on main) and never off-main.
     dispatchPrecondition(condition: .onQueue(.main))
     guard let rec = sessions.removeValue(forKey: id) else { return }
@@ -923,7 +922,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     }
     let session = rec.session
     let key = rec.key
-    // Same F.3 ordering discipline as disposeSession: removeBrowser unregisters
+    // Same ordering discipline as disposeSession: removeBrowser unregisters
     // under lock (reader stops routing to this session), and a last-browser
     // host is fully shut down (reader joined) BEFORE the session's unlocked
     // establishment counters are reset in detachForFreeze.
@@ -999,7 +998,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     return "~ephemeral~" + sessionId
   }
 
-  /// Resolve the on-disk cache dir for a profile. F.4: a null/empty profile gets
+  /// Resolve the on-disk cache dir for a profile. A null/empty profile gets
   /// a unique throwaway temp dir (ephemeral, removed on host shutdown); a named
   /// profile gets a stable 0700 dir under Application Support that survives
   /// relaunch. Both go through one downstream code path: the host always receives

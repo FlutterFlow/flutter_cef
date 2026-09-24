@@ -1,5 +1,5 @@
 #!/bin/bash
-# Compile + run the standalone ResizeWatchdogPolicy unit tests (the F-4 visibility-gating
+# Compile + run the standalone ResizeWatchdogPolicy unit tests (the visibility gating
 # that prevents the resize/cull wedge). ResizeWatchdogPolicy uses only the Swift stdlib,
 # so no Xcode/pod harness is needed.
 set -euo pipefail

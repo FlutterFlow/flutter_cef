@@ -1,11 +1,11 @@
 // SHARED-HOST page->host channel probe — the single-controller channel_probe.dart
 // PASSES, so the basic channel works. Campus's peer tile differs in that it runs
-// on a SHARED cef_host (a named profile → one host for many sessions, per the
-// #138 consolidation). This probe mounts TWO controllers on ONE named profile
-// (= one shared cef_host), each registering the SAME channel name 'probeHost'
-// (exactly like every Campus agent_ui uses 'campusHost'), each page posting a
-// DISTINCT tag. It verifies each controller's handler receives ONLY its own tag
-// — i.e. OnQuery's slot_->browser_id routing stays correct across sessions.
+// on a SHARED cef_host (a named profile → one host for many sessions). This
+// probe mounts TWO controllers on ONE named profile (= one shared cef_host),
+// each registering the SAME channel name 'probeHost' (exactly like every Campus
+// agent_ui uses 'campusHost'), each page posting a DISTINCT tag. It verifies
+// each controller's handler receives ONLY its own tag — i.e. OnQuery's
+// slot_->browser_id routing stays correct across sessions.
 //
 // Run:
 //   FLUTTER_CEF_HOST=<.../cef_host.app/Contents/MacOS/cef_host> \

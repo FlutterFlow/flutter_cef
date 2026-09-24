@@ -13,7 +13,7 @@ extension CefProfileHost {
   /// process arg shared by every browser in the profile — it's taken from the
   /// first browser that triggered this spawn. Returns false on failure.
   ///
-  /// `agentControl` (CEF-1) switches the LAUNCH MECHANISM only: when true we use
+  /// `agentControl` switches the LAUNCH MECHANISM only: when true we use
   /// posix_spawn instead of Foundation.Process so cef_host inherits two CDP pipes
   /// on fds 3/4 (Foundation.Process can't place arbitrary fds), and we add the
   /// `--cdp-pipe` flag so the native side injects the `remote-debugging-pipe`
@@ -115,13 +115,13 @@ extension CefProfileHost {
     running = true
     readerStarted = true
     Thread.detachNewThread { [weak self] in self?.acceptAndRead() }
-    startLivenessSweep()  // F-6: steady-state post-establishment liveness watchdog
+    startLivenessSweep()  // steady-state post-establishment liveness watchdog
     // Agent-control: drain CDP off fd 3/4's parent ends on a dedicated reader,
     // splitting the NUL-delimited JSON stream into messages. Started only after
     // a successful spawn (the fds exist). Joined in shutdown() before close.
     // Install the (debug-only) validation handler BEFORE starting the reader so
     // the reader never observes a half-installed onCdpMessage (the only path that
-    // mutates it in CEF-1); in normal flow it's a no-op and onCdpMessage stays
+    // mutates it before a relay exists); in normal flow it's a no-op and onCdpMessage stays
     // nil. The probe-send loop it kicks off is fine to start first — the response
     // just buffers in the pipe until the reader drains it.
     if agentControl && cdpReadFd >= 0 {
@@ -252,7 +252,7 @@ extension CefProfileHost {
     cdpReadFd = outRead
     _ = fcntl(cdpWriteFd, F_SETFD, FD_CLOEXEC)
     _ = fcntl(cdpReadFd, F_SETFD, FD_CLOEXEC)
-    // SIGPIPE guard on the WRITE end (H2 discipline, pipe edition): the IPC conn
+    // SIGPIPE guard on the WRITE end (same as the IPC socket's): the IPC conn
     // fd uses the SO_NOSIGPIPE socket option, but pipe fds don't take it, so a
     // write to a cef_host that closed its CDP read end (it died) would otherwise
     // raise SIGPIPE and kill the whole host APP. F_SETNOSIGPIPE is the Darwin
@@ -333,15 +333,15 @@ extension CefProfileHost {
       // No connection and no clean shutdown in flight is a dead host too:
       // cef_host exited before connecting (e.g. a crash during CefInitialize, or
       // a FLUTTER_CEF_HOST that isn't cef_host), or accept() failed.
-      // handleHostDeath() no-ops on a clean shutdown (running==false). The C2
-      // cache-lock loss connects first (it SendLogs "profile-locked" then exits
-      // 2), so it usually surfaces via the read-loop EOF below; either way
+      // handleHostDeath() no-ops on a clean shutdown (running==false). A
+      // cache-lock loss (another process holds the profile) connects first (it
+      // SendLogs "profile-locked" then exits 2), so it usually surfaces via the read-loop EOF below; either way
       // handleHostDeath() reads the real exit status.
       NSLog("[cef] cef_host for profile '\(profileId)' never connected")
       handleHostDeath()
       return
     }
-    // After accept(), guard the conn fd against SIGPIPE (H2): a write() to a
+    // After accept(), guard the conn fd against SIGPIPE: a write() to a
     // peer-closed socket would otherwise raise SIGPIPE and kill the whole host
     // APP, not just fail the write. With SO_NOSIGPIPE the write returns -1/EPIPE
     // and writeAll() reports failure, which we route to handleHostDeath().
@@ -370,7 +370,7 @@ extension CefProfileHost {
     }
     pendingFrames.removeAll()
     writeLock.unlock()
-    // A flush write that failed means the pipe is already dead (H2) — treat it
+    // A flush write that failed means the pipe is already dead — treat it
     // as a host death rather than spinning into the read loop on a broken fd.
     if !flushOk { handleHostDeath(); return }
     while running {
@@ -378,7 +378,7 @@ extension CefProfileHost {
       if !readAll(fd, &hdr, 4) { break }
       let bodyLen = (Int(hdr[0]) << 24) | (Int(hdr[1]) << 16) | (Int(hdr[2]) << 8) | Int(hdr[3])
       // Minimum valid body is 5 bytes (4 browserId + 1 op + 0 payload).
-      // H9: a malformed/oversized length means a wire desync and tears down EVERY
+      // A malformed/oversized length means a wire desync and tears down EVERY
       // browser on this host — log the rejected length first so it isn't a silent,
       // breadcrumb-less all-tiles crash (the IPC peer is trusted, so this only fires
       // on a genuine framing bug).
@@ -394,7 +394,7 @@ extension CefProfileHost {
       if bid == 0 {
         handleProcessFrame(op, payload)
       } else if op == CefOp.targetId {
-        // CEF-2b: a targetId resolution result — route to the pending completion,
+        // A targetId resolution result — route to the pending completion,
         // not the session.
         handleTargetId(bid, String(bytes: payload, encoding: .utf8))
       } else if op == CefOp.evalResult,
@@ -427,7 +427,7 @@ extension CefProfileHost {
       } else {
         browsersLock.lock()
         let session = browsers[bid]
-        // C1: detect the FIRST present under the browsersLock we already hold, via a
+        // Detect the FIRST present under the browsersLock we already hold, via a
         // per-session flag, so the watchdog-cancel (presentLock) fires once per browser
         // instead of acquiring a second lock on every (up to 60fps) present frame.
         var firstPaint = false
@@ -442,7 +442,7 @@ extension CefProfileHost {
             DispatchQueue.global().async { [weak self] in self?.recordGpuProcess() }
           }
           if s.presentCount == estabStableFrames { reachedStableFrames = true }
-          // F-6: any present clears the liveness-stall state — the browser is alive.
+          // Any present clears the liveness-stall state — the browser is alive.
           s.lastPresentNs = DispatchTime.now().uptimeNanoseconds
           s.livenessNudgedAt = 0
         } else if op == CefOp.pageStart, let s = session {
@@ -477,7 +477,7 @@ extension CefProfileHost {
         session?.handleFrame(op, payload)
       }
     }
-    // C1: the loop exited. If `running` is still true this was NOT a clean
+    // The loop exited. If `running` is still true this was NOT a clean
     // shutdown() (which clears `running` BEFORE shutting the fds down) — the
     // host died (EOF/ECONNRESET on the peer, or a malformed frame). Surface it.
     // shutdown() flips `running` false first, so its fd-close-driven read EOF
@@ -485,11 +485,11 @@ extension CefProfileHost {
     handleHostDeath()
   }
 
-  /// C1/H2: the host has (apparently) died — the reader hit EOF while running,
+  /// The host has (apparently) died — the reader hit EOF while running,
   /// accept()/the pre-ready flush failed, or a send's writeAll failed. Fire
   /// `onHostDied` ONCE on the main thread (the plugin's maps are main-thread
-  /// confined — H3), passing the process exit status so the plugin can tell a
-  /// cache-lock loss (status 2 — C2 contract) from a generic crash. A clean
+  /// confined), passing the process exit status so the plugin can tell a
+  /// cache-lock loss (cef_host exits 2) from a generic crash. A clean
   /// shutdown() (running==false) is not a death and is ignored.
   func handleHostDeath() {
     writeLock.lock()
@@ -499,12 +499,12 @@ extension CefProfileHost {
     guard running, !diedFired else { writeLock.unlock(); return }
     diedFired = true
     crashed = true
-    // H6: abandon paced creates — the host is gone. Sessions stay in `browsers`, so
+    // Abandon paced creates — the host is gone. Sessions stay in `browsers`, so
     // the onHostDied → plugin path still emits processGone for each queued one.
     createSendQueue.removeAll()
     createInFlight.removeAll()
     let p = process
-    // H5: TAKE the posix_spawn pid (zero it) so this reaper is the SOLE owner of its
+    // TAKE the posix_spawn pid (zero it) so this reaper is the SOLE owner of its
     // waitpid — a later terminateProcess()/shutdown() then sees 0 and won't
     // double-reap a pid this thread is about to harvest (which could kill an
     // OS-recycled pid). If it's wedged and we can't reap within the grace window
@@ -541,12 +541,12 @@ extension CefProfileHost {
     // terminationStatus traps if read while the process is still running — so we
     // must not busy-wait here. Hop to a background queue, wait briefly for the
     // process to actually exit (EOF usually means it already has), then deliver
-    // on main (the plugin's maps are main-thread confined — H3). Generic-crash
+    // on main (the plugin's maps are main-thread confined). Generic-crash
     // status (-1) if it outlives the grace window.
     //
     // Two launch paths: `process` (Foundation.Process) exposes isRunning/
     // terminationStatus; the posix_spawn path has only `pid`, so we poll waitpid
-    // (WNOHANG) and extract the exit code via WEXITSTATUS so the C2 cache-lock
+    // (WNOHANG) and extract the exit code via WEXITSTATUS so the cache-lock
     // signal (exit 2 -> "locked") matches Process.terminationStatus's semantics.
     DispatchQueue.global().async { [weak self] in
       var status: Int32 = -1
@@ -571,7 +571,7 @@ extension CefProfileHost {
           }
           usleep(50_000)
         }
-        // H5: still alive after the grace window (a wedged child that didn't exit on
+        // Still alive after the grace window (a wedged child that didn't exit on
         // EOF). Don't merely hand it back — the clean-shutdown path may never call
         // terminateProcess() again, leaving a zombie/orphan cef_host. SIGKILL + reap it
         // right here. We exclusively own this pid (spawnedPid was zeroed above) and it
@@ -610,7 +610,7 @@ extension CefProfileHost {
       }
       let flags = payload.first ?? 0
       let adhoc = (flags & 0x01) != 0
-      // F.5 dev safety-rail: an ad-hoc (mock-keychain) host must NOT load a named
+      // Dev safety rail: an ad-hoc (mock-keychain) host must NOT load a named
       // persistent profile unless explicitly allowed, because at-rest creds
       // wouldn't be protected. Nothing has been written yet (no browser was
       // created), so refusing here leaks nothing. The plugin respawns an

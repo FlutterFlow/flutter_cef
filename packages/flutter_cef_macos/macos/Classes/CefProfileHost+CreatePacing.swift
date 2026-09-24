@@ -17,7 +17,7 @@ extension CefProfileHost {
     // browserIds are STRICTLY MONOTONIC and never reused: nextBrowserId only ever
     // increments (never reset/decremented) and a disposed id is never recycled, so
     // guard it — the slot we're about to hand out must be FREE (never previously
-    // registered). H8: a UInt32 wrap (or any bug) reusing an id would SILENTLY
+    // registered). A UInt32 wrap (or any bug) reusing an id would SILENTLY
     // overwrite a live sibling's slot in a release build (the old guard was a
     // debug-only `assert`, compiled out) → the reader misroutes that wire id's frames
     // (paint/cookies/CDP/relay) to the wrong tile. Make it a hard runtime invariant (a
@@ -33,7 +33,7 @@ extension CefProfileHost {
     writeLock.lock()
     let isReady = ready
     if !isReady {
-      // Queue until kOpReady; the safety-rail (F.5) may refuse to flush these. The
+      // Queue until kOpReady; the ad-hoc-build safety rail may refuse to flush these. The
       // payload is built at FLUSH time inside sendCreate from the session's LIVE
       // surfaceId/geometry — a resize during the pre-ready spawn window
       // reallocates the IOSurface (freeing the old global id) and updates the
@@ -52,7 +52,7 @@ extension CefProfileHost {
   /// pre-connect resizes are no longer dropped. The payload is assembled HERE
   /// (not at createBrowser time) so it carries the session's current surfaceId +
   /// geometry: {u32 w}{u32 h}{f64 dpr}{u32 iosurfaceId}{utf8 url}. allowedSchemes
-  /// is NOT here — it's a process arg fixed at spawn (A.4).
+  /// is NOT here — it's a process arg fixed at spawn.
   private func sendCreate(_ id: UInt32, _ session: CefWebSession, _ url: String) {
     writeLock.lock()
     // Read the session's LIVE geometry + surfaceId AND write the create frame in a
@@ -62,7 +62,7 @@ extension CefProfileHost {
     // Any resize after this lands after the create, so cef_host has a slot and
     // self-heals the surface via DoResize. (writeLock→bufferLock here is safe: no
     // path holds bufferLock then takes writeLock.)
-    // H4: read (w, h, dpr, surfaceId) as ONE atomic snapshot rather than four separate
+    // Read (w, h, dpr, surfaceId) as ONE atomic snapshot rather than four separate
     // bufferLock acquisitions — otherwise a resize interleaving between the reads could
     // ship e.g. old width + new surfaceId, blitting the first paint into a mis-sized
     // surface. (create-pacing widened this window: a browser can sit queued for N×
@@ -97,7 +97,7 @@ extension CefProfileHost {
       ok = frame.withUnsafeBytes { writeAll(connFd, $0.baseAddress!, frame.count) }
     }
     writeLock.unlock()
-    // H2: surface a dead pipe (unlocked first — handleHostDeath re-takes writeLock).
+    // Surface a dead pipe (unlocked first — handleHostDeath re-takes writeLock).
     if !ok { handleHostDeath() }
   }
 
@@ -124,7 +124,7 @@ extension CefProfileHost {
     // advanceCreatePacer, which re-pumps.
     while true {
       writeLock.lock()
-      // H6: never pump on a dead/dying host — the queue was abandoned in
+      // Never pump on a dead/dying host — the queue was abandoned in
       // shutdown()/handleHostDeath(); pumping would sendCreate into a closed pipe and a
       // stuck slot could wedge a reused host.
       if !running || crashed || createInFlight.count >= maxCreateInFlight ||
@@ -149,7 +149,7 @@ extension CefProfileHost {
       // Arm the watchdog (insert into firstPresentPending) BEFORE sendCreate so a first
       // kOpPresent can never be observed before the id is registered as pending (which would
       // leave a healthy painting tile stuck "pending" → false perpetual paintStalled).
-      armFirstPresentWatchdog(next.id)  // C1
+      armFirstPresentWatchdog(next.id)
       sendCreate(next.id, next.session, next.url)
       // Release this slot on the browser's FIRST PAINT (firstPresentArrived, in the
       // reader); this timer is only the backstop if it binds but never paints in time.
@@ -186,12 +186,12 @@ extension CefProfileHost {
     guard let s = browsers[browserId], !s.goneReported else { browsersLock.unlock(); return }
     s.goneReported = true
     browsersLock.unlock()
-    firstPresentArrived(browserId)  // cancel the C1 watchdog for a browser that won't paint
+    firstPresentArrived(browserId)  // cancel the first-present watchdog for a browser that won't paint
     onBrowserGone?(browserId, reason)
     advanceCreatePacer(after: browserId, timedOut: false)
   }
 
-  // MARK: C1 first-present watchdog
+  // MARK: First-present watchdog
 
   /// Arm the first-present watchdog for a freshly-sent create: after `firstPaintGrace`
   /// with no frame at all, run a liveness check.
@@ -218,7 +218,7 @@ extension CefProfileHost {
     presentLock.unlock()
   }
 
-  /// C1: track WasHidden state (peeked from kOpSetVisible). A hidden browser produces no
+  /// Track WasHidden state (peeked from kOpSetVisible). A hidden browser produces no
   /// frames, so the watchdog suspends rather than flagging it stalled. On UNHIDE, re-arm
   /// the watchdog for a browser that's still blank, so a genuinely-stuck now-visible tile
   /// is still caught.

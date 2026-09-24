@@ -104,7 +104,7 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr,
   // build leaves shared_texture_enabled off.) All browsers in this process share
   // one GPU/Viz process; set per-create, it resolves to that same process (the
   // second+ browser attaching cleanly is the one multiplex behavior to confirm
-  // at runtime under a signed build — see CONTRACT H.6).
+  // at runtime under a signed build).
   window_info.shared_texture_enabled = true;
 #endif
   // Own the frame clock. Without this CEF's internal scheduler decides when to paint and can
@@ -157,7 +157,7 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr,
     slot->trusted_pending.insert(NormalizeAuthoredUrl(url));
   }
   CefRefPtr<CefClient> client = NewHostClient(slot);
-  // H3: ASYNC create. CreateBrowserSync BLOCKS this (the single CEF UI) thread until
+  // ASYNC create. CreateBrowserSync BLOCKS this (the single CEF UI) thread until
   // the renderer + GPU/Viz accelerated-surface handshake completes — so a burst of
   // creates serialized here, contended the one shared GPU process (later browsers got
   // no surface, never painted), and one hung create wedged input/resize/dispose for
@@ -171,7 +171,7 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr,
       window_info, client, create_url, settings,
       TakeDocumentStartExtraInfo(wire_id, &slot->channels), nullptr);
   if (!dispatched) {
-    // H7: the create couldn't even be dispatched — OnAfterCreated/OnBeforeClose will
+    // The create couldn't even be dispatched — OnAfterCreated/OnBeforeClose will
     // never fire, so reclaim the slot + the looked-up IOSurface (+1 ref) here (else
     // they leak and the wire id is stranded) and tell the host so it drops the session
     // (processGone) and its create-pacer advances instead of stalling on the ack.
@@ -215,7 +215,7 @@ void DoDisposeBrowser(uint32_t wire_id) {
   if (slot->browser) {
     slot->browser->GetHost()->CloseBrowser(true);
   } else {
-    // H3: the async CreateBrowser hasn't bound the browser yet — record the close so
+    // The async CreateBrowser hasn't bound the browser yet — record the close so
     // OnAfterCreated closes it the instant it lands. Without this the create completes
     // into a live orphan browser the Swift side has already forgotten (browsers[id]
     // cleared), leaking a renderer + IOSurface until whole-host shutdown.
@@ -259,12 +259,12 @@ void DoResize(const std::shared_ptr<Slot>& slot, int w, int h, double dpr) {
       // the new surface immediately; PumpBeginFrame's ongoing ticks cover the heavy-page settle.
       slot->browser->GetHost()->SendExternalBeginFrame();
     } else {
-      // F-2: HIDDEN — the begin-frame pump is gated off (PumpBeginFrame skips while
+      // HIDDEN — the begin-frame pump is gated off (PumpBeginFrame skips while
       // !visible), so WasResized()+SendExternalBeginFrame() here would never paint the
       // freshly-swapped (blank) surface, yet the Swift resizeWatchdog would force-promote
       // it to the live texture → permanent blank on a static page. The surface + dims are
       // already swapped above (geometry is current); defer the screen-info re-assert + the
-      // repaint to DoSetVisible's hidden->visible edge (F-1). WasResized while hidden is
+      // repaint to DoSetVisible's hidden->visible edge. WasResized while hidden is
       // pointless (no frame can result), so it is dropped, not deferred.
       if (dpr_changed) slot->needs_screen_info_on_show = true;
     }
@@ -373,10 +373,10 @@ void DoSetVisible(const std::shared_ptr<Slot>& slot, bool visible) {
   slot->visible = visible;  // PumpBeginFrame reads this to idle the begin-frame pump while hidden
   if (!slot->browser) return;
   slot->browser->GetHost()->WasHidden(!visible);
-  // F-1 (keystone): on the hidden->visible edge, FORCE a fresh full-viewport repaint at the
+  // On the hidden->visible edge, FORCE a fresh full-viewport repaint at the
   // current geometry. WasHidden(false) alone does NOT repaint, and three things can have left
   // the live texture blank/stale while hidden: (a) a resize landed while the pump was gated off
-  // (F-2 deferred its paint here); (b) a dpr/screen-info change was deferred; (c) Chromium's
+  // (DoResize deferred its paint here); (b) a dpr/screen-info change was deferred; (c) Chromium's
   // FrameEvictionManager reclaimed the off-screen compositor frame entirely (happens past ~5
   // browsers / under memory pressure) so there is nothing to show even though geometry is
   // unchanged. Re-assert screen info (if a dpr change was deferred) + size, then drive a
@@ -723,7 +723,7 @@ void DoShowDevTools(const std::shared_ptr<Slot>& slot, int inspect_x,
 
 namespace {
 
-// CEF-2b: resolve a browser's CDP targetId so the Swift relay can scope an agent's
+// Resolve a browser's CDP targetId so the Swift relay can scope an agent's
 // CDP session to exactly this tile. Extract the first quoted string value for `key`
 // from a flat CDP result JSON (targetIds are GUIDs with no embedded quotes/escapes).
 std::string ExtractJsonStringField(const std::string& json,
@@ -924,7 +924,7 @@ void DoKey(const std::shared_ptr<Slot>& slot, int type, uint32_t modifiers,
   slot->browser->GetHost()->SendKeyEvent(ev);
 }
 
-// C1: force a repaint. The host's first-present watchdog sends kOpInvalidate when a
+// Force a repaint. The host's first-present watchdog sends kOpInvalidate when a
 // browser hasn't delivered its first frame within the deadline — re-requesting the
 // frame self-heals a dropped/raced first paint instead of a permanently blank texture.
 void DoInvalidate(const std::shared_ptr<Slot>& slot) {

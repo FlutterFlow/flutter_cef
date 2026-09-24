@@ -11,6 +11,8 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+      - name: No audit tags or line citations in comments
+        run: tool/check_comment_tags.sh
       - uses: subosito/flutter-action@v2
         with:
           # Pin to the Flutter version the consumer (work_canvas) ships against

@@ -187,6 +187,9 @@ and memory stay bounded under recreate churn).
   changes over broad refactors. The Dart, Swift, and CMake all carry dense
   explanatory comments at the non-obvious seams — keep that up; a tricky fix
   should explain *why*, not just *what*.
+- **Say the reason in words.** Comments carry no audit or port-plan tags and
+  no `file.ext:<line>` citations; CI runs `tool/check_comment_tags.sh`, which
+  fails on them.
 - **Document threading assumptions in the native layers.** The Swift/native code
   spans the Flutter platform thread, CEF's UI thread, the GPU/Viz process, and
   the socket relay. When you touch a method that must run on (or hand off to) a

@@ -1,4 +1,4 @@
-// Standalone unit tests for LivenessProbePolicy — the F-6 steady-state liveness
+// Standalone unit tests for LivenessProbePolicy — the steady-state liveness
 // watchdog decision (catch a painted-then-wedged browser; discriminate a healthy idle
 // static page via a nudge before declaring a stall). Swift stdlib only, so it compiles +
 // runs with `swiftc` alone (no Xcode/pod harness/Campus):
@@ -54,7 +54,7 @@ enum LivenessProbePolicyTests {
     check("one ns under staleness → healthy",
           act(sinceLastPresentNs: staleness - 1) == .healthy)
 
-    // Grace boundary (audit P3): one ns under grace still waits; at/over grace declares.
+    // Grace boundary: one ns under grace still waits; at/over grace declares.
     check("nudged, one ns UNDER grace → wait (healthy)",
           act(sinceLastPresentNs: 14_000_000_000, nudged: true, sinceNudgeNs: grace - 1)
             == .healthy)
@@ -65,7 +65,7 @@ enum LivenessProbePolicyTests {
           act(sinceLastPresentNs: 14_000_000_000, nudged: true, sinceNudgeNs: grace + 1)
             == .declareStalled)
 
-    // WEDGE-vs-IDLE INDISTINGUISHABILITY (audit P3, documented as a test so the limitation is
+    // WEDGE-vs-IDLE INDISTINGUISHABILITY (documented as a test so the limitation is
     // explicit + locked): a static-idle tile and a hung-renderer tile present the SAME inputs to
     // this policy (stale, nudged, no present within grace) → BOTH reach .declareStalled. The
     // policy CANNOT tell them apart by timing alone; the consumer (CefProfileHost) deliberately

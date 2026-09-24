@@ -57,7 +57,7 @@ void SendFrame(uint32_t browser_id, uint8_t opcode, const void* payload,
     return;
   }
   std::lock_guard<std::mutex> lock(g_ipc_write_mutex);
-  // C3: SNAPSHOT the fd under the write lock and write to the snapshot, never re-loading
+  // SNAPSHOT the fd under the write lock and write to the snapshot, never re-loading
   // g_ipc_fd at write time. Teardown sets g_ipc_fd=-1 (exchange) and close()s the old fd
   // under this same lock, so once we hold it the fd is either still valid (write) or
   // already -1 (skip) — a paint thread can no longer pass the early-out and then write
