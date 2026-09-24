@@ -1,4 +1,4 @@
-## Unreleased
+## 0.2.0
 
 * `FlutterCefPlatform` gains a typed method for every method-channel call
   (`create`, `navigate`, `resize`, `pointer`, …) and `setEventHandler` for the

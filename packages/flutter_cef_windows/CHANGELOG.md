@@ -1,4 +1,4 @@
-## Unreleased
+## 0.1.0
 
 * Authored documents at a real origin (`kOpSetAuthoredHtml` 0x3f and the
   `loadAuthored` verb). `loadHtmlString(baseUrl:)` is no longer limited by the
