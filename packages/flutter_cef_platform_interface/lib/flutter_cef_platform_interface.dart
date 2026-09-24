@@ -2,7 +2,7 @@
 ///
 /// Holds the shared Dart types ([CefCookie], [CefLoadError], input mappings,
 /// …) and the [FlutterCefPlatform] contract that each platform implementation
-/// (macOS, and future Windows / Linux) speaks. App-facing code depends on
+/// (macOS and Windows) speaks. App-facing code depends on
 /// `package:flutter_cef/flutter_cef.dart`, which re-exports the types here.
 library;
 

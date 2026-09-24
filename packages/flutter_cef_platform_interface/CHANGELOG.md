@@ -5,6 +5,10 @@
   native events, so the protocol's method names and arguments are written once.
   They go over `channel`, so an implementation that only overrides `channel`
   keeps working.
+* `FlutterCefPlatform.methodNames` lists every method-channel call. A test
+  checks the macOS and Windows plugins' dispatch against it.
+* `kCefUnsupportedCode` and `isCefUnsupported(error)`: the answer a platform
+  gives for a method it doesn't implement, told apart from "no such session".
 
 ## 0.1.3
 

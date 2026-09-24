@@ -23,6 +23,8 @@ export 'package:flutter_cef_platform_interface/flutter_cef_platform_interface.da
         CefMediaPermissionRequest,
         CefMediaSetting,
         CefMediaState,
-        CefSurfaceInfo;
+        CefSurfaceInfo,
+        isCefUnsupported,
+        kCefUnsupportedCode;
 export 'src/cef_web_controller.dart' show CefSessionState, CefWebController;
 export 'src/cef_web_view.dart' show CefWebView;

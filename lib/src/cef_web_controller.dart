@@ -60,7 +60,10 @@ class CefWebController {
   })  : sessionId = sessionId ?? 'cef-${_counter++}',
         documentStartScripts = List<String>.unmodifiable(documentStartScripts) {
     // Register + install the host->Dart handler at construction (not in create),
-    // so callbacks wired before create() can't miss early events.
+    // so callbacks wired before create() can't miss early events. A controller
+    // given the id of one that is still alive takes the id over: events go to
+    // the newest one, and the native session is its own once it creates (see
+    // [dispose]).
     _bySession[this.sessionId] = this;
     _installHandler();
   }
@@ -108,12 +111,13 @@ class CefWebController {
   bool get _disposed => _state.value == CefSessionState.disposed;
 
   // Last visibility the consumer requested, and whether it was ever set
-  // explicitly. Re-asserted to the native side once the browser binds (see
-  // [_createSession]) so a `setVisible` that raced or was lost during the create
-  // burst can't leave the slot latched hidden — a permanently blank on-screen
-  // tile. Only re-asserted when explicitly set: a never-set slot keeps CEF's
-  // default-shown, so a fresh/recovered OFF-screen slot isn't briefly forced
-  // visible (which would pump it at 60fps until its cull edge lands).
+  // explicitly. Re-sent once create() returns (see [_createSession]): a
+  // `setVisible` made before the platform had a session for this id was
+  // dropped there, so this is what hands the new session the consumer's
+  // choice (the platform then re-applies it when cef_host binds the browser).
+  // Only sent when explicitly set: a never-set slot keeps CEF's default-shown,
+  // so a fresh/recovered OFF-screen slot isn't briefly forced visible (which
+  // would pump it at 60fps until its cull edge lands).
   bool _lastVisible = true;
   bool _visibilityExplicitlySet = false;
 
@@ -263,12 +267,17 @@ class CefWebController {
   /// unset, alerts are auto-dismissed.
   Future<void> Function(CefJsDialogRequest request)? onJavaScriptAlertDialog;
 
-  /// Handle a page `confirm(...)`. Return true for OK, false for Cancel. If
-  /// unset, confirms default to OK.
+  /// Handle a page `confirm(...)`. Return true for OK, false for Cancel.
+  ///
+  /// **If unset, confirms are cancelled** (`confirm()` returns false): with no
+  /// handler there is no human to ask, and a page's "Delete everything?" must
+  /// not be accepted on nobody's behalf. This matches a handler that throws,
+  /// and [onMediaPermissionRequest]'s deny-by-default.
   Future<bool> Function(CefJsDialogRequest request)? onJavaScriptConfirmDialog;
 
-  /// Handle a page `prompt(...)`. Return the entered text, or null to cancel. If
-  /// unset, prompts return their default value.
+  /// Handle a page `prompt(...)`. Return the entered text, or null to cancel.
+  /// **If unset, prompts are cancelled** (`prompt()` returns null), for the
+  /// same reason as [onJavaScriptConfirmDialog].
   Future<String?> Function(CefJsDialogRequest request)?
       onJavaScriptTextInputDialog;
 
@@ -337,14 +346,18 @@ class CefWebController {
       } catch (e, st) {
         // A consumer callback threw. Report it: thrown from here it would only
         // reach the platform side, which ignores the reply.
-        FlutterError.reportError(FlutterErrorDetails(
-          exception: e,
-          stack: st,
-          library: 'flutter_cef',
-          context: ErrorDescription('while handling the $event event'),
-        ));
+        _reportCallbackError(e, st, 'while handling the $event event');
       }
     });
+  }
+
+  static void _reportCallbackError(Object e, StackTrace st, String context) {
+    FlutterError.reportError(FlutterErrorDetails(
+      exception: e,
+      stack: st,
+      library: 'flutter_cef',
+      context: ErrorDescription(context),
+    ));
   }
 
   void _onEvent(String method, Map<String, dynamic> a) {
@@ -469,15 +482,16 @@ class CefWebController {
         final reason = a['reason'] as String? ?? 'crashed';
         // The browser never came up (dispatch failed, or the host speaks another
         // wire protocol): the same "can't create" signal create() throws for.
-        // A throwing onCreateFailed must not keep onProcessGone from running.
-        try {
-          if (reason == 'createFailed' ||
-              reason.startsWith('protocolMismatch')) {
+        // A throwing onCreateFailed must not keep onProcessGone from running,
+        // and each one's error is reported on its own.
+        if (reason == 'createFailed' || reason.startsWith('protocolMismatch')) {
+          try {
             onCreateFailed?.call(StateError('cef_host: $reason'));
+          } catch (e, st) {
+            _reportCallbackError(e, st, 'while calling onCreateFailed');
           }
-        } finally {
-          onProcessGone?.call(reason);
         }
+        onProcessGone?.call(reason);
         break;
       case 'paintStalled':
         // C1: the browser came up but never delivered its first frame even after a
@@ -549,12 +563,11 @@ class CefWebController {
     try {
       switch (a['type'] as int? ?? 0) {
         case 1:
-          ok = (await onJavaScriptConfirmDialog?.call(req)) ?? true;
+          // No handler, no human to ask: Cancel (see onJavaScriptConfirmDialog).
+          ok = (await onJavaScriptConfirmDialog?.call(req)) ?? false;
           break;
         case 2:
-          final r = onJavaScriptTextInputDialog == null
-              ? req.defaultText
-              : await onJavaScriptTextInputDialog!(req);
+          final r = await onJavaScriptTextInputDialog?.call(req);
           ok = r != null;
           text = r ?? '';
           break;
@@ -576,9 +589,7 @@ class CefWebController {
     await _platform.respondJsDialog(sessionId, id, ok, text);
   }
 
-  /// A page asked for the camera/mic and the site has no remembered decision.
-  /// Mirrors [_handleJsDialog]: the page's `getUserMedia` is blocked on the
-  /// native callback until this answers, so every path must answer exactly once.
+  /// A right-click landed in the page: ask [onContextMenu] which item to run.
   Future<void> _handleContextMenu(Map<String, dynamic> a) async {
     final id = a['id'] as int? ?? 0;
     // Answer EXACTLY ONCE, whatever happens: CEF requires the menu callback be
@@ -607,6 +618,9 @@ class CefWebController {
     await _platform.chooseContextMenu(sessionId, id, command ?? 0);
   }
 
+  /// A page asked for the camera/mic and the site has no remembered decision.
+  /// Mirrors [_handleJsDialog]: the page's `getUserMedia` is blocked on the
+  /// native callback until this answers, so every path must answer exactly once.
   Future<void> _handleMediaRequest(Map<String, dynamic> a) async {
     final id = a['id'] as int? ?? 0;
     // Bits from cef_media_access_permission_types_t: audio = 1<<0, video = 1<<1.
@@ -658,16 +672,29 @@ class CefWebController {
   static Duration spawnSpacing = const Duration(milliseconds: 120);
 
   static int _activeCreates = 0;
-  static final List<Completer<void>> _createQueue = <Completer<void>>[];
+  static final List<Completer<bool>> _createQueue = <Completer<bool>>[];
 
-  static Future<void> _acquireCreateSlot() {
+  // This controller's place in [_createQueue] while its create() waits there.
+  Completer<bool>? _slotWaiter;
+
+  // True once this spawn holds a slot; false when [dispose] took the controller
+  // out of the queue first (it never held one, so it must not release one).
+  Future<bool> _acquireCreateSlot() {
     if (maxConcurrentCreates <= 0 || _activeCreates < maxConcurrentCreates) {
       _activeCreates++;
-      return Future<void>.value();
+      return Future<bool>.value(true);
     }
-    final waiter = Completer<void>();
+    final waiter = _slotWaiter = Completer<bool>();
     _createQueue.add(waiter);
     return waiter.future; // the slot is handed over (active count preserved).
+  }
+
+  // Disposed while queued: leave the queue at once, so a dead controller
+  // neither takes a slot nor costs the spawns behind it a [spawnSpacing] gap.
+  void _leaveCreateQueue() {
+    final waiter = _slotWaiter;
+    _slotWaiter = null;
+    if (waiter != null && _createQueue.remove(waiter)) waiter.complete(false);
   }
 
   // Frees this spawn's slot. Under contention, waits [spawnSpacing] first so the
@@ -683,7 +710,8 @@ class CefWebController {
 
   static void _releaseCreateSlot() {
     if (_createQueue.isNotEmpty) {
-      _createQueue.removeAt(0).complete(); // pass our slot to the next waiter.
+      // Pass our slot to the next waiter.
+      _createQueue.removeAt(0).complete(true);
     } else if (_activeCreates > 0) {
       _activeCreates--;
     }
@@ -696,6 +724,10 @@ class CefWebController {
   // converge on ONE process even when the warm create() is still parked in the
   // spawn throttle when the view mounts.
   Future<int?>? _createInFlight;
+
+  // The htmlBaseUrl the session was created with (null unless created on
+  // html), so thaw(html:) re-authors the document at the same origin.
+  String? _htmlBaseUrl;
 
   /// Spawn the renderer for [url] at [width]×[height] logical px. Returns the
   /// [Texture] id to display, or null on failure.
@@ -736,6 +768,9 @@ class CefWebController {
         'Use agentControl for a private CDP-over-pipe channel instead.');
     if (_textureId != null) return Future<int?>.value(_textureId);
     if (_disposed) return Future<int?>.value();
+    if (_createInFlight == null) {
+      _htmlBaseUrl = html != null ? htmlBaseUrl : null;
+    }
     // create-with-html: a base64 data: URL (as loadHtmlString builds). cef_host
     // arms the trusted-load exemption for a data:/file: create URL, so this
     // renders the authored doc as the browser's first (and only) page.
@@ -768,11 +803,14 @@ class CefWebController {
     required bool agentControl,
     String? authoredHtml,
   }) async {
-    await _acquireCreateSlot();
-    // Disposed while parked in the spawn-throttle queue — never fork for a dead
-    // controller (its slot must still be released so waiters proceed).
+    // Disposed while parked in the spawn-throttle queue: it left the queue
+    // without a slot, and never forks for a dead controller.
+    if (!await _acquireCreateSlot()) return null;
+    _slotWaiter = null;
+    // Disposed after the slot was handed over: pass it straight on, with no
+    // spacing gap, since nothing was spawned.
     if (_disposed) {
-      _scheduleSlotRelease();
+      _releaseCreateSlot();
       return null;
     }
     Map<String, dynamic>? res;
@@ -826,6 +864,7 @@ class CefWebController {
       return null;
     }
     _textureId = id;
+    _zoomLevel = 0; // a new browser starts at 100%
     _moveTo(CefSessionState.live);
     // The 127.0.0.1 CDP port CEF bound for this session (0 if CDP wasn't
     // requested). The server comes up shortly after; a CDP client should retry.
@@ -835,15 +874,15 @@ class CefWebController {
     for (final name in _channels.keys) {
       _platform.addJavaScriptChannel(sessionId, name);
     }
-    // Re-assert the last-known visibility now the browser is bound — but only if
-    // the consumer ever set it. A setVisible that landed before the browser bound
-    // (recorded as intent only) or was lost / mis-ordered under the create burst
-    // would otherwise leave the slot latched hidden — a permanently blank
-    // on-screen tile. Idempotent when already in sync (the native hidden->visible
-    // edge repaints; a matching state is a no-op). Gated on the explicit-set flag
-    // so a fresh/recovered slot that was never told a visibility keeps CEF's
-    // default-shown instead of being force-repainted. Pairs with the consumer-side
-    // direct drive in the agent_ui tile.
+    // Hand the new session the consumer's last visibility — but only if the
+    // consumer ever set it. The platform only now has a session for this id:
+    // a setVisible made before create() returned was dropped there, and would
+    // leave an off-screen tile painting (or an on-screen one latched hidden).
+    // The browser isn't bound yet (create returns before cef_host binds it);
+    // the platform records the visibility and re-sends it once the browser
+    // binds. Gated on the explicit-set flag so a fresh/recovered slot that was
+    // never told a visibility keeps CEF's default-shown instead of being
+    // force-repainted.
     if (_visibilityExplicitlySet) {
       _platform.setVisible(sessionId, _lastVisible);
     }
@@ -868,7 +907,9 @@ class CefWebController {
   /// hangs because there is no window for the system sheet to attach to. This pops
   /// a real Chrome-runtime window that CAN, sharing this tile's cookie jar so the
   /// sign-in propagates back to the tile once the window is closed. Typically
-  /// called with the tile's current address ([url]'s live value).
+  /// called with the tile's current address ([url]'s live value). A platform
+  /// without it throws a [PlatformException] that [isCefUnsupported]
+  /// recognises.
   Future<void> openAuthWindow(String url) {
     // Defense-in-depth (mirrored authoritatively in the Swift session): only ever
     // open the cookie-bearing auth window at a real web origin. Refuse non-http(s)
@@ -1038,8 +1079,12 @@ class CefWebController {
   /// Clear the page's `localStorage`.
   Future<void> clearLocalStorage() => executeJavaScript('localStorage.clear()');
 
-  /// Set a cookie in the global (process-wide) cookie store. [url] scopes the
-  /// cookie; [domain] defaults to the url's host.
+  /// Set a cookie in this session's cookie jar. [url] scopes the cookie;
+  /// [domain] defaults to the url's host.
+  ///
+  /// The jar belongs to the `cef_host` the session runs in, so it is shared by
+  /// every view on the same [profile] or [hostGroup]; a session with neither
+  /// has a jar of its own.
   ///
   /// [secure], [httpOnly], and [sameSite] mirror the cookie attributes of the
   /// same names. [CefCookieSameSite.none] requires [secure] — Chromium rejects
@@ -1069,10 +1114,12 @@ class CefWebController {
         sameSite: sameSite,
       );
 
-  /// Delete all cookies from the global cookie store.
+  /// Delete all cookies from this session's cookie jar. On a shared [profile]
+  /// or [hostGroup] that signs every view on it out, not just this one.
   Future<void> clearCookies() => _platform.clearCookies(sessionId);
 
-  /// Read cookies from the global store. With no [url], returns every cookie;
+  /// Read cookies from this session's cookie jar (shared per [profile] or
+  /// [hostGroup], like [setCookie]'s). With no [url], returns every cookie;
   /// with a [url], only the cookies that would be sent to it. Includes
   /// `httpOnly` cookies (not reachable from page JavaScript).
   Future<List<CefCookie>> getCookies({String? url}) {
@@ -1123,6 +1170,8 @@ class CefWebController {
   /// panel as ⌃⌘Space) targeting this view. The view must be focused so the
   /// picked glyph is inserted into the page's focused field. The picker is
   /// anchored at the composition caret (or the last click); see [CefWebView].
+  /// A platform without it throws a [PlatformException] that
+  /// [isCefUnsupported] recognises.
   Future<void> showEmojiPicker() => _platform.showEmojiPicker(sessionId);
 
   /// Update the active IME composition with [text] (the in-progress, underlined
@@ -1164,7 +1213,10 @@ class CefWebController {
     if (baseUrl == null || baseUrl.isEmpty) return html;
     final tag =
         '<base href="${const HtmlEscape(HtmlEscapeMode.attribute).convert(baseUrl)}">';
-    final head = RegExp(r'<head[^>]*>', caseSensitive: false).firstMatch(html);
+    // `<head>` or `<head …>`, never `<header>`: a fragment with a <header>
+    // and no <head> gets the tag first, ahead of every URL in it.
+    final head =
+        RegExp(r'<head(\s[^>]*)?>', caseSensitive: false).firstMatch(html);
     return head == null
         ? '$tag$html'
         : html.replaceRange(head.end, head.end, tag);
@@ -1204,8 +1256,15 @@ class CefWebController {
 
   /// Set the page content zoom. `level` is a Chromium zoom *level*; the zoom
   /// *factor* is `1.2^level` (0 = 100%, 1 ≈ 120%, -1 ≈ 83%).
-  Future<void> setZoomLevel(double level) =>
-      _platform.setZoomLevel(sessionId, level);
+  Future<void> setZoomLevel(double level) {
+    _zoomLevel = level;
+    return _platform.setZoomLevel(sessionId, level);
+  }
+
+  /// The zoom level last set with [setZoomLevel] (including by [CefWebView]'s
+  /// ⌘+/⌘−/⌘0), or 0 for a session that hasn't been zoomed.
+  double get zoomLevel => _zoomLevel;
+  double _zoomLevel = 0;
 
   /// Run a browser edit command on the FOCUSED frame. In off-screen-rendering
   /// mode a raw ⌘C/⌘V key event does NOT trigger these (there is no AppKit
@@ -1245,7 +1304,9 @@ class CefWebController {
   /// grants it without prompting. The page is NOT reloaded — a browser doesn't
   /// yank the page to change a permission, so the new decision simply applies
   /// the next time the site calls `getUserMedia`, and a stream already running
-  /// keeps running because it belongs to the page.
+  /// keeps running because it belongs to the page. A platform without
+  /// camera/mic handling throws a [PlatformException] that [isCefUnsupported]
+  /// recognises.
   Future<void> setMediaSetting(CefMediaSetting setting) =>
       _platform.setMediaSetting(sessionId, setting);
 
@@ -1254,21 +1315,31 @@ class CefWebController {
   /// Returns null when the platform has no such session (never created, or
   /// already disposed). Cheap — the counters are maintained where present
   /// frames already arrive, so this adds no IPC to the host.
+  ///
+  /// A platform that doesn't keep these counters throws a [PlatformException]
+  /// that [isCefUnsupported] recognises; that is not "no such session".
   Future<CefSessionStats?> sessionStats() => _platform.sessionStats(sessionId);
 
   /// Mute or unmute the page's audio output. Besides silencing it, a hidden
   /// AND muted page regains Chromium's intensive wake-up throttling (audible
   /// pages are exempt), so muting on hide keeps a background tile's timers
   /// cheap. Policy is the caller's — muting is user-visible for media tiles.
+  /// A no-op on a platform that doesn't support it.
   Future<void> setAudioMuted(bool muted) =>
-      _platform.setAudioMuted(sessionId, muted);
+      _ignoreUnsupported(_platform.setAudioMuted(sessionId, muted));
 
   /// Set the visible frame cadence: milliseconds between begin-frames (the OSR
   /// frame clock). 16 ≈ 60fps (the default), 33 ≈ 30fps for a
   /// visible-but-unengaged tile. Clamped natively to [8, 250]. Hidden views
-  /// produce no frames regardless (see [setVisible]).
+  /// produce no frames regardless (see [setVisible]). A no-op on a platform
+  /// that doesn't support it.
   Future<void> setFrameInterval(int milliseconds) =>
-      _platform.setFrameInterval(sessionId, milliseconds);
+      _ignoreUnsupported(_platform.setFrameInterval(sessionId, milliseconds));
+
+  // For calls that are only a hint (muting, frame cadence): a platform without
+  // them ignores the hint, as it always has, rather than failing the caller.
+  static Future<void> _ignoreUnsupported(Future<void> call) =>
+      call.catchError((Object _) {}, test: isCefUnsupported);
 
   /// Whether the native browser is currently frozen — torn down by [freeze]
   /// while the texture keeps serving the last painted frame.
@@ -1285,10 +1356,16 @@ class CefWebController {
   /// for a named [profile] (disk-backed jar) but not for an ephemeral session.
   /// [thaw] recreates the browser on the same texture. Returns false when
   /// there was nothing to freeze (not created, already frozen, or the native
-  /// process was already gone).
+  /// process was already gone), and on a platform that can't freeze: the
+  /// session then simply stays live.
   Future<bool> freeze() async {
     if (_state.value != CefSessionState.live) return false;
-    if (!await _platform.freezeSession(sessionId)) return false;
+    try {
+      if (!await _platform.freezeSession(sessionId)) return false;
+    } catch (e) {
+      if (isCefUnsupported(e)) return false;
+      rethrow;
+    }
     // The session may have ended or been disposed while the call was out.
     if (_state.value != CefSessionState.live) return false;
     _moveTo(CefSessionState.frozen);
@@ -1305,16 +1382,34 @@ class CefWebController {
   /// [create]) re-authors the document directly, for consumers whose content
   /// state lives host-side. Omitted, the browser reloads what [create] was
   /// originally given. Returns false when the session wasn't frozen.
-  Future<bool> thaw({String? url, String? html}) async {
+  ///
+  /// [html] is served the way [create] served it: at [htmlBaseUrl] (by
+  /// default the one [create] was given) when that is http(s), so the page
+  /// keeps its origin; otherwise as a `data:` URL with `<base href>`.
+  Future<bool> thaw({String? url, String? html, String? htmlBaseUrl}) async {
     if (!isFrozen) return false;
-    final thawUrl = html != null ? _htmlDataUrl(html) : url;
+    String? thawUrl = url;
+    if (html != null) {
+      final base = htmlBaseUrl ?? _htmlBaseUrl;
+      if (_servesAtOrigin(base)) {
+        // Stage the document on the frozen session (there is no browser to
+        // load it into yet): the recreated browser at [base] is then served it,
+        // exactly as create(html:, htmlBaseUrl:) was.
+        await _platform.loadAuthored(sessionId, base!, html);
+        if (!isFrozen) return false;
+        thawUrl = base;
+      } else {
+        thawUrl = _htmlDataUrl(_withBaseHref(html, base));
+      }
+    }
     final res = await _platform.thawSession(sessionId, url: thawUrl);
     if (res == null || !isFrozen) return false;
+    _zoomLevel = 0; // a new browser starts at 100%
     _moveTo(CefSessionState.live);
-    // Same post-bind re-assert as _createSession: the thawed browser's fresh
-    // slot is default-shown, so push the consumer's last explicit visibility
-    // (a culled tile thawed for e.g. room preload must come back hidden). JS
-    // channels re-flush natively in attach().
+    // The platform kept the session (and the visibility it was last given)
+    // through the freeze and re-applies it when the new browser binds; this
+    // re-send is belt and braces for a culled tile that must come back hidden.
+    // JS channels re-flush natively in attach().
     if (_visibilityExplicitlySet) {
       _platform.setVisible(sessionId, _lastVisible);
     }
@@ -1388,16 +1483,22 @@ class CefWebController {
     );
   }
 
-  /// Tear down the native session (the per-view `cef_host` process tree and
-  /// texture). Pending [runJavaScriptReturningResult] / [getCookies] futures
-  /// fail with a [StateError], and the controller is unusable afterwards.
+  /// Tear down the native session: its browser and texture, and its
+  /// `cef_host` when this was the host's last session. Pending
+  /// [runJavaScriptReturningResult] / [getCookies] futures fail with a
+  /// [StateError], and the controller is unusable afterwards.
+  ///
+  /// If a newer controller was constructed with this one's [sessionId], the id
+  /// and its native session are the newer one's: they are left alone.
   Future<void> dispose() async {
     if (_disposed) return; // Idempotent: a controller can be disposed twice
     // (e.g. an externally-owned controller torn down by both the app and a stale
     // view). A second pass must not throw via the ValueNotifier dispose asserts.
     _moveTo(CefSessionState.disposed);
     _textureId = null;
-    _bySession.remove(sessionId);
+    _leaveCreateQueue();
+    final ownsId = identical(_bySession[sessionId], this);
+    if (ownsId) _bySession.remove(sessionId);
     _failPendingEvals('controller disposed');
     _failPendingCookies('controller disposed');
     _channels.clear();
@@ -1410,6 +1511,6 @@ class CefWebController {
     url.dispose();
     mediaState.dispose();
     _state.dispose();
-    await _platform.dispose(sessionId);
+    if (ownsId) await _platform.dispose(sessionId);
   }
 }

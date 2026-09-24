@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -862,5 +863,273 @@ void main() {
       await tester.pump();
       expect(callsTo('editCommand'), isEmpty);
     }, variant: onWindows);
+  });
+
+  group('robustness', () {
+    Future<void> emitTo(String sessionId, String method,
+            [Map<String, Object?> a = const {}]) =>
+        messenger.handlePlatformMessage(
+          'flutter_cef',
+          const StandardMethodCodec().encodeMethodCall(
+              MethodCall(method, {'sessionId': sessionId, ...a})),
+          (_) {},
+        );
+
+    testWidgets('a url change while create is in flight is navigated to',
+        (tester) async {
+      createDelay = const Duration(milliseconds: 50);
+      const key = ValueKey('v');
+      await tester
+          .pumpWidget(boxed(const CefWebView(key: key, url: 'about:blank')));
+      await tester.pump(); // create is out
+      await tester.pumpWidget(
+          boxed(const CefWebView(key: key, url: 'https://real.test/')));
+      await tester.pump(const Duration(milliseconds: 100));
+      await tester.pumpAndSettle();
+      expect((callsTo('create').single.arguments as Map)['url'], 'about:blank');
+      final navs = callsTo('navigate');
+      expect(navs, hasLength(1));
+      expect((navs.single.arguments as Map)['url'], 'https://real.test/');
+    });
+
+    testWidgets('a new controller is adopted; the old one is left alone',
+        (tester) async {
+      final a = CefWebController(sessionId: 'swap-a');
+      final b = CefWebController(sessionId: 'swap-b');
+      addTearDown(a.dispose);
+      addTearDown(b.dispose);
+      await tester
+          .pumpWidget(boxed(CefWebView(url: 'https://a.test/', controller: a)));
+      await tester.pumpAndSettle();
+      await tester
+          .pumpWidget(boxed(CefWebView(url: 'https://a.test/', controller: b)));
+      await tester.pumpAndSettle();
+      final creates =
+          callsTo('create').map((c) => (c.arguments as Map)['sessionId']);
+      expect(creates, ['swap-a', 'swap-b']);
+      expect(callsTo('dispose'), isEmpty,
+          reason: 'an external controller is its owner\'s to dispose');
+      expect(a.onImeCompositionBounds, isNull);
+      expect(b.onImeCompositionBounds, isNotNull);
+      // Input now drives the new session.
+      log.clear();
+      await tester.tapAt(tester.getCenter(find.byType(Texture)));
+      await tester.pump();
+      expect(
+          callsTo('pointer')
+              .map((c) => (c.arguments as Map)['sessionId'])
+              .toSet(),
+          {'swap-b'});
+    });
+
+    testWidgets('a new profile replaces the view\'s own controller',
+        (tester) async {
+      const key = ValueKey('p');
+      await tester.pumpWidget(boxed(
+          const CefWebView(key: key, url: 'about:blank', profile: 'one')));
+      await tester.pumpAndSettle();
+      await tester.pumpWidget(boxed(
+          const CefWebView(key: key, url: 'about:blank', profile: 'two')));
+      await tester.pumpAndSettle();
+      final creates = callsTo('create')
+          .map((c) => (c.arguments as Map)['profile'])
+          .toList();
+      expect(creates, ['one', 'two']);
+      expect(callsTo('dispose'), hasLength(1),
+          reason: 'the view disposes the controller it made');
+    });
+
+    testWidgets(
+        'a session that ends shows the placeholder, and comes back '
+        'when the host creates again', (tester) async {
+      final c = CefWebController(sessionId: 'pg-view')..onProcessGone = (_) {};
+      addTearDown(c.dispose);
+      await tester.pumpWidget(boxed(CefWebView(
+        url: 'about:blank',
+        controller: c,
+        placeholder: const Text('placeholder'),
+      )));
+      await tester.pumpAndSettle();
+      expect(find.byType(Texture), findsOneWidget);
+      await emitTo('pg-view', 'processGone', {'reason': 'crashed'});
+      await tester.pumpAndSettle();
+      expect(find.byType(Texture), findsNothing,
+          reason: 'the texture is dead once the session is gone');
+      expect(find.text('placeholder'), findsOneWidget);
+      expect(callsTo('create'), hasLength(1),
+          reason: 'the view does not respawn on its own');
+      await c.create(url: 'about:blank', width: 320, height: 240);
+      await tester.pumpAndSettle();
+      expect(find.byType(Texture), findsOneWidget);
+      expect(callsTo('create'), hasLength(2));
+    });
+
+    testWidgets('a controller disposed under the view does not spin',
+        (tester) async {
+      final c = CefWebController(sessionId: 'spin');
+      await c.dispose();
+      await tester.pumpWidget(boxed(CefWebView(
+        url: 'about:blank',
+        controller: c,
+        placeholder: const Text('placeholder'),
+      )));
+      await tester.pump();
+      await tester.pump();
+      expect(tester.binding.hasScheduledFrame, isFalse,
+          reason: 'create() answers null for a disposed controller; the view '
+              'must not ask again every frame');
+      expect(find.text('placeholder'), findsOneWidget);
+    });
+
+    testWidgets('removing one of two views keeps the other\'s IME handler',
+        (tester) async {
+      final c = CefWebController(sessionId: 'two-views');
+      addTearDown(c.dispose);
+      Widget views(List<int> keys) => Directionality(
+            textDirection: TextDirection.ltr,
+            child: Row(children: [
+              for (final i in keys)
+                SizedBox(
+                    key: ValueKey(i),
+                    width: 100,
+                    height: 100,
+                    child: CefWebView(url: 'about:blank', controller: c)),
+            ]),
+          );
+      await tester.pumpWidget(views([0, 1]));
+      await tester.pumpAndSettle();
+      // The second view installed its handler last; removing the first must
+      // not clear it.
+      await tester.pumpWidget(views([1]));
+      await tester.pumpAndSettle();
+      expect(c.onImeCompositionBounds, isNotNull);
+    });
+
+    testWidgets('unbounded constraints fail with a clear message',
+        (tester) async {
+      final errors = <FlutterErrorDetails>[];
+      final prev = FlutterError.onError;
+      FlutterError.onError = errors.add;
+      try {
+        await tester.pumpWidget(const Directionality(
+          textDirection: TextDirection.ltr,
+          child: Column(children: [CefWebView(url: 'about:blank')]),
+        ));
+        await tester.pump();
+      } finally {
+        FlutterError.onError = prev;
+      }
+      expect(errors.map((e) => '${e.exception}'),
+          contains(contains('unbounded constraints')));
+      expect(callsTo('create'), isEmpty);
+    });
+
+    testWidgets('a cancelled press releases the button in the page',
+        (tester) async {
+      await tester.pumpWidget(boxed(const CefWebView(url: 'about:blank')));
+      await tester.pumpAndSettle();
+      log.clear();
+      final g = await tester.startGesture(
+          tester.getCenter(find.byType(Texture)),
+          buttons: kSecondaryButton);
+      await g.cancel();
+      await tester.pump();
+      final types = callsTo('pointer')
+          .map((c) =>
+              ((c.arguments as Map)['type'], (c.arguments as Map)['button']))
+          .toList();
+      expect(types, [(1, 2), (2, 2)],
+          reason: 'down then up, both on the right button');
+    });
+
+    testWidgets('quick clicks cycle the click count 1, 2, 3, 1',
+        (tester) async {
+      await tester.pumpWidget(boxed(const CefWebView(url: 'about:blank')));
+      await tester.pumpAndSettle();
+      log.clear();
+      final at = tester.getCenter(find.byType(Texture));
+      for (var i = 0; i < 4; i++) {
+        await tester.tapAt(at);
+        await tester.pump(const Duration(milliseconds: 50));
+      }
+      final counts = callsTo('pointer')
+          .map((c) => c.arguments as Map)
+          .where((a) => a['type'] == 1)
+          .map((a) => a['clickCount'])
+          .toList();
+      expect(counts, [1, 2, 3, 1]);
+    });
+
+    testWidgets('a trackpad pan scrolls the page; leaving sends a leave',
+        (tester) async {
+      await tester.pumpWidget(boxed(const CefWebView(url: 'about:blank')));
+      await tester.pumpAndSettle();
+      log.clear();
+      final at = tester.getCenter(find.byType(Texture));
+      final pan = await tester.createGesture(kind: PointerDeviceKind.trackpad);
+      await pan.panZoomStart(at);
+      await pan.panZoomUpdate(at, pan: const Offset(0, -10));
+      await pan.panZoomEnd();
+      final wheel = callsTo('pointer')
+          .map((c) => c.arguments as Map)
+          .where((a) => a['type'] == 3)
+          .toList();
+      expect(wheel, hasLength(1));
+      expect(wheel.single['dy'], -30.0, reason: 'pan delta x the scroll gain');
+
+      final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+      await mouse.addPointer(location: at);
+      await mouse.moveTo(Offset.zero);
+      await tester.pump();
+      expect(callsTo('pointer').map((c) => (c.arguments as Map)['type']),
+          contains(4));
+      await mouse.removePointer();
+    });
+
+    testWidgets('a consumed zoom shortcut keeps its key-up from the page',
+        (tester) async {
+      await focusedView(tester);
+      log.clear();
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.meta);
+      await tester.sendKeyEvent(LogicalKeyboardKey.equal);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.meta);
+      await tester.pump();
+      final equalKeys = callsTo('key')
+          .map((c) => c.arguments as Map)
+          .where((a) => a['nativeKeyCode'] == 24); // kVK_ANSI_Equal
+      expect(equalKeys, isEmpty,
+          reason: 'the page never saw the key-down, so no key-up either');
+      // The next plain press is the page's again.
+      await tester.sendKeyEvent(LogicalKeyboardKey.equal);
+      await tester.pump();
+      expect(
+          callsTo('key')
+              .map((c) => c.arguments as Map)
+              .where((a) => a['nativeKeyCode'] == 24)
+              .map((a) => a['type']),
+          [0, 2]);
+    });
+
+    testWidgets('numpad + zooms in, continuing from the controller\'s level',
+        (tester) async {
+      final focus = FocusNode();
+      addTearDown(focus.dispose);
+      final c = CefWebController(sessionId: 'zoom-np');
+      addTearDown(c.dispose);
+      await tester.pumpWidget(boxed(
+          CefWebView(url: 'about:blank', controller: c, focusNode: focus)));
+      await tester.pumpAndSettle();
+      focus.requestFocus();
+      await tester.pump();
+      await c.setZoomLevel(2);
+      log.clear();
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.meta);
+      await tester.sendKeyEvent(LogicalKeyboardKey.numpadAdd);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.meta);
+      await tester.pump();
+      final zooms = callsTo('setZoomLevel');
+      expect(zooms, hasLength(1));
+      expect((zooms.single.arguments as Map)['level'], 2.5);
+    });
   });
 }

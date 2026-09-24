@@ -1,8 +1,8 @@
-
 import 'dart:async';
 
 import 'package:flutter/foundation.dart' show defaultTargetPlatform;
 import 'package:flutter/gestures.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
@@ -44,11 +44,15 @@ const double _kZoomMax = 4.0;
 /// [PointerScrollEvent] to pan-zoom events — e.g. canvas hosts).
 ///
 /// If the backing `cef_host` process dies (crash, or the profile's cache lock
-/// was taken by another process), the texture freezes on its last frame. Wire
-/// [CefWebController.onProcessGone] to detect it and recreate the view — this
-/// widget surfaces the event through the controller rather than handling it
-/// itself, so the host decides what UI to show (a reload affordance, an
-/// "already open elsewhere" message for the `"locked"` reason, etc.).
+/// was taken by another process), the session and its texture are gone and
+/// the view shows its [placeholder] again. It does not start a new session on
+/// its own: wire [CefWebController.onProcessGone] to decide what to do (a
+/// reload affordance, an "already open elsewhere" message for the `"locked"`
+/// reason, …). Calling [CefWebController.create] on the view's controller, or
+/// recreating the view, starts a new session, and the view shows it.
+///
+/// The view needs a bounded size: inside a [Column], [Row] or scroll view,
+/// give it one with a [SizedBox] or [Expanded].
 ///
 /// ```dart
 /// CefWebView(url: 'https://flutter.dev')
@@ -94,8 +98,12 @@ class CefWebView extends StatefulWidget {
   ///
   /// When you supply a controller **you own its lifecycle** — the view only
   /// auto-disposes a controller it created itself. Call `controller.dispose()`
-  /// when you're done with it, otherwise the per-view `cef_host` process tree,
-  /// the texture, and the controller's notifiers leak.
+  /// when you're done with it, otherwise its browser (and its `cef_host`, when
+  /// no other session shares it), the texture, and the controller's notifiers
+  /// leak.
+  ///
+  /// Passing a different controller later switches the view to it: the view
+  /// shows that controller's session, creating one if it has none.
   final CefWebController? controller;
 
   /// Optional focus node. Provide one when an outer surface manages focus
@@ -157,7 +165,8 @@ class CefWebView extends StatefulWidget {
   /// The persistent, shared browser profile this view's login lives in. Views with
   /// the same non-null [profile] share one signed-in profile that survives relaunch.
   /// Null (default) is ephemeral. Ignored when an external [controller] is supplied
-  /// (that controller carries its own profile). Mutually exclusive with the TCP
+  /// (that controller carries its own profile). Changing it replaces the view's
+  /// own controller, and so its session. Mutually exclusive with the TCP
   /// [enableCdp] (open port), but compatible with [agentControl] (private pipe).
   final String? profile;
 
@@ -187,8 +196,7 @@ class _CefWebViewState extends State<CefWebView>
   /// non-Windows — i.e. existing macOS — branches.)
   static bool get _isWindows =>
       defaultTargetPlatform == TargetPlatform.windows;
-  late final CefWebController _controller =
-      widget.controller ?? CefWebController(profile: widget.profile);
+  late CefWebController _controller;
   bool _ownsController = false;
   FocusNode? _ownFocusNode;
   int? _textureId;
@@ -196,6 +204,9 @@ class _CefWebViewState extends State<CefWebView>
   double? _lastDpr;
   bool _creating = false;
   bool _createFailed = false;
+  // Physical keys whose key-down was taken as a view shortcut (zoom, find):
+  // their key-up is kept from the page too, which never saw the key-down.
+  final Set<PhysicalKeyboardKey> _shortcutKeys = <PhysicalKeyboardKey>{};
 
   // ── IME / text input ─────────────────────────────────────────────
   // While focused we hold a TextInputConnection so the platform IME drives
@@ -219,21 +230,100 @@ class _CefWebViewState extends State<CefWebView>
   @override
   void initState() {
     super.initState();
-    _ownsController = widget.controller == null;
+    _bindController(
+        widget.controller ?? CefWebController(profile: widget.profile),
+        owned: widget.controller == null);
+    _attachFocusListener();
+  }
+
+  void _bindController(CefWebController controller, {required bool owned}) {
+    _controller = controller;
+    _ownsController = owned;
     // Adopt an externally-pre-created controller (e.g. one a host eager-spawned
     // before this view mounted) instead of calling create() again: the native
     // create handler disposes + recreates the session, which would throw away
     // the warm process and cold-start fresh. With textureId already set,
     // _ensureSession skips create() and just reconciles size via resize().
-    _textureId = _controller.textureId;
-    _controller.onImeCompositionBounds = _onImeCompositionBounds;
-    _attachFocusListener();
+    _textureId = controller.textureId;
+    _lastSize = null;
+    _lastDpr = null;
+    _creating = false;
+    _createFailed = controller.state.value == CefSessionState.disposed;
+    controller.onImeCompositionBounds = _onImeCompositionBounds;
+    if (!_createFailed) controller.state.addListener(_onSessionState);
+  }
+
+  void _unbindController() {
+    final c = _controller;
+    c.state.removeListener(_onSessionState);
+    // Leave a handler someone else installed since (another view on the same
+    // controller) in place.
+    if (c.onImeCompositionBounds == _onImeCompositionBounds) {
+      c.onImeCompositionBounds = null;
+    }
+    if (_ownsController) c.dispose();
+  }
+
+  // The session behind the view changed without the view asking.
+  void _onSessionState() {
+    if (!mounted) return;
+    // A controller disposed from another widget's build or dispose: the tree
+    // is locked, so catch up after the frame.
+    if (SchedulerBinding.instance.schedulerPhase ==
+        SchedulerPhase.persistentCallbacks) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _onSessionState());
+      return;
+    }
+    final c = _controller;
+    switch (c.state.value) {
+      case CefSessionState.gone:
+      case CefSessionState.disposed:
+        // The texture is dead: show the placeholder, and don't start a new
+        // session on every layout — the consumer decides (onProcessGone).
+        if (_textureId != null || !_createFailed) {
+          setState(() {
+            _textureId = null;
+            _createFailed = true;
+          });
+        }
+      case CefSessionState.live:
+        // Someone (the host, or this view's own create) brought a session up
+        // on this controller: show it, sized to this view.
+        if (c.textureId != _textureId) {
+          setState(() {
+            _textureId = c.textureId;
+            _createFailed = false;
+            _lastSize = null;
+            _lastDpr = null;
+          });
+        }
+      case CefSessionState.idle:
+      case CefSessionState.creating:
+      case CefSessionState.frozen:
+        break;
+    }
   }
 
   @override
   void didUpdateWidget(CefWebView old) {
     super.didUpdateWidget(old);
     _attachFocusListener();
+    // A new controller (or, for the view's own controller, a new profile):
+    // switch to it. Its session is created with the current props.
+    final wantsOwn = widget.controller == null;
+    final swap = wantsOwn
+        ? !_ownsController || old.profile != widget.profile
+        : !identical(widget.controller, _controller);
+    if (swap) {
+      final hadFocus = _textInput != null;
+      _closeTextInput();
+      _unbindController();
+      _bindController(
+          widget.controller ?? CefWebController(profile: widget.profile),
+          owned: wantsOwn);
+      if (hadFocus && _focusNode.hasFocus) _openTextInput();
+      return;
+    }
     // Navigate only when the [url] prop changes to a page we're NOT already on.
     // A host that mirrors the live URL back into [url] (e.g. binding the prop to
     // the controller's own onUrlChange) would otherwise re-issue navigate() to
@@ -260,6 +350,8 @@ class _CefWebViewState extends State<CefWebView>
       _openTextInput();
     } else {
       _closeTextInput();
+      // Their key-ups now go elsewhere.
+      _shortcutKeys.clear();
     }
   }
 
@@ -268,7 +360,7 @@ class _CefWebViewState extends State<CefWebView>
     // disposed (same-frame removal). Bail before touching context / the
     // controller so we don't read a deactivated MediaQuery or resize a
     // torn-down session.
-    if (!mounted) return;
+    if (!mounted || !size.width.isFinite || !size.height.isFinite) return;
     // Effective render dpr: an explicit [renderScale] (e.g. screenDpr × canvas zoom,
     // for crispness when an ancestor transform scales the view) overrides the screen
     // dpr from MediaQuery. Clamped to the native guard range (dpr ≤ 8).
@@ -279,9 +371,11 @@ class _CefWebViewState extends State<CefWebView>
     if (w <= 0 || h <= 0) return;
     if (_textureId == null && !_creating && !_createFailed) {
       _creating = true;
+      final c = _controller;
+      final createUrl = widget.url;
       try {
-        final id = await _controller.create(
-            url: widget.url,
+        final id = await c.create(
+            url: createUrl,
             html: widget.html,
             htmlBaseUrl: widget.htmlBaseUrl,
             width: w,
@@ -295,31 +389,39 @@ class _CefWebViewState extends State<CefWebView>
         // we can't assume the live surface is `size`. Leaving `_lastSize` null
         // makes the resize branch below reconcile to the real laid-out size on
         // the next frame (a no-op resize when create() did size to `size`).
-        // The session ended before create() returned (onProcessGone has run):
-        // like a create that throws, keep the placeholder rather than spawn
-        // again on every layout.
-        if (id == null && _controller.state.value == CefSessionState.gone) {
-          _createFailed = true;
-        }
+        // The view switched controllers while this create was out.
+        if (!identical(c, _controller)) return;
+        // No session came of it (the session ended before create() returned,
+        // or the controller was disposed): like a create that throws, keep
+        // the placeholder rather than create again on every layout.
+        if (id == null) _createFailed = true;
         if (mounted) setState(() => _textureId = id);
+        // The url prop changed while the create was out (parked in the spawn
+        // throttle, say): didUpdateWidget couldn't navigate then, so do it now.
+        if (id != null &&
+            mounted &&
+            widget.url != createUrl &&
+            widget.url != c.url.value) {
+          c.navigate(widget.url);
+        }
       } catch (e, st) {
+        if (!identical(c, _controller)) return;
         // No cef_host, or it failed to spawn. Retrying on every rebuild would
         // just fail again, so keep the placeholder and hand the failure to the
         // consumer (which may fall back to another engine).
         _createFailed = true;
-        final onFailed = _controller.onCreateFailed;
+        final onFailed = c.onCreateFailed;
         if (onFailed != null) {
-          onFailed(e);
+          try {
+            onFailed(e);
+          } catch (e2, st2) {
+            _report(e2, st2, 'while calling onCreateFailed');
+          }
         } else {
-          FlutterError.reportError(FlutterErrorDetails(
-            exception: e,
-            stack: st,
-            library: 'flutter_cef',
-            context: ErrorDescription('creating the CEF browser session'),
-          ));
+          _report(e, st, 'creating the CEF browser session');
         }
       } finally {
-        _creating = false;
+        if (identical(c, _controller)) _creating = false;
       }
       return;
     }
@@ -334,13 +436,21 @@ class _CefWebViewState extends State<CefWebView>
     }
   }
 
+  static void _report(Object e, StackTrace st, String context) {
+    FlutterError.reportError(FlutterErrorDetails(
+      exception: e,
+      stack: st,
+      library: 'flutter_cef',
+      context: ErrorDescription(context),
+    ));
+  }
+
   @override
   void dispose() {
     _listenedFocusNode?.removeListener(_handleFocusChanged);
-    _controller.onImeCompositionBounds = null;
     _closeTextInput();
+    _unbindController();
     _ownFocusNode?.dispose();
-    if (_ownsController) _controller.dispose();
     super.dispose();
   }
 
@@ -348,6 +458,14 @@ class _CefWebViewState extends State<CefWebView>
   Widget build(BuildContext context) {
     return LayoutBuilder(
       builder: (context, constraints) {
+        // The page renders into a surface of exactly the view's size, so it
+        // can't be sized by its content the way a Column or ListView asks.
+        assert(
+            constraints.hasBoundedWidth && constraints.hasBoundedHeight,
+            'CefWebView was given unbounded constraints ($constraints). It '
+            'renders at exactly its laid-out size, so it needs a bounded width '
+            'and height: inside a Column, Row or scroll view, wrap it in a '
+            'SizedBox or Expanded.');
         final size = Size(constraints.maxWidth, constraints.maxHeight);
         WidgetsBinding.instance
             .addPostFrameCallback((_) => _ensureSession(size));
@@ -374,6 +492,7 @@ class _CefWebViewState extends State<CefWebView>
                 onPointerMove: _onPointerMove,
                 onPointerHover: _onPointerHover,
                 onPointerUp: _onPointerUp,
+                onPointerCancel: _onPointerCancel,
                 onPointerSignal: _onPointerSignal,
                 onPointerPanZoomStart: _onPointerPanZoomStart,
                 onPointerPanZoomUpdate: _onPointerPanZoomUpdate,
@@ -388,14 +507,10 @@ class _CefWebViewState extends State<CefWebView>
 
   // ── input forwarding ──────────────────────────────────────────────
   int _lastButton = 0;
-  // Current content-zoom level (CEF factor = 1.2^level), driven by ⌘+/-/0. View-
-  // local: a fresh session (recovery) starts at 100%, matching this reset to 0.
-  double _zoomLevel = 0;
 
-  void _applyZoom(double level) {
-    _zoomLevel = level;
-    unawaited(_controller.setZoomLevel(level));
-  }
+  // ⌘+/-/0 step from the controller's level (CEF factor = 1.2^level), so they
+  // continue from a zoom the host set with setZoomLevel.
+  void _applyZoom(double level) => unawaited(_controller.setZoomLevel(level));
   // Multi-click tracking — the page keys word/line selection off clickCount,
   // which Flutter's Listener doesn't surface.
   Duration _lastDownAt = Duration.zero;
@@ -473,6 +588,17 @@ class _CefWebViewState extends State<CefWebView>
       clickCount: _clickCount,
       modifiers: _cefModifiers());
 
+  // The OS or an ancestor took the pointer mid-press (a drag became a system
+  // gesture, the window lost the mouse): release the button in the page, or
+  // Chromium keeps it held and every later hover extends a selection or drag.
+  void _onPointerCancel(PointerCancelEvent e) => _controller.sendPointer(
+      type: 2,
+      x: e.localPosition.dx,
+      y: e.localPosition.dy,
+      button: _lastButton,
+      clickCount: _clickCount,
+      modifiers: _cefModifiers());
+
   void _onPointerSignal(PointerSignalEvent e) {
     if (e is PointerScrollEvent) {
       _controller.sendPointer(
@@ -516,6 +642,11 @@ class _CefWebViewState extends State<CefWebView>
     //     the double delete / double arrow-move) or Flutter's own shortcuts
     //     (which eat arrows). `ignored` would let both fire; blanket `handled`
     //     would starve the IME of text.
+    if (event is KeyUpEvent && _shortcutKeys.remove(event.physicalKey)) {
+      return KeyEventResult.handled;
+    }
+    // A fresh press is the page's unless it's a shortcut again (re-added below).
+    if (event is KeyDownEvent) _shortcutKeys.remove(event.physicalKey);
     if (_composing) {
       // While composing the IME owns the keystroke end-to-end (extend, candidate
       // navigation, confirm, cancel) — it must reach the platform IME, and we
@@ -563,17 +694,23 @@ class _CefWebViewState extends State<CefWebView>
       final k = event.logicalKey;
       // Content zoom (⌘+/-/0). `=`/`+` in, `-` out, `0` reset. Repeat-friendly.
       if (widget.enableZoomShortcuts) {
-        if (k == LogicalKeyboardKey.equal || k == LogicalKeyboardKey.add) {
-          _applyZoom((_zoomLevel + _kZoomStep).clamp(_kZoomMin, _kZoomMax));
+        final zoom = _controller.zoomLevel;
+        if (k == LogicalKeyboardKey.equal ||
+            k == LogicalKeyboardKey.add ||
+            k == LogicalKeyboardKey.numpadAdd) {
+          _applyZoom((zoom + _kZoomStep).clamp(_kZoomMin, _kZoomMax));
+          _shortcutKeys.add(event.physicalKey);
           return KeyEventResult.handled;
         }
         if (k == LogicalKeyboardKey.minus ||
             k == LogicalKeyboardKey.numpadSubtract) {
-          _applyZoom((_zoomLevel - _kZoomStep).clamp(_kZoomMin, _kZoomMax));
+          _applyZoom((zoom - _kZoomStep).clamp(_kZoomMin, _kZoomMax));
+          _shortcutKeys.add(event.physicalKey);
           return KeyEventResult.handled;
         }
         if (k == LogicalKeyboardKey.digit0 || k == LogicalKeyboardKey.numpad0) {
           _applyZoom(0);
+          _shortcutKeys.add(event.physicalKey);
           return KeyEventResult.handled;
         }
       }
@@ -584,6 +721,7 @@ class _CefWebViewState extends State<CefWebView>
           k == LogicalKeyboardKey.keyF &&
           widget.onFind != null) {
         widget.onFind!();
+        _shortcutKeys.add(event.physicalKey);
         return KeyEventResult.handled;
       }
     }

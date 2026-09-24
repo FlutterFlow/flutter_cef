@@ -130,6 +130,48 @@
 * The controller talks to the platform through `FlutterCefPlatform`'s typed
   methods instead of ~45 raw method-channel strings; the wire calls are
   unchanged and pinned by `test/platform_wire_test.dart`.
+* **Behavior change — JS dialogs fail closed**: with no
+  `onJavaScriptConfirmDialog`, a page's `confirm()` now returns false (it
+  returned true), and with no `onJavaScriptTextInputDialog`, `prompt()` returns
+  null (it returned its default). A page's "Delete everything?" is no longer
+  accepted with no human asked. This matches a throwing handler and the
+  camera/mic deny-by-default. Set the handlers to keep the old answers.
+* **`CefWebView` follows its controller**:
+  * a new `controller` (or, for the view's own controller, a new `profile`) is
+    adopted; it used to be ignored, and consumers re-keyed the view instead;
+  * when the session ends (`onProcessGone`), the view shows its placeholder
+    instead of a dead texture, and shows the new session once the host calls
+    `create()` again;
+  * a `url` changed while `create()` was still queued is navigated to once the
+    session is up; it used to be lost;
+  * a disposed controller no longer makes the view call `create()` every frame;
+  * unbounded constraints (a view in a `Column`) fail with a clear message
+    instead of an `UnsupportedError` every frame.
+* **Input**: a cancelled press sends the page a mouse-up, so Chromium no longer
+  keeps the button held (later hovers extended a selection). ⌘+ on the numpad
+  zooms in. The key-up of a key taken as a zoom or find shortcut is kept from
+  the page, which never saw its key-down. ⌘+/⌘− continue from a zoom set with
+  `setZoomLevel`, now readable as `CefWebController.zoomLevel`.
+* **Controller fixes**:
+  * `thaw(html:)` serves the document at the `htmlBaseUrl` the session was
+    created with (new optional `thaw(htmlBaseUrl:)`), so the page keeps its
+    origin; it always became an opaque `data:` URL.
+  * A controller disposed while its `create()` waits in the spawn throttle
+    leaves the queue at once; each one used to take a turn and a spacing gap.
+  * Disposing a controller whose `sessionId` a newer controller took over no
+    longer tears down the newer one's session or drops its events.
+  * `<base href>` in the `data:` fallback is no longer inserted inside a
+    `<header>` element.
+  * A throwing `onCreateFailed` and `onProcessGone` are each reported through
+    `FlutterError.reportError`.
+* **Unsupported platform calls**: a platform answers a method it doesn't
+  implement with a `PlatformException` whose code is `kCefUnsupportedCode`
+  (`'unsupported'`); `isCefUnsupported(error)` recognises it. `freeze()`
+  returns false and `setAudioMuted` / `setFrameInterval` do nothing there;
+  `sessionStats()` throws rather than answering null, which means "no such
+  session".
+* Docs: cookies live in the host's jar, shared per profile or host group (not
+  a process-wide store), and `clearCookies` signs out every view on it.
 
 ## 0.2.0
 
