@@ -51,10 +51,16 @@ SHA-256-verifies the pinned CEF binary distribution into `~/.cache/flutter_cef`)
 
 ```sh
 cd packages/flutter_cef_macos
-native/build_cef_host.sh            # fetches CEF + builds cef_host.app -> native/cef_host/build
+FLUTTER_CEF_STOCK_FRAMEWORK=1 native/build_cef_host.sh   # fetches CEF + builds cef_host.app -> native/cef_host/build
 export FLUTTER_CEF_HOST="$PWD/native/cef_host/build/cef_host.app/Contents/MacOS/cef_host"
 cd ../../example && flutter run -d macos
 ```
+
+`native/cef_host/CEF_FRAMEWORK_VARIANT` pins a patched CEF framework (the
+published prebuilt carries a WebAuthn keychain patch and H.264/AAC), which
+takes a from-source Chromium build (`native/build-cef-from-source.sh`).
+`FLUTTER_CEF_STOCK_FRAMEWORK=1` builds against the stock framework instead; the
+host works, minus those patches, and can't be published.
 
 The plugin resolves `cef_host` in this order: `$FLUTTER_CEF_HOST` → pod
 resources → the host app's `Contents/Frameworks` → `Contents/Helpers`. For dev
@@ -66,9 +72,10 @@ The script reads a few env vars (defaults in parentheses):
 
 | Var | Default | Effect |
 | --- | --- | --- |
-| `CEF_HOST_ADHOC` | `ON` | **Dev/CI.** Ad-hoc signature, mock keychain, Mach-port peer-validation bypass — runs without Developer-ID signing, unsandboxed. `OFF` = **signed release**: real Keychain/OSCrypt, enforced validation, sandbox — requires correct inside-out Developer-ID signing. Also required for at-rest cookie encryption on a persistent profile. |
+| `CEF_HOST_ADHOC` | `ON` | **Dev/CI.** Ad-hoc signature, mock keychain, Mach-port peer-validation bypass — runs without Developer-ID signing, unsandboxed. `OFF` = **signed release**: real Keychain/OSCrypt, enforced validation, sandbox — requires correct inside-out Developer-ID signing, and signs with a secure timestamp (needed for notarization). Also required for at-rest cookie encryption on a persistent profile. |
 | `CODESIGN_ID` | `-` (ad-hoc) | Pass a Developer ID / Apple Development identity for standalone use. When bundled into a host app, the app's own signing re-signs the tree instead. |
 | `CEF_MULTI_PROCESS` | `ON` | Multi-process GPU-accelerated OSR (crash-isolated, heavy SPAs render). `OFF` = simpler single-process software-blit fallback. |
+| `FLUTTER_CEF_STOCK_FRAMEWORK` | unset | `1` = build against the stock CEF framework even though `CEF_FRAMEWORK_VARIANT` pins a patched one. For contributors and CI; `publish-cef-host.sh` refuses it. |
 | `FLUTTER_CEF_CACHE` | `~/.cache/flutter_cef` | Where the CEF dist is fetched/extracted. |
 
 Signed-release build:
