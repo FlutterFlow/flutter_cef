@@ -35,7 +35,7 @@ class CefConsoleMessage {
   String toString() => 'CefConsoleMessage($level, $message)';
 }
 
-/// A find-in-page result update (see [CefWebController.find]).
+/// A find-in-page result update (see `CefWebController.find`).
 class CefFindResult {
   const CefFindResult({
     required this.numberOfMatches,
@@ -58,7 +58,7 @@ class CefFindResult {
 }
 
 /// A JavaScript dialog (`alert` / `confirm` / `prompt`) the page raised. Passed
-/// to the [CefWebController] dialog callbacks; reply by returning from them.
+/// to the `CefWebController` dialog callbacks; reply by returning from them.
 class CefJsDialogRequest {
   const CefJsDialogRequest({required this.message, this.defaultText = ''});
 
@@ -74,7 +74,7 @@ class CefJsDialogRequest {
 
 /// A page's request to use the camera and/or microphone (`getUserMedia`),
 /// raised only when the site has no remembered decision. Passed to
-/// [CefWebController.onMediaPermissionRequest]; answer by returning
+/// `CefWebController.onMediaPermissionRequest`; answer by returning
 /// allow/deny, and the answer is remembered for [origin].
 ///
 /// The grant is all-or-nothing: CEF requires the answer to a `getUserMedia`
@@ -116,7 +116,7 @@ enum CefMediaSetting {
 
 /// Live camera/microphone status for a page: whether capture is actually
 /// happening right now, plus the site's remembered decision. Delivered by
-/// [CefWebController.mediaState]; the capture flags are the honest source for
+/// `CefWebController.mediaState`; the capture flags are the honest source for
 /// an "in use" indicator, since they reflect what Chromium is really capturing
 /// rather than what was merely permitted.
 class CefMediaState {
@@ -195,9 +195,9 @@ class CefSessionStats {
 
 /// The live frame surface backing a session: the global IOSurface id its
 /// off-screen CVPixelBuffer is wrapped over, plus the surface's PHYSICAL
-/// (Retina) pixel dimensions. Delivered by [CefWebController.onSurface] on each
+/// (Retina) pixel dimensions. Delivered by `CefWebController.onSurface` on each
 /// (re)allocation (create + every resize) and pullable on demand via
-/// [CefWebController.getFrameSurface]. A consumer resolves the surface by id
+/// `CefWebController.getFrameSurface`. A consumer resolves the surface by id
 /// (e.g. `IOSurfaceLookup`) to mirror the live page pixels off-Flutter; it must
 /// re-read on every change, since a resize frees the old surface.
 class CefSurfaceInfo {
@@ -228,7 +228,7 @@ class CefSurfaceInfo {
 /// `Secure` alongside it and drops the cookie otherwise.
 enum CefCookieSameSite { unspecified, none, lax, strict }
 
-/// A cookie returned by [CefWebController.getCookies].
+/// A cookie returned by `CefWebController.getCookies`.
 class CefCookie {
   const CefCookie({
     required this.name,
@@ -270,10 +270,10 @@ class CefCookie {
 
 /// One row in a page context menu, as Chromium built it.
 ///
-/// Campus draws these; Chromium executes the chosen [commandId]. That split is
-/// deliberate — [enabled] and [checked] come from Chromium's own menu model, so
-/// "Paste" greys out with an empty clipboard and the spellcheck block carries
-/// live dictionary suggestions without Campus deriving any of it.
+/// The host app draws these; Chromium executes the chosen [commandId]. That
+/// split is deliberate — [enabled] and [checked] come from Chromium's own menu
+/// model, so "Paste" greys out with an empty clipboard and the spellcheck block
+/// carries live dictionary suggestions without the host deriving any of it.
 class CefContextMenuItem {
   const CefContextMenuItem({
     required this.type,

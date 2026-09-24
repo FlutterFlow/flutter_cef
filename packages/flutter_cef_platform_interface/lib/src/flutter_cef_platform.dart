@@ -9,6 +9,20 @@ import 'method_channel_flutter_cef.dart';
 typedef CefEventHandler = void Function(
     String sessionId, String event, Map<String, dynamic> args);
 
+/// The [PlatformException.code] a platform answers a method it doesn't
+/// implement with.
+const String kCefUnsupportedCode = 'unsupported';
+
+/// Whether [error] means the platform doesn't implement the call: a
+/// [PlatformException] with code [kCefUnsupportedCode], or a
+/// [MissingPluginException] (no handler for the method at all).
+///
+/// This is not "no such session": a method a platform implements answers null
+/// or false for a session it doesn't have.
+bool isCefUnsupported(Object error) =>
+    error is MissingPluginException ||
+    (error is PlatformException && error.code == kCefUnsupportedCode);
+
 /// The interface that platform-specific implementations of `flutter_cef` must
 /// implement to be endorsed (macOS and Windows today).
 ///
@@ -48,6 +62,56 @@ abstract class FlutterCefPlatform extends PlatformInterface {
   /// communicate over. See `PORTING.md` for the full method + event + IPC
   /// protocol.
   static const String channelName = 'flutter_cef';
+
+  /// Every method the app-facing side calls over [channel]: one per typed
+  /// method below. A native plugin dispatches on these names; a test checks
+  /// the macOS and Windows dispatch against this list, so a renamed or missing
+  /// verb fails there rather than being silently ignored. A platform that
+  /// doesn't implement one answers with a [kCefUnsupportedCode] error.
+  static const List<String> methodNames = <String>[
+    'create',
+    'dispose',
+    'freezeSession',
+    'thawSession',
+    'setVisible',
+    'resize',
+    'setFrameInterval',
+    'setAudioMuted',
+    'sessionStats',
+    'getFrameSurface',
+    'navigate',
+    'loadTrusted',
+    'loadAuthored',
+    'reload',
+    'stop',
+    'goBack',
+    'goForward',
+    'setZoomLevel',
+    'find',
+    'stopFind',
+    'openAuthWindow',
+    'showDevTools',
+    'executeJavaScript',
+    'evalReturning',
+    'addJavaScriptChannel',
+    'respondJsDialog',
+    'chooseContextMenu',
+    'respondMediaRequest',
+    'setMediaSetting',
+    'setCookie',
+    'clearCookies',
+    'visitCookies',
+    'deleteCookie',
+    'pointer',
+    'key',
+    'editCommand',
+    'imeSetComposition',
+    'imeCommitText',
+    'imeCancelComposition',
+    'showEmojiPicker',
+    'enableAgentControl',
+    'disableAgentControl',
+  ];
 
   /// The channel the protocol runs over. The default returns
   /// `MethodChannel(channelName)`; a platform only overrides this if it needs a
@@ -142,7 +206,9 @@ abstract class FlutterCefPlatform extends PlatformInterface {
   Future<void> setAudioMuted(String sessionId, bool muted) =>
       _call('setAudioMuted', sessionId, {'muted': muted});
 
-  /// Pixel-liveness counters, or null when there is no such session.
+  /// Pixel-liveness counters, or null when there is no such session. A
+  /// platform that doesn't report them throws (see [isCefUnsupported]) rather
+  /// than answering null.
   Future<CefSessionStats?> sessionStats(String sessionId) async {
     final raw = await _callMap('sessionStats', sessionId);
     if (raw == null) return null;

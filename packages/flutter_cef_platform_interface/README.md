@@ -5,7 +5,7 @@ The common platform interface for the
 
 It holds the shared Dart types (`CefCookie`, `CefLoadError`, the input
 mappings, …) and the `FlutterCefPlatform` contract that each platform
-implementation (macOS today, Windows / Linux later) speaks. The cross-platform
+implementation (macOS and Windows) speaks. The cross-platform
 contract is the method-channel protocol — see
 [`PORTING.md`](https://github.com/FlutterFlow/flutter_cef/blob/main/PORTING.md).
 

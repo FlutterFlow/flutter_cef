@@ -718,7 +718,7 @@ void main() {
     // create() so the host binds it to the now-attached browser; if this re-send
     // is dropped, the window.<name> shim is never injected and page->host messages
     // die — the exact B->A Campus regression. (Native end-to-end delivery on a
-    // real cef_host is covered by test/run_channel_integration.sh.)
+    // real cef_host is covered by the channel probes in tool/run_probes.sh.)
     final c = CefWebController(sessionId: 'prech');
     await c.addJavaScriptChannel('Early', onMessageReceived: (_) {});
     log.clear();
@@ -1529,6 +1529,375 @@ void main() {
       expect(await c.create(url: 'about:blank', width: 1, height: 1), isNull);
       expect(log.where((m) => m.method == 'create'), isEmpty);
       expect(c.state.value, CefSessionState.disposed);
+    });
+  });
+
+  group('robustness', () {
+    List<Map<String, dynamic>> argsOf(String method) => log
+        .where((m) => m.method == method)
+        .map((m) => (m.arguments as Map).cast<String, dynamic>())
+        .toList();
+
+    Future<List<FlutterErrorDetails>> collectErrors(
+        Future<void> Function() body) async {
+      final errors = <FlutterErrorDetails>[];
+      final prev = FlutterError.onError;
+      FlutterError.onError = errors.add;
+      try {
+        await body();
+      } finally {
+        FlutterError.onError = prev;
+      }
+      return errors;
+    }
+
+    test('a throwing onCreateFailed and onProcessGone are both reported',
+        () async {
+      final c = CefWebController(sessionId: 'rb-both');
+      await c.create(url: 'about:blank', width: 1, height: 1);
+      c.onCreateFailed = (_) => throw StateError('create bug');
+      c.onProcessGone = (_) => throw StateError('gone bug');
+      final errors = await collectErrors(
+          () => emit('rb-both', 'processGone', {'reason': 'createFailed'}));
+      expect(errors.map((e) => '${e.exception}'),
+          containsAll(['Bad state: create bug', 'Bad state: gone bug']));
+      await c.dispose();
+    });
+
+    test('a throwing callback does not stop later events', () async {
+      final c = CefWebController(sessionId: 'rb-later');
+      await c.create(url: 'about:blank', width: 1, height: 1);
+      c.onUrlChange = (_) => throw StateError('url bug');
+      final errors = await collectErrors(() async {
+        await emit('rb-later', 'url', {'url': 'https://a.test/'});
+        await emit('rb-later', 'title', {'title': 'after'});
+      });
+      expect(errors, hasLength(1));
+      expect(c.url.value, 'https://a.test/');
+      expect(c.title.value, 'after');
+      await c.dispose();
+    });
+
+    test('with no handler, confirm is OK and prompt returns its default',
+        () async {
+      // An app that shows no dialog UI must not silently cancel every
+      // confirm-gated action a user starts in the page.
+      final c = CefWebController(sessionId: 'rb-dlg');
+      await c.create(url: 'about:blank', width: 1, height: 1);
+      await emit('rb-dlg', 'jsDialog',
+          {'id': 1, 'type': 1, 'message': 'Discard changes?'});
+      await emit('rb-dlg', 'jsDialog',
+          {'id': 2, 'type': 2, 'message': 'name?', 'defaultText': 'x'});
+      await emit('rb-dlg', 'jsDialog', {'id': 3, 'type': 0, 'message': 'hi'});
+      await pumpEventQueue();
+      final byId = {for (final a in argsOf('respondJsDialog')) a['id']: a};
+      expect(byId[1]!['ok'], true);
+      expect(byId[2]!['ok'], true);
+      expect(byId[2]!['text'], 'x');
+      expect(byId[3]!['ok'], true, reason: 'an alert is just dismissed');
+      await c.dispose();
+    });
+
+    test('<base href> goes after <head>, never inside <header>', () async {
+      final c = CefWebController(sessionId: 'rb-base');
+      String loaded() {
+        final url = argsOf('loadTrusted').last['url'] as String;
+        return utf8.decode(base64Decode(url.split('base64,').last));
+      }
+
+      await c.loadHtmlString('<header class="h"><a href="x">x</a></header>',
+          baseUrl: 'file:///site/');
+      expect(loaded(),
+          '<base href="file:///site/"><header class="h"><a href="x">x</a></header>');
+      await c.loadHtmlString('<HEAD lang="en"><header></header>',
+          baseUrl: 'file:///site/');
+      expect(loaded(),
+          '<HEAD lang="en"><base href="file:///site/"><header></header>');
+      await c.dispose();
+    });
+
+    test('thaw(html:) keeps the origin the session was created at', () async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        log.add(call);
+        return switch (call.method) {
+          'create' => <String, dynamic>{'textureId': 7},
+          'freezeSession' => true,
+          'thawSession' => <String, dynamic>{'textureId': 7},
+          _ => null,
+        };
+      });
+      final c = CefWebController(sessionId: 'rb-thaw');
+      await c.create(
+          url: 'about:blank',
+          width: 1,
+          height: 1,
+          html: '<p>1</p>',
+          htmlBaseUrl: 'https://app.example/');
+      expect(await c.freeze(), isTrue);
+      log.clear();
+      expect(await c.thaw(html: '<p>2</p>'), isTrue);
+      expect(log.map((m) => m.method), ['loadAuthored', 'thawSession'],
+          reason: 'the document is staged on the session before the browser '
+              'is recreated at its URL');
+      expect(argsOf('loadAuthored').single, {
+        'sessionId': 'rb-thaw',
+        'url': 'https://app.example/',
+        'html': '<p>2</p>'
+      });
+      expect(argsOf('thawSession').single['url'], 'https://app.example/');
+
+      // Without an http(s) origin it stays a data: URL, now with <base href>.
+      debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+      expect(await c.freeze(), isTrue);
+      log.clear();
+      expect(await c.thaw(html: '<p>3</p>'), isTrue);
+      final url = argsOf('thawSession').single['url'] as String;
+      expect(utf8.decode(base64Decode(url.split('base64,').last)),
+          '<base href="https://app.example/"><p>3</p>');
+      await c.dispose();
+    });
+
+    test('freeze fails pending evals and cookies; thaw passes the url',
+        () async {
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        log.add(call);
+        return switch (call.method) {
+          'create' => <String, dynamic>{'textureId': 7},
+          'freezeSession' => true,
+          'thawSession' => <String, dynamic>{'textureId': 7},
+          _ => null,
+        };
+      });
+      final c = CefWebController(sessionId: 'rb-freeze');
+      await c.create(url: 'about:blank', width: 1, height: 1);
+      final eval =
+          expectLater(c.runJavaScriptReturningResult('1'), throwsStateError);
+      final cookies = expectLater(c.getCookies(), throwsStateError);
+      expect(await c.freeze(), isTrue);
+      await eval;
+      await cookies;
+      await expectLater(c.runJavaScriptReturningResult('1'), throwsStateError);
+      expect(await c.thaw(url: 'https://now.test/'), isTrue);
+      expect(argsOf('thawSession').single['url'], 'https://now.test/');
+      await c.dispose();
+    });
+
+    test('a thaw the platform refuses leaves the session frozen', () async {
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        log.add(call);
+        return switch (call.method) {
+          'create' => <String, dynamic>{'textureId': 7},
+          'freezeSession' => true,
+          _ => null, // thawSession: nothing to thaw
+        };
+      });
+      final c = CefWebController(sessionId: 'rb-nothaw');
+      await c.create(url: 'about:blank', width: 1, height: 1);
+      await c.freeze();
+      expect(await c.thaw(), isFalse);
+      expect(c.state.value, CefSessionState.frozen);
+      await c.dispose();
+    });
+
+    test('a controller reusing a live id keeps it when the old one is disposed',
+        () async {
+      final old = CefWebController(sessionId: 'rb-dup');
+      await old.create(url: 'about:blank', width: 1, height: 1);
+      final fresh = CefWebController(sessionId: 'rb-dup');
+      await fresh.create(url: 'about:blank', width: 1, height: 1);
+      log.clear();
+      await old.dispose();
+      expect(argsOf('dispose'), isEmpty,
+          reason: "the native session is the new controller's now");
+      await emit('rb-dup', 'title', {'title': 'still here'});
+      expect(fresh.title.value, 'still here',
+          reason: 'events keep reaching the new controller');
+      await fresh.dispose();
+      expect(argsOf('dispose'), hasLength(1));
+    });
+
+    test('an unsupported sessionStats throws; it is not "no such session"',
+        () async {
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        log.add(call);
+        if (call.method == 'create') return <String, dynamic>{'textureId': 7};
+        if (call.method == 'sessionStats' || call.method == 'getFrameSurface') {
+          throw PlatformException(code: 'unsupported', message: 'not here');
+        }
+        return null;
+      });
+      final c = CefWebController(sessionId: 'rb-uns-stats');
+      await c.create(url: 'about:blank', width: 1, height: 1);
+      Object? error;
+      try {
+        await c.sessionStats();
+      } catch (e) {
+        error = e;
+      }
+      expect(error, isA<PlatformException>());
+      expect(isCefUnsupported(error!), isTrue);
+      await c.dispose();
+    });
+
+    test('unsupported freeze returns false; unsupported hints are no-ops',
+        () async {
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        log.add(call);
+        if (call.method == 'create') return <String, dynamic>{'textureId': 7};
+        if (const {'freezeSession', 'setAudioMuted', 'setFrameInterval'}
+            .contains(call.method)) {
+          throw PlatformException(code: kCefUnsupportedCode);
+        }
+        if (call.method == 'showEmojiPicker') throw MissingPluginException();
+        if (call.method == 'setMediaSetting') {
+          throw PlatformException(code: 'boom');
+        }
+        return null;
+      });
+      final c = CefWebController(sessionId: 'rb-uns');
+      await c.create(url: 'about:blank', width: 1, height: 1);
+      expect(await c.freeze(), isFalse);
+      expect(c.state.value, CefSessionState.live);
+      await expectLater(c.setAudioMuted(true), completes);
+      await expectLater(c.setFrameInterval(33), completes);
+      // A call that does something the caller asked for still fails loudly,
+      // and so does any other error.
+      await expectLater(
+          c.showEmojiPicker(), throwsA(isA<MissingPluginException>()));
+      await expectLater(c.setMediaSetting(CefMediaSetting.allow),
+          throwsA(isA<PlatformException>()));
+      await c.dispose();
+    });
+
+    test('isCefUnsupported recognises only the unsupported answers', () {
+      expect(isCefUnsupported(PlatformException(code: 'unsupported')), isTrue);
+      expect(isCefUnsupported(MissingPluginException()), isTrue);
+      expect(
+          isCefUnsupported(PlatformException(code: 'spawn_failed')), isFalse);
+      expect(isCefUnsupported(StateError('x')), isFalse);
+    });
+
+    test('sessionStats, getFrameSurface and onSurface decode the platform',
+        () async {
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        log.add(call);
+        return switch (call.method) {
+          'create' => <String, dynamic>{'textureId': 7},
+          'sessionStats' => <String, dynamic>{
+              'presentCount': 12,
+              'lastPresentAgoMs': 40,
+              'firstPresentSeen': true,
+              'frozen': false,
+            },
+          'getFrameSurface' => <String, dynamic>{
+              'surfaceId': 99,
+              'width': 640,
+              'height': 480,
+            },
+          _ => null,
+        };
+      });
+      final c = CefWebController(sessionId: 'rb-stats');
+      await c.create(url: 'about:blank', width: 1, height: 1);
+      final st = (await c.sessionStats())!;
+      expect(st.presentCount, 12);
+      expect(st.lastPresentAgoMs, 40);
+      expect(st.firstPresentSeen, isTrue);
+      expect(st.frozen, isFalse);
+      final surf = (await c.getFrameSurface())!;
+      expect((surf.surfaceId, surf.width, surf.height), (99, 640, 480));
+      CefSurfaceInfo? pushed;
+      c.onSurface = (i) => pushed = i;
+      await emit(
+          'rb-stats', 'onSurface', {'surfaceId': 5, 'width': 10, 'height': 20});
+      expect((pushed!.surfaceId, pushed!.width, pushed!.height), (5, 10, 20));
+      await c.dispose();
+    });
+
+    test('a platform with no such session answers null stats', () async {
+      final c = CefWebController(sessionId: 'rb-nostats');
+      expect(await c.sessionStats(), isNull);
+      expect(await c.getFrameSurface(), isNull);
+      await c.dispose();
+    });
+
+    test('openAuthWindow only opens http(s) URLs', () async {
+      final c = CefWebController(sessionId: 'rb-auth');
+      for (final u in [
+        'javascript:alert(1)',
+        'data:text/html,x',
+        'file:///etc/passwd',
+        'about:blank',
+      ]) {
+        await c.openAuthWindow(u);
+      }
+      expect(argsOf('openAuthWindow'), isEmpty);
+      await c.openAuthWindow('https://accounts.example/');
+      expect(
+          argsOf('openAuthWindow').single['url'], 'https://accounts.example/');
+      await c.dispose();
+    });
+
+    test('zoomLevel follows setZoomLevel and resets with a new session',
+        () async {
+      final c = CefWebController(sessionId: 'rb-zoom');
+      await c.create(url: 'about:blank', width: 1, height: 1);
+      expect(c.zoomLevel, 0);
+      await c.setZoomLevel(1.5);
+      expect(c.zoomLevel, 1.5);
+      await emit('rb-zoom', 'processGone', {'reason': 'crashed'});
+      await c.create(url: 'about:blank', width: 1, height: 1);
+      expect(c.zoomLevel, 0);
+      await c.dispose();
+    });
+
+    testWidgets('a controller disposed while queued frees its place at once',
+        (tester) async {
+      // Closing a room with many tiles still queued used to hold every live
+      // spawn behind them: each dead waiter took its turn and a spacing gap.
+      CefWebController.maxConcurrentCreates = 1;
+      CefWebController.spawnSpacing = const Duration(seconds: 1);
+      addTearDown(() {
+        CefWebController.maxConcurrentCreates = 3;
+        CefWebController.spawnSpacing = const Duration(milliseconds: 120);
+      });
+      final started = <String>[];
+      final gate = Completer<void>();
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        if (call.method == 'create') {
+          final id = (call.arguments as Map)['sessionId'] as String;
+          started.add(id);
+          if (id == 'q-a') await gate.future;
+          return <String, dynamic>{'textureId': 1};
+        }
+        return null;
+      });
+      final a = CefWebController(sessionId: 'q-a');
+      final b = CefWebController(sessionId: 'q-b');
+      final c = CefWebController(sessionId: 'q-c');
+      final fa = a.create(url: 'about:blank', width: 1, height: 1);
+      final fb = b.create(url: 'about:blank', width: 1, height: 1);
+      final fc = c.create(url: 'about:blank', width: 1, height: 1);
+      await tester.pump();
+      expect(started, ['q-a']);
+      var bDone = false;
+      unawaited(fb.then((_) => bDone = true));
+      await b.dispose();
+      await tester.pump();
+      expect(bDone, isTrue, reason: 'b leaves the queue at once');
+      gate.complete();
+      await tester.pump(); // a's create returns; c waits one spacing gap
+      await tester.pump(const Duration(milliseconds: 1100));
+      expect(started, ['q-a', 'q-c'],
+          reason: 'c starts one gap after a, not two (b took no turn)');
+      expect(await fa, 1);
+      expect(await fb, isNull);
+      expect(await fc, 1);
+      await a.dispose();
+      await c.dispose();
+      await tester.pump(const Duration(seconds: 2));
     });
   });
 }

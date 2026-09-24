@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/services.dart';
 import 'package:flutter_cef_platform_interface/flutter_cef_platform_interface.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -289,6 +291,45 @@ void main() {
       expect(log.single.method, method);
       expect(log.single.arguments, {'sessionId': s, ...args});
     });
+  });
+
+  // The verb list is the one place the method names are written down for the
+  // native side to be checked against.
+  test('the typed methods use exactly the listed method names', () {
+    final used = {for (final (_, method, _) in cases.values) method};
+    expect(used, FlutterCefPlatform.methodNames.toSet());
+    expect(FlutterCefPlatform.methodNames.toSet(),
+        hasLength(FlutterCefPlatform.methodNames.length),
+        reason: 'a name is listed twice');
+  });
+
+  String read(String path) =>
+      File(path).readAsStringSync().replaceAll('\r\n', '\n');
+
+  test('the macOS plugin dispatches exactly the listed methods', () {
+    final src =
+        read('packages/flutter_cef_macos/macos/Classes/FlutterCefPlugin.swift');
+    final start = src.indexOf('public func handle(');
+    final end = src.indexOf('default: result(FlutterMethodNotImplemented)');
+    expect(start, isNonNegative);
+    expect(end, greaterThan(start));
+    final dispatched = RegExp(r'case "(\w+)"')
+        .allMatches(src.substring(start, end))
+        .map((m) => m[1]!)
+        .toSet();
+    expect(dispatched, FlutterCefPlatform.methodNames.toSet());
+  });
+
+  test('the Windows plugin dispatches only listed methods', () {
+    // Windows doesn't implement every verb yet; the ones it doesn't answer
+    // with an unsupported error. Any name it does dispatch must be real.
+    final src =
+        read('packages/flutter_cef_windows/windows/flutter_cef_plugin.cpp');
+    final dispatched =
+        RegExp(r'method == "(\w+)"').allMatches(src).map((m) => m[1]!).toSet();
+    expect(dispatched, isNotEmpty);
+    expect(
+        dispatched.difference(FlutterCefPlatform.methodNames.toSet()), isEmpty);
   });
 
   test('events reach the handler with their session id', () async {
