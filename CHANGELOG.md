@@ -35,6 +35,25 @@
   for 15 s (`FLUTTER_CEF_HANG_MS`) while not painting counts as hung. Idle
   static pages answer the ping and are left alone. Windows does not have this
   yet.
+* **The hang check leaves paused pages alone**: a page waiting on a JS dialog, or
+  one that may be paused in a debugger (DevTools opened, CDP or agent control
+  enabled), can't answer the ping but isn't hung, and is no longer ended as
+  `crashed`.
+* **macOS: a named profile reopened at once is no longer reported `locked`**:
+  closing a profile's last view shuts its host down, and the next host of that
+  profile could start before the old one let go of the profile's lock. The
+  plugin now waits for its own previous host and starts the new one again.
+* **macOS: the startup sweep keeps other apps' ephemeral profiles**: it removed
+  every `flutter_cef_ephem_*` dir in `$TMPDIR`, including those of other running
+  apps that use flutter_cef. Dirs now carry the owning pid and are removed only
+  once that app has exited.
+* **`processGone` ends the session**: `isCreated` turns false, a later
+  `create()` starts a new session, and `isLoading`/`mediaState` reset. A
+  throwing `onCreateFailed` no longer keeps `onProcessGone` from running, and an
+  error thrown by any event callback is reported instead of breaking the channel.
+* **`runJavaScriptReturningResult` and `getCookies` fail at once** with a
+  `StateError` when there is no session to answer (not created, disposed, gone
+  or frozen), instead of never completing.
 * **Windows**: `loadHtmlString(baseUrl:)` and create-with-html now serve the
   document at its http(s) origin, as macOS does. This means no `data:` URL and no
   2 MB cap. The Windows wire protocol is now v4.

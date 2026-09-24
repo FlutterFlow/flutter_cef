@@ -36,6 +36,7 @@ final class CefProfileHost {
   static let opEvalResult: UInt8 = 0x16       // cef_host -> us: "id:json"; the liveness ping's reply stops here
   static let opPageStart: UInt8 = 0x0a        // cef_host -> us: main-frame load started; drops an outstanding liveness ping
   static let opEvalReturning: UInt8 = 0x2a    // us -> cef_host: {u32 id}{js}; the liveness sweep's renderer-hang ping
+  static let opJsDialog: UInt8 = 0x0f         // cef_host -> us: the page opened a JS dialog; its renderer waits on it
   // Eval id of the liveness ping. Dart's eval ids count up from 0 and never reach it.
   static let livenessPingId: UInt32 = .max
   private static let livenessPingReplyPrefix = Array("\(livenessPingId):".utf8)
@@ -296,6 +297,11 @@ final class CefProfileHost {
     }
     if !allowedSchemes.isEmpty {
       args.append("--allowed-schemes=\(allowedSchemes)")
+    }
+    if agentControl || enableCdp {
+      // A CDP client can pause the page in the debugger, which the liveness ping can't
+      // tell from a hang.
+      browsersLock.lock(); cdpClientsCanPause = true; browsersLock.unlock()
     }
     if agentControl {
       // Agent-control / pipe mode: CDP rides inherited fds 3/4 (set up below in
@@ -813,6 +819,24 @@ final class CefProfileHost {
   // guarded by browsersLock. A GPU process that started after it is a replacement.
   private var firstPresentWallUs: UInt64 = 0
   private var wedgeEnded = false  // sweep-only (one pass at a time, each scheduling the next)
+  // Set at spawn when a CDP client (agent control, or the TCP port) can reach the
+  // pages; browsersLock-guarded.
+  private var cdpClientsCanPause = false
+
+  /// The page's JS dialog `bid` was answered, so its renderer runs again.
+  func noteDialogAnswered(_ bid: UInt32) {
+    browsersLock.lock()
+    if let s = browsers[bid], s.livenessDialogsOpen > 0 { s.livenessDialogsOpen -= 1 }
+    browsersLock.unlock()
+  }
+
+  /// DevTools opened on `bid`. Its debugger can pause the page for as long as the
+  /// user likes, so the liveness ping leaves that browser alone from now on.
+  func noteDevToolsOpened(_ bid: UInt32) {
+    browsersLock.lock()
+    if let s = browsers[bid] { s.livenessDevToolsOpened = true; s.livenessPingSentAt = 0 }
+    browsersLock.unlock()
+  }
 
   /// Start the periodic liveness sweep once (idempotent). Called after the reader is up.
   private func startLivenessSweep() {
@@ -838,10 +862,14 @@ final class CefProfileHost {
     // 1) Snapshot ESTABLISHED browsers + their liveness state under browsersLock.
     browsersLock.lock()
     var cands: [(bid: UInt32, sinceLast: UInt64, nudgedAt: UInt64,
-                 pingSentAt: UInt64, pingRepliedAt: UInt64)] = []
+                 pingSentAt: UInt64, pingRepliedAt: UInt64, mayPing: Bool)] = []
     for (bid, s) in browsers where s.firstPresentSeen {
+      let mayPing = LivenessProbePolicy.mayPing(
+        dialogsOpen: s.livenessDialogsOpen, devToolsOpened: s.livenessDevToolsOpened,
+        cdpClientsCanPause: cdpClientsCanPause)
+      if !mayPing { s.livenessPingSentAt = 0 }
       cands.append((bid, now &- s.lastPresentNs, s.livenessNudgedAt,
-                    s.livenessPingSentAt, s.livenessPingRepliedAt))
+                    mayPing ? s.livenessPingSentAt : 0, s.livenessPingRepliedAt, mayPing))
     }
     let firstPresentUs = firstPresentWallUs
     browsersLock.unlock()
@@ -895,7 +923,8 @@ final class CefProfileHost {
           // it, a hung renderer doesn't (checked at the top of the loop).
           if LivenessProbePolicy.pingAction(
                nowNs: now, pingSentNs: c.pingSentAt, pingRepliedNs: c.pingRepliedAt,
-               pingIntervalNs: livenessStalenessNs, hangNs: livenessHangNs) == .ping {
+               pingIntervalNs: livenessStalenessNs, hangNs: livenessHangNs) == .ping,
+             c.mayPing {
             let id = Self.livenessPingId
             var p: [UInt8] = [UInt8(id >> 24 & 0xff), UInt8(id >> 16 & 0xff),
                               UInt8(id >> 8 & 0xff), UInt8(id & 0xff)]
@@ -927,7 +956,7 @@ final class CefProfileHost {
     scheduleLivenessSweep()
   }
 
-  private func hostPid() -> pid_t {
+  func hostPid() -> pid_t {
     writeLock.lock(); defer { writeLock.unlock() }
     return process?.processIdentifier ?? spawnedPid
   }
@@ -956,6 +985,20 @@ final class CefProfileHost {
       return (pid, info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
     }
     return (0, 0)
+  }
+
+  /// Waits (polling) until `pid` has exited, for at most `timeout` seconds. Doesn't
+  /// reap it; its owner does.
+  static func waitForExit(_ pid: pid_t, timeout: TimeInterval) {
+    guard pid > 0 else { return }
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      var info = proc_bsdinfo()
+      let n = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size))
+      // Gone, or a zombie waiting to be reaped: either way it has stopped running.
+      if n != Int32(MemoryLayout<proc_bsdinfo>.size) || info.pbi_status == UInt32(SZOMB) { return }
+      usleep(50_000)
+    }
   }
 
   private static func wallClockUs() -> UInt64 {
@@ -1124,9 +1167,9 @@ final class CefProfileHost {
     if listenFd >= 0 { if readerJoined { close(listenFd) }; listenFd = -1 }
     writeLock.unlock()
     if !socketPath.isEmpty { unlink(socketPath); socketPath = "" }
-    if isEphemeral && !profileDir.isEmpty {
-      try? FileManager.default.removeItem(atPath: profileDir)
-    }
+    // The ephemeral profile dir goes once cef_host has exited, below: it writes to it
+    // until then.
+    let exitingPid = hostPid()
     // Agent-control: close OUR CDP write end first — cef_host sees EOF on fd 3
     // (DevToolsPipeHandler's disconnect signal), a clean CDP shutdown. The read
     // end can't be Darwin.shutdown()'d (that's socket-only) and closing an fd the
@@ -1140,6 +1183,13 @@ final class CefProfileHost {
     // which closes its CDP write end (fd 4) and yields EOF on cdpReadFd so the
     // CDP reader loop returns. Done before the CDP reader join for that reason.
     terminateProcess()
+    if isEphemeral && !profileDir.isEmpty {
+      let dir = profileDir
+      DispatchQueue.global().async {
+        Self.waitForExit(exitingPid, timeout: 3)
+        try? FileManager.default.removeItem(atPath: dir)
+      }
+    }
     // H1: same discipline for the CDP reader — gate on cdpReaderStarted alone, and
     // never close the read fd on a join timeout (the reader is still in read() on it).
     let cdpJoined = !cdpReaderStarted || cdpReaderDone.wait(timeout: .now() + 2) == .success
@@ -1370,7 +1420,13 @@ final class CefProfileHost {
           s.lastPresentNs = DispatchTime.now().uptimeNanoseconds
           s.livenessNudgedAt = 0
         } else if op == Self.opPageStart, let s = session {
-          // The ping's reply can be lost with the document it ran in.
+          // The ping's reply can be lost with the document it ran in, and a navigation
+          // dismisses the page's dialogs.
+          s.livenessPingSentAt = 0
+          s.livenessDialogsOpen = 0
+        } else if op == Self.opJsDialog, let s = session {
+          // The renderer waits on the dialog, so it can't answer the ping until then.
+          s.livenessDialogsOpen += 1
           s.livenessPingSentAt = 0
         }
         browsersLock.unlock()
