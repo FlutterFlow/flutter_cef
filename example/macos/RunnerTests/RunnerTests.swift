@@ -6,7 +6,7 @@ import XCTest
 
 // Unit test for the macOS plugin's method-channel dispatcher. Real end-to-end
 // behavior (rendering, JS channels, CDP) is covered by the example probes +
-// test/run_channel_integration.sh against a real cef_host; this only checks the
+// tool/run_probes.sh against a real cef_host; this only checks the
 // dispatcher's default path, which needs no live host.
 class RunnerTests: XCTestCase {
   func testUnknownVerbReturnsNotImplemented() {

@@ -14,16 +14,15 @@
 #
 #   FLUTTER_CEF_HOST=/path/to/cef_host.app/Contents/MacOS/cef_host ./run_conformance_oracle.sh
 #
-# Requires a built cef_host (see `make cef-host`; rm build/cef_host/.flutter_cef_ref after a
-# native edit so it actually rebuilds). Honors HARNESS_N (default 9) and SOAK_SECONDS (default 55,
+# Requires a built cef_host (packages/flutter_cef_macos/native/build_cef_host.sh).
+# Honors HARNESS_N (default 9) and SOAK_SECONDS (default 55,
 # enough for the auto-cycle to traverse every storm phase at least once).
 set -uo pipefail
 
 HOST="${FLUTTER_CEF_HOST:?set FLUTTER_CEF_HOST to a built cef_host binary}"
 [ -x "$HOST" ] || { echo "FAIL: FLUTTER_CEF_HOST not executable: $HOST"; exit 2; }
 DIR="$(cd "$(dirname "$0")" && pwd)"
-ENGINE="$(cd "$DIR/../../.." && pwd)/work_canvas/scripts/campus-flutter-engine.sh"
-[ -x "$ENGINE" ] || ENGINE="flutter"  # fallback to PATH flutter
+ENGINE="${FLUTTER:-flutter}"
 SOAK="${SOAK_SECONDS:-55}"
 LOGDIR="$(mktemp -d)"; LOG="$LOGDIR/conformance.log"; : > "$LOG"
 
@@ -32,7 +31,7 @@ echo "[oracle] driving conformance_harness HARD for ${SOAK}s…"
 pkill -f "flutter_cef_example" 2>/dev/null; sleep 1
 ( cd "$DIR" && FLUTTER_CEF_HOST="$HOST" FLUTTER_CEF_ALLOW_INSECURE_PROFILE=1 \
     FLUTTER_CEF_DEBUG=1 FLUTTER_CEF_DIAGPX_EVERY=6 HARNESS_HARD=1 HARNESS_N="${HARNESS_N:-9}" \
-    "$ENGINE" run -d macos -t lib/conformance_harness.dart >> "$LOG" 2>&1 ) &
+    $ENGINE run -d macos -t lib/conformance_harness.dart >> "$LOG" 2>&1 ) &
 RUNPID=$!
 
 # Wait for first paint (build can take minutes), then soak through the storm cycle.

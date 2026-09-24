@@ -2,12 +2,12 @@
 
 `flutter_cef` embeds a live Chromium browser (via the
 [Chromium Embedded Framework](https://bitbucket.org/chromiumembedded/cef/)) as a
-Flutter `Texture` on **macOS 12+**. This guide covers the repo layout, building
+Flutter `Texture` on **macOS 12+** (Apple silicon) and **Windows 10+** (x64). This guide covers the repo layout, building
 the native renderer, and running the same checks CI does before you open a PR.
 
 ## Package layout (federated plugin)
 
-The repo is a federated plugin — three packages, consumed from source (path /
+The repo is a federated plugin — four packages, consumed from source (path /
 git), not yet from pub.dev:
 
 | Package | Path | What it is |
@@ -15,12 +15,13 @@ git), not yet from pub.dev:
 | `flutter_cef` | repo root (`lib/`, `pubspec.yaml`) | The app-facing API: `CefWebView`, `CefWebController`. Re-exports the platform interface. |
 | `flutter_cef_platform_interface` | `packages/flutter_cef_platform_interface` | The shared Dart types + the method-channel contract every platform implementation speaks. No native code. Breaking changes here require a major bump + a coordinated update of all implementations. |
 | `flutter_cef_macos` | `packages/flutter_cef_macos` | The endorsed macOS implementation: the Swift host plugin (`FlutterCefPlugin`), the `cef_host` subprocess sources + build, the CDP relay, and the bundling tooling. |
+| `flutter_cef_windows` | `packages/flutter_cef_windows` | The endorsed Windows implementation: the C++ plugin, the Windows `cef_host` (built by CMake during `flutter build windows`), the CDP relay, and `PROTOCOL.md`. |
 
 The root `flutter_cef` package depends on both siblings via `path:` and endorses
-`flutter_cef_macos` as the macOS `default_package`, so a plain dependency on
-`flutter_cef` pulls in macOS support automatically. `example/` is a full browser
+`flutter_cef_macos` and `flutter_cef_windows` as the `default_package` for
+their platforms, so a plain dependency on `flutter_cef` pulls in both. `example/` is a full browser
 chrome (URL bar, back/forward/reload, loading bar, live title) plus the
-integration probes (`example/lib/*.dart`).
+real-host probes (`example/lib/*_probe.dart`).
 
 A new platform is a sibling `flutter_cef_<os>` package — see
 [`PORTING.md`](PORTING.md) for the contract and seam map.
@@ -32,7 +33,7 @@ source. `pub publish` rejects path deps, so **if/when we publish, publish
 bottom-up**:
 
 1. `flutter_cef_platform_interface`
-2. `flutter_cef_macos`
+2. `flutter_cef_macos` and `flutter_cef_windows`
 3. `flutter_cef` (root)
 
 At each step, swap the sibling `path:` deps for hosted caret constraints and keep
@@ -116,7 +117,7 @@ hand.
 CI (`.github/workflows/ci.yaml`, `macos-14`, Flutter **3.38.8 / stable**) runs
 the steps below in order. Reproduce them all before pushing.
 
-> CI pins Flutter to **3.38.8** — the version the primary consumer (work_canvas)
+> CI pins Flutter to **3.38.8** — the version the primary consumer
 > ships against — not floating `stable`. Floating stable breaks CI whenever the
 > framework adds an interface method the pinned engine doesn't carry. Use the
 > same version locally if you hit an analyzer/`TextInputClient` mismatch.
@@ -140,42 +141,44 @@ flutter analyze
 flutter test
 ```
 
-### 3. CDP isolation filter tests (security keystone)
+### 3. Swift tests
 
-The per-tile CDP Target-domain isolation filter is the security boundary that
-confines an agent-controlled tile to its own target. `CdpRelay.swift` uses only
-system frameworks, so the suite compiles + runs with `swiftc` directly — no
-Xcode/CocoaPods harness:
-
-```sh
-./packages/flutter_cef_macos/test/run_filter_tests.sh
-```
-
-A regression here once shipped unnoticed precisely because CI wasn't running it —
-**do not skip it** when touching `CdpRelay.swift` or the filter.
-
-### 4. Real-host integration probes (not in CI — run before bumping a consumer pin)
-
-The Dart `integration_test` mocks the host method channel, so it cannot catch
-native channel-delivery or CDP-relay regressions (that's how the shared-host
-page→host channel bug shipped). These probes drive the **real** `cef_host`
-headless and assert a `/tmp` JSON result:
+The plugin's pure-logic pieces (the CDP isolation filter, the liveness and
+resize policies) use only system frameworks, so each suite compiles and runs
+with `swiftc` directly, with no Xcode or CocoaPods harness. CI runs every
+`run_*.sh` in the test folder:
 
 ```sh
-./test/run_channel_integration.sh                       # all probes
-./test/run_channel_integration.sh channel_probe_shared  # just one
+for t in packages/flutter_cef_macos/test/run_*.sh; do "$t" || break; done
 ```
 
-Probes (`example/lib/`):
-- `channel_probe` — single ephemeral host: page→host JS channel delivers.
-- `channel_probe_shared` — two sessions on one shared host: channel delivers +
-  routes per-session (the B→A regression).
-- `multiview_probe` — agent-control / CDP relay isolation on a shared host.
+The CDP filter suite (`run_filter_tests.sh`) guards the boundary that confines
+an agent-controlled tile to its own target; a regression there once shipped
+because CI didn't run it.
 
-The runner builds an ad-hoc `cef_host` if `$FLUTTER_CEF_HOST` is unset, and sets
-`FLUTTER_CEF_ALLOW_INSECURE_PROFILE=1` so the shared-host probes get a real
-shared host (an ad-hoc host otherwise downgrades named profiles to ephemeral,
-masking the very regression they guard).
+### 4. Real-host probes (not in CI; run before bumping a consumer pin)
+
+The Dart tests mock the method channel, so they can't catch a regression in the
+plugin, `cef_host` or the wire between them. The probes in `example/lib` are app
+entry points that drive a real `cef_host` and report PASS or FAIL:
+
+```sh
+tool/run_probes.sh                 # every automatic probe (about 20 minutes)
+tool/run_probes.sh page_boundary   # just one (prefix match)
+tool/run_probes.sh --list          # what each probe checks, including manual ones
+```
+
+It tests the host at `$FLUTTER_CEF_HOST`, or the one `build_cef_host.sh` built.
+Probes that open a named profile need a signed host and are skipped on an
+ad-hoc one. Run the probes that cover the code you touched, and the whole set
+for any native change. A new probe prints `CEF_PROBE_RESULT PASS|FAIL` and gets
+a row in the script's table.
+
+Longer gates for the rendering pipeline, run by hand after changing surface or
+pacing code: `test/run_cascade_probe.sh` (many tiles created at once all
+paint), `example/run_conformance_oracle.sh` (no wrong-size or blank frames
+under resize, zoom and cull storms) and `example/run_leak_soak.sh` (surfaces
+and memory stay bounded under recreate churn).
 
 ## Coding conventions
 
@@ -199,10 +202,10 @@ masking the very regression they guard).
 
 ## Pull requests
 
-- Run all four check stages above (analyze ×4, `flutter test`,
-  `run_filter_tests.sh`, and — for anything touching native delivery or the
-  relay — `run_channel_integration.sh`).
+- Run the check stages above: analyze, `flutter test`, the Swift suites, and,
+  for anything touching native code or the relay, `tool/run_probes.sh`.
 - Add a `CHANGELOG.md` entry.
-- If you change the wire protocol, update both `flutter_cef_platform_interface`
-  and `flutter_cef_macos` in the same PR, and note any pin-bump implications for
-  consumers.
+- If you change the wire protocol, change `tool/protocol/spec.dart`, regenerate,
+  and update every platform that speaks the changed opcodes in the same PR. A
+  macOS protocol change also needs a new prebuilt (`make publish-cef-host`)
+  before consumers can repin.

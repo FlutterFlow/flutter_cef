@@ -1,9 +1,9 @@
 # Porting flutter_cef to a new platform
 
-`flutter_cef` is a **federated** Flutter plugin. macOS ships today
-(`flutter_cef_macos`); Windows and Linux can be added as sibling
-implementation packages without touching the app-facing API or the macOS
-implementation. CEF itself is cross-platform — the work is re-implementing the
+`flutter_cef` is a **federated** Flutter plugin. macOS (`flutter_cef_macos`)
+and Windows (`flutter_cef_windows`) ship today; Linux can be added as a sibling
+implementation package without touching the app-facing API or the existing
+implementations. CEF itself is cross-platform — the work is re-implementing the
 thin platform glue around it.
 
 ```
@@ -11,7 +11,8 @@ flutter_cef/                         # app-facing package (re-exports the API)
   packages/
     flutter_cef_platform_interface/  # the shared Dart contract (no platform code)
     flutter_cef_macos/               # the macOS implementation (reference)
-    flutter_cef_windows/  _linux/    # <- you add these
+    flutter_cef_windows/
+    flutter_cef_linux/    # <- you add this
 ```
 
 ## 1. The Dart / package side (small)
@@ -62,7 +63,7 @@ lives in the Flutter app's process and:
   re-mints) the shared surface itself and announces it to the host via
   `opPresent` frames carrying `{surface-id, srcW, srcH}` (the host promotes a
   frame only when its dims match the expected size — see
-  `docs/OSR_SCALE_MISMATCH.md`). `--profile-dir` is always passed; a
+  `docs/history/OSR_SCALE_MISMATCH.md`). `--profile-dir` is always passed; a
   persistent (named) profile points it at a stable cache dir, while an ephemeral
   profile points it at a unique throwaway temp dir and adds `--ephemeral` (so the
   host's CDP / mock-keychain guards fire only for a real persistent profile —

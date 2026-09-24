@@ -16,8 +16,7 @@ set -uo pipefail
 HOST="${FLUTTER_CEF_HOST:?set FLUTTER_CEF_HOST to a built cef_host binary}"
 [ -x "$HOST" ] || { echo "FAIL: FLUTTER_CEF_HOST not executable: $HOST"; exit 2; }
 DIR="$(cd "$(dirname "$0")" && pwd)"
-ENGINE="$(cd "$DIR/../../.." && pwd)/work_canvas/scripts/campus-flutter-engine.sh"
-[ -x "$ENGINE" ] || ENGINE="flutter"
+ENGINE="${FLUTTER:-flutter}"
 SOAK="${SOAK_SECONDS:-100}"
 RSS_CEILING_MULT="${RSS_CEILING_MULT:-1.5}"   # post-warmup RSS may not exceed baseline x this
 LOGDIR="$(mktemp -d)"; LOG="$LOGDIR/leak.log"; : > "$LOG"
@@ -25,7 +24,7 @@ LOGDIR="$(mktemp -d)"; LOG="$LOGDIR/leak.log"; : > "$LOG"
 echo "[leak] cef_host: $HOST"
 pkill -f "flutter_cef_example" 2>/dev/null; sleep 1
 ( cd "$DIR" && FLUTTER_CEF_HOST="$HOST" FLUTTER_CEF_ALLOW_INSECURE_PROFILE=1 FLUTTER_CEF_DEBUG=1 \
-    "$ENGINE" run -d macos -t lib/recreate_soak_probe.dart >> "$LOG" 2>&1 ) &
+    $ENGINE run -d macos -t lib/recreate_soak_probe.dart >> "$LOG" 2>&1 ) &
 
 # Wait for establishment (build can take minutes).
 for _ in $(seq 1 90); do grep -q "FIRSTPAINT\|BUILD FAILED\|: error:" "$LOG" && break; sleep 4; done

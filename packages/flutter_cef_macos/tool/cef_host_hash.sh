@@ -2,9 +2,9 @@
 # Deterministic content hash of the cef_host build inputs.
 #
 # Sourced by BOTH fetch_cef_host.sh (consumer, at pod install) and
-# publish-cef-host.sh (CI) so they ALWAYS compute the same digest from the same
-# source tree — that digest is the GCS object key, so any drift here is a silent
-# cache miss. Prints a 64-hex digest to stdout.
+# publish-cef-host.sh (make publish-cef-host) so they ALWAYS compute the same
+# digest from the same source tree — that digest names the GitHub release
+# (cef-host-<digest>), so any drift here is a silent cache miss. Prints a 64-hex digest to stdout.
 #
 # Inputs = native/build_cef_host.sh (carries CEF_VERSION + the CEF dist sha pin +
 # the signing/adhoc defaults) + every source file under native/cef_host/
@@ -29,10 +29,10 @@ cef_host_input_hash() {
   # proprietary codecs). The framework BYTES are NOT hashed here (only CEF_VERSION
   # is, transitively via build_cef_host.sh) -- so WITHOUT this, a patched framework
   # shipped under the same CEF_VERSION would collide with the stock content hash:
-  # publish-cef-host would idempotent-skip, cef-doctor would pass on the OLD stock
-  # object, and every consumer would silently fetch the UNPATCHED framework. Folding
-  # the variant into the digest gives a patched build a DISTINCT GCS key. Read from
-  # a version-controlled marker file so publish (CI) and fetch (pod install) agree.
+  # publish-cef-host would idempotent-skip on the OLD stock release, and every
+  # consumer would silently fetch the UNPATCHED framework. Folding the variant into
+  # the digest gives a patched build a DISTINCT release. Read from a
+  # version-controlled marker file so publish and fetch (pod install) agree.
   # Emitted ONLY when non-stock, so the stock digest is byte-identical to before
   # (no republish of the existing stock host required).
   local variant="stock"

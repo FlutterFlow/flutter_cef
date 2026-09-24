@@ -1,11 +1,11 @@
 # CEF Off-Screen-Rendering Visibility / Resize / Cull / Lifecycle Audit
 
 Repos:
-- **flutter_cef** = `/Users/wenkaifan/.pub-cache/git/flutter_cef-c29b93f39b74be493f726130ae524e39c374ff66`
+- **flutter_cef** = flutter_cef at `c29b93f`
   - native = `packages/flutter_cef_macos/native/cef_host/main.mm`
   - swift = `packages/flutter_cef_macos/macos/Classes/{CefWebSession,CefProfileHost,FlutterCefPlugin}.swift`
   - dart = `lib/src/{cef_web_view,cef_web_controller}.dart`
-- **Campus** = `/Users/wenkaifan/Dev/work_canvas_agentui_test` (HEAD `de0f9458`, pins flutter_cef `c29b93f`)
+- **Campus** = the Campus app at `de0f9458` (pins flutter_cef `c29b93f`)
 
 ---
 

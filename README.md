@@ -2,7 +2,7 @@
 
 Embed a **live Chromium browser** (via the [Chromium Embedded Framework](https://bitbucket.org/chromiumembedded/cef/)) as a Flutter widget — rendered into a `Texture`, so it composites, transforms, clips, and zooms like any other widget, and **keeps rendering even when off-screen / not focused**. Pointer, scroll, and trackpad two-finger pans are forwarded by coordinate (pans are caught even when an ancestor opts into Flutter's trackpad gesture API, as canvas hosts do), and keyboard input reaches the page as real `keydown → keypress → keyup` events (Enter activates a focused button / submits a form, Space toggles a checkbox) — including platform IME composition for CJK / emoji and the ⌃⌘Space emoji picker. Text input is bound to the hosting `FlutterView` (as `EditableText` does), so it **works in multi-view / multi-window apps**; the page cursor drives a `MouseRegion`.
 
-> Status: **experimental, macOS 12+ only** (CEF 144 runtime floor). Real Chromium (any site — JS/CSS/WebGL/video). **Multi-process by default** (GPU-accelerated OSR — `OnAcceleratedPaint` GPU compositing into a shared IOSurface, Retina-crisp; renderer/utility crashes isolated, so heavy SPAs like Google sign-in render and survive); `CEF_MULTI_PROCESS=OFF packages/flutter_cef_macos/native/build_cef_host.sh` for the simpler single-process build. No mobile (iOS bans third-party engines); desktop by nature.
+> Status: **experimental.** macOS 12+ on Apple silicon (the prebuilt `cef_host` is arm64 only; Intel Macs must build it from source) and Windows 10+ x64. CEF 144. Real Chromium (any site — JS/CSS/WebGL/video). **Multi-process by default** (GPU-accelerated OSR — `OnAcceleratedPaint` GPU compositing into a shared IOSurface, Retina-crisp; renderer/utility crashes isolated, so heavy SPAs like Google sign-in render and survive); `CEF_MULTI_PROCESS=OFF packages/flutter_cef_macos/native/build_cef_host.sh` for the simpler single-process build. No mobile (iOS bans third-party engines); desktop by nature.
 
 ```dart
 import 'package:flutter_cef/flutter_cef.dart';
@@ -79,22 +79,38 @@ bar, live title).
 
 ```
 Dart  CefWebView + CefWebController   (MethodChannel "flutter_cef")
-  → macOS plugin (FlutterCefPlugin / CefWebSession):
-      allocates a global IOSurface + CVPixelBuffer, registers a FlutterTexture,
-      spawns one cef_host.app per view, relays input + cursor over a Unix socket
-  → cef_host.app: CEF windowless (OSR), multi-process — the GPU/Viz process
-      composites the page and hands OnAcceleratedPaint a shared-texture
-      IOSurface, which cef_host copies into the host-shared IOSurface →
-      "present" → the texture re-samples. (OnPaint software blit is the
-      single-process fallback.)
+  → platform plugin (flutter_cef_macos / flutter_cef_windows):
+      registers a Flutter texture per view, spawns one cef_host process per
+      profile or host group (every view in it shares that process), and relays
+      input, cursor and page events over a private socket (macOS) or named
+      pipe (Windows)
+  → cef_host: CEF windowless (OSR), multi-process. The GPU process composites
+      each page and hands OnAcceleratedPaint a shared texture, which cef_host
+      copies into a surface it owns:
+        macOS    an IOSurface, sent to the plugin as a Mach port (not a global
+                 id, so other processes can't read the pixels)
+        Windows  a D3D11 shared texture
+      then sends "present" and the Flutter texture re-samples.
 ```
+
+The wire protocol between the plugin and `cef_host` is defined once, in
+`tool/protocol/spec.dart`, and documented in
+[PROTOCOL.md](packages/flutter_cef_windows/native/cef_host/PROTOCOL.md).
 
 Same pattern JCEF (JetBrains) and CefSharp use to render Chromium into a non-native toolkit — adapted to Flutter's `Texture` + `IOSurface`.
 
 ## Building
 
-CEF (~200 MB) is **fetched**, not vendored. Build the renderer once (needs
-`cmake` + `ninja` — `brew install cmake ninja`):
+**Using the package:** nothing to build. On macOS, `pod install` downloads the
+prebuilt `cef_host.app` that matches this checkout's native sources (a GitHub
+release tagged `cef-host-<input hash>`) and the build embeds it in your app.
+Windows fetches the CEF distribution and builds `cef_host` during `flutter
+build windows`.
+
+**Working on the native code (macOS):** CEF (~200 MB) is fetched, not
+vendored. Build the renderer yourself (needs `cmake` + `ninja` — `brew install
+cmake ninja`); contributors without the patched framework set
+`FLUTTER_CEF_STOCK_FRAMEWORK=1` (see [CONTRIBUTING](CONTRIBUTING.md)):
 
 ```sh
 # The macOS implementation lives in packages/flutter_cef_macos.
@@ -118,8 +134,8 @@ packages/flutter_cef_macos/tool/bundle_cef_host.sh "build/macos/.../YourApp.app"
 or wire it as a Run Script build phase on your Runner target (snippet in
 `packages/flutter_cef_macos/tool/bundle_cef_host.sh`) so it runs before Xcode's
 code-sign phase. Your host
-app **must not be App-Sandboxed** (CEF spawns the helper, shares a global
-IOSurface, writes a cache); entitlements need
+app **must not be App-Sandboxed** (CEF spawns helper processes and writes a
+cache); entitlements need
 `com.apple.security.cs.disable-library-validation` + JIT — see
 `example/macos/Runner/*.entitlements` for the reference set. Sign everything with
 one identity (framework → cef_host → app, inside-out) and library validation can
@@ -195,9 +211,8 @@ Other always-on protections:
 ### Known limitations / hardening backlog
 
 This is a competent CEF embedding with honestly-labeled deferrals, not a fully
-hardened browser. Notable items still open — see
-[`specs/persistent-profiles/SECURITY-REVIEW.md`](specs/persistent-profiles/SECURITY-REVIEW.md)
-for the full punch list (file:line) and prioritization:
+hardened browser. Notable items still open (the original review is in
+[`docs/history/persistent-profiles/SECURITY-REVIEW.md`](docs/history/persistent-profiles/SECURITY-REVIEW.md)):
 
 - **Per-product keychain item name** for OSCrypt (true at-rest isolation from
   other CEF apps) — needs a from-source CEF build to override the hardcoded
@@ -238,14 +253,11 @@ CefWebView(url: startUrl, controller: c);
   `deleteCookie()` clear the cookie for *all* views in the profile, by design.
 - **One trust domain per profile.** Because a named profile is one process with
   one cookie jar, sessions sharing a profile are **not isolated from each
-  other**. The cookie jar is common (a page in one view can read another's
-  cookies via `getCookies`), and registered JS channels
-  (`addJavaScriptChannel`) are process-global, so a page in one view can observe
-  a channel name another view registered. Per-message *routing* stays
-  per-session — a channel message is delivered only to the view whose page sent
-  it (`OnQuery` stamps the originating browser), so this is an information-
-  sharing boundary, not a message-spoofing one — but the rule is the same:
-  **co-locate only mutually-trusting content on one profile.** For
+  other**: the cookie jar is common, so a page in one view can read another's
+  cookies via `getCookies`. JS channels (`addJavaScriptChannel`) are
+  per-view — a page only sees the channels registered on its own view, and a
+  message is delivered only to the view whose page sent it. The rule still
+  stands: **co-locate only mutually-trusting content on one profile.** For
   mutually-distrusting content (e.g. arbitrary third-party pages from different
   authors), give each its own `profile`, or use the ephemeral default — each
   gets its own process, cookie jar, and channel namespace.
@@ -413,56 +425,27 @@ out-of-band (never on disk/argv/env). See [Agent control](#agent-control).
 
 ## Roadmap
 
-Known limitation: the IOSurface is single-buffered, so very fast-updating pages
-can tear slightly under the compositor; double-buffering is planned. Working
-today: **multi-process, GPU-accelerated** OSR render (on/off-screen,
-HiDPI/Retina-crisp, GPU compositing via `OnAcceleratedPaint`, heavy SPAs render +
-survive),
-pointer/scroll/trackpad-pan/keyboard input, **IME text input** (CJK composition
-+ emoji, the candidate window tracked under the caret, and the ⌃⌘Space emoji
-picker — `showEmojiPicker()`) **in single- and multi-view (multi-window) hosts**
-(the connection carries `TextInputConfiguration.viewId` and is re-shown on every
-click, EditableText-style), `<select>` popups, page cursor;
-navigation + history, page-lifecycle events (start/finish/progress/url-change),
-new-window routing (`onCreateWindow`), loading/title/url/error/console state; JS
-dialogs (alert/confirm/prompt), a JS bridge (`addJavaScriptChannel` +
-`runJavaScriptReturningResult` over `CefMessageRouter`), `executeJavaScript`;
-content zoom, find-in-page, `loadHtmlString`/`loadFile`, cookies
-(set/clear plus read/enumerate via `getCookies` + `deleteCookie`), scroll,
-title/user-agent getters, downloads, and a Chrome DevTools inspector window
-(`openDevTools`).
+Working today on macOS and Windows: multi-process, GPU-accelerated off-screen
+rendering; pointer, scroll, trackpad and keyboard input; IME composition and
+the emoji picker; navigation, history and page-lifecycle events; JS dialogs,
+the JS bridge and `runJavaScriptReturningResult`; zoom, find-in-page,
+`loadHtmlString`/`loadFile`, cookies, downloads, DevTools; persistent and
+shared profiles; agent control over a token-gated relay. On macOS also: camera
+and microphone permission prompts, the context menu, freeze/thaw, audio mute,
+frame-rate control and sign-in popups (`openAuthWindow`).
 
 Next:
 
-- **True zero-copy GPU render.** Rendering is now GPU-accelerated:
-  `OnAcceleratedPaint` (GPU compositing) is on by default, multi-process and
-  crash-isolated. The `-67030` that used to gate the GPU→browser handoff (Chromium
-  144 validating cef_host's ad-hoc signature) is cleared by disabling the
-  `MachPortRendezvous*PeerRequirements` features — no Developer-ID signing needed.
-  We still **copy** the GPU surface into the shared surface (cheap on
-  unified-memory Macs, where compositing — not the copy — was the bottleneck).
-  TRUE zero-copy — handing the GPU IOSurface to Flutter with no copy — needs
-  cross-process Mach-port surface transfer (CEF's GPU surfaces aren't resolvable
-  by global id from another process), and mostly helps discrete-GPU Macs and
-  scenes with many simultaneously-animating webviews; deferred until measured.
-- **Double-buffer the IOSurface** to remove the residual tearing on
-  fast-updating pages (JCEF's named-mutex 2-slot buffer is a good reference).
-- **The CEF feature tail** that CefSharp/JCEF expose: `loadRequest` with custom
-  headers / POST body, `setUserAgent`, request / resource interception, custom
-  scheme handlers, a typed DevTools/CDP client (the inspector window already
-  ships via `openDevTools`; this is the programmatic CDP surface), and `CefPermissionHandler`
-  (WebRTC camera/mic prompts).
-- **Windows / Linux** — the package is **federated** (`flutter_cef` +
-  `flutter_cef_platform_interface` + `flutter_cef_macos`); a new platform is a
-  sibling `flutter_cef_<os>` package. The CEF logic + IPC protocol are portable;
-  each OS supplies its own host plugin + shared-texture / transport / sandbox
-  glue. See [`PORTING.md`](PORTING.md) for the full contract and seam map. A
-  Windows port (`flutter_cef_windows`) is in progress: the Dart controller /
-  widget surface is already cross-platform (the JS bridge, JS dialogs,
-  find-in-page, content zoom, and downloads all speak the same
-  method-channel/wire protocol on both OSes — see
-  `packages/flutter_cef_windows/native/cef_host/PROTOCOL.md`), with the Windows
-  host's sandbox + code-signing story still pending.
+- **Windows parity** for the macOS-only features above.
+- **True zero-copy.** `cef_host` still copies each GPU frame into the surface
+  it shares with the plugin. Handing Chromium's own surface to Flutter would
+  save that copy; it mostly matters on discrete GPUs and with many animating
+  views, so it waits until measured.
+- **The CEF feature tail** that CefSharp and JCEF expose: `loadRequest` with
+  custom headers or a POST body, `setUserAgent`, request interception, custom
+  scheme handlers, and a typed CDP client.
+- **Linux**: a sibling `flutter_cef_linux` package. See
+  [PORTING.md](PORTING.md) for the contract a new platform implements.
 
 ## Credits
 
