@@ -31,6 +31,7 @@
 //
 // Args (all per-PROCESS / per-profile): --ipc=<path> --cdp-port=<port>
 //       --allowed-schemes=<csv> --profile-dir=<abs path>
+//       --surface-port=<bootstrap name of the plugin's SurfacePort>
 // --profile-dir maps to settings.root_cache_path (empty/omitted -> a per-pid
 // ephemeral temp dir; Swift always supplies it, so the fallback is defensive).
 // The per-view args (url/width/height/dpr/iosurface-id) moved into the
@@ -66,6 +67,8 @@
 
 #include <libgen.h>
 #include <mach-o/dyld.h>
+#include <mach/mach.h>
+#include <servers/bootstrap.h>
 #include <sys/event.h>
 #include <sys/file.h>
 #include <sys/resource.h>
@@ -112,7 +115,8 @@ namespace {
 // stale embedded copy). BUMP THIS on any semantic change to the kOp wire protocol
 // below, together with CefProfileHost.protocolVersion (Swift side) — the two must
 // stay equal. Hosts predating the handshake send a 1-byte payload and read as v0.
-constexpr uint8_t kCefHostProtocolVersion = 8;
+// v9: tile surfaces are private and handed over by Mach port (--surface-port).
+constexpr uint8_t kCefHostProtocolVersion = 9;
 
 // ---- Opcodes ----
 constexpr uint8_t kOpPresent = 0x01;
@@ -445,6 +449,49 @@ static bool EnsureMetal() {
   if (!g_mtl_device) return false;
   g_mtl_queue = [g_mtl_device newCommandQueue];
   return g_mtl_queue != nil;
+}
+
+// Where tile surfaces go: a send right to the plugin's SurfacePort, looked up by
+// the bootstrap name in --surface-port. Surfaces are not global (any local
+// process could look a global one up by id and read the page), so this port is
+// the only way the plugin gets them. MACH_PORT_NULL without --surface-port.
+mach_port_t g_surface_port = MACH_PORT_NULL;
+
+// One surface handed to the plugin. Must match SurfacePort.swift.
+struct SurfaceMsg {
+  mach_msg_header_t header;
+  mach_msg_body_t body;
+  mach_msg_port_descriptor_t surface;
+  uint32_t browser_id;
+  uint32_t surface_id;
+};
+static_assert(sizeof(SurfaceMsg) == 48, "must match SurfacePort.swift");
+
+// Sends `surface` to the plugin before the present that names it: the plugin
+// reads presents off the IPC socket and takes the surface from its port, where
+// this message is already queued by then.
+void SendSurface(uint32_t browser_id, IOSurfaceRef surface) {
+  if (g_surface_port == MACH_PORT_NULL) return;
+  SurfaceMsg msg = {};
+  msg.header.msgh_bits =
+      MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
+  msg.header.msgh_size = sizeof(msg);
+  msg.header.msgh_remote_port = g_surface_port;
+  msg.body.msgh_descriptor_count = 1;
+  msg.surface.name = IOSurfaceCreateMachPort(surface);
+  msg.surface.disposition = MACH_MSG_TYPE_MOVE_SEND;
+  msg.surface.type = MACH_MSG_PORT_DESCRIPTOR;
+  msg.browser_id = browser_id;
+  msg.surface_id = IOSurfaceGetID(surface);
+  const kern_return_t kr =
+      mach_msg(&msg.header, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof(msg), 0,
+               MACH_PORT_NULL, 100, MACH_PORT_NULL);
+  if (kr != KERN_SUCCESS) {
+    // Not sent: the surface right is still ours.
+    mach_port_deallocate(mach_task_self(), msg.surface.name);
+    fprintf(stderr, "[cef_host] handing a surface to the plugin failed: %d\n",
+            kr);
+  }
 }
 
 // Host-set navigation scheme allowlist (lowercased; `--allowed-schemes=a,b`).
@@ -945,7 +992,6 @@ class HostRenderHandler : public CefRenderHandler {
       (id)kIOSurfaceBytesPerRow : @(static_cast<long>(bpr)),
       (id)kIOSurfaceAllocSize : @(static_cast<long>(bpr * sh)),
       (id)kIOSurfacePixelFormat : @(0x42475241),  // 'BGRA' = kCVPixelFormatType_32BGRA
-      @"IOSurfaceIsGlobal" : @YES,                // resolvable cross-process by id (consumer Lookups it)
     };
     IOSurfaceRef fresh = IOSurfaceCreate((__bridge CFDictionaryRef)props);
     if (!fresh) {
@@ -953,6 +999,7 @@ class HostRenderHandler : public CefRenderHandler {
       return;  // keep the old surface; next paint retries
     }
     slot_->surface = fresh;  // cef_host's +1 (mint, not Lookup)
+    SendSurface(slot_->browser_id, fresh);
     [slot_->dst_mtl release];
     slot_->dst_mtl = nil;
     slot_->dst_mtl_sid = 0;  // the cached Metal wrap pointed at `cur`; rebuilt this same paint
@@ -3835,6 +3882,14 @@ int main(int argc, char* argv[]) {
     if (!s.empty()) g_allowed_schemes.insert(s);
     if (comma == std::string::npos) break;
     start = comma + 1;
+  }
+
+  const std::string surface_port = ArgValue(argc, argv, "surface-port");
+  if (!surface_port.empty() &&
+      bootstrap_look_up(bootstrap_port, surface_port.c_str(),
+                        &g_surface_port) != KERN_SUCCESS) {
+    fprintf(stderr, "[cef_host] no surface port %s\n", surface_port.c_str());
+    return 1;
   }
 
   if (!ipc_path.empty()) {

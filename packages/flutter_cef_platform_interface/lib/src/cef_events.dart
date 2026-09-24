@@ -207,7 +207,9 @@ class CefSurfaceInfo {
     required this.height,
   });
 
-  /// The global IOSurface id, resolvable cross-process. 0 before allocation.
+  /// The IOSurface id, 0 before allocation. On macOS it resolves with
+  /// `IOSurfaceLookup` in this app's process only: surfaces are not global, so
+  /// other processes can't read the page.
   final int surfaceId;
 
   /// Physical (Retina) pixel width of the surface.

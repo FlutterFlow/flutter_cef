@@ -744,16 +744,16 @@ final class CefWebSession: NSObject, FlutterTexture {
 
   // MARK: Buffers
 
-  /// PRODUCER-ALLOCATES: wrap a producer-owned IOSurface (looked up by the id cef_host sent in
-  /// a present) in a CVPixelBuffer for Flutter. cef_host created the surface IOSurfaceIsGlobal,
-  /// so IOSurfaceLookup resolves it cross-process. IOSurfaceLookup is CF_RETURNS_RETAINED, so
-  /// Swift manages that +1 and releases it when `surf` leaves scope; the CVPixelBuffer takes its
-  /// OWN retain on the surface for as long as Flutter may sample it — so the surface lives until
-  /// this CVPixelBuffer is overwritten/niled (consumer ref) AND cef_host has released its ref.
-  /// Returns nil if the id no longer resolves (producer freed it racing a close) — the caller
-  /// keeps the current buffer and retries on the next present. Called under bufferLock.
+  /// PRODUCER-ALLOCATES: wrap a producer-owned IOSurface (the one cef_host named in a
+  /// present, handed over by Mach port — see SurfacePort) in a CVPixelBuffer for Flutter. The
+  /// CVPixelBuffer takes its OWN retain on the surface for as long as Flutter may sample it — so
+  /// the surface lives until this CVPixelBuffer is overwritten/niled (consumer ref) AND cef_host
+  /// has released its ref. Returns nil if the surface hasn't arrived — the caller keeps the
+  /// current buffer and retries on the next present. Called under bufferLock.
   private func adoptSurfaceLocked(_ sid: UInt32) -> CVPixelBuffer? {
-    guard let surf = IOSurfaceLookup(sid) else { return nil }
+    guard let surf = host?.surfacePort?.take(browserId: browserId, surfaceId: sid) else {
+      return nil
+    }
     var pbOut: Unmanaged<CVPixelBuffer>?
     let attrs: [CFString: Any] = [
       kCVPixelBufferMetalCompatibilityKey: true,
@@ -817,8 +817,8 @@ final class CefWebSession: NSObject, FlutterTexture {
       // PRODUCER-ALLOCATES ADOPT: the present names the PRODUCER-OWNED surface id cef_host just
       // painted (+ its physical dims). The producer mints a new surface (new id) whenever it
       // re-rasters at a new size/dpr, so a present whose id differs from the one currently
-      // backing our pixelBuffer means "adopt the new surface." We IOSurfaceLookup it (cross-
-      // process, resolvable because cef_host created it IOSurfaceIsGlobal) and wrap it in a
+      // backing our pixelBuffer means "adopt the new surface." We take it from the host's
+      // SurfacePort (cef_host sent it by Mach port just before this present) and wrap it in a
       // CVPixelBuffer. src==dst by construction (cef_host sized the surface to its own paint),
       // so there is no crop/stretch/stale class anymore. We keep serving the current pixelBuffer
       // until the new one is wrapped (no flash), and the producer only ever presents a sid after

@@ -48,7 +48,7 @@ final class CefProfileHost {
   // processGone) instead of silently mis-parsing frames into frozen/blank tiles; the
   // skew vectors are FLUTTER_CEF_HOST overrides, stale from-source builds, and stale
   // embedded copies (the content-hash fetch can't drift on the normal path).
-  static let protocolVersion: UInt8 = 8
+  static let protocolVersion: UInt8 = 9
 
   // Profile identity / config.
   let profileId: String
@@ -119,6 +119,9 @@ final class CefProfileHost {
   // the pipe path reuses the same teardown/crash-surfacing seams via the pid.
   private var process: Process?
   private var spawnedPid: pid_t = 0
+  /// Where cef_host sends its tile surfaces (see SurfacePort). Set in spawn()
+  /// before the reader starts and never replaced; close() makes it inert.
+  private(set) var surfacePort: SurfacePort?
   private var listenFd: Int32 = -1
   private var connFd: Int32 = -1
   private var socketPath = ""
@@ -286,9 +289,12 @@ final class CefProfileHost {
 
     // Per-process args only: per-view geometry/url now ride opCreateBrowser. The
     // cache path is always the resolved --profile-dir (ephemeral = throwaway temp).
+    guard let surfaces = SurfacePort() else { return false }
+    surfacePort = surfaces
     var args = [
       "--ipc=\(socketPath)",
       "--profile-dir=\(profileDir)",
+      "--surface-port=\(surfaces.name)",
     ]
     // Mark the throwaway-temp case so the host's CDP / mock-keychain guards fire
     // only for a real persistent profile (--profile-dir is set for both).
@@ -329,7 +335,11 @@ final class CefProfileHost {
       agentControl
         ? launchViaPosixSpawn(cefHostPath: cefHostPath, args: args)
         : launchViaProcess(cefHostPath: cefHostPath, args: args)
-    guard launched else { return false }
+    guard launched else {
+      surfaces.close()
+      return false
+    }
+    surfaces.senderPid = hostPid()
 
     running = true
     readerStarted = true
@@ -1083,6 +1093,7 @@ final class CefProfileHost {
     // relay outside cdpHandlerLock.
     disableAgentControl(browserId: browserId)
     send(browserId, Self.opDisposeBrowser, [])
+    surfacePort?.forget(browserId: browserId)
     browsersLock.lock()
     browsers[browserId] = nil
     let remaining = browsers.count
@@ -1183,6 +1194,7 @@ final class CefProfileHost {
     // which closes its CDP write end (fd 4) and yields EOF on cdpReadFd so the
     // CDP reader loop returns. Done before the CDP reader join for that reason.
     terminateProcess()
+    surfacePort?.close()
     if isEphemeral && !profileDir.isEmpty {
       let dir = profileDir
       DispatchQueue.global().async {
@@ -1487,6 +1499,7 @@ final class CefProfileHost {
     spawnedPid = 0
     let died = onHostDied
     writeLock.unlock()
+    surfacePort?.close()
     // Abandon pre-opReady queued creates too (pendingCreates is browsersLock-guarded) —
     // symmetric with the createSendQueue/createInFlight teardown above; the onHostDied path
     // still emits processGone for the sessions left in `browsers`.
