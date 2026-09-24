@@ -15,22 +15,31 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   private var channel: FlutterMethodChannel?
   // Two-level registry: one host per profile, many sessions per host.
   private var profiles: [String: CefProfileHost] = [:]   // key: profile name OR "~ephemeral~"+sessionId
-  private var sessions: [String: CefWebSession] = [:]     // sessionId -> session (verb routing)
-  private var sessionHost: [String: CefProfileHost] = [:] // sessionId -> its host
-  private var sessionKey: [String: String] = [:]          // sessionId -> profiles[] key, for teardown
-  // C2: per-session create args, so when a shared host turns out to be ad-hoc and
-  // refuses its named profile we can re-home EVERY session on it onto ephemeral hosts
-  // (not just the last one whose closure was installed), preserving each session's
-  // url + schemes + agent-control transport. Also the freeze/thaw recipe: thaw
-  // respawns a host of the ORIGINAL kind (profile / enableCdp) and recreates the
-  // browser at the original url unless the thaw call overrides it.
-  private var sessionCreateArgs: [String: (url: String, allowedSchemes: String,
-                                           agentControl: Bool, profile: String?,
-                                           enableCdp: Bool, hostGroup: String?)] = [:]
-  // Sessions whose native browser was torn down by freezeSession while the
-  // session + texture live on serving the last painted frame. Not in
-  // sessionHost/sessionKey while frozen (their host may be gone entirely).
-  private var frozenSessions: Set<String> = []
+  private var sessions: [String: SessionRecord] = [:]     // sessionId -> its record
+
+  /// How a session was created. C2: when a shared host turns out to be ad-hoc and
+  /// refuses its named profile, EVERY session on it is re-homed onto an ephemeral
+  /// host with its own url + schemes + agent-control transport. Also the
+  /// freeze/thaw recipe: thaw respawns a host of the ORIGINAL kind (profile /
+  /// enableCdp) and recreates the browser at the original url unless the thaw call
+  /// overrides it.
+  private typealias CreateArgs = (url: String, allowedSchemes: String,
+                                  agentControl: Bool, profile: String?,
+                                  enableCdp: Bool, hostGroup: String?)
+
+  /// Everything the plugin keeps for one session. Main-thread only (H3), like the
+  /// rest of these maps.
+  private struct SessionRecord {
+    let session: CefWebSession
+    let createArgs: CreateArgs
+    /// The host serving the session, and its key in `profiles`. Both nil while the
+    /// session is frozen: freezeSession closed its native browser (the host may be
+    /// gone entirely) while the session + texture live on serving the last
+    /// painted frame.
+    var host: CefProfileHost?
+    var key: String?
+    var frozen: Bool { host == nil }
+  }
   // C2: named profiles a running ad-hoc host already refused — future creates for them
   // go straight to ephemeral instead of racing onto a doomed shared host.
   private var adhocBlockedProfiles: Set<String> = []
@@ -104,8 +113,6 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     }
     profiles.removeAll()
     sessions.removeAll()
-    sessionHost.removeAll()
-    sessionKey.removeAll()
   }
 
   /// Reclaim ephemeral (throwaway) profile temp dirs orphaned by a previous crash/
@@ -161,15 +168,15 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       // stale texture. A JS round-trip proves only that the renderer executes
       // script; presentCount/lastPresentAgoMs prove frames are still reaching
       // the texture, which is what "frozen" actually means to a user.
-      guard let sid = args["sessionId"] as? String, let s = sessions[sid] else {
+      guard let sid = args["sessionId"] as? String, let rec = sessions[sid] else {
         result(nil); return
       }
-      let st = s.presentStats()
+      let st = rec.session.presentStats()
       result([
         "presentCount": Int(clamping: st.count),
         "lastPresentAgoMs": st.lastAgoMs as Any,
         "firstPresentSeen": st.firstSeen,
-        "frozen": frozenSessions.contains(sid),
+        "frozen": rec.frozen,
       ])
     case "dispose": destroy(args, result)
     case "pointer": pointer(args, result)
@@ -287,12 +294,12 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       // CEF-2b: broker a token-gated CDP endpoint scoped to THIS tile's CDP target.
       // Async (resolves the targetId via cef_host first). Requires the session to
       // have been created with agentControl (pipe) mode.
-      guard let sid = args["sessionId"] as? String, let host = sessionHost[sid],
-            let session = sessions[sid] else {
+      guard let sid = args["sessionId"] as? String, let rec = sessions[sid],
+            let host = rec.host else {
         result(FlutterError(code: "agent_control", message: "no such session", details: nil))
         return
       }
-      host.enableAgentControl(browserId: session.browserId) { info in
+      host.enableAgentControl(browserId: rec.session.browserId) { info in
         DispatchQueue.main.async {
           if let info = info {
             result(["wsUrl": info.wsUrl, "token": info.token, "port": info.port])
@@ -307,8 +314,8 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       // CEF-2b: route by this session's browserId (mirrors enableAgentControl) so
       // only THIS tile's relay is torn down — siblings on the same shared host stay
       // agent-controlled.
-      if let sid = args["sessionId"] as? String, let session = sessions[sid] {
-        sessionHost[sid]?.disableAgentControl(browserId: session.browserId)
+      if let sid = args["sessionId"] as? String, let rec = sessions[sid] {
+        rec.host?.disableAgentControl(browserId: rec.session.browserId)
       }
       result(nil)
     case "showEmojiPicker":
@@ -330,7 +337,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   }
 
   private func withSession(_ a: [String: Any], _ body: (CefWebSession) -> Void) {
-    if let id = a["sessionId"] as? String, let s = sessions[id] { body(s) }
+    if let id = a["sessionId"] as? String, let s = sessions[id]?.session { body(s) }
   }
 
   /// Relay an event from a session (any thread) to Dart on the main thread.
@@ -550,12 +557,10 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       scripts: a["documentStartScripts"] as? [String] ?? [],
       channels: a["channels"] as? [String] ?? [])
     _ = host.createBrowser(session, url: url)
-    sessions[sessionId] = session
-    sessionHost[sessionId] = host
-    sessionKey[sessionId] = key
-    // C2 re-home + freeze/thaw recipe.
-    sessionCreateArgs[sessionId] =
-      (url, allowedSchemes, agentControl, profile, enableCdp, hostGroup)
+    sessions[sessionId] = SessionRecord(
+      session: session,
+      createArgs: (url, allowedSchemes, agentControl, profile, enableCdp, hostGroup),
+      host: host, key: key)
     result([
       "textureId": session.textureId, "width": width, "height": height,
       "cdpPort": host.cdpPort,
@@ -613,21 +618,18 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     dispatchPrecondition(condition: .onQueue(.main))
     // Every session still routed to this host loses its browser. Snapshot first
     // (we mutate the maps in the loop).
-    let goneSessions = sessionHost.compactMap { $0.value === host ? $0.key : nil }
+    let goneSessions = sessions.compactMap { $0.value.host === host ? $0.key : nil }
     for sid in goneSessions {
       emit("processGone", ["sessionId": sid, "reason": reason])
-      // F-5: dispose the session BEFORE niling the maps. dispose() is the only caller of
-      // registry.unregisterTexture (+ frees the CVPixelBuffer / IOSurface / any pending
+      // F-5: dispose the session BEFORE dropping its record. dispose() is the only caller
+      // of registry.unregisterTexture (+ frees the CVPixelBuffer / IOSurface / any pending
       // buffer). If we just nil sessions[sid], the later Dart controller.dispose ->
       // disposeSession early-returns on the now-missing session, so the texture + surfaces
       // leak for the engine's lifetime — on EVERY host crash, exactly when recovery (a
       // fresh create) happens most. (onBrowserGone / respawn-failure already dispose;
       // this path was the asymmetric leak.)
-      sessions[sid]?.dispose()
+      sessions[sid]?.session.dispose()
       sessions[sid] = nil
-      sessionHost[sid] = nil
-      sessionKey[sid] = nil
-      sessionCreateArgs[sid] = nil
     }
     // Drop the host from the profile registry so a re-create spawns a fresh
     // one. Snapshot the matching keys first — never mutate a Dictionary while
@@ -720,7 +722,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
 
   /// Find the sessionId of the session bound to `browserId` on `host` (main-thread maps).
   private func sessionId(forBrowserId browserId: UInt32, on host: CefProfileHost) -> String? {
-    for (sid, s) in sessions where s.browserId == browserId && sessionHost[sid] === host {
+    for (sid, rec) in sessions where rec.session.browserId == browserId && rec.host === host {
       return sid
     }
     return nil
@@ -738,8 +740,8 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   /// again and move `oldHost`'s sessions onto it. Main-thread only.
   private func respawnNamedHost(_ oldHost: CefProfileHost, key: String) {
     dispatchPrecondition(condition: .onQueue(.main))
-    let victims = sessionHost.compactMap { $0.value === oldHost ? $0.key : nil }
-    guard let first = victims.first, let args = sessionCreateArgs[first],
+    let victims = sessions.compactMap { $0.value.host === oldHost ? $0.key : nil }
+    guard let first = victims.first, let args = sessions[first]?.createArgs,
           let cefHost = resolveCefHostPath() else {
       failHost(oldHost, reason: "locked")
       return
@@ -752,19 +754,16 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     else {
       for sid in victims {
         emit("processGone", ["sessionId": sid, "reason": "locked"])
-        sessions[sid]?.dispose()
+        sessions[sid]?.session.dispose()
         sessions[sid] = nil
-        sessionHost[sid] = nil
-        sessionKey[sid] = nil
-        sessionCreateArgs[sid] = nil
       }
       return
     }
     for sid in victims {
-      guard let session = sessions[sid], let a = sessionCreateArgs[sid] else { continue }
-      _ = host.createBrowser(session, url: a.url)
-      sessionHost[sid] = host
-      sessionKey[sid] = key
+      guard let rec = sessions[sid] else { continue }
+      _ = host.createBrowser(rec.session, url: rec.createArgs.url)
+      sessions[sid]?.host = host
+      sessions[sid]?.key = key
     }
   }
 
@@ -781,13 +780,14 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     dispatchPrecondition(condition: .onQueue(.main))
     guard let cefHost = resolveCefHostPath() else { return }
     adhocBlockedProfiles.insert(refusedProfile)
-    let victims = sessionHost.compactMap { $0.value === oldHost ? $0.key : nil }
+    let victims = sessions.compactMap { $0.value.host === oldHost ? $0.key : nil }
     // Forget + tear down the refused host (every session on it is about to move off).
     let goneKeys = profiles.compactMap { $0.value === oldHost ? $0.key : nil }
     for k in goneKeys { profiles[k] = nil }
     oldHost.shutdown()
     for sid in victims {
-      guard let session = sessions[sid], let args = sessionCreateArgs[sid] else { continue }
+      guard let rec = sessions[sid] else { continue }
+      let session = rec.session, args = rec.createArgs
       let (profileDir, isEphemeral) = resolveProfileDir(nil)
       let key = "~ephemeral~" + sid
       let host = CefProfileHost(profileId: key, profileDir: profileDir, isEphemeral: isEphemeral)
@@ -801,22 +801,19 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
         NSLog("[cef] C2 respawn ephemeral host failed for \(sid)")
         emit("processGone", ["sessionId": sid, "reason": "respawnFailed"])
         sessions[sid] = nil
-        sessionHost[sid] = nil
-        sessionKey[sid] = nil
-        sessionCreateArgs[sid] = nil
         session.dispose()
         continue
       }
       profiles[key] = host
       _ = host.createBrowser(session, url: args.url)
-      sessionHost[sid] = host
-      sessionKey[sid] = key
+      sessions[sid]?.host = host
+      sessions[sid]?.key = key
     }
   }
 
   private func navigate(_ a: [String: Any], _ result: @escaping FlutterResult) {
     if let id = a["sessionId"] as? String, let url = a["url"] as? String {
-      sessions[id]?.navigate(url)
+      sessions[id]?.session.navigate(url)
     }
     result(nil)
   }
@@ -826,7 +823,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   /// sign-in propagates back to the tile.
   private func openAuthWindow(_ a: [String: Any], _ result: @escaping FlutterResult) {
     if let id = a["sessionId"] as? String, let url = a["url"] as? String {
-      sessions[id]?.openAuthWindow(url)
+      sessions[id]?.session.openAuthWindow(url)
     }
     result(nil)
   }
@@ -835,7 +832,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   /// navigation scheme allowlist in cef_host.
   private func loadTrusted(_ a: [String: Any], _ result: @escaping FlutterResult) {
     if let id = a["sessionId"] as? String, let url = a["url"] as? String {
-      sessions[id]?.loadTrusted(url)
+      sessions[id]?.session.loadTrusted(url)
     }
     result(nil)
   }
@@ -844,13 +841,13 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   private func loadAuthored(_ a: [String: Any], _ result: @escaping FlutterResult) {
     if let id = a["sessionId"] as? String, let url = a["url"] as? String,
        let html = a["html"] as? String {
-      sessions[id]?.loadAuthored(url: url, html: html)
+      sessions[id]?.session.loadAuthored(url: url, html: html)
     }
     result(nil)
   }
 
   private func resize(_ a: [String: Any], _ result: @escaping FlutterResult) {
-    if let id = a["sessionId"] as? String, let s = sessions[id] {
+    if let id = a["sessionId"] as? String, let s = sessions[id]?.session {
       s.resize(width: a["width"] as? Int ?? 800, height: a["height"] as? Int ?? 600,
                dpr: (a["dpr"] as? Double).map { CGFloat($0) } ?? 0)
       result(["textureId": s.textureId])
@@ -866,7 +863,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   /// (re)alloc, this verb is the on-demand pull. Returns nil for an unknown
   /// session, or `surfaceId: 0` before the buffer is allocated.
   private func getFrameSurface(_ a: [String: Any], _ result: @escaping FlutterResult) {
-    guard let id = a["sessionId"] as? String, let s = sessions[id] else {
+    guard let id = a["sessionId"] as? String, let s = sessions[id]?.session else {
       result(nil)
       return
     }
@@ -891,17 +888,11 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     // Unlocked session/profile dictionaries — main-thread confined (H3). Reached
     // from create()/destroy() (channel handler, on main) and never off-main.
     dispatchPrecondition(condition: .onQueue(.main))
-    guard let session = sessions[id] else { return }
-    let host = sessionHost[id]
-    let key = sessionKey[id]
-    sessions[id] = nil
-    sessionHost[id] = nil
-    sessionKey[id] = nil
-    sessionCreateArgs[id] = nil
-    // A frozen session has no host on record; the guard below releases it.
-    frozenSessions.remove(id)
-    guard let host = host else {
-      // No host on record (shouldn't happen) — just release the session.
+    guard let rec = sessions.removeValue(forKey: id) else { return }
+    let session = rec.session
+    let key = rec.key
+    guard let host = rec.host else {
+      // A frozen session has no host on record — just release the session.
       session.dispose()
       return
     }
@@ -925,12 +916,13 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   /// already frozen, or its host already died — processGone handles that path).
   private func freezeSession(_ a: [String: Any], _ result: @escaping FlutterResult) {
     dispatchPrecondition(condition: .onQueue(.main))
-    guard let id = a["sessionId"] as? String, let session = sessions[id],
-          !frozenSessions.contains(id), let host = sessionHost[id] else {
+    guard let id = a["sessionId"] as? String, let rec = sessions[id],
+          !rec.frozen, let host = rec.host else {
       result(false)
       return
     }
-    let key = sessionKey[id]
+    let session = rec.session
+    let key = rec.key
     // Same F.3 ordering discipline as disposeSession: removeBrowser unregisters
     // under lock (reader stops routing to this session), and a last-browser
     // host is fully shut down (reader joined) BEFORE the session's unlocked
@@ -942,14 +934,13 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       if let key = key { profiles[key] = nil }
     }
     session.detachForFreeze()
-    frozenSessions.insert(id)
-    sessionHost[id] = nil
-    sessionKey[id] = nil
+    sessions[id]?.host = nil
+    sessions[id]?.key = nil
     result(true)
   }
 
   /// Thaw a frozen session: resolve/spawn a host of the ORIGINAL kind (same
-  /// profile / transport, from sessionCreateArgs) and recreate a browser onto
+  /// profile / transport, from its createArgs) and recreate a browser onto
   /// the SAME session + texture — attach() re-binds the wire id and re-flushes
   /// JS channels, and the create pacer / first-present watchdog treat it as a
   /// fresh establishment. The frozen frame keeps showing until the new
@@ -958,11 +949,12 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   /// when there is nothing to thaw.
   private func thawSession(_ a: [String: Any], _ result: @escaping FlutterResult) {
     dispatchPrecondition(condition: .onQueue(.main))
-    guard let id = a["sessionId"] as? String, frozenSessions.contains(id),
-          let session = sessions[id], let args = sessionCreateArgs[id] else {
+    guard let id = a["sessionId"] as? String, let rec = sessions[id], rec.frozen else {
       result(nil)
       return
     }
+    let session = rec.session
+    let args = rec.createArgs
     guard let cefHost = resolveCefHostPath() else {
       result(FlutterError(code: "no_cef_host",
                           message: "cef_host not found (set FLUTTER_CEF_HOST)",
@@ -990,12 +982,11 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
                           message: "failed to spawn cef_host", details: nil))
       return
     }
-    frozenSessions.remove(id)
     _ = host.createBrowser(session, url: url)
-    sessionHost[id] = host
-    sessionKey[id] = key
-    // sessionCreateArgs keeps the ORIGINAL url: a later thaw without an
-    // override falls back to it again (the thaw url is transient).
+    sessions[id]?.host = host
+    sessions[id]?.key = key
+    // createArgs keeps the ORIGINAL url: a later thaw without an override falls
+    // back to it again (the thaw url is transient).
     result(["textureId": session.textureId])
   }
 
@@ -1042,7 +1033,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   }
 
   private func pointer(_ a: [String: Any], _ result: @escaping FlutterResult) {
-    if let id = a["sessionId"] as? String, let s = sessions[id] {
+    if let id = a["sessionId"] as? String, let s = sessions[id]?.session {
       s.sendPointer(
         type: a["type"] as? Int ?? 0, button: a["button"] as? Int ?? 0,
         clickCount: a["clickCount"] as? Int ?? 1,
@@ -1054,7 +1045,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
   }
 
   private func key(_ a: [String: Any], _ result: @escaping FlutterResult) {
-    if let id = a["sessionId"] as? String, let s = sessions[id] {
+    if let id = a["sessionId"] as? String, let s = sessions[id]?.session {
       s.sendKey(
         type: a["type"] as? Int ?? 0,
         modifiers: UInt32(truncatingIfNeeded: a["modifiers"] as? Int ?? 0),

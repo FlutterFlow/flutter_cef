@@ -91,6 +91,10 @@
   id mappings when a new client connects.
 * Tests: `test/run_host_config_tests.sh`, and `test/run_host_lifecycle_test.sh`
   (needs a built host; skips without one).
+* Source layout, no behavior change: `cef_host`'s `main.mm` is split into nine
+  translation units (see its header), `CefProfileHost` into four extension
+  files with its locks documented in one place, and the plugin keeps one
+  `SessionRecord` per session instead of five parallel maps.
 
 ## 0.2.0
 
