@@ -42,6 +42,47 @@ jobs:
             "$t"
           done
 
+  # macOS native: compile cef_host (main.mm) and the plugin's Swift by building
+  # the host from source and the example app, so native changes don't merge
+  # unbuilt. Uses the stock CEF framework (the pinned patched variant needs a
+  # from-source Chromium build); publishing still requires the variant.
+  macos-build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.38.8
+          channel: stable
+      - name: Cache the CEF SDK
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/flutter_cef/cef_binary_*
+          key: cef-sdk-${{ hashFiles('packages/flutter_cef_macos/native/build_cef_host.sh') }}
+      - name: Build cef_host from source (stock CEF framework)
+        run: |
+          brew install ninja
+          FLUTTER_CEF_STOCK_FRAMEWORK=1 packages/flutter_cef_macos/native/build_cef_host.sh
+      - name: Build example for macOS (compiles the plugin)
+        run: |
+          cd example
+          flutter pub get
+          FLUTTER_CEF_FROM_SOURCE=1 flutter build macos --debug
+      - name: Is a prebuilt published for these sources?
+        # Not a failure: a PR that changes native/ can't have one until it merges
+        # and someone runs `make publish-cef-host`. Consumers pinned to such a
+        # commit need it before a release build (FLUTTER_CEF_REQUIRE_PREBUILT).
+        run: |
+          cd packages/flutter_cef_macos
+          . tool/cef_host_hash.sh
+          HASH="$(cef_host_input_hash native)"
+          URL="https://github.com/FlutterFlow/flutter_cef/releases/download/cef-host-$HASH/cef_host-macos-arm64.tar.gz.sha256"
+          if curl -fsIL "$URL" >/dev/null; then
+            echo "prebuilt cef-host-$HASH is published"
+          else
+            echo "::warning::No prebuilt for cef_host input hash $HASH. Run make publish-cef-host after merging."
+          fi
+
   # Windows: analyze the endorsed windows implementation + build the example so
   # the ~5.5k lines of native plugin/cef_host/CDP-relay code (profiles, cookies,
   # JS bridge, agent control) are actually compiled by CI, not merged blind.

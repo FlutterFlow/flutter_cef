@@ -51,7 +51,8 @@ cef_host_input_hash() {
       find cef_host -type f \
         -not -path 'cef_host/prebuilt/*' \
         -not -path 'cef_host/build/*' \
-        -not -path 'cef_host/CEF_FRAMEWORK_VARIANT'
+        -not -path 'cef_host/CEF_FRAMEWORK_VARIANT' \
+        -not -name '.DS_Store'
     } | LC_ALL=C sort -u | while IFS= read -r f; do
         printf '%s\n' "$f"
         _cefhost_sha256 "$f" | awk '{print $1}'

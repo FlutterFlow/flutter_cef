@@ -25,6 +25,23 @@ command -v gh >/dev/null 2>&1 || { echo "::error:: gh (GitHub CLI) not found" >&
 arch=arm64
 FILE="cef_host-macos-${arch}.tar.gz"
 
+if [ -n "${FLUTTER_CEF_STOCK_FRAMEWORK:-}" ]; then
+  echo "::error:: FLUTTER_CEF_STOCK_FRAMEWORK is set; a published host must carry the pinned framework variant" >&2
+  exit 1
+fi
+
+# The hash covers every file under native/cef_host, and the release is tagged at
+# HEAD, so an untracked, ignored or modified input would publish bytes no commit
+# holds under a hash consumers can't reproduce. Only the build outputs may differ.
+dirty="$(git -C "$REPO" status --porcelain --ignored --untracked-files=all -- \
+  "$NATIVE/build_cef_host.sh" "$NATIVE/build-cef-from-source.sh" "$NATIVE/patches" \
+  "$NATIVE/cef_host" ":(exclude)$NATIVE/cef_host/build" ":(exclude)$NATIVE/cef_host/prebuilt")"
+if [ -n "$dirty" ]; then
+  echo "::error:: cef_host inputs differ from HEAD; commit or remove them first:" >&2
+  printf '%s\n' "$dirty" >&2
+  exit 1
+fi
+
 # shellcheck source=cef_host_hash.sh
 . "$HERE/cef_host_hash.sh"
 HASH="$(cef_host_input_hash "$NATIVE")"
@@ -76,6 +93,21 @@ case "$sig" in
      printf '%s\n' "$sig" | head -3 >&2
      exit 1 ;;
 esac
+
+# Every Mach-O must carry a secure timestamp, or notarizing an app that embeds
+# this host as-is fails.
+untimed=""
+while IFS= read -r -d '' f; do
+  kind="$(file -b "$f")"
+  case "$kind" in *Mach-O*) : ;; *) continue ;; esac
+  info="$(codesign -dvv "$f" 2>&1 || true)"
+  case "$info" in *"Timestamp="*) : ;; *) untimed+="  $f"$'\n' ;; esac
+done < <(find "$APP" -type f -print0)
+if [ -n "$untimed" ]; then
+  echo "::error:: Mach-O files without a secure timestamp:" >&2
+  printf '%s' "$untimed" >&2
+  exit 1
+fi
 
 # --- Provenance stamps beside the app (informational; the URL is the hash) ---
 SRC_SHA="$(git -C "$REPO" rev-parse HEAD)"

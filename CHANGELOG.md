@@ -102,6 +102,16 @@
   * `cef_host.app` keeps only the English locale paks, since CEF runs en-US
     regardless of the system language. This saves about 49 MB installed and
     about 12 MB compressed. See `CEF_HOST_LOCALES`.
+* **Release pipeline**:
+  * The published `cef_host` is signed with a secure timestamp, so an app that
+    embeds it as-is can be notarized. `publish-cef-host.sh` refuses a build
+    with any Mach-O lacking one.
+  * `publish-cef-host.sh` refuses to publish when a hashed input is modified,
+    untracked or ignored, so a release always matches the commit it's tagged at.
+  * `FLUTTER_CEF_STOCK_FRAMEWORK=1 native/build_cef_host.sh` builds against the
+    stock CEF framework, for contributors without the patched from-source one.
+  * CI compiles `cef_host` and the macOS plugin, and warns when no prebuilt is
+    published for the sources.
 
 ## 0.2.0
 

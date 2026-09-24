@@ -9,7 +9,11 @@
 # when bundled into an app, the app's own signing re-signs it),
 # CEF_MULTI_PROCESS (default ON; OFF for the single-process fallback),
 # CEF_HOST_ADHOC (default ON; OFF for a signed release — drops the mock
-# keychain + Mach-port peer-validation bypass, so it needs Developer-ID signing).
+# keychain + Mach-port peer-validation bypass, so it needs Developer-ID signing),
+# FLUTTER_CEF_STOCK_FRAMEWORK=1 (build against the stock CEF framework even when
+# CEF_FRAMEWORK_VARIANT names a patched one: for contributors and CI, who don't
+# have the from-source build. The result lacks the variant's patches, so
+# publish-cef-host.sh refuses it).
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
@@ -60,6 +64,11 @@ CEF_VARIANT="stock"
 [ -f "$HERE/cef_host/CEF_FRAMEWORK_VARIANT" ] && \
   CEF_VARIANT="$(tr -d '[:space:]' < "$HERE/cef_host/CEF_FRAMEWORK_VARIANT")"
 [ -z "$CEF_VARIANT" ] && CEF_VARIANT="stock"
+if [ "$CEF_VARIANT" != "stock" ] && [ "${FLUTTER_CEF_STOCK_FRAMEWORK:-}" = "1" ]; then
+  echo "[flutter_cef] FLUTTER_CEF_STOCK_FRAMEWORK=1: building against the stock framework," \
+    "without the '$CEF_VARIANT' patches (not publishable)"
+  CEF_VARIANT="stock"
+fi
 if [ "$CEF_VARIANT" != "stock" ]; then
   echo "[flutter_cef] CEF framework variant: $CEF_VARIANT (expecting a PATCHED from-source framework)"
   case "$CEF_VARIANT" in
