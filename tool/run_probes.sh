@@ -58,6 +58,7 @@ PROBES=(
   "stress|stress_probe|300|json:/tmp/cef_stress.json|default|manual|many animating tiles on one host (tunable with dart-defines)"
   "recreate_soak|recreate_soak_probe|0|stdout|default|manual|create/dispose churn"
   "profile|profile_probe|0|stdout|default|manual|Windows: named profile and cookies end to end"
+  "windows_smoke|windows_smoke_probe|0|stdout|default|manual|Windows: paint, eval, channel, resize, freeze/thaw (run by the windows-build CI job)"
   "agentcontrol|agentcontrol_probe|0|stdout|default|manual|Windows agent-control smoke"
   "jsbridge_smoke|jsbridge_smoke|0|stdout|default|manual|Windows JS bridge smoke"
   "conformance|conformance_harness|0|stdout|default|manual|rendering conformance against Chrome (example/run_conformance_oracle.sh)"

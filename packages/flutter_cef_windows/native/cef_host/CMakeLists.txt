@@ -2,56 +2,31 @@
 # plugin build (driven by build_cef_host.bat, which the plugin CMakeLists
 # invokes via add_custom_command).
 #
-# Ship shape (LAW 8, S2): the host is a client DLL `cef_host.dll` exporting
-# RunConsoleMain, loaded by CEF's prebuilt bootstrap. We ship bootstrapc.exe
-# RENAMED to cef_host.exe beside the DLL (the rename selects the module —
-# no --module flag needed; clean Task Manager names). The slice runs
-# no_sandbox=1 (sandbox is P11), but the bootstrap layout is the shipping
-# contract from day one so P11 is a settings flip, not a restructure.
+# Ship shape (docs/history/windows-port/SPIKES.md S2): the host is a client
+# DLL `cef_host.dll` exporting RunConsoleMain, loaded by CEF's prebuilt
+# bootstrap. We ship bootstrapc.exe RENAMED to cef_host.exe beside the DLL (the
+# rename selects the module — no --module flag needed; clean Task Manager
+# names). The bootstrap owns the Chromium sandbox: it hands RunConsoleMain the
+# sandbox_info the host forwards to CEF.
 #
 # CEF's own cmake config (find_package(CEF)) drives compiler flags (/MT):
 # this target never links against Flutter, so the plugin's /MD rule (S6a)
 # does not apply here. The client DLL must link delayimp.lib (CEF's
-# /DELAYLOAD list — SPIKES.md S2).
+# /DELAYLOAD list — docs/history/windows-port/SPIKES.md S2).
 
 cmake_minimum_required(VERSION 3.21)
 project(cef_host_win LANGUAGES CXX)
 
-# CEF_DIST_NAME: the pinned distribution (keep in lockstep with fetch_cef.ps1,
-# ../../windows/CMakeLists.txt, build_cef_host.sh:17 and SPIKES.md).
-set(CEF_DIST_NAME
-    "cef_binary_144.0.27+g3fae261+chromium-144.0.7559.254_windows64_minimal")
-
-# CEF_ROOT resolution — ONE shared order, mirrored in ../../windows/CMakeLists.txt
-# and fetch_cef.ps1:
-#   -DCEF_ROOT=... > env CEF_ROOT > %LOCALAPPDATA%/flutter_cef/<dist>. If none
-#   exists, ask fetch_cef.ps1 to resolve/print it; still unresolved -> fail.
-if(NOT DEFINED CEF_ROOT)
-  if(DEFINED ENV{CEF_ROOT})
-    set(CEF_ROOT "$ENV{CEF_ROOT}")
-  elseif(EXISTS "$ENV{LOCALAPPDATA}/flutter_cef/${CEF_DIST_NAME}/cmake")
-    set(CEF_ROOT "$ENV{LOCALAPPDATA}/flutter_cef/${CEF_DIST_NAME}")
-  else()
-    execute_process(
-      COMMAND powershell -NoProfile -ExecutionPolicy Bypass -File
-              "${CMAKE_CURRENT_SOURCE_DIR}/fetch_cef.ps1"
-      OUTPUT_VARIABLE CEF_ROOT
-      OUTPUT_STRIP_TRAILING_WHITESPACE
-      RESULT_VARIABLE _fetch_cef_result)
-    if(NOT _fetch_cef_result EQUAL 0)
-      set(CEF_ROOT "")
-    endif()
-  endif()
+# The pin and CEF_ROOT resolution are shared with ../../windows/CMakeLists.txt
+# (cef_pin.cmake; the pin itself is cef_pin.txt). Order: -DCEF_ROOT= > env
+# CEF_ROOT > %LOCALAPPDATA%/flutter_cef/<dist> > fetch_cef.ps1, and the result
+# must be the pinned version.
+include("${CMAKE_CURRENT_SOURCE_DIR}/cef_pin.cmake")
+set(_explicit_cef_root "")
+if(DEFINED CEF_ROOT)
+  set(_explicit_cef_root "${CEF_ROOT}")
 endif()
-# Normalize to forward slashes: %LOCALAPPDATA% (and env CEF_ROOT) come back with
-# backslashes, which CMake reads as escape sequences in later string references.
-file(TO_CMAKE_PATH "${CEF_ROOT}" CEF_ROOT)
-if(NOT EXISTS "${CEF_ROOT}/cmake")
-  message(FATAL_ERROR
-    "CEF_ROOT not found (resolved '${CEF_ROOT}'). Run fetch_cef.ps1 to stage "
-    "'${CEF_DIST_NAME}' under %LOCALAPPDATA%/flutter_cef/, or set CEF_ROOT "
-    "(env or -DCEF_ROOT=) to an extracted copy.")
-endif()
+flutter_cef_resolve_cef_root(CEF_ROOT "${_explicit_cef_root}")
 message(STATUS "cef_host: resolved CEF_ROOT = ${CEF_ROOT}")
 list(APPEND CMAKE_MODULE_PATH "${CEF_ROOT}/cmake")
 find_package(CEF REQUIRED)
@@ -72,6 +47,7 @@ endif()
 # The client DLL (loaded by the renamed bootstrapc.exe).
 add_library(cef_host SHARED
   cef_host_win.cc
+  cef_host_policy.h
   cef_host_protocol.h
   cef_host_opcodes.h
   document_start.h
@@ -94,14 +70,14 @@ target_link_libraries(cef_host
 # Plain Win32 + cef_host_protocol.h, NO CEF link. Acts as the plugin side of
 # the named pipe: spawns cef_host.exe, drives kOpCreateBrowser/kOpNavigate/
 # kOpShutdown and asserts kOpReady/kOpCreated/kOpPresent/events. Built on
-# demand (`--target pipe_probe`); build_cef_host.bat builds only cef_host, so
-# plugin builds never compile this.
+# demand (`--target pipe_probe`; the windows-build CI job does) —
+# build_cef_host.bat builds only cef_host, so plugin builds never compile it.
 add_executable(pipe_probe EXCLUDE_FROM_ALL test/pipe_probe.cc)
 target_include_directories(pipe_probe PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_definitions(pipe_probe PRIVATE NOMINMAX)
 
 # Stage the ship pair beside the build output: cef_host.dll + cef_host.exe
-# (bootstrapc.exe renamed — LAW 8).
+# (bootstrapc.exe renamed).
 add_custom_command(TARGET cef_host POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
           "${CEF_ROOT}/Release/bootstrapc.exe"

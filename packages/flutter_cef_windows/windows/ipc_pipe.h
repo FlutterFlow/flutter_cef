@@ -25,7 +25,7 @@
 //  - Framing: [u32 bodyLen BE][u32 browserId BE][u8 op][payload], bodyLen =
 //    4+1+payloadLen, guard 5..64 MiB (kMinBodyLen/kMaxBodyLen). Outbound
 //    frames are assembled contiguously and written whole under a write mutex
-//    (mirror main.mm SendFrame:420-446).
+//    (as main.mm's SendFrame does), with a bounded wait (kWriteTimeoutMs).
 //  - The FrameHandler/DisconnectHandler run on the READER thread; the caller
 //    must marshal to the platform thread before touching the MethodChannel.
 //  - Teardown (Close): signal the stop event + CancelIoEx, bounded join. If
@@ -67,7 +67,7 @@ class IpcPipe {
   IpcPipe(const IpcPipe&) = delete;
   IpcPipe& operator=(const IpcPipe&) = delete;
 
-  // Mints the next unique pipe name: \\.\pipe\flutter_cef_<pid>_<counter>.
+  // Mints a fresh unguessable pipe name: \\.\pipe\flutter_cef_<128-bit hex>.
   static std::wstring NextPipeName();
 
   // Creates the single-instance overlapped byte-stream pipe server (and the
@@ -80,9 +80,15 @@ class IpcPipe {
   // initiated the stop).
   bool StartReader(FrameHandler handler, DisconnectHandler on_disconnect);
 
-  // Frames + writes atomically (thread-safe; overlapped write awaited to
-  // completion under the write mutex). False if not connected or the write
-  // failed.
+  // How long SendFrame waits for the host to take a frame before giving up
+  // on the pipe.
+  static constexpr DWORD kWriteTimeoutMs = 3000;
+
+  // Frames + writes atomically (thread-safe; overlapped write under the write
+  // mutex, bounded by kWriteTimeoutMs). False if not connected, the payload is
+  // too large, or the write failed. A failed or timed-out write latches
+  // write_failed(): part of a frame may be on the wire, so every later send
+  // fails too and the owner should treat the host as gone.
   bool SendFrame(uint32_t browser_id, uint8_t opcode, const uint8_t* payload,
                  uint32_t payload_len);
 
@@ -93,6 +99,7 @@ class IpcPipe {
   bool Close();
 
   bool connected() const { return connected_.load(); }
+  bool write_failed() const { return write_failed_.load(); }
   const std::wstring& pipe_name() const { return pipe_name_; }
 
  private:
@@ -110,6 +117,7 @@ class IpcPipe {
   std::atomic<bool> connected_{false};
   std::atomic<bool> closing_{false};
   std::atomic<bool> reader_done_{false};
+  std::atomic<bool> write_failed_{false};
 };
 
 }  // namespace flutter_cef

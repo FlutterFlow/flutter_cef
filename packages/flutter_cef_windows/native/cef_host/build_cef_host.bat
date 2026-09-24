@@ -1,14 +1,17 @@
 @echo off
-rem build_cef_host.bat — build cef_host.dll + stage cef_host.exe (renamed
-rem bootstrapc.exe, LAW 8). Invoked standalone by developers AND from the
+rem build_cef_host.bat — build cef_host.dll + stage cef_host.exe (the renamed
+rem bootstrapc.exe). Invoked standalone by developers AND from the
 rem plugin's windows/CMakeLists.txt add_custom_command during
 rem `flutter build windows`.
 rem
-rem Usage: build_cef_host.bat [BUILD_DIR] [OUT_DIR]
+rem Usage: build_cef_host.bat [BUILD_DIR] [OUT_DIR] [TARGET]
 rem   BUILD_DIR  cmake binary dir     (default: %~dp0build)
 rem   OUT_DIR    where cef_host.dll + cef_host.exe land (default: BUILD_DIR)
+rem   TARGET     cmake target (default: cef_host; CI also builds pipe_probe,
+rem              which is built in BUILD_DIR and not staged)
 rem Env overrides:
-rem   CEF_ROOT         extracted cef_binary_144.0.27 windows64_minimal dir
+rem   CEF_ROOT         extracted windows64_minimal dir of the version pinned in
+rem                    cef_pin.txt (configure fails on any other version)
 rem   CEF_WRAPPER_LIB  prebuilt /MT libcef_dll_wrapper.lib to reuse
 rem   VSINSTALLDIR     Visual Studio install root (skips the vswhere lookup)
 rem   CMAKE            cmake.exe to use (default: VS-bundled, else on PATH)
@@ -21,6 +24,7 @@ setlocal enabledelayedexpansion
 set "SRC_DIR=%~dp0"
 if "%~1"=="" (set "BUILD_DIR=%SRC_DIR%build") else (set "BUILD_DIR=%~1")
 if "%~2"=="" (set "OUT_DIR=%BUILD_DIR%") else (set "OUT_DIR=%~2")
+if "%~3"=="" (set "TARGET=cef_host") else (set "TARGET=%~3")
 
 rem --- MSVC toolchain: locate Visual Studio via vswhere (honor VSINSTALLDIR).
 rem No hardcoded edition/year — any install with the VC++ x64 tools works.
@@ -61,8 +65,9 @@ if not exist "%BUILD_DIR%\build.ninja" (
   "!CMAKE!" -G Ninja -DCMAKE_BUILD_TYPE=Release !MAKE_PROG_ARG! -S "%SRC_DIR%." -B "%BUILD_DIR%"
   if errorlevel 1 exit /b 2
 )
-"!CMAKE!" --build "%BUILD_DIR%" --target cef_host
+"!CMAKE!" --build "%BUILD_DIR%" --target %TARGET%
 if errorlevel 1 exit /b 3
+if /i not "%TARGET%"=="cef_host" exit /b 0
 
 if /i not "%OUT_DIR%"=="%BUILD_DIR%" (
   if not exist "%OUT_DIR%" mkdir "%OUT_DIR%"

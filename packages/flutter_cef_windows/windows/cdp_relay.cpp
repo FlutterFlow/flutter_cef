@@ -188,7 +188,7 @@ bool CdpRelay::Start() {
   }
   port_ = ntohs(bound.sin_port);
 
-  listen_sock_ = fd;
+  listen_sock_.store(fd);
   running_.store(true);
   std::thread([self = shared_from_this()]() { self->AcceptLoop(); }).detach();
   DLog("listening on 127.0.0.1:%u", port_);
@@ -197,8 +197,7 @@ bool CdpRelay::Start() {
 
 void CdpRelay::Stop() {
   running_.store(false);
-  SOCKET lfd = listen_sock_;
-  listen_sock_ = INVALID_SOCKET;
+  const SOCKET lfd = listen_sock_.exchange(INVALID_SOCKET);
   if (lfd != INVALID_SOCKET) {
     shutdown(lfd, SD_BOTH);
     closesocket(lfd);  // wakes accept()
@@ -215,10 +214,19 @@ void CdpRelay::Stop() {
 
 void CdpRelay::AcceptLoop() {
   while (running_.load()) {
-    SOCKET fd = accept(listen_sock_, nullptr, nullptr);
+    const SOCKET lfd = listen_sock_.load();
+    if (lfd == INVALID_SOCKET) break;  // Stop() swapped it out
+    SOCKET fd = accept(lfd, nullptr, nullptr);
     if (fd == INVALID_SOCKET) {
       if (running_.load()) continue;
       break;
+    }
+    // Too many connections still handshaking: drop this one rather than add
+    // another thread. A real client retries; a flood can't exhaust threads.
+    if (pending_handshakes_.fetch_add(1) >= kMaxPendingHandshakes) {
+      pending_handshakes_.fetch_sub(1);
+      closesocket(fd);
+      continue;
     }
     // Detached handler thread; the shared_from_this() keeps the relay alive for
     // the duration of the connection even across a concurrent Stop().
@@ -231,6 +239,18 @@ void CdpRelay::AcceptLoop() {
 // MARK: HTTP / handshake
 
 void CdpRelay::HandleConnection(SOCKET fd) {
+  // This connection counts against kMaxPendingHandshakes until it either
+  // becomes the ws client or is closed.
+  struct PendingHandshake {
+    std::atomic<int>* count;
+    bool done = false;
+    void Finish() {
+      if (!done) count->fetch_sub(1);
+      done = true;
+    }
+    ~PendingHandshake() { Finish(); }
+  } pending{&pending_handshakes_};
+
   // Read timeout for the HANDSHAKE only (slowloris backstop). Cleared after a
   // successful upgrade — the ws frame loop idles between agent commands.
   DWORD rcv = 10000;
@@ -293,6 +313,7 @@ void CdpRelay::HandleConnection(SOCKET fd) {
     }
     client_sock_ = fd;
   }
+  pending.Finish();
 
   // Sec-WebSocket-Accept = base64(SHA1(key + GUID)).
   std::string accept_src = key_it->second + kWsGuid;

@@ -8,7 +8,7 @@
 
 namespace flutter_cef {
 
-constexpr uint8_t kCefHostProtocolVersion = 4;
+constexpr uint8_t kCefHostProtocolVersion = 5;
 
 // ---- cef_host -> plugin ----
 // {u64 bridgeHandle}{u32 srcW}{u32 srcH}: bridgeHandle is the DXGI legacy
@@ -128,6 +128,10 @@ constexpr uint8_t kOpResolveTargetId = 0x36;
 constexpr uint8_t kOpInvalidate = 0x37;
 // {u8 cmd} in the focused frame: 0=copy 1=cut 2=paste 3=selectAll 4=undo 5=redo
 constexpr uint8_t kOpEditCommand = 0x38;
+// {u8 muted}
+constexpr uint8_t kOpSetAudioMuted = 0x3a;
+// {u16 ms} visible begin-frame cadence, clamped to [8, 250]
+constexpr uint8_t kOpSetPumpInterval = 0x3b;
 // {utf8 baseUrl}\0{utf8 html}: store-only; serve html as the main-frame
 // response for exactly baseUrl (empty html clears it). The load is a following
 // kOpCreateBrowser or kOpLoadTrusted for that URL

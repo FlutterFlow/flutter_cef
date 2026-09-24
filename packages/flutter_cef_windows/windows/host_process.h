@@ -1,17 +1,19 @@
 // HostProcess — spawns and owns one cef_host.exe.
 //
-// Slice model: ONE host per session/create (profile-sharing host reuse is
-// P6). The plugin creates the IpcPipe FIRST, then spawns
-//   cef_host.exe --ipc=<pipe name> --profile-dir=<%TEMP% unique> --ephemeral
+// One host per PROFILE, serving every session on it (see flutter_cef_plugin.h).
+// The plugin creates the IpcPipe FIRST, then spawns
+//   cef_host.exe --ipc=<pipe name> --profile-dir=<dir> [--ephemeral]
+//                [--allowed-schemes=<csv>] [--cdp-io-pipes=<r>,<w>]
 // (named pipe: the child connects by NAME with CreateFileW, so no handle
 // inheritance is needed — cf. S3, which inherited anonymous handles).
 //
 // Kill guarantees:
 //  - Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, assigned before the
 //    (suspended) child runs: closing the job handle (Shutdown()/dtor) is a
-//    kernel-guaranteed kill — no orphaned cef_host, ever.
+//    kernel-guaranteed kill — no orphaned cef_host, ever. Chromium's children
+//    are spawned inside the same job.
 //  - Graceful path: the plugin sends kOpShutdown first, then a reaper thread
-//    does WaitForExit(bounded) -> Terminate() -> Shutdown().
+//    does WaitForExit(bounded) -> KillTreeAndWait() -> Shutdown().
 //
 // NOTE: deliberately flutter-free (windows.h only) so it can be exercised by
 // a standalone harness without an engine.
@@ -39,8 +41,8 @@ class HostProcess {
   // Spawns cef_host.exe bound to the (already created) pipe `pipe_name`.
   // `allowed_schemes` is an optional csv navigation-scheme allowlist passed as
   // --allowed-schemes=<csv> (empty = omitted = allow all; mirrors
-  // CefProfileHost.spawn, CefProfileHost.swift:289-291). Returns false on
-  // spawn failure.
+  // CefProfileHost.spawn). A list that isn't all valid schemes is refused.
+  // Returns false on spawn failure.
   //
   // AGENT CONTROL (P9): when `agent_control` is true, the spawn additionally
   // sets up the CDP-over-pipe transport (the S3 recipe, mirroring macOS
@@ -75,6 +77,12 @@ class HostProcess {
   // exit-watcher thread that must outlive this object's handles. Caller
   // closes it. nullptr if not running.
   HANDLE DuplicateProcessHandle() const;
+
+  // Ends the whole process tree (the host and every Chromium child in its
+  // job) and waits up to `timeout_ms` for all of them to be gone. True once
+  // the job is empty. Call before deleting the profile dir: a live child
+  // still holds files in it.
+  bool KillTreeAndWait(unsigned long timeout_ms);
 
   // Closes process + job handles. KILL_ON_JOB_CLOSE means this kills the
   // process if it is somehow still alive.

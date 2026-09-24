@@ -124,8 +124,16 @@ class CdpRelay : public std::enable_shared_from_this<CdpRelay> {
   std::string token_;
   uint16_t port_ = 0;
 
-  SOCKET listen_sock_ = INVALID_SOCKET;
+  // Read by the accept thread while Stop() swaps it out on another, so atomic.
+  std::atomic<SOCKET> listen_sock_{INVALID_SOCKET};
   std::atomic<bool> running_{false};
+
+  // Connections still in their HTTP handshake (no token presented yet). The
+  // port is reachable by any local user, and each such connection holds a
+  // thread for up to the 10 s handshake timeout, so past this many the relay
+  // closes new connections at once instead of spawning more threads.
+  static constexpr int kMaxPendingHandshakes = 8;
+  std::atomic<int> pending_handshakes_{0};
 
   // The single active ws client (one connection per relay; a second upgrade is
   // 503'd). Guarded by client_lock_, which also serializes writes to it.

@@ -1,0 +1,11 @@
+# The CEF distribution the Windows build pins. The one place to change it:
+# fetch_cef.ps1 reads this file, and both CMakeLists read it through
+# cef_pin.cmake, which also refuses a CEF_ROOT whose include/cef_version.h
+# names a different version.
+#
+# CEF_SHA256 is the tarball's digest, pinned here rather than fetched from the
+# host that serves the tarball, so a tampered mirror can't vouch for itself.
+# When bumping, take it from the .sha256 file published beside the tarball on
+# cef-builds.spotifycdn.com and check it against your own download.
+CEF_VERSION=144.0.27+g3fae261+chromium-144.0.7559.254
+CEF_SHA256=bf1d96e076a649679e7f345a537fbf2a351b03b8297796770e6fba47f0361230

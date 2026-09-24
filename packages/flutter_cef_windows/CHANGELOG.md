@@ -11,14 +11,50 @@
   message for a channel the browser didn't register is refused.
 * Ctrl editing shortcuts are the page's first: `cef_host` runs the edit command
   (`OnKeyEvent`) only for a key the page and Blink left unhandled.
-* `fetch_cef.ps1` checks the CEF download against a SHA-1 pinned in the script,
-  not one fetched from the same CDN, and fails when it doesn't match.
+* The CEF pin lives in one file, `native/cef_host/cef_pin.txt` (version and
+  SHA-256), read by `fetch_cef.ps1` and both CMakeLists. The download is
+  checked against the pinned SHA-256, and configure fails when `CEF_ROOT`
+  points at a different CEF version.
 * A host that dies before `kOpReady` is reported as `createFailed`, not
   `crashed` (exit code 2 is still `locked`).
-* Fix: a view hidden right after `create()` kept painting: `cef_host` drops a
-  `kOpSetVisible` sent before the browser's slot exists. The plugin re-sends
-  the hide on `kOpCreated`.
-* Protocol v4.
+* Fix: a view hidden right after `create()` kept painting: `cef_host` dropped a
+  `kOpSetVisible` sent before the browser existed. The plugin re-sends the hide
+  on `kOpCreated`.
+* Fix: ops sent in the first moments after create (a resize, JS, input) were
+  dropped because the browser didn't exist yet; `cef_host` now holds them and
+  runs them once it does. A create queued before the host is ready is sent at
+  the view's current size, and a frame the size gate rejects no longer counts
+  as painted, so a tile stuck at the wrong size reports `paintStalled`.
+* Fix: `cef_host` read its arguments in the ANSI code page, so a profile path
+  under a non-ASCII user name failed. It reads the UTF-16 command line.
+* Fix: a locked profile could be reported as `createFailed`.
+* Fix: a pipe write to a host that stopped reading could freeze the UI thread.
+  Writes time out after 3 s and end the host (`processGone('crashed')`).
+* Fix: the reaper deleted an ephemeral profile dir while Chromium children
+  still held files in it; it now ends the whole process tree first.
+* A renderer that crashes 4 times within 10 s ends the host instead of
+  reloading forever, and a liveness sweep ends a host whose renderer leaves a
+  JS ping unanswered for 15 s (as on macOS; GPU-process replacement isn't
+  detected). `paintStalled` now repeats every grace, the macOS cadence.
+* `sessionStats`, `setAudioMuted`, `setFrameInterval`, `freezeSession` and
+  `thawSession` are implemented. `chooseContextMenu`, `respondMediaRequest`,
+  `setMediaSetting`, `openAuthWindow` and `showEmojiPicker` reply
+  `PlatformException('unsupported')`, and unknown verbs `NotImplemented`,
+  instead of succeeding silently.
+* `enableAgentControl` explains when a view asked for agent control but joined
+  a profile whose host started without it.
+* Security: the Chromium sandbox is on (`FLUTTER_CEF_NO_SANDBOX=1` turns it
+  off for diagnosis). Downloads open a Save As dialog with a sanitized, unique
+  name instead of writing silently. Page-sourced payloads are capped at 8 MiB so
+  one page can't take down a shared host. `allowedSchemes` must be scheme
+  tokens. The agent-control relay caps connections that haven't authenticated.
+* Rendering: software-composited frames (no GPU, Remote Desktop, VMs) are
+  uploaded into the shared texture, `<select>` dropdowns are drawn, and the
+  host falls back to a WARP device. `FLUTTER_CEF_SOFTWARE_COMPOSITING=1`
+  forces the software path.
+* CI builds and runs `pipe_probe` and a runtime smoke test of the example app,
+  each with and without software compositing.
+* Protocol v5 (`kOpSetAudioMuted` and `kOpSetPumpInterval` on Windows).
 
 # 0.1.0
 

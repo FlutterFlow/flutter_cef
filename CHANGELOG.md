@@ -1,5 +1,12 @@
 ## Unreleased
 
+* **Windows catches up with macOS**: `sessionStats`, `setAudioMuted`,
+  `setFrameInterval` and `freeze`/`thaw` work; verbs Windows can't serve
+  (context menus, camera/microphone prompts, the auth window, the emoji picker)
+  throw `PlatformException('unsupported')` instead of succeeding silently. The
+  Chromium sandbox is on, downloads ask where to save, tiles render without a
+  GPU, and early resizes, non-ASCII profile paths, locked profiles and hung
+  hosts are handled. See `packages/flutter_cef_windows/CHANGELOG.md`.
 * **Document-start scripts**: `CefWebController(documentStartScripts: [...])`
   runs each script in every main-frame document before the page's own scripts
   (also after a cross-site navigation). A script that throws is reported to the
@@ -33,8 +40,8 @@
   recovers from a crash. A GPU process that started after the host's first
   frame counts as a replacement; a renderer that leaves a JS ping unanswered
   for 15 s (`FLUTTER_CEF_HANG_MS`) while not painting counts as hung. Idle
-  static pages answer the ping and are left alone. Windows does not have this
-  yet.
+  static pages answer the ping and are left alone. Windows now has the hung
+  renderer check, but not the GPU-process one.
 * **The hang check leaves paused pages alone**: a page waiting on a JS dialog, or
   one that may be paused in a debugger (DevTools opened, CDP or agent control
   enabled), can't answer the ping but isn't hung, and is no longer ended as
