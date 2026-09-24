@@ -6,9 +6,11 @@
 #
 # Resolution order (shared with both CMakeLists): env CEF_ROOT, then
 # %LOCALAPPDATA%/flutter_cef/<dist>. If neither exists, download the pinned
-# tarball from cef-builds.spotifycdn.com, verify it against the SHA-1 pinned
-# below (fail closed), extract with native tar.exe (bsdtar handles .tar.bz2,
-# SPIKES.md S6), and cache it under %LOCALAPPDATA%/flutter_cef for later builds.
+# tarball from cef-builds.spotifycdn.com, verify it against the SHA-256 pinned
+# in cef_pin.txt (fail closed), extract with native tar.exe (bsdtar handles
+# .tar.bz2, docs/history/windows-port/SPIKES.md S6), and cache it under
+# %LOCALAPPDATA%/flutter_cef for later builds. The CMake side checks the
+# resolved tree's include/cef_version.h against the same pin.
 
 $ErrorActionPreference = 'Stop'
 
@@ -17,14 +19,18 @@ $ErrorActionPreference = 'Stop'
 # ONLY the final Write-Output (the CEF root) may reach stdout.
 function Info($m) { [Console]::Error.WriteLine($m) }
 
-# The pin (matches build_cef_host.sh:17 / SPIKES.md header).
-$CefVersion = '144.0.27+g3fae261+chromium-144.0.7559.254'
+# The pin: cef_pin.txt beside this script, the one place it is written down.
+$Pin = @{}
+foreach ($line in Get-Content (Join-Path $PSScriptRoot 'cef_pin.txt')) {
+  if ($line -match '^(CEF_[A-Z0-9_]+)=(.*)$') { $Pin[$Matches[1]] = $Matches[2].Trim() }
+}
+$CefVersion = $Pin['CEF_VERSION']
+$CefDistSha256 = $Pin['CEF_SHA256']
+if (-not $CefVersion -or -not $CefDistSha256) {
+  Write-Error "fetch_cef: cef_pin.txt must set CEF_VERSION and CEF_SHA256"
+  exit 1
+}
 $CefDistName = "cef_binary_${CefVersion}_windows64_minimal"
-# SHA-1 of that tarball, from the CEF builds index (index.json and the .sha1
-# beside the tarball agree). Pinned here, not fetched from the host that
-# serves the tarball, so a tampered mirror can't vouch for itself. Update it
-# with $CefVersion.
-$CefDistSha1 = '4bdedf91fb973c99570728d228098638f004c5e9'
 
 $Candidates = @()
 if ($env:CEF_ROOT) { $Candidates += $env:CEF_ROOT }
@@ -54,14 +60,14 @@ if ($LASTEXITCODE -ne 0) {
   exit 1
 }
 
-# Fail-closed SHA-1 check against the pinned digest.
-$actual = (Get-FileHash -Algorithm SHA1 -Path $tarball).Hash.ToLower()
-if ($actual -ne $CefDistSha1) {
+# Fail-closed SHA-256 check against the pinned digest.
+$actual = (Get-FileHash -Algorithm SHA256 -Path $tarball).Hash.ToLower()
+if ($actual -ne $CefDistSha256.ToLower()) {
   Remove-Item $tarball -Force -ErrorAction SilentlyContinue
-  Write-Error "fetch_cef: SHA-1 mismatch (got $actual, pinned $CefDistSha1)"
+  Write-Error "fetch_cef: SHA-256 mismatch (got $actual, pinned $CefDistSha256)"
   exit 1
 }
-Info "fetch_cef: SHA-1 verified $actual"
+Info "fetch_cef: SHA-256 verified $actual"
 
 # Extract into a temp dir, then move into place, so a partial extract is never
 # resolved by a concurrent build.
@@ -72,7 +78,8 @@ Info "fetch_cef: extracting"
 # Use the Windows system bsdtar by FULL PATH. A bare `tar` on a CI runner
 # resolves to Git's bundled MSYS GNU tar, which reads "C:\...tarball" as a
 # host:path remote spec ("Cannot connect to C:"). System32\tar.exe is libarchive
-# (bsdtar), handles .tar.bz2 and drive-letter paths natively (SPIKES.md S6).
+# (bsdtar), handles .tar.bz2 and drive-letter paths natively
+# (docs/history/windows-port/SPIKES.md S6).
 $SystemTar = Join-Path $env:SystemRoot 'System32\tar.exe'
 if (-not (Test-Path $SystemTar)) { $SystemTar = 'tar.exe' }
 & $SystemTar -xf $tarball -C $tmp

@@ -2,7 +2,7 @@
 //
 // Acts as the PLUGIN side of the IPC contract (PROTOCOL.md): creates the
 // named pipe server, spawns cef_host.exe against it, then drives the slice
-// vertical: kOpReady (v3 handshake) -> kOpCreateBrowser 1024x768@1.0 ->
+// vertical: kOpReady (version handshake) -> kOpCreateBrowser 1024x768@1.0 ->
 // kOpCreated -> first kOpPresent within 20s -> kOpNavigate to a second URL ->
 // url/title/loadState events -> kOpShutdown -> clean host exit.
 //

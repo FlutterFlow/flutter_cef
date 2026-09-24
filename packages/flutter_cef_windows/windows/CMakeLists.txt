@@ -35,6 +35,8 @@ list(APPEND PLUGIN_SOURCES
   "ipc_pipe.h"
   "cdp_relay.cpp"
   "cdp_relay.h"
+  "current_user_sd.h"
+  "liveness_policy.h"
 )
 
 add_library(${PLUGIN_NAME} SHARED
@@ -66,52 +68,20 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
   bcrypt
 )
 
-# ---- cef_host: build + stage (LAW 8 ship pair: cef_host.dll + renamed
+# ---- cef_host: build + stage (the ship pair: cef_host.dll + the renamed
 # bootstrapc.exe as cef_host.exe) ----
 
 set(CEF_HOST_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../native/cef_host")
 set(CEF_HOST_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/cef_host_build")
 set(CEF_HOST_DIST_DIR "${CMAKE_CURRENT_BINARY_DIR}/cef_host_dist")
 
-# CEF_DIST_NAME: the pinned distribution (keep in lockstep with
-# ../native/cef_host/fetch_cef.ps1, build_cef_host.sh:17 and SPIKES.md). The
-# LOCALAPPDATA candidate below is exactly what fetch_cef.ps1 advertises.
-set(CEF_DIST_NAME
-    "cef_binary_144.0.27+g3fae261+chromium-144.0.7559.254_windows64_minimal")
-
-# CEF_ROOT resolution — ONE shared order, mirrored in
-# ../native/cef_host/CMakeLists.txt and fetch_cef.ps1:
-#   (1) env CEF_ROOT, (2) %LOCALAPPDATA%/flutter_cef/<dist>. If neither exists,
-#   ask fetch_cef.ps1 to resolve/print it; still unresolved -> fail configure.
-if(DEFINED ENV{CEF_ROOT})
-  set(FLUTTER_CEF_CEF_ROOT "$ENV{CEF_ROOT}")
-elseif(EXISTS "$ENV{LOCALAPPDATA}/flutter_cef/${CEF_DIST_NAME}/cmake")
-  set(FLUTTER_CEF_CEF_ROOT "$ENV{LOCALAPPDATA}/flutter_cef/${CEF_DIST_NAME}")
-else()
-  # Last resort: let fetch_cef.ps1 resolve (and, in a future P11, download) it.
-  execute_process(
-    COMMAND powershell -NoProfile -ExecutionPolicy Bypass -File
-            "${CEF_HOST_SRC_DIR}/fetch_cef.ps1"
-    OUTPUT_VARIABLE FLUTTER_CEF_CEF_ROOT
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    RESULT_VARIABLE _fetch_cef_result)
-  if(NOT _fetch_cef_result EQUAL 0)
-    set(FLUTTER_CEF_CEF_ROOT "")
-  endif()
-endif()
-# Normalize to forward slashes: %LOCALAPPDATA% (and env CEF_ROOT) come back with
-# backslashes, which CMake reads as escape sequences (\U -> CMP0010) in the
-# bundled-library string list.
-file(TO_CMAKE_PATH "${FLUTTER_CEF_CEF_ROOT}" FLUTTER_CEF_CEF_ROOT)
-
-if(NOT EXISTS "${FLUTTER_CEF_CEF_ROOT}/cmake")
-  message(FATAL_ERROR
-    "flutter_cef_windows: CEF distribution not found. Set the CEF_ROOT env var "
-    "to an extracted '${CEF_DIST_NAME}', or run "
-    "native/cef_host/fetch_cef.ps1 to stage it under "
-    "%LOCALAPPDATA%/flutter_cef/. (Resolved candidate: "
-    "'${FLUTTER_CEF_CEF_ROOT}'.)")
-endif()
+# The CEF pin (../native/cef_host/cef_pin.txt) and CEF_ROOT resolution, shared
+# with ../native/cef_host/CMakeLists.txt: env CEF_ROOT >
+# %LOCALAPPDATA%/flutter_cef/<dist> > fetch_cef.ps1 (downloads and verifies
+# it). Configure fails if nothing resolves or the resolved tree is not the
+# pinned version.
+include("${CEF_HOST_SRC_DIR}/cef_pin.cmake")
+flutter_cef_resolve_cef_root(FLUTTER_CEF_CEF_ROOT "")
 message(STATUS "flutter_cef_windows: resolved CEF_ROOT = ${FLUTTER_CEF_CEF_ROOT}")
 
 # CEF is guaranteed present at this point (resolution FATALs otherwise).
@@ -131,10 +101,13 @@ add_custom_command(
   COMMAND "${_cef_host_bat}" "${_cef_host_build_native}" "${_cef_host_dist_native}"
   DEPENDS
     "${CEF_HOST_SRC_DIR}/cef_host_win.cc"
+    "${CEF_HOST_SRC_DIR}/cef_host_policy.h"
     "${CEF_HOST_SRC_DIR}/cef_host_protocol.h"
     "${CEF_HOST_SRC_DIR}/cef_host_opcodes.h"
     "${CEF_HOST_SRC_DIR}/document_start.h"
     "${CEF_HOST_SRC_DIR}/CMakeLists.txt"
+    "${CEF_HOST_SRC_DIR}/cef_pin.cmake"
+    "${CEF_HOST_SRC_DIR}/cef_pin.txt"
     "${CEF_HOST_SRC_DIR}/build_cef_host.bat"
   COMMENT "Building cef_host (CEF OSR host) via build_cef_host.bat"
   VERBATIM
