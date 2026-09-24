@@ -126,8 +126,11 @@ jobs:
       - name: Build and run pipe_probe (cef_host against a stub plugin)
         # Reuses the cef_host build tree the example build just configured.
         # pipe_probe drives the host over the pipe: handshake, create, first
-        # frame, a navigation, shutdown. The second run turns the GPU off and
-        # checks the frames came through OnPaint, the software path.
+        # frame, a navigation, shutdown; then a host whose UI thread it
+        # suspends before kOpShutdown, which has to exit on its own. It serves
+        # its pages on 127.0.0.1, so the network can't slow it down. The
+        # second run turns the GPU off and checks the frames came through
+        # OnPaint, the software path.
         shell: pwsh
         timeout-minutes: 10
         run: |
@@ -149,11 +152,13 @@ jobs:
           }
       - name: Runtime smoke test (example app, real cef_host)
         # Runs the app against the cef_host it just built: first frame, eval, a
-        # JS channel, resize, freeze/thaw, and a crash loop on one of two tiles
-        # sharing a host. Once as the runner composites, once with the GPU off
+        # JS channel, resize, freeze/thaw, then a crash loop and a hung
+        # renderer on one of several tiles sharing a host, and a replaced GPU
+        # process. Once as the runner composites, once with the GPU off
         # (software paint). The plugin's and hosts' log lines go to a file
-        # (FLUTTER_CEF_LOG_FILE); the crash-loop lines are printed, and the
-        # whole log when a mode fails. See example/lib/windows_smoke_probe.dart.
+        # (FLUTTER_CEF_LOG_FILE); the crash-loop and liveness lines are
+        # printed, and the whole log when a mode fails. See
+        # example/lib/windows_smoke_probe.dart.
         shell: pwsh
         timeout-minutes: 20
         run: |
@@ -185,8 +190,8 @@ jobs:
                 Write-Output "== plugin and host log, $mode compositing"
                 Get-Content $log
               } else {
-                Write-Output "== host crash-loop lines, $mode compositing"
-                Select-String -Path $log -Pattern "renderer terminated|giving up|several browsers|browser gone" | ForEach-Object { $_.Line }
+                Write-Output "== host crash-loop and liveness lines, $mode compositing"
+                Select-String -Path $log -Pattern "renderer terminated|giving up|several browsers|browser gone|liveness ping" | ForEach-Object { $_.Line }
               }
             }
             if ($modeFailed) { $failed = $true }

@@ -257,6 +257,10 @@ class FlutterCefPlugin : public flutter::Plugin {
                            const std::string& allowed_schemes,
                            bool agent_control);
   void DisposeSession(const std::string& session_id);
+  // One session can't go on while its host is otherwise fine (its create
+  // failed, its renderer kept crashing or hung): emit processGone(`reason`)
+  // for it and dispose it. The host carries on for its other sessions.
+  void ReportBrowserGone(std::string session_id, const std::string& reason);
   // freezeSession / thawSession (see the .cpp).
   void FreezeSession(
       const flutter::EncodableMap& args,

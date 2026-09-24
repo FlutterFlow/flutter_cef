@@ -8,9 +8,10 @@
 //
 // A static page legitimately presents nothing while idle, so staleness alone
 // is not a hang. The sweep first nudges a stale tile (kOpInvalidate) and pings
-// its renderer with an eval the page can't see. A healthy page answers the
-// ping; a renderer that leaves it unanswered for `hang_ns` is hung, and the
-// plugin ends the host so the tiles are recreated.
+// its renderer: an eval id that cef_host answers from the renderer's main
+// thread, not the page. A live renderer answers the ping; one that leaves it
+// unanswered for `hang_ns` is hung, and the plugin ends that tile alone with
+// processGone("crashed").
 
 #ifndef FLUTTER_PLUGIN_FLUTTER_CEF_LIVENESS_POLICY_H_
 #define FLUTTER_PLUGIN_FLUTTER_CEF_LIVENESS_POLICY_H_

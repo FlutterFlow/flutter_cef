@@ -34,10 +34,18 @@ renderer that crashes 4 times within 10 s ends only its own tile
 tiles crash-loop within 10 s of each other, the host's child processes can't
 start, so the host exits and every tile on it gets `processGone('crashed')`.
 
-The plugin reports `paintStalled` for a tile that never paints. Liveness
-differs from macOS in two ways: a renderer that leaves a JS ping unanswered
-for 15 s (`FLUTTER_CEF_HANG_MS`) ends the whole host rather than just its
-tile, and a replaced GPU process isn't detected.
+The plugin reports `paintStalled` for a tile that never paints. A tile whose
+renderer hangs is handled as on macOS: a tile that has shown no new frame for
+10 s is pinged, and a renderer that leaves the ping unanswered for 15 s
+(`FLUTTER_CEF_HANG_MS`) ends only its own tile (`processGone('crashed')`). The
+renderer answers the ping, not the page, so a page that breaks
+`window.cefQuery` or `JSON` isn't taken for hung. One difference: macOS ends a
+host whose GPU process Chromium had to replace, because its tiles never paint
+again. On Windows they keep painting, so the host carries on.
+
+A `cef_host` that is still running 6 s after it was asked to shut down (30 s
+once its message loop has quit and `CefShutdown` is running) ends itself, as
+on macOS, and writes `still running after shutdown` to its stderr.
 
 ## Sandbox
 

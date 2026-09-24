@@ -1,5 +1,23 @@
 ## Unreleased
 
+* A renderer that leaves the liveness ping unanswered ends only its own tile
+  (`processGone("crashed")`); it used to end the whole host. The ping is
+  answered by the renderer's main thread (a process message), not the page, so
+  a page that breaks `window.cefQuery` or `JSON.stringify` isn't taken for
+  hung, and a page can't answer in the ping's place. As on macOS.
+* `cef_host` ends itself when it is still running 6 s after a shutdown
+  request, or 30 s after its message loop quit (a stuck `CefShutdown`),
+  logging `still running after shutdown (<why>); exiting now` to stderr. As on
+  macOS. The watchdog's thread starts with the host, so a wedged thread
+  holding the loader lock can't keep it from starting.
+* A replaced GPU process doesn't end the host, unlike on macOS: Windows tiles
+  keep painting after Chromium relaunches it.
+* CI: `pipe_probe` serves its pages on 127.0.0.1 instead of example.com,
+  prints each host's stdout and stderr, and checks that a host whose UI
+  thread is suspended at `kOpShutdown` exits on its own about 6 s later. The
+  smoke test hangs one tile's renderer on a shared host (only that tile goes;
+  a page that breaks evals beside it stays) and replaces a host's GPU process
+  (its tiles keep painting).
 * `FLUTTER_CEF_LOG_FILE=<path>` appends the plugin's and every `cef_host`'s log
   lines to that file, each with a millisecond tick, as well as sending them to
   `OutputDebugString`.

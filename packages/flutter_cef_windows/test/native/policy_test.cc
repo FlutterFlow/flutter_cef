@@ -128,6 +128,48 @@ void TestCrashLoopBurstsAgeOut() {
   CHECK(f.OnRendererTerminated(1, At(t0, 3)) == Crash::kReload);
 }
 
+// The hard-exit watchdog's wait against a fake clock. `extend_at` > 0 moves
+// the deadline out to extend_at + the teardown allowance during the first
+// sleep, as the host does when its message loop quits; `early_ms` wakes the
+// first sleep that much early. Returns when the wait ended; counts sleeps.
+int64_t HardExitAt(int64_t start, int64_t extend_at, int64_t early_ms,
+                   int* sleeps) {
+  const auto ms = [](std::chrono::seconds s) {
+    return static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(s).count());
+  };
+  int64_t now = start;
+  int64_t deadline = ms(policy::kHardExitAfterShutdown);
+  *sleeps = 0;
+  policy::WaitForDeadline(
+      [&] { return now; }, [&] { return deadline; },
+      [&](int64_t left) {
+        if (++*sleeps == 1) {
+          if (extend_at > 0)
+            deadline = extend_at + ms(policy::kHardExitAfterTeardown);
+          left -= early_ms;
+        }
+        now += left;
+      });
+  return now;
+}
+
+void TestHardExit() {
+  // The same timings as the macOS host.
+  CHECK(policy::kHardExitAfterShutdown == std::chrono::seconds(6));
+  CHECK(policy::kHardExitAfterTeardown == std::chrono::seconds(30));
+  int sleeps = 0;
+  // Nothing moves the deadline: the process ends 6 s after the request.
+  CHECK(HardExitAt(0, 0, 0, &sleeps) == 6000 && sleeps == 1);
+  // The message loop quits 2 s in, while the watchdog sleeps: on waking it
+  // sees the teardown deadline and waits for that instead.
+  CHECK(HardExitAt(0, 2000, 0, &sleeps) == 32000 && sleeps == 2);
+  // A sleep that ends early is followed by one for the rest.
+  CHECK(HardExitAt(0, 0, 1000, &sleeps) == 6000 && sleeps == 2);
+  // A deadline already behind: no wait at all.
+  CHECK(HardExitAt(7000, 0, 0, &sleeps) == 7000 && sleeps == 0);
+}
+
 void TestPayloadCaps() {
   // Under the cap: untouched.
   CHECK(policy::CapText("hello", 10) == "hello");
@@ -304,6 +346,7 @@ int main() {
   TestCrashLoopOneBrowser();
   TestCrashLoopSeveralBrowsers();
   TestCrashLoopBurstsAgeOut();
+  TestHardExit();
   TestPayloadCaps();
   TestSchemes();
   TestFrameRate();
