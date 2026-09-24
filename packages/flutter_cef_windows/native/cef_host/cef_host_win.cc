@@ -138,6 +138,15 @@ std::set<std::string> g_allowed_schemes;
 // translation (OnBeforeCommandLineProcessing in main.mm).
 std::string g_cdp_io_pipes;
 
+// The plugin's liveness ping: kOpEvalReturning under this id, which Dart never
+// issues. DoEvalReturning asks the renderer itself (kPingMessage, answered
+// from the renderer's main thread with kPongMessage), not the page, so a hung
+// renderer doesn't answer and a page can't stop a live one from answering (by
+// replacing window.cefQuery or JSON, say). As on macOS.
+constexpr uint32_t kLivenessPingId = 0xFFFFFFFFu;
+constexpr char kPingMessage[] = "flutter_cef.ping";
+constexpr char kPongMessage[] = "flutter_cef.pong";
+
 // JS channels: on each MAIN-frame load OnLoadStart injects a
 // window.<name>.postMessage shim for each of the browser's Slot::channels,
 // routed to the browser process over window.cefQuery (the CefMessageRouter
@@ -1329,6 +1338,14 @@ class HostClient : public CefClient,
         callback->Failure(403, "subframe");
         return true;
       }
+      // Only the renderer answers the liveness ping (OnProcessMessageReceived
+      // below), never the page.
+      static const std::string kPingReply =
+          "eval:" + std::to_string(kLivenessPingId) + ":";
+      if (r.rfind(kPingReply, 0) == 0) {
+        callback->Failure(403, "reserved eval id");
+        return true;
+      }
       SendUtf8(slot_->browser_id, kOpEvalResult,
                policy::CapEvalResult(r.substr(5)));
       callback->Success(CefString());
@@ -1367,6 +1384,14 @@ class HostClient : public CefClient,
                                 CefRefPtr<CefFrame> frame,
                                 CefProcessId source_process,
                                 CefRefPtr<CefProcessMessage> message) override {
+    // The renderer answered the liveness ping (see DoEvalReturning); reply as
+    // the plugin's ping eval would have.
+    if (message->GetName().ToString() == kPongMessage) {
+      if (frame && frame->IsMain())
+        SendUtf8(slot_->browser_id, kOpEvalResult,
+                 std::to_string(kLivenessPingId) + ":{\"ok\":true,\"v\":1}");
+      return true;
+    }
     return router_->OnProcessMessageReceived(browser, frame, source_process,
                                              message);
   }
@@ -1716,6 +1741,14 @@ class HostApp : public CefApp,
                                 CefRefPtr<CefFrame> frame,
                                 CefProcessId source_process,
                                 CefRefPtr<CefProcessMessage> message) override {
+    // The liveness ping: answered from this (the renderer's main) thread,
+    // which a hung page or renderer never gets back to.
+    if (message->GetName().ToString() == kPingMessage) {
+      if (frame)
+        frame->SendProcessMessage(PID_BROWSER,
+                                  CefProcessMessage::Create(kPongMessage));
+      return true;
+    }
     return render_router_ &&
            render_router_->OnProcessMessageReceived(browser, frame,
                                                     source_process, message);
@@ -1978,6 +2011,12 @@ void DoJsDialogResp(const std::shared_ptr<Slot>& slot, uint32_t id, bool ok,
 void DoEvalReturning(Slot& slot, uint32_t id, const std::string& code) {
   CefRefPtr<CefFrame> frame = slot.browser->GetMainFrame();
   if (!frame) return;
+  if (id == kLivenessPingId) {
+    // Asked of the renderer itself, not the page.
+    frame->SendProcessMessage(PID_RENDERER,
+                              CefProcessMessage::Create(kPingMessage));
+    return;
+  }
   std::string js =
       "window.cefQuery({request:'eval:" + std::to_string(id) +
       ":'+(function(){try{return JSON.stringify({ok:true,v:(" + code +
@@ -2224,6 +2263,59 @@ void FinishShutdownQuit() {
   CefQuitMessageLoop();
 }
 
+// Ends the process if it is still running a while after a shutdown was
+// requested (policy::kHardExitAfterShutdown; see cef_host_policy.h). Armed
+// once, wherever a shutdown is requested; any thread. As the macOS host's
+// ArmHardExit, except that its thread starts with the process
+// (StartHardExitWatchdog): starting a thread takes the loader lock, which a
+// wedged thread may hold.
+std::once_flag g_hard_exit_armed;
+HANDLE g_hard_exit_event = nullptr;  // set when armed
+std::atomic<int64_t> g_hard_exit_at_ms{0};  // GetTickCount64 clock
+std::atomic<const char*> g_hard_exit_why{""};
+
+int64_t TickMs() { return static_cast<int64_t>(GetTickCount64()); }
+
+void StartHardExitWatchdog() {
+  g_hard_exit_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!g_hard_exit_event) {
+    LogErr("[cef_host] CreateEvent failed (%lu): no hard exit after shutdown",
+           GetLastError());
+    return;
+  }
+  std::thread([] {
+    WaitForSingleObject(g_hard_exit_event, INFINITE);
+    policy::WaitForDeadline(
+        TickMs, [] { return g_hard_exit_at_ms.load(); },
+        [](int64_t ms) { Sleep(static_cast<DWORD>(ms)); });
+    LogErr("[cef_host] still running after shutdown (%s); exiting now",
+           g_hard_exit_why.load());
+    // Not exit(): that runs DLL detach code, which can block on a lock the
+    // wedged thread holds.
+    TerminateProcess(GetCurrentProcess(), 0);
+  }).detach();
+}
+
+// `why` must be a string literal.
+void ArmHardExit(const char* why) {
+  std::call_once(g_hard_exit_armed, [why] {
+    g_hard_exit_why = why;
+    g_hard_exit_at_ms =
+        TickMs() + std::chrono::milliseconds(policy::kHardExitAfterShutdown)
+                       .count();
+    if (g_hard_exit_event) SetEvent(g_hard_exit_event);
+  });
+}
+
+// The message loop has quit and CefShutdown is next: allow it
+// policy::kHardExitAfterTeardown from now.
+void ExtendHardExitForTeardown() {
+  ArmHardExit("teardown");
+  g_hard_exit_at_ms =
+      TickMs() +
+      std::chrono::milliseconds(policy::kHardExitAfterTeardown).count();
+}
+
 // Cookie-store flush completion: once the on-disk jar is written, quit.
 class ShutdownFlushCallback : public CefCompletionCallback {
  public:
@@ -2249,6 +2341,7 @@ class ShutdownFlushCallback : public CefCompletionCallback {
 // grace. The macOS host does not need this.
 void DoShutdown() {
   CEF_REQUIRE_UI_THREAD();
+  ArmHardExit("shutdown");
   std::vector<std::shared_ptr<Slot>> slots;
   {
     std::lock_guard<std::mutex> lock(g_slots_mutex);
@@ -2343,6 +2436,7 @@ void IpcReadLoop() {
         SetDocumentStart(wire_id, document_start::ParsePayload(p, plen));
         break;
       case kOpShutdown:
+        ArmHardExit("kOpShutdown");
         CefPostTask(TID_UI, base::BindOnce(&DoShutdown));
         return;
       case kOpResize: {
@@ -2600,6 +2694,7 @@ void IpcReadLoop() {
   }
   // Plugin died / pipe closed: quit. (Orphan-kill backstop is the plugin's
   // Job Object — JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE — not a parent watch.)
+  ArmHardExit("IPC closed");
   CefPostTask(TID_UI, base::BindOnce(&DoShutdown));
 }
 
@@ -2639,6 +2734,7 @@ extern "C" CEF_BOOTSTRAP_EXPORT int RunConsoleMain(
   if (code >= 0) return code;
 
   // ---- Browser process from here on. ----
+  StartHardExitWatchdog();
   const std::vector<std::string> args = Utf8Args();
   std::string ipc_name = GetSwitch(args, "--ipc=");
   std::string profile_dir = GetSwitch(args, "--profile-dir=");
@@ -2796,6 +2892,7 @@ extern "C" CEF_BOOTSTRAP_EXPORT int RunConsoleMain(
   }
 
   CefRunMessageLoop();
+  ExtendHardExitForTeardown();
 
   // Teardown: invalidate the pipe FIRST (atomic exchange), THEN close — so a
   // late SendFrame from a CEF thread can't write into a recycled handle

@@ -89,6 +89,25 @@ class RendererCrashPolicy {
   std::map<uint32_t, Clock::time_point> bursts_;  // by wire id
 };
 
+// ---- Hard exit after shutdown -----------------------------------------------
+//
+// A host whose UI thread is wedged never runs the shutdown it was sent, so it
+// lingers and keeps its profile's lock. A shutdown request therefore also
+// starts a watchdog that ends the process kHardExitAfterShutdown later. Once
+// the message loop has quit, CefShutdown is running, which takes a second or
+// so and longer on a first launch, so the deadline moves out to
+// kHardExitAfterTeardown from then. The same timings as macOS.
+constexpr std::chrono::seconds kHardExitAfterShutdown{6};
+constexpr std::chrono::seconds kHardExitAfterTeardown{30};
+
+// The watchdog's wait: sleeps until `deadline()` has passed, reading it again
+// after every sleep, so a deadline moved out meanwhile is kept. `now()` and
+// `deadline()` are milliseconds on one clock; `sleep_ms(ms)` sleeps.
+template <typename NowFn, typename DeadlineFn, typename SleepFn>
+void WaitForDeadline(NowFn now, DeadlineFn deadline, SleepFn sleep_ms) {
+  for (int64_t left; (left = deadline() - now()) > 0;) sleep_ms(left);
+}
+
 // ---- Page-sourced payloads --------------------------------------------------
 //
 // The plugin treats a frame body over 64 MiB as a desynced stream and drops

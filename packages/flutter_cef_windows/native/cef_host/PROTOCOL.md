@@ -264,11 +264,22 @@ thread (marshal from the reader thread).
 - Steady-state liveness: every 2 s the plugin checks each painted, visible
   tile. One with no frame for 10 s (`FLUTTER_CEF_LIVENESS_MS`) gets a 0x37
   repaint and a ping: `kOpEvalReturning` with id `0xFFFFFFFF` (Dart's ids never
-  reach it; the reply is consumed, not forwarded). An idle page answers; a
-  renderer that leaves the ping unanswered for 15 s (`FLUTTER_CEF_HANG_MS`)
-  ends its host. Tiles blocked on a JS dialog, with DevTools opened, or on an
-  agent-control host are not pinged. macOS also detects a replaced GPU
-  process; Windows doesn't.
+  reach it; the reply is consumed, not forwarded). The host doesn't evaluate
+  it in the page: it sends the renderer a process message, which the
+  renderer's main thread answers, and replies `0xFFFFFFFF:{"ok":true,"v":1}`
+  (a page's own `eval:` reply under that id is refused). A renderer that
+  leaves the ping unanswered for 15 s (`FLUTTER_CEF_HANG_MS`) is hung: the
+  plugin emits `processGone("crashed")` for that session alone and disposes
+  it, and the host's other browsers carry on. Tiles blocked on a JS dialog,
+  with DevTools opened, or on an agent-control host are not pinged. macOS
+  also ends a host whose GPU process was replaced; on Windows the tiles keep
+  painting after one is, so it isn't watched.
+- Shutdown: `kOpShutdown`, the pipe closing and a crash-loop host exit all
+  arm a watchdog in the host, which ends the process (exit code 0) if it is
+  still running 6 s later, or 30 s after its message loop has quit, logging
+  `[cef_host] still running after shutdown (<why>); exiting now` to stderr.
+  A wedged UI thread never runs the shutdown, and a host left running keeps
+  its profile locked. The timings are the macOS host's.
 - Renderer crash loops are counted per browser, as on macOS. A crash reloads
   the page; 4 crashes of one browser within 10 s end only that browser
   (kOpBrowserGone "crashed", no more reloads): the plugin emits

@@ -14,7 +14,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -1148,6 +1147,16 @@ void FlutterCefPlugin::DisposeSession(const std::string& session_id) {
   if (!host_key.empty()) DetachFromHost(host_key, browser_id);
 }
 
+// `session_id` is taken by value: callers pass the session's own id, which
+// DisposeSession frees. Disposing the host's last session shuts the host
+// down, as any dispose does. As macOS reportBrowserGone.
+void FlutterCefPlugin::ReportBrowserGone(std::string session_id,
+                                         const std::string& reason) {
+  EmitEvent("processGone", session_id,
+            {{Ev("reason"), flutter::EncodableValue(reason)}});
+  DisposeSession(session_id);
+}
+
 void FlutterCefPlugin::DetachFromHost(const std::string& host_key,
                                       uint32_t browser_id) {
   auto hit = hosts_.find(host_key);
@@ -1845,29 +1854,18 @@ void FlutterCefPlugin::HandleSessionFrame(
       // still goes out after it.
       if (!s->visible) SendOrQueue(s, kOpSetVisible, {uint8_t{0}});
       break;
-    case kOpCreateFailed: {
-      // This browser's create failed; the host process is otherwise healthy —
-      // drop just this ONE session (emit processGone, close its browser, keep
-      // the host for its siblings, as macOS onBrowserGone does). Copy the id
-      // first: DisposeSession frees `s`, dangling session_id (an alias of
-      // s->id).
-      const std::string sid = session_id;
-      EmitEvent("processGone", sid,
-                {{Ev("reason"), flutter::EncodableValue("createFailed")}});
-      DisposeSession(sid);
+    case kOpCreateFailed:
+      // This browser's create failed; the host process is otherwise healthy,
+      // so only this session goes.
+      ReportBrowserGone(session_id, "createFailed");
       break;
-    }
     case kOpBrowserGone: {
       // cef_host gave up on this browser (its renderer keeps crashing). The
       // host and its other browsers are fine: drop just this session, as for
-      // a failed create. Disposing it shuts the host down when it was the
-      // host's last browser.
-      const std::string sid = session_id;
+      // a failed create.
       std::string reason = PayloadString(payload);
       if (reason.empty()) reason = "crashed";
-      EmitEvent("processGone", sid,
-                {{Ev("reason"), flutter::EncodableValue(reason)}});
-      DisposeSession(sid);
+      ReportBrowserGone(session_id, reason);
       break;
     }
     case kOpTargetId:
@@ -2112,11 +2110,13 @@ void FlutterCefPlugin::OnWatchdogTimer(UINT_PTR timer_id) {
 // signal. This sweep (a port of CefProfileHost's) covers the steady state.
 // Staleness alone isn't a hang — a static page idles without frames — so a
 // stale tile is nudged with a repaint and its renderer pinged with an eval
-// under liveness::kPingId, an id Dart never issues. A healthy page answers
-// the ping; a renderer that leaves it unanswered for FLUTTER_CEF_HANG_MS is
-// hung, and its host is ended so every tile on it reports processGone
-// ("crashed") and recovers. GPU-process replacement, which macOS also checks,
-// is not detected here.
+// under liveness::kPingId, an id Dart never issues, which cef_host puts to
+// the renderer itself rather than the page. A live renderer answers it; one
+// that leaves it unanswered for FLUTTER_CEF_HANG_MS is hung, and only its
+// tile ends, with processGone("crashed"): its siblings on the host are fine.
+// macOS also ends a host whose GPU process was replaced, because its views
+// never paint again; on Windows they keep painting (the smoke test's
+// chrome://gpucrash case), so there is nothing to watch for.
 
 void FlutterCefPlugin::EnsureLivenessTimer() {
   if (liveness_timer_active_ || !message_window_) return;
@@ -2134,7 +2134,8 @@ void FlutterCefPlugin::OnLivenessTimer() {
   const uint64_t stale_ms = LivenessStalenessMs();
   const uint64_t hang_ms = LivenessHangMs();
   const auto ns = [](uint64_t ms) { return ms * 1000000ull; };
-  std::set<std::string> hung_hosts;
+  // Ended after the loop: ReportBrowserGone erases sessions.
+  std::vector<std::string> hung;
   for (auto& kv : sessions_) {
     Session* s = kv.second.get();
     // Frozen tiles have no browser, and the first-present watchdog owns tiles
@@ -2158,7 +2159,7 @@ void FlutterCefPlugin::OnLivenessTimer() {
     // renderer.
     if (liveness::Ping(ns(now), ns(s->ping_sent_ms), ns(s->ping_replied_ms),
                        ns(stale_ms), ns(hang_ms)) == liveness::PingAction::kHung) {
-      hung_hosts.insert(s->host_key);
+      hung.push_back(s->id);
       continue;
     }
     const bool nudged = s->nudged_at_ms != 0;
@@ -2186,14 +2187,14 @@ void FlutterCefPlugin::OnLivenessTimer() {
       SendOrQueue(s, kOpEvalReturning, std::move(p));
     }
   }
-  // Outside the loop: FailHost erases sessions.
-  for (const auto& key : hung_hosts) {
-    auto it = hosts_.find(key);
-    if (it == hosts_.end()) continue;
-    Log("host '" + key + "': a renderer left a liveness ping unanswered for " +
-        std::to_string(hang_ms / 1000) + "s — ending the host");
-    if (it->second->process) it->second->process->Terminate();
-    FailHost(key, "crashed");
+  for (const auto& sid : hung) {
+    auto it = sessions_.find(sid);
+    if (it == sessions_.end()) continue;
+    Log("host '" + it->second->host_key + "': browser " +
+        std::to_string(it->second->browser_id) +
+        "'s renderer left the liveness ping unanswered for " +
+        std::to_string(hang_ms / 1000) + "s — reporting it gone");
+    ReportBrowserGone(sid, "crashed");
   }
 }
 

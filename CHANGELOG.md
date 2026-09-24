@@ -1,5 +1,12 @@
 ## Unreleased
 
+* **Windows: a hung renderer ends only its tile**, as on macOS: a renderer
+  that leaves the liveness ping unanswered for 15 s gets
+  `processGone('crashed')` for its own tile, and the other tiles on its host
+  carry on. The renderer answers the ping, not the page, so a page that breaks
+  `window.cefQuery` or `JSON` isn't taken for hung.
+* **Windows `cef_host` exits on its own when stuck at shutdown**: 6 s after a
+  shutdown request, or 30 s once `CefShutdown` is running, as on macOS.
 * **Windows logs to a file on request**: set `FLUTTER_CEF_LOG_FILE` to a path
   and the plugin appends its own and every `cef_host`'s log lines there (they
   otherwise go only to `OutputDebugString`).

@@ -17,7 +17,13 @@
 //   * dispose;
 //   * a tile whose renderer keeps crashing ends alone: two tiles share a host,
 //     one is sent to chrome://kill until the host gives up on it, and it gets
-//     processGone('crashed') while the other keeps painting and answering.
+//     processGone('crashed') while the other keeps painting and answering;
+//   * a tile whose renderer hangs ends alone, too: its page loops forever, the
+//     liveness ping goes unanswered, and it gets processGone('crashed'). A
+//     page on the same host that only breaks evals is left alone, because the
+//     ping is answered by the renderer, not the page;
+//   * a GPU process that Chromium replaces (chrome://gpucrash) leaves the
+//     host's tiles painting.
 //
 // The result is a `CEF_PROBE_RESULT PASS|FAIL` line on stdout and, because a
 // Windows GUI app's stdout isn't reliably captured, also in the file named by
@@ -27,6 +33,7 @@
 //       set FLUTTER_CEF_PROBE_OUT=%TEMP%\smoke.txt
 //       build\windows\x64\runner\Debug\flutter_cef_example.exe
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -43,10 +50,17 @@ const _html = '''<!doctype html><meta charset="utf-8">
 </style>
 <div id="s"></div>''';
 
-// The crash-loop case's two tiles are served at different sites, so site
-// isolation gives each its own renderer process and killing one can't take
-// the other with it.
+// A page with nothing to animate: it presents only when something changes.
+const _static =
+    '<!doctype html><body style="background:#234;color:#fff">'
+    '<h1>static</h1>';
+
+// The crash-loop and hang cases' tiles are served at different sites, so site
+// isolation gives each its own renderer process, and killing or hanging one
+// can't take the others with it.
 const _sentinelUrl = 'https://flutter-cef-sentinel.test/';
+const _hangUrl = 'https://flutter-cef-hang.test/';
+const _noEvalsUrl = 'https://flutter-cef-no-evals.test/';
 
 void main() => runApp(const MaterialApp(home: ProbeApp()));
 
@@ -209,6 +223,8 @@ class _ProbeAppState extends State<ProbeApp> {
     }
     await c.dispose();
     await _crashLoops();
+    await _hungRenderer();
+    await _gpuProcessReplaced();
     _finish();
   }
 
@@ -338,6 +354,216 @@ class _ProbeAppState extends State<ProbeApp> {
     }
     await sentinel.dispose();
     await victim.dispose();
+  }
+
+  /// A renderer that stops answering ends only its own tile, and a page that
+  /// merely can't answer evals is left alone.
+  Future<void> _hungRenderer() async {
+    const tag = 'hung renderer';
+    const group = 'windows-smoke-hang';
+    final sentinel = CefWebController(hostGroup: group);
+    final hung = CefWebController(hostGroup: group);
+    final noEvals = CefWebController(hostGroup: group);
+    final clock = Stopwatch()..start();
+    void event(String what) =>
+        _log('  $tag +${clock.elapsedMilliseconds}ms $what');
+    final loaded = <CefWebController>{};
+    String? sentinelGone;
+    String? noEvalsGone;
+    final hungGone = Completer<String>();
+    sentinel.onProcessGone = (r) => sentinelGone ??= r;
+    noEvals.onProcessGone = (r) {
+      event('evals-breaking tile processGone($r)');
+      noEvalsGone ??= r;
+    };
+    hung.onProcessGone = (r) {
+      event('hung tile processGone($r)');
+      if (!hungGone.isCompleted) hungGone.complete(r);
+    };
+    for (final c in [sentinel, hung, noEvals]) {
+      c.onPageFinished = (_) => loaded.add(c);
+    }
+    try {
+      for (final (c, url, html) in [
+        (sentinel, _sentinelUrl, _html),
+        (hung, _hangUrl, _static),
+        (noEvals, _noEvalsUrl, _static),
+      ]) {
+        await c.create(
+          url: url,
+          html: html,
+          htmlBaseUrl: url,
+          width: 320,
+          height: 240,
+        );
+      }
+      _check(
+        '$tag: the tiles load and paint',
+        await _waitFor(() => loaded.length == 3, const Duration(seconds: 60)) &&
+            await _presentsPast(hung, 0) &&
+            await _presentsPast(noEvals, 0),
+      );
+
+      // Every eval's reply goes through JSON.stringify in the page, so once
+      // that throws the page can't answer one. Broken after this eval has
+      // answered.
+      final one = await noEvals
+          .runJavaScriptReturningResult(
+            '(setTimeout(() => { JSON.stringify = () => { throw 0; }; }, 0), 1)',
+          )
+          .timeout(const Duration(seconds: 10));
+      _check(
+        '$tag: an eval answers before the page breaks them',
+        '$one' == '1',
+        one,
+      );
+      final broken = Stopwatch()..start();
+      // This page never returns to its event loop, so its renderer's main
+      // thread can't answer the ping.
+      await hung.executeJavaScript('setTimeout(() => { for (;;) {} }, 0)');
+      event('page hung');
+
+      // The sweep pings a tile that has shown no new frame for 10 s, and a
+      // renderer that leaves the ping unanswered for 15 s is hung.
+      final gone = await hungGone.future.timeout(
+        const Duration(seconds: 60),
+        onTimeout: () => '<none within 60 s>',
+      );
+      _check(
+        '$tag: the hung tile gets processGone(crashed)',
+        gone == 'crashed',
+        gone,
+      );
+      // By 45 s the sweep has pinged the evals-breaking page too. Had the page
+      // been asked rather than its renderer, it would be gone by now.
+      final rest = const Duration(seconds: 45) - broken.elapsed;
+      if (rest > Duration.zero) await Future<void>.delayed(rest);
+      _check(
+        '$tag: a page that can\'t answer evals is left alone',
+        noEvalsGone == null,
+        noEvalsGone,
+      );
+
+      final before = await _presents(sentinel);
+      _check(
+        '$tag: the other tiles keep painting',
+        await _presentsPast(
+          sentinel,
+          before,
+          within: const Duration(seconds: 10),
+        ),
+        await sentinel.sessionStats(),
+      );
+      final four = await sentinel
+          .runJavaScriptReturningResult('2 + 2')
+          .timeout(const Duration(seconds: 10));
+      _check('$tag: the other tiles answer evals', '$four' == '4', four);
+      _check(
+        '$tag: the other tiles get no processGone',
+        sentinelGone == null,
+        sentinelGone,
+      );
+    } catch (e, st) {
+      _check('$tag: ran to completion', false, '$e\n$st');
+    }
+    await sentinel.dispose();
+    await hung.dispose();
+    await noEvals.dispose();
+  }
+
+  /// A GPU process that Chromium replaces leaves the host's tiles painting,
+  /// so Windows, unlike macOS, doesn't end a host for it.
+  Future<void> _gpuProcessReplaced() async {
+    const tag = 'gpu process replaced';
+    const group = 'windows-smoke-gpu';
+    final a = CefWebController(hostGroup: group);
+    final b = CefWebController(hostGroup: group);
+    String? gone;
+    a.onProcessGone = (r) => gone ??= 'a: $r';
+    b.onProcessGone = (r) => gone ??= 'b: $r';
+    try {
+      await a.create(
+        url: _sentinelUrl,
+        html: _html,
+        htmlBaseUrl: _sentinelUrl,
+        width: 320,
+        height: 240,
+      );
+      await b.create(
+        url: 'about:blank',
+        html: _static,
+        width: 320,
+        height: 240,
+      );
+      _check(
+        '$tag: the tiles paint',
+        await _presentsPast(a, 0, within: const Duration(seconds: 60)) &&
+            await _presentsPast(b, 0, within: const Duration(seconds: 60)),
+      );
+      final before = await _gpuProcesses();
+      // chrome://gpucrash is a debug URL: Chromium crashes the GPU process
+      // and starts a new one.
+      await b.navigate('chrome://gpucrash');
+      // Replaced: one of the GPU processes from before is gone, and a new one
+      // is running.
+      bool replaced(Set<int> after) =>
+          !after.containsAll(before) && !before.containsAll(after);
+      var after = before;
+      final sw = Stopwatch()..start();
+      while (sw.elapsed < const Duration(seconds: 15) && !replaced(after)) {
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+        after = await _gpuProcesses();
+      }
+      _check(
+        '$tag: chrome://gpucrash replaces the GPU process',
+        replaced(after),
+        'before $before, after $after',
+      );
+      final presented = await _presents(a);
+      await Future<void>.delayed(const Duration(seconds: 2));
+      final since = await _presents(a) - presented;
+      _check(
+        '$tag: the tiles keep painting',
+        since > 30,
+        '$since presents in 2 s',
+      );
+      final c = CefWebController(hostGroup: group);
+      await c.create(url: 'about:blank', html: _html, width: 320, height: 240);
+      _check(
+        '$tag: a new tile on the host paints',
+        await _presentsPast(c, 0, within: const Duration(seconds: 30)),
+        await c.sessionStats(),
+      );
+      await c.dispose();
+      _check('$tag: no processGone', gone == null, gone);
+    } catch (e, st) {
+      _check('$tag: ran to completion', false, '$e\n$st');
+    }
+    await a.dispose();
+    await b.dispose();
+  }
+
+  /// The pids of the running GPU processes of every cef_host.
+  Future<Set<int>> _gpuProcesses() async {
+    const script =
+        "Get-CimInstance Win32_Process -Filter \"Name='cef_host.exe'\" | "
+        "Where-Object { \$_.CommandLine -like '*--type=gpu-process*' } | "
+        "ForEach-Object { \$_.ProcessId }";
+    // -EncodedCommand takes UTF-16LE, base64: no quoting to get wrong.
+    final utf16 = <int>[];
+    for (final u in script.codeUnits) {
+      utf16
+        ..add(u & 0xff)
+        ..add(u >> 8);
+    }
+    final r = await Process.run('powershell', [
+      '-NoProfile',
+      '-EncodedCommand',
+      base64Encode(utf16),
+    ]);
+    return {
+      for (final w in '${r.stdout}'.split(RegExp(r'\s+'))) ?int.tryParse(w),
+    };
   }
 
   void _finish() {
