@@ -242,7 +242,7 @@ class _ProbeAppState extends State<ProbeApp> {
             children: [
               Padding(
                 padding: const EdgeInsets.all(8),
-                child: Text('P2-step2 probe — $_status',
+                child: Text('multiview probe — $_status',
                     style: const TextStyle(fontWeight: FontWeight.w600)),
               ),
               Expanded(

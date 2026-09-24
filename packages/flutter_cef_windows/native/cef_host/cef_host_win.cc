@@ -1499,9 +1499,9 @@ class HostClient : public CefClient,
       if (!logged.exchange(true))
         SendLog(slot_->browser_id,
                 "OnBeforePopup: sized popup (CEF_WOD_NEW_POPUP) diverted in-tab "
-                "— native OAuth-popup window is post-slice on Windows; "
+                "— Windows has no native OAuth-popup window yet, so "
                 "window.open sign-in (opener/postMessage) will not complete "
-                "(macOS OpenNativeAuthPopup, main.mm:1444)");
+                "(macOS opens one: OpenNativeAuthPopup)");
     }
     // Non-native case (matches macOS's non-popup branch):
     // load the target in this tile.
