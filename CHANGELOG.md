@@ -51,6 +51,30 @@
   `create()` starts a new session, and `isLoading`/`mediaState` reset. A
   throwing `onCreateFailed` no longer keeps `onProcessGone` from running, and an
   error thrown by any event callback is reported instead of breaking the channel.
+* **macOS: answering a JS dialog no longer crashes `cef_host`**: every
+  `alert()`/`confirm()`/`prompt()` answer took down the host and every tile on
+  it (`processGone('crashed')`), because `Continue()` re-entered
+  `OnResetDialogState` and cleared the map being erased from. Windows already
+  had this fix.
+* **Agent control can't reach sibling tiles** (macOS): the relay forwarded
+  every `Target.*` command sent on the agent's own page session, and a page
+  session answers for the whole browser, so an agent could list the other tiles
+  on its host (`Target.getTargets`), attach to one (`Target.attachToTarget`) and
+  run script in it. On a page session only `setAutoAttach` (flatten),
+  `detachFromTarget`, `getTargetInfo`, `activateTarget` and `closeTarget` for
+  its own target now go through. Windows was not affected: it grants agent
+  control only on a host with one tile.
+* **JS channels are per tile**: a channel was injected into every tile's page on
+  the host, and a page could post to any registered channel name through
+  `window.cefQuery`. A page now gets, and can post to, only the channels its own
+  controller registered.
+* **macOS: sized popups are capped at 4 open at once**, and a popup is held to
+  the tile's scheme allowlist, for the URL it opens and for its own
+  navigations.
+* **macOS: an early navigate is held to the scheme allowlist**: a `navigate()`
+  that reached the host before its tile's create frame replaced the create URL
+  and, for a `data:` or `file:` URL, was treated as host content and loaded
+  despite the allowlist.
 * **`runJavaScriptReturningResult` and `getCookies` fail at once** with a
   `StateError` when there is no session to answer (not created, disposed, gone
   or frozen), instead of never completing.

@@ -86,6 +86,36 @@ enum CdpRelayFilterTests {
     fwd("Runtime.evaluate on our session", #"{"id":1,"method":"Runtime.evaluate","sessionId":"SESS-A","params":{}}"#)
     drop("command on foreign session", #"{"id":1,"method":"Runtime.evaluate","sessionId":"SESS-B","params":{}}"#)
 
+    // ── C→R: Target.* on OUR page session — a page session answers for the whole
+    //    browser, so only what drives our own page and its sub-targets goes through ──
+    drop("Target.getTargets on our session (lists siblings)",
+      #"{"id":1,"method":"Target.getTargets","sessionId":"SESS-A"}"#)
+    drop("Target.attachToTarget(sibling) on our session",
+      #"{"id":1,"method":"Target.attachToTarget","sessionId":"SESS-A","params":{"targetId":"TILE-B","flatten":true}}"#)
+    drop("Target.attachToTarget(ours) on our session",
+      #"{"id":1,"method":"Target.attachToTarget","sessionId":"SESS-A","params":{"targetId":"TILE-A","flatten":true}}"#)
+    drop("Target.setDiscoverTargets on our session",
+      #"{"id":1,"method":"Target.setDiscoverTargets","sessionId":"SESS-A","params":{"discover":true}}"#)
+    drop("Target.createTarget on our session",
+      #"{"id":1,"method":"Target.createTarget","sessionId":"SESS-A","params":{"url":"about:blank"}}"#)
+    drop("Target.attachToBrowserTarget on our session",
+      #"{"id":1,"method":"Target.attachToBrowserTarget","sessionId":"SESS-A"}"#)
+    drop("Target.sendMessageToTarget on our session",
+      #"{"id":1,"method":"Target.sendMessageToTarget","sessionId":"SESS-A","params":{"sessionId":"SESS-B","message":"{}"}}"#)
+    drop("Target.exposeDevToolsProtocol on our session",
+      #"{"id":1,"method":"Target.exposeDevToolsProtocol","sessionId":"SESS-A","params":{"targetId":"TILE-B"}}"#)
+    drop("Target.closeTarget(sibling) on our session",
+      #"{"id":1,"method":"Target.closeTarget","sessionId":"SESS-A","params":{"targetId":"TILE-B"}}"#)
+    drop("Target.detachFromTarget(sibling session) on our session",
+      #"{"id":1,"method":"Target.detachFromTarget","sessionId":"SESS-A","params":{"sessionId":"SESS-B"}}"#)
+    drop("Target.setAutoAttach non-flatten on our session",
+      #"{"id":1,"method":"Target.setAutoAttach","sessionId":"SESS-A","params":{"autoAttach":true,"flatten":false}}"#)
+    fwd("Target.setAutoAttach(flatten) on our session (frames, workers)",
+      #"{"id":1,"method":"Target.setAutoAttach","sessionId":"SESS-A","params":{"autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true}}"#)
+    fwd("Target.getTargetInfo on our session", #"{"id":1,"method":"Target.getTargetInfo","sessionId":"SESS-A"}"#)
+    fwd("Target.detachFromTarget(our session)",
+      #"{"id":1,"method":"Target.detachFromTarget","sessionId":"SESS-A","params":{"sessionId":"SESS-A"}}"#)
+
     // ── C→R: browser-level allow-list + fail-closed ──
     fwd("Browser.getVersion (benign)", #"{"id":1,"method":"Browser.getVersion"}"#)
     drop("Browser.setDownloadBehavior (no-op'd, not forwarded)",

@@ -38,6 +38,18 @@
   pid has exited; older unnamed dirs are swept after a day untouched.
 * An ephemeral profile dir is removed after its host has exited, not while the
   host may still be writing to it.
+* Fix: answering a JS dialog crashed `cef_host` (`DoJsDialogResp` erased
+  through an iterator `Continue()` had invalidated via `OnResetDialogState`).
+* Security: the CDP relay allowlists `Target.*` on the agent's page session
+  (a page session answers `Target.getTargets`/`attachToTarget` for the whole
+  browser, which let an agent drive sibling tiles).
+* Security: JS channels are registered per browser (`Slot::channels`), not per
+  host, and `OnQuery` refuses a `ch:` message for a channel the browser didn't
+  register.
+* Security: a sized popup needs a user gesture, a URL `SchemeAllowed`, and fewer
+  than 4 native popups open; popup windows gate their own navigations too.
+* Security: a navigate parked for a not-yet-created browser no longer arms the
+  `data:`/`file:` trusted-load exemption.
 
 ## 0.2.0
 

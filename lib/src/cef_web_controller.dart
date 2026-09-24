@@ -887,6 +887,10 @@ class CefWebController {
   /// Evaluate [code] in the main frame and return its value (decoded from JSON,
   /// so primitives, lists and maps all round-trip). Completes with an error if
   /// the script throws.
+  ///
+  /// [code] runs in the page's own JavaScript world and its result comes back
+  /// through it, so treat the result as data from the page: a page can change
+  /// what the script sees or answer in its place.
   Future<Object?> runJavaScriptReturningResult(String code) {
     final unavailable = _sessionUnavailable;
     if (unavailable != null) return Future.error(StateError(unavailable));
