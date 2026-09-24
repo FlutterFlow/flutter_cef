@@ -91,6 +91,13 @@
   id mappings when a new client connects.
 * Tests: `test/run_host_config_tests.sh`, and `test/run_host_lifecycle_test.sh`
   (needs a built host; skips without one).
+* Fix: a view created on a warm host sometimes never painted. The first
+  off-screen view in a process gets begin-frame source id 0, and in viz a new
+  view's begin-frame source treats 0 as its own id until its first begin frame.
+  A frame of the id-0 view in flight at that moment left that first begin frame
+  unfinished forever, so CEF dropped every later one. Before its first tile,
+  `cef_host` now creates and closes a browser that takes id 0 (about 20 ms,
+  once per host). Probe: `warm_host_paint`. The prebuilt must be republished.
 * Source layout, no behavior change: `cef_host`'s `main.mm` is split into nine
   translation units (see its header), `CefProfileHost` into four extension
   files with its locks documented in one place, and the plugin keeps one

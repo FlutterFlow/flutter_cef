@@ -17,6 +17,7 @@
 #include "ipc.h"
 #include "mac_key_bindings.h"
 #include "popups.h"
+#include "render_handler.h"
 #include "renderer_messages.h"
 
 namespace cef_host {
@@ -45,6 +46,7 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr,
   CEF_REQUIRE_UI_THREAD();
   if (wire_id > g_max_created_wire_id) g_max_created_wire_id = wire_id;
   if (g_shutting_down) return;
+  ClaimFirstBeginFrameSource();
   // A load that beat this (paced) create frame here supersedes the create URL.
   bool early_trusted = false;
   bool early_untrusted = false;
