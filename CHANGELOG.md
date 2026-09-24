@@ -1,3 +1,11 @@
+## Unreleased
+
+* **Windows logs to a file on request**: set `FLUTTER_CEF_LOG_FILE` to a path
+  and the plugin appends its own and every `cef_host`'s log lines there (they
+  otherwise go only to `OutputDebugString`).
+* The Windows runtime smoke test's crash-loop case no longer depends on the
+  network or a fixed pace, and CI prints the host's side of it.
+
 ## 0.3.0
 
 * **Windows catches up with macOS**: `sessionStats`, `setAudioMuted`,

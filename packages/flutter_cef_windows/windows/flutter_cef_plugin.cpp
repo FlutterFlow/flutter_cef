@@ -60,8 +60,26 @@ UINT WatchdogGraceMs() { return EnvMs(L"FLUTTER_CEF_FIRSTPAINT_MS", 10000); }
 UINT LivenessStalenessMs() { return EnvMs(L"FLUTTER_CEF_LIVENESS_MS", 10000); }
 UINT LivenessHangMs() { return EnvMs(L"FLUTTER_CEF_HANG_MS", 15000); }
 
+// The plugin's and the hosts' log lines go to OutputDebugString. When
+// FLUTTER_CEF_LOG_FILE names a file they are also appended there, with a
+// millisecond tick, for where no debugger is attached (CI).
 void Log(const std::string& msg) {
-  OutputDebugStringA(("[flutter_cef_windows] " + msg + "\n").c_str());
+  const std::string line = "[flutter_cef_windows] " + msg + "\n";
+  OutputDebugStringA(line.c_str());
+  static const std::wstring log_file = [] {
+    wchar_t buf[MAX_PATH] = {};
+    const DWORD n =
+        GetEnvironmentVariableW(L"FLUTTER_CEF_LOG_FILE", buf, MAX_PATH);
+    return n > 0 && n < MAX_PATH ? std::wstring(buf, n) : std::wstring();
+  }();
+  if (log_file.empty()) return;
+  static std::mutex log_mutex;
+  std::lock_guard<std::mutex> lock(log_mutex);
+  FILE* f = nullptr;
+  if (_wfopen_s(&f, log_file.c_str(), L"ab") != 0 || !f) return;
+  fprintf(f, "%llu %s", static_cast<unsigned long long>(GetTickCount64()),
+          line.c_str());
+  fclose(f);
 }
 
 // Verbs the macOS plugin serves that Windows has no host support for. They
