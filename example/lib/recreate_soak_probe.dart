@@ -1,5 +1,5 @@
 // Recreate SOAK probe — mimics Campus's CefSessionController.recover() (the one pattern
-// the other probes never exercised): on a paint-stall / F-6 stall Campus DISPOSES the
+// the other probes never exercised): on a paint stall or liveness stall Campus DISPOSES the
 // controller, builds a FRESH one, and REMOUNTS the CefWebView against it (a generation
 // ValueKey bump). This probe drives that recreate cycle interleaved with zoom (renderScale)
 // and cull (setVisible) — the suspected source of "looks fine, then after interaction

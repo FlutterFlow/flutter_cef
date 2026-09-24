@@ -5,7 +5,7 @@
 //   cef_host.exe --ipc=<pipe name> --profile-dir=<dir> [--ephemeral]
 //                [--allowed-schemes=<csv>] [--cdp-io-pipes=<r>,<w>]
 // (named pipe: the child connects by NAME with CreateFileW, so no handle
-// inheritance is needed — cf. S3, which inherited anonymous handles).
+// inheritance is needed, unlike the agent-control CDP pipes below).
 //
 // Kill guarantees:
 //  - Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, assigned before the
@@ -44,8 +44,8 @@ class HostProcess {
   // CefProfileHost.spawn). A list that isn't all valid schemes is refused.
   // Returns false on spawn failure.
   //
-  // AGENT CONTROL (P9): when `agent_control` is true, the spawn additionally
-  // sets up the CDP-over-pipe transport (the S3 recipe, mirroring macOS
+  // AGENT CONTROL: when `agent_control` is true, the spawn additionally
+  // sets up the CDP-over-pipe transport (mirroring macOS
   // launchViaPosixSpawn's fds 3/4): it CreatePipe()s two anonymous pipes, marks
   // ONLY the child-side ends inheritable, spawns cef_host with a
   // STARTUPINFOEX PROC_THREAD_ATTRIBUTE_HANDLE_LIST containing exactly those two
@@ -58,7 +58,7 @@ class HostProcess {
   // `out_cdp_read` (we read CDP responses/events here; child writes) and
   // `out_cdp_write` (we write CDP commands here; child reads). The caller owns +
   // closes them. When `agent_control` is false the spawn is byte-identical to
-  // the pre-P9 path (no handle inheritance, no extra pipes).
+  // a plain spawn (no handle inheritance, no extra pipes).
   bool Spawn(const std::wstring& cef_host_exe, const std::wstring& pipe_name,
              const std::wstring& profile_dir, bool ephemeral,
              const std::string& allowed_schemes = std::string(),
@@ -92,7 +92,7 @@ class HostProcess {
 
  private:
   HANDLE process_ = nullptr;  // held hProcess (no pid dance — a HANDLE is
-                              // not a recyclable global name, PLAN §4.2)
+                              // not a recyclable global name)
   HANDLE job_ = nullptr;      // kill-on-close Job Object
 };
 

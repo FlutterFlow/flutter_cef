@@ -372,7 +372,7 @@ and committed text — including emoji — should appear intact.</p>
                     onPressed: _controller.openDevTools,
                   ),
                   // macOS-only: showEmojiPicker drives the AppKit Character
-                  // Palette; there is no supported Win32 equivalent (PLAN §6),
+                  // Palette; there is no supported Win32 equivalent,
                   // so the button is hidden per-platform.
                   if (Platform.isMacOS)
                     IconButton(

@@ -2,7 +2,7 @@
 # plugin build (driven by build_cef_host.bat, which the plugin CMakeLists
 # invokes via add_custom_command).
 #
-# Ship shape (docs/history/windows-port/SPIKES.md S2): the host is a client
+# Ship shape: the host is a client
 # DLL `cef_host.dll` exporting RunConsoleMain, loaded by CEF's prebuilt
 # bootstrap. We ship bootstrapc.exe RENAMED to cef_host.exe beside the DLL (the
 # rename selects the module — no --module flag needed; clean Task Manager
@@ -10,9 +10,9 @@
 # sandbox_info the host forwards to CEF.
 #
 # CEF's own cmake config (find_package(CEF)) drives compiler flags (/MT):
-# this target never links against Flutter, so the plugin's /MD rule (S6a)
-# does not apply here. The client DLL must link delayimp.lib (CEF's
-# /DELAYLOAD list — docs/history/windows-port/SPIKES.md S2).
+# this target never links against Flutter, so the plugin's /MD rule (the CEF
+# wrapper built against Flutter's runtime) does not apply here. The client
+# DLL must link delayimp.lib (CEF's /DELAYLOAD list needs it).
 
 cmake_minimum_required(VERSION 3.21)
 project(cef_host_win LANGUAGES CXX)
@@ -53,15 +53,15 @@ add_library(cef_host SHARED
   document_start.h
 )
 SET_LIBRARY_TARGET_PROPERTIES(cef_host)
-# NOMINMAX: cef_types_win.h pulls windows.h; without it std::min/max -> C2589
-# (S6a). CEF's own configs may set it too — harmless twice.
+# NOMINMAX: cef_types_win.h pulls windows.h; without it std::min/max -> C2589.
+# CEF's own configs may set it too — harmless twice.
 target_compile_definitions(cef_host PRIVATE NOMINMAX)
 target_include_directories(cef_host PRIVATE ${CEF_ROOT})
 target_link_libraries(cef_host
   ${WRAPPER_LIB}
   "${CEF_ROOT}/Release/libcef.lib"
   delayimp.lib
-  # The OnAcceleratedPaint NT->legacy bridge blit (S1 pixel path).
+  # The OnAcceleratedPaint NT->legacy bridge blit (the GPU pixel path).
   d3d11.lib
   dxgi.lib
 )

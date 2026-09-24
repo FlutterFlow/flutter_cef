@@ -1,4 +1,4 @@
-// P2-step2 LIVE probe (cef-multiview PLAN Tests A + D + E) — flutter_cef side.
+// Multi-view agent-control LIVE probe (checks A, D, E, F below) — flutter_cef side.
 //
 // Auto-running, headless-friendly self-test: mounts TWO CefWebViews on ONE shared
 // named profile (an isolated 'p2probe' — deliberately NOT Campus's real 'campus-web'
@@ -18,11 +18,11 @@
 //   E. each relay's Target.getTargets returns ONLY its own target (A can't see B),
 //      and presenting tile A's token to tile B's port is rejected.
 //   F. concurrency + lifecycle: enabling both CONCURRENTLY brings up two isolated
-//      relays (the per-browserId dict, not the P1 scalar); disabling A kills only
+//      relays (one per browserId, not a single per-host slot); disabling A kills only
 //      A's grant (its endpoint goes dead) while B keeps driving; and A can be
 //      RE-ENABLED after disable — a fresh port+token, the torn-down grant stays dead.
 //
-// Not covered here — reader-stall isolation (PLAN Test G, the SO_SNDTIMEO reaping of
+// Not covered here — reader-stall isolation (the SO_SNDTIMEO reaping of
 // a wedged client + no sibling starvation): a faithful repro needs a real CDP driver
 // that completes the flatten auto-attach handshake and drives pipe-routed commands
 // (this probe's Target.getTargets is synthesized client-side and bypasses the shared
@@ -125,8 +125,8 @@ class _ProbeAppState extends State<ProbeApp> {
     final out = <String, dynamic>{};
     try {
       setState(() => _status = 'enabling agent-control on both views CONCURRENTLY…');
-      // F — concurrent enable: fire BOTH at once (not sequentially). The P1 scalar
-      // relay/relayBrowserId would have lost this race; the per-browserId dict +
+      // F — concurrent enable: fire BOTH at once (not sequentially). A single
+      // per-host relay/relayBrowserId would have lost this race; the per-browserId dict +
       // cdpHandlerLock must bring up two isolated relays under simultaneous enable.
       final grants = await Future.wait([_enable(_a), _enable(_b)]);
       final gA = grants[0], gB = grants[1];
@@ -242,7 +242,7 @@ class _ProbeAppState extends State<ProbeApp> {
             children: [
               Padding(
                 padding: const EdgeInsets.all(8),
-                child: Text('P2-step2 probe — $_status',
+                child: Text('multiview probe — $_status',
                     style: const TextStyle(fontWeight: FontWeight.w600)),
               ),
               Expanded(

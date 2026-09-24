@@ -495,7 +495,7 @@ class CefWebController {
         onProcessGone?.call(reason);
         break;
       case 'paintStalled':
-        // C1: the browser came up but never delivered its first frame even after a
+        // The browser came up but never delivered its first frame even after a
         // re-kick — the texture is (still) blank with no other signal. Surface it so
         // the consumer can recover (e.g. recreate the view) instead of a silent blank.
         onPaintStalled?.call();
@@ -829,9 +829,9 @@ class CefWebController {
             ? allowedSchemes.map((s) => s.toLowerCase()).join(',')
             : null,
         enableCdp: enableCdp,
-        // Agent-control / pipe mode (CEF-1): the native side launches cef_host
-        // via posix_spawn with CDP over inherited fds 3/4 (--cdp-pipe) instead
-        // of a TCP --cdp-port.
+        // Agent-control / pipe mode: the native side launches cef_host with
+        // CDP over inherited pipes (fds 3/4 on macOS, two anonymous pipes on
+        // Windows) instead of a TCP --cdp-port.
         agentControl: agentControl,
         profile: profile != null && profile!.isNotEmpty ? profile : null,
         hostGroup:
@@ -922,7 +922,7 @@ class CefWebController {
     return _platform.openAuthWindow(sessionId, url);
   }
 
-  /// CEF-2a — enable agent control for this tile and return a brokered, token-gated
+  /// Enable agent control for this tile and return a brokered, token-gated
   /// CDP endpoint a standard CDP client (e.g. `agent-browser`) can connect to.
   ///
   /// Requires the controller to have been created with `agentControl: true` (the
@@ -959,7 +959,7 @@ class CefWebController {
     return (wsUrl: wsUrl, token: token, port: port);
   }
 
-  /// CEF-2a — tear down the agent-control relay (closes the listener and any client,
+  /// Tear down the agent-control relay (closes the listener and any client,
   /// invalidates the token). The tile itself keeps running. Idempotent.
   Future<void> disableAgentControl() =>
       _platform.disableAgentControl(sessionId);

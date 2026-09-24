@@ -1,4 +1,4 @@
-// P7 JS-bridge smoke harness (Windows integration proof) — reload-tolerant.
+// JS-bridge smoke harness (Windows integration proof) — reload-tolerant.
 //
 // loadHtmlString settles with an extra page reload, so linear orchestration on
 // one page session is fragile. Instead: confirm() + the download click run in

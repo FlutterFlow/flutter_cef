@@ -4,7 +4,7 @@
 // packages/flutter_cef_macos/macos/Classes/CdpRelay.swift (the canonical
 // relay): it re-exposes cef_host's CDP-over-pipe (Chromium
 // --remote-debugging-pipe + --remote-debugging-io-pipes, NUL-framed JSON on
-// two inherited anonymous pipes — the S3 recipe) to a standard CDP client
+// two inherited anonymous pipes) to a standard CDP client
 // (Playwright via connectOverCDP / agent-browser) as a loopback HTTP+WebSocket
 // endpoint. The Swift protocol logic ports directly: the POSIX socket calls
 // (socket/bind/listen/accept/recv/send, fd) become winsock (WSAStartup,
@@ -24,11 +24,11 @@
 //  - Single active client — a second concurrent ws upgrade is rejected 503.
 //  - CSPRNG token (BCryptGenRandom), constant-time compared.
 //
-// SINGLE-TILE SCOPE (P9): this relay is the raw browser-level PASSTHROUGH
-// (CEF-2a) — the CDP pipe carries exactly ONE page target (the one tile), so a
-// passthrough is functionally correct and safe (there is no sibling tile to
-// hide). The per-tile Target-domain FILTER + N-relay CDP-id MULTIPLEX (CEF-2b —
-// the `scopeTargetId`/`relayId` machinery in CdpRelay.swift:560-884) is the
+// SINGLE-TILE SCOPE: this relay is the raw browser-level PASSTHROUGH — the
+// CDP pipe carries exactly ONE page target (the one tile), so a passthrough is
+// functionally correct and safe (there is no sibling tile to hide). The
+// per-tile Target-domain FILTER + N-relay CDP-id MULTIPLEX (the
+// `scopeTargetId` filter and `CdpPipeIds` remap in CdpRelay.swift) is the
 // documented follow-up for N-tile Target multiplexing and is NOT implemented
 // here. The `scope_target_id` seam below is left in place for it (empty =
 // passthrough today); see the class comment where the filter hooks would go.
@@ -64,10 +64,10 @@ class CdpRelay : public std::enable_shared_from_this<CdpRelay> {
   // safe to call from the relay's frame-loop thread.
   using SendToPipe = std::function<void(const std::string&)>;
 
-  // `send_to_pipe` bridges client->pipe. `scope_target_id` is the CEF-2b
-  // per-tile filter seam: empty (the P9 single-tile default) is the raw
-  // browser-level passthrough; a non-empty targetId would engage the
-  // Target-domain filter (NOT implemented in the slice — see the file comment).
+  // `send_to_pipe` bridges client->pipe. `scope_target_id` is the per-tile
+  // filter seam: empty (the single-tile default) is the raw browser-level
+  // passthrough; a non-empty targetId would engage the Target-domain filter
+  // (NOT implemented yet — see the file comment).
   explicit CdpRelay(SendToPipe send_to_pipe,
                     std::string scope_target_id = std::string());
   ~CdpRelay();
@@ -120,7 +120,7 @@ class CdpRelay : public std::enable_shared_from_this<CdpRelay> {
   void WriteRaw(SOCKET fd, const std::string& s);
 
   const SendToPipe send_to_pipe_;
-  const std::string scope_target_id_;  // CEF-2b seam (empty = passthrough)
+  const std::string scope_target_id_;  // per-tile seam (empty = passthrough)
   std::string token_;
   uint16_t port_ = 0;
 

@@ -1,6 +1,6 @@
 #!/bin/bash
-# LEAK-SOAK GATE — guards the producer-allocates IOSurface LIFETIME invariant (the property the
-# three sev-8 audit findings probed and which the render oracle does NOT cover): cef_host mints a
+# LEAK-SOAK GATE — guards the producer-allocates IOSurface LIFETIME invariant (which the render
+# oracle does NOT cover): cef_host mints a
 # surface per paint/recreate and CFReleases the old; the consumer's CVPixelBuffer holds the only
 # remaining ref until it adopts the next id. If that ledger ever regresses (producer forgets to
 # release, or the consumer never drops the old ref), surfaces accumulate — invisible to the render

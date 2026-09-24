@@ -3,24 +3,24 @@
 // The Flutter plugin (packages/flutter_cef_windows/windows/) spawns one
 // cef_host per profile and drives N browsers in it over a named-pipe IPC.
 // The wire contract is PROTOCOL.md + cef_host_protocol.h in this directory —
-// transcribed verbatim from the macOS reference
-// packages/flutter_cef_macos/native/cef_host/main.mm, with ONE payload
-// difference (LAW 10): kOpPresent carries {u64 bridgeHandle BE}{u32 srcW BE}
+// transcribed verbatim from the macOS reference host
+// (packages/flutter_cef_macos/native/cef_host/), with ONE payload
+// difference: kOpPresent carries {u64 bridgeHandle BE}{u32 srcW BE}
 // {u32 srcH BE} where bridgeHandle is the DXGI LEGACY shared handle of the
 // host-minted D3D11_RESOURCE_MISC_SHARED bridge texture.
 //
-// Ship shape (LAW 8, SPIKES.md S2): this builds as cef_host.dll exporting
+// Ship shape: this builds as cef_host.dll exporting
 // RunConsoleMain, loaded by CEF's prebuilt bootstrapc.exe shipped RENAMED to
 // cef_host.exe beside it. bootstrapc's sandbox_info is forwarded to BOTH
 // CefExecuteProcess and CefInitialize, so the renderer, GPU and utility
 // children run sandboxed. FLUTTER_CEF_NO_SANDBOX=1 turns the sandbox off.
 //
-// THE LAWS this file keeps (specs/windows-port/SPIKES.md):
+// Rules this file keeps (measured on CEF 144 during the Windows port):
 //  1. external_begin_frame_enabled = FALSE; windowless_frame_rate = 60.
-//     (S4: with the external pump only the FIRST browser in the process ever
-//     paints. The macOS PumpBeginFrame pacer is NOT ported; everywhere main.mm
-//     calls SendExternalBeginFrame we use Invalidate(PET_VIEW) — with the
-//     internal frame timer ON that is sufficient to drive a repaint.)
+//     (With the external pump only the FIRST browser in the process ever
+//     paints. The macOS PumpBeginFrame pacer is NOT ported; everywhere the
+//     macOS host calls SendExternalBeginFrame we use Invalidate(PET_VIEW) —
+//     with the internal frame timer ON that is sufficient to drive a repaint.)
 //  2. OnAcceleratedPaint's NT handle is valid ONLY inside the callback:
 //     OpenSharedResource1 + CopyResource to the legacy bridge INSIDE the
 //     callback, synchronously. The NT handle is never stored.
@@ -33,8 +33,9 @@
 //     consumer contract, PROTOCOL.md §5) can refuse stale-size frames.
 //  5. Bridge textures are D3D11_RESOURCE_MISC_SHARED (LEGACY handle via
 //     IDXGIResource::GetSharedHandle, not NT) — what ANGLE/Flutter accepts.
-//  6. (Plugin-side; supported here by keeping the retired bridge alive until
-//     the present announcing its replacement has been written to the pipe.)
+//  6. The plugin holds its own opened reference to the bridge it shows; this
+//     side helps by keeping the retired bridge alive until the present
+//     announcing its replacement has been written to the pipe.
 //
 // Args (per-PROCESS / per-profile, as on macOS), read from the wide command
 // line as UTF-8:
@@ -110,29 +111,31 @@ using namespace flutter_cef;  // opcodes + BE codecs (cef_host_protocol.h)
 using Microsoft::WRL::ComPtr;
 
 // ---- Shared runtime state ----
-// The IPC pipe handle. Atomic for the same reason main.mm:166-172 makes the
-// fd atomic: the reader thread, SendFrame (any CEF thread), and teardown all
+// The IPC pipe handle. Atomic for the same reason the macOS host's g_ipc_fd
+// (ipc.mm) is: the reader thread, SendFrame (any CEF thread), and teardown all
 // touch it.
 std::atomic<HANDLE> g_ipc_pipe{INVALID_HANDLE_VALUE};
 std::mutex g_ipc_write_mutex;
 
 // One hidden window per host process, passed to SetAsWindowless(parent) so
-// dialogs/menus/IMM degrade gracefully (PLAN §4.3; S5 works either way but
-// an HWND is the better default).
+// dialogs/menus/IMM degrade gracefully (the WebAuthn passkey UI shows either
+// way, but an HWND is the better default).
 HWND g_hidden_hwnd = nullptr;
 
 // Host-set navigation scheme allowlist (lowercased; --allowed-schemes=a,b).
 // Empty = allow all. `about` is always allowed. Enforced in
-// HostClient::OnBeforeBrowse exactly like main.mm:335-342/1528-1565.
+// HostClient::OnBeforeBrowse exactly like the macOS host (SchemeAllowed in
+// host_state.mm, OnBeforeBrowse in host_client.mm).
 std::set<std::string> g_allowed_schemes;
 
-// Agent-control CDP-over-pipe (P9). "<read>,<write>" decimal inherited-HANDLE
-// values from the plugin's --cdp-io-pipes= switch (the S3 recipe): the browser
-// READS CDP commands from <read> and WRITES responses/events to <write>. Set in
-// RunConsoleMain (browser process only) BEFORE CefInitialize; OnBeforeCommand-
-// LineProcessing then injects Chromium's --remote-debugging-pipe +
-// --remote-debugging-io-pipes. Empty = agent control off (byte-identical to the
-// pre-P9 launch). Mirrors macOS main.mm's --cdp-pipe translation.
+// Agent-control CDP-over-pipe. "<read>,<write>" decimal inherited-HANDLE
+// values of two anonymous pipes, from the plugin's --cdp-io-pipes= switch: the
+// browser READS CDP commands from <read> and WRITES responses/events to
+// <write>. Set in RunConsoleMain (browser process only) BEFORE CefInitialize;
+// OnBeforeCommandLineProcessing then injects Chromium's --remote-debugging-pipe
+// + --remote-debugging-io-pipes. Empty = agent control off (byte-identical to
+// a launch without agent control). Mirrors the macOS host's --cdp-pipe
+// translation (OnBeforeCommandLineProcessing in main.mm).
 std::string g_cdp_io_pipes;
 
 // JS channels: on each MAIN-frame load OnLoadStart injects a
@@ -219,7 +222,7 @@ void LogErr(const char* fmt, ...) {
   va_end(ap);
 }
 
-// ---- Pipe I/O (framing per PROTOCOL.md §1 / main.mm:416-446) ----
+// ---- Pipe I/O (framing per PROTOCOL.md §1) ----
 //
 // OVERLAPPED, EMPIRICALLY REQUIRED (found via pipe_probe, 2026-07-20): on a
 // SYNCHRONOUS pipe handle Windows serializes all I/O on the file object, so
@@ -275,10 +278,10 @@ bool WriteAllPipe(HANDLE pipe, const void* buf, size_t len) {
 
 // Frame layout: [u32 bodyLen BE][u32 browserId BE][u8 opcode][payload].
 // bodyLen = 4 + 1 + payloadLen. Assembled whole + written under the write
-// mutex so a partial write never desyncs the peer (mirrors main.mm SendFrame).
-// C3 ordering: the handle is snapshotted UNDER the write lock; teardown
-// exchanges INVALID_HANDLE_VALUE + closes under this same lock, so a late
-// paint-thread send can never write into a recycled handle.
+// mutex so a partial write never desyncs the peer (mirrors the macOS host's
+// SendFrame in ipc.mm). Ordering: the handle is snapshotted UNDER the write
+// lock; teardown exchanges INVALID_HANDLE_VALUE + closes under this same lock,
+// so a late paint-thread send can never write into a recycled handle.
 void SendFrame(uint32_t browser_id, uint8_t opcode, const void* payload,
                size_t payload_len) {
   if (g_ipc_pipe.load() == INVALID_HANDLE_VALUE) return;  // racy early-out
@@ -387,10 +390,10 @@ std::string TempDirUtf8() {
 
 // ---- Process-wide D3D11 device for the bridge-blit present path ----
 // One device + immediate context for the whole cef_host process, created
-// lazily on the first accelerated paint (mirrors main.mm's g_mtl_device
-// singleton, main.mm:320-333). The immediate context is NOT thread-safe;
-// OnAcceleratedPaint arrives on the CEF UI thread only, but g_d3d_mutex
-// serializes it anyway (belt + suspenders, and future-proof).
+// lazily on the first accelerated paint (mirrors the macOS host's
+// g_mtl_device singleton in render_handler.mm). The immediate context is NOT
+// thread-safe; OnAcceleratedPaint arrives on the CEF UI thread only, but
+// g_d3d_mutex serializes it anyway (belt + suspenders, and future-proof).
 ComPtr<ID3D11Device> g_d3d_device;
 ComPtr<ID3D11Device1> g_d3d_device1;
 ComPtr<ID3D11DeviceContext> g_d3d_ctx;
@@ -462,9 +465,9 @@ struct Slot;
 using BrowserOp = std::function<void(Slot&)>;
 
 // Per-browser state: one cef_host process multiplexes N browsers, one Slot
-// per plugin-assigned wire id (mirrors main.mm's Slot, with the IOSurface/Metal
-// fields swapped for the D3D11 bridge and the macOS-only begin-frame-pump
-// fields dropped per LAW 1).
+// per plugin-assigned wire id (mirrors the macOS host's Slot in host_state.h,
+// with the IOSurface/Metal fields swapped for the D3D11 bridge and the
+// begin-frame-pump fields dropped: this host never uses external begin frames).
 //
 // The slot is registered by the IPC reader when the create frame arrives, so
 // every frame behind it (a resize, zoom, JS, input) finds it. The browser binds
@@ -472,7 +475,7 @@ using BrowserOp = std::function<void(Slot&)>;
 struct Slot {
   uint32_t browser_id = 0;  // plugin-assigned wire id (>=1); NOT GetIdentifier().
   CefRefPtr<CefBrowser> browser;
-  // H3 async-create dispose-loss guard: a dispose arriving while CreateBrowser
+  // Async-create dispose-loss guard: a dispose arriving while CreateBrowser
   // is in flight records intent here; OnAfterCreated honors it the instant the
   // browser binds. UI-thread-confined.
   bool close_requested = false;
@@ -486,24 +489,26 @@ struct Slot {
   double created_dpr = 1.0;
 
   // Guards bridge / width / height / dpr for THIS browser. Per-slot so paints
-  // on independent browsers don't contend (main.mm surface_mutex).
+  // on independent browsers don't contend (as the macOS Slot's surface_mutex).
   std::mutex surface_mutex;
-  // The host-minted legacy MISC_SHARED bridge texture (LAWs 3/5) — the
-  // identity Flutter sees. Re-minted whenever CEF paints at a new size
+  // The host-minted legacy MISC_SHARED bridge texture (legacy handle because
+  // that is what ANGLE/Flutter accepts) — the identity Flutter sees, since
+  // CEF's own handle values alias. Re-minted whenever CEF paints at a new size
   // (producer-allocates: the bridge always matches the painted frame, so the
   // CopyResource below is always 1:1 — the wrong-size class is structurally
-  // gone, same rationale as main.mm EnsureSurfaceForPaint:749-785).
+  // gone, same rationale as the macOS host's EnsureSurfaceForPaint in
+  // render_handler.mm).
   ComPtr<ID3D11Texture2D> bridge;
   uint64_t bridge_handle = 0;  // IDXGIResource::GetSharedHandle of `bridge`
   int bridge_w = 0;
   int bridge_h = 0;
   // g_d3d_epoch the current `bridge` was minted at. A mismatch means the device
-  // it lives on was lost/reset, so the bridge must be re-minted (#9).
+  // it lives on was lost/reset, so the bridge must be re-minted.
   uint64_t bridge_epoch = 0;
-  // Belt-1 friendliness: the OLD bridge is kept alive here across a re-mint
-  // until the kOpPresent announcing its replacement has been written to the
-  // pipe (the plugin also holds its own opened D3D reference — LAW 6 — this
-  // is the producer-side half of that belt).
+  // The OLD bridge is kept alive here across a re-mint until the kOpPresent
+  // announcing its replacement has been written to the pipe (the plugin also
+  // holds its own opened D3D reference to the bridge it shows; this is the
+  // producer-side half of keeping a shown texture alive).
   ComPtr<ID3D11Texture2D> retired_bridge;
   // Set under surface_mutex in OnBeforeClose BEFORE releasing `bridge`, so a
   // paint racing teardown doesn't re-mint a bridge for a closing browser.
@@ -523,8 +528,9 @@ struct Slot {
   double dpr = 1.0;
 
   // Exact URLs armed for a host-trusted content load (kOpLoadTrusted /
-  // data:-file: create). Exact-URL matched + consumed in OnBeforeBrowse —
-  // see main.mm:222-233 for why it is URL-bound, not a one-shot flag.
+  // data:-file: create). Exact-URL matched + consumed in OnBeforeBrowse. It is
+  // URL-bound, not a one-shot flag, because OnBeforeBrowse arrives as a later
+  // task and a page navigation queued in the gap could consume a flag.
   // UI-thread only.
   std::multiset<std::string> trusted_pending;
 
@@ -533,11 +539,12 @@ struct Slot {
   uint32_t dialog_next = 1;
 
   // Visibility (kOpSetVisible -> WasHidden). UI-thread only. On Windows there
-  // is no begin-frame pump to gate (LAW 1); this drives WasHidden plus the
-  // hidden->visible repaint kick (the F-1 keystone, main.mm:1962-1985).
+  // is no begin-frame pump to gate (no external begin frames); this drives
+  // WasHidden plus the hidden->visible repaint kick (as the macOS host's
+  // DoSetVisible in browser_ops.mm).
   bool visible = true;
-  // F-1/F-2: a dpr change landing while hidden defers its screen-info
-  // re-assert to the hidden->visible edge. UI-thread only.
+  // A dpr change landing while hidden defers its screen-info re-assert to the
+  // hidden->visible edge, where the repaint kick picks it up. UI-thread only.
   bool needs_screen_info_on_show = false;
 
   // The JS channels this browser's consumer registered, before create (they
@@ -626,9 +633,10 @@ class HostRenderHandler : public CefRenderHandler {
   }
 
   // The REAL display (DIP), not the tile: `window.screen == innerWidth` is a
-  // textbook headless/OSR fingerprint (see main.mm RealScreenDip:586-609 and
-  // commit 855042d). GetSystemMetrics returns px in this process's DPI
-  // context; divide by dpr for DIP. Falls back to a plausible frame.
+  // textbook headless/OSR fingerprint (see the macOS host's RealScreenDip in
+  // render_handler.mm and commit 855042d). GetSystemMetrics returns px in this
+  // process's DPI context; divide by dpr for DIP. Falls back to a plausible
+  // frame.
   static void RealScreenDip(double dpr, CefRect& full, CefRect& work) {
     const double s = dpr > 0.0 ? dpr : 1.0;
     const int pw = GetSystemMetrics(SM_CXSCREEN);
@@ -647,7 +655,7 @@ class HostRenderHandler : public CefRenderHandler {
   }
 
   // Device scale so CEF renders logical*dpr (HiDPI-native) + real screen
-  // bounds and color depth (mirrors main.mm GetScreenInfo:614-625).
+  // bounds and color depth (mirrors the macOS host's GetScreenInfo).
   bool GetScreenInfo(CefRefPtr<CefBrowser>, CefScreenInfo& info) override {
     std::lock_guard<std::mutex> lock(slot_->surface_mutex);
     info.device_scale_factor = static_cast<float>(slot_->dpr);
@@ -662,8 +670,8 @@ class HostRenderHandler : public CefRenderHandler {
   }
 
   // Plausible window frame at a non-zero offset, taller than the view by
-  // typical browser chrome (outerHeight > innerHeight like a real window) —
-  // main.mm GetRootScreenRect:633-638.
+  // typical browser chrome (outerHeight > innerHeight like a real window), as
+  // the macOS host's GetRootScreenRect does.
   bool GetRootScreenRect(CefRefPtr<CefBrowser>, CefRect& rect) override {
     std::lock_guard<std::mutex> lock(slot_->surface_mutex);
     constexpr int kChromeH = 87;
@@ -695,7 +703,7 @@ class HostRenderHandler : public CefRenderHandler {
     d.SampleDesc.Count = 1;
     d.Usage = D3D11_USAGE_DEFAULT;
     d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-    d.MiscFlags = D3D11_RESOURCE_MISC_SHARED;  // LEGACY handle (LAW 5)
+    d.MiscFlags = D3D11_RESOURCE_MISC_SHARED;  // LEGACY handle, for ANGLE
     ComPtr<ID3D11Texture2D> fresh;
     HRESULT hr = g_d3d_device->CreateTexture2D(&d, nullptr, &fresh);
     if (FAILED(hr)) {
@@ -713,7 +721,7 @@ class HostRenderHandler : public CefRenderHandler {
       return false;
     }
     // Park the old bridge until the present carrying the NEW handle is sent
-    // (belt-1 friendliness — the plugin's own opened ref is the primary belt).
+    // (a courtesy — the plugin's own opened ref is what keeps it alive).
     slot_->retired_bridge = slot_->bridge;
     slot_->bridge = fresh;
     slot_->bridge_handle =
@@ -726,9 +734,9 @@ class HostRenderHandler : public CefRenderHandler {
   }
 
   // Present the just-filled bridge, tagging the frame with the bridge handle
-  // (the identity, LAW 3) and the PHYSICAL px dims of the frame actually
-  // composited (the size-gate signal, LAW 4 / PROTOCOL.md §5). Caller holds
-  // slot_->surface_mutex. Windows payload (LAW 10):
+  // (the identity Flutter sees) and the PHYSICAL px dims of the frame actually
+  // composited (so the plugin's size-gate can refuse stale-size frames,
+  // PROTOCOL.md §5). Caller holds slot_->surface_mutex. Windows-only payload:
   // {u64 bridgeHandle BE}{u32 srcW BE}{u32 srcH BE} = 16 bytes.
   void SendPresentLocked(int srcW, int srcH) {
     uint8_t p[16];
@@ -737,7 +745,7 @@ class HostRenderHandler : public CefRenderHandler {
     WriteU32BE(p + 12, static_cast<uint32_t>(srcH < 0 ? 0 : srcH));
     SendFrame(slot_->browser_id, kOpPresent, p, 16);
     // The present announcing the new bridge is on the wire — the old bridge
-    // may now die (the plugin holds its own reference to it, LAW 6).
+    // may now die (the plugin holds its own reference to it).
     slot_->retired_bridge.Reset();
   }
 
@@ -795,7 +803,7 @@ class HostRenderHandler : public CefRenderHandler {
   }
 
   // Flush the device and check it survived; on loss reset it so the next paint
-  // re-creates it and every bridge (#9). False = don't present this frame.
+  // re-creates it and every bridge. False = don't present this frame.
   // Caller holds g_d3d_mutex.
   bool FlushAndCheckDeviceLocked(const char* where) {
     g_d3d_ctx->Flush();
@@ -822,11 +830,10 @@ class HostRenderHandler : public CefRenderHandler {
     slot_->popup_rect = rect;
   }
 
-  // GPU pixel path (LAW 2, the S1 cef_leg.cpp recipe): CEF's GPU process
-  // composites the page and hands an NT shared handle valid ONLY inside this
-  // callback. Open it on our device, copy it into the legacy bridge (the view)
-  // or the kept dropdown texture (PET_POPUP), Flush — all synchronously, never
-  // storing the NT handle.
+  // GPU pixel path: CEF's GPU process composites the page and hands an NT
+  // shared handle valid ONLY inside this callback. Open it on our device, copy
+  // it into the legacy bridge (the view) or the kept dropdown texture
+  // (PET_POPUP), Flush — all synchronously, never storing the NT handle.
   void OnAcceleratedPaint(CefRefPtr<CefBrowser>, PaintElementType type,
                           const RectList&,
                           const CefAcceleratedPaintInfo& info) override {
@@ -848,13 +855,13 @@ class HostRenderHandler : public CefRenderHandler {
     int srcW = 0, srcH = 0;
     {
       std::lock_guard<std::mutex> d3d(g_d3d_mutex);
-      // LAW 2: open + copy INSIDE the callback. `src` (the ComPtr) is
-      // released before we return; the NT handle itself is never kept.
+      // Open + copy INSIDE the callback (the NT handle dies with it). `src`
+      // (the ComPtr) is released before we return; the handle is never kept.
       ComPtr<ID3D11Texture2D> src;
       HRESULT hr = g_d3d_device1->OpenSharedResource1(
           nt, __uuidof(ID3D11Texture2D), &src);
       if (FAILED(hr)) {
-        // #9: distinguish a transient bad-handle miss from real device loss. On
+        // Distinguish a transient bad-handle miss from real device loss. On
         // loss, drop the cached device (+ bump the epoch) so the next paint
         // re-creates the device and every bridge — otherwise the dead device is
         // cached forever and the tile never repaints.
@@ -898,7 +905,7 @@ class HostRenderHandler : public CefRenderHandler {
         CompositePopupLocked();
         // CopyResource/Flush return void; device loss surfaces via
         // GetDeviceRemovedReason. If it went down mid-blit, reset and skip this
-        // frame — never present pixels from a dead device (#9).
+        // frame — never present pixels from a dead device.
         if (!FlushAndCheckDeviceLocked("blit")) return;
       }
     }
@@ -1017,9 +1024,9 @@ std::string CrashBurstText() {
 
 void DoShutdown();  // defined below; the crash-loop exit reuses it
 
-// Deny-default permission gate (verbatim port of main.mm:1068-1089): no
-// per-site UI exists here, so every permission prompt and media-access
-// request is denied up front.
+// Deny-default permission gate (verbatim port of the macOS host's
+// HostPermissionHandler in host_client.mm): no per-site UI exists here, so
+// every permission prompt and media-access request is denied up front.
 class HostPermissionHandler : public CefPermissionHandler {
  public:
   bool OnRequestMediaAccessPermission(
@@ -1045,7 +1052,8 @@ class HostPermissionHandler : public CefPermissionHandler {
 // it at 2 MB. So the plugin can hand us the HTML plus the URL it should appear
 // to come from, and we answer the MAIN-FRAME request for exactly that URL with
 // the HTML instead of the network. Everything else the page loads goes to the
-// network as normal. Verbatim port of main.mm's g_authored.
+// network as normal. Verbatim port of the macOS host's g_authored
+// (authored_content.mm).
 //
 // Keyed by WIRE ID and written on the reader thread, not stored on the Slot: the
 // frame is sent immediately ahead of the create / load it belongs to and must be
@@ -1170,10 +1178,11 @@ class HostClient : public CefClient,
  public:
   explicit HostClient(std::shared_ptr<Slot> slot) : slot_(std::move(slot)) {
     // Browser-side message router (default config: window.cefQuery /
-    // cefQueryCancel) — the SAME config the renderer half uses (main.mm:
-    // 1228-1234). One router per HostClient, i.e. per browser: OnQuery below
-    // stamps slot_->browser_id so a page message is delivered ONLY to the
-    // originating session (per-session routing, channel_probe_shared).
+    // cefQueryCancel) — the SAME config the renderer half uses (as on macOS,
+    // host_client.mm + process_helper.mm). One router per HostClient, i.e. per
+    // browser: OnQuery below stamps slot_->browser_id so a page message is
+    // delivered ONLY to the originating session (per-session routing,
+    // channel_probe_shared).
     CefMessageRouterConfig config;
     router_ = CefMessageRouterBrowserSide::Create(config);
     router_->AddHandler(this, false);
@@ -1223,7 +1232,7 @@ class HostClient : public CefClient,
     return true;
   }
 
-  // CefFindHandler (main.mm:1260-1275).
+  // CefFindHandler (as on macOS).
   void OnFindResult(CefRefPtr<CefBrowser>, int, int count, const CefRect&,
                     int activeMatchOrdinal, bool finalUpdate) override {
     uint8_t p[9];
@@ -1233,7 +1242,7 @@ class HostClient : public CefClient,
     SendFrame(slot_->browser_id, kOpFindResult, p, 9);
   }
 
-  // CefJSDialogHandler (main.mm:1279-1315): forward alert/confirm/prompt;
+  // CefJSDialogHandler (as on macOS): forward alert/confirm/prompt;
   // the plugin answers via kOpJsDialogResp -> DoJsDialogResp -> Continue.
   bool OnJSDialog(CefRefPtr<CefBrowser>, const CefString&,
                   JSDialogType dialog_type, const CefString& message_text,
@@ -1300,7 +1309,7 @@ class HostClient : public CefClient,
     }
   }
 
-  // CefMessageRouter wiring (main.mm:1468-1501). The renderer half (HostApp
+  // CefMessageRouter wiring (as on macOS). The renderer half (HostApp
   // below) injects window.cefQuery; queries land here. Forward the request to
   // the plugin: "eval:<id>:<json>" -> kOpEvalResult (a
   // runJavaScriptReturningResult result); "ch:<name>:<message>" ->
@@ -1352,7 +1361,7 @@ class HostClient : public CefClient,
   }
 
   // Route renderer->browser process messages through the message router
-  // (main.mm:1495-1501). This carries the cefQuery payloads that surface in
+  // (as on macOS). This carries the cefQuery payloads that surface in
   // OnQuery above.
   bool OnProcessMessageReceived(CefRefPtr<CefBrowser> browser,
                                 CefRefPtr<CefFrame> frame,
@@ -1373,7 +1382,7 @@ class HostClient : public CefClient,
       SendUtf8(slot_->browser_id, kOpPageStart,
                policy::TruncateUtf8(frame->GetURL().ToString(),
                                     policy::kMaxPagePayload));
-      // SECURITY (main.mm:1339-1343): install the JS-channel shims ONLY into
+      // SECURITY (as on macOS): install the JS-channel shims ONLY into
       // the MAIN frame — injecting the privileged window.<name> bridge into a
       // cross-origin subframe would hand an untrusted iframe that bridge.
       for (const auto& name : slot_->channels) InjectChannelShim(frame, name);
@@ -1385,9 +1394,10 @@ class HostClient : public CefClient,
       SendUtf8(slot_->browser_id, kOpPageFinish,
                policy::TruncateUtf8(frame->GetURL().ToString(),
                                     policy::kMaxPagePayload));
-      // C1 render floor (main.mm:1350-1363, minus the external begin-frame
-      // per LAW 1): re-assert size + damage when the main frame finishes so a
-      // coalesced/dropped first frame is re-driven. Hidden tiles stay paused.
+      // Render floor (the macOS host's OnLoadEnd, minus the external
+      // begin-frame this host never sends): re-assert size + damage when the
+      // main frame finishes so a coalesced/dropped first frame is re-driven
+      // instead of leaving a blank tile. Hidden tiles stay paused.
       if (browser && browser->GetHost() && slot_->visible) {
         auto h = browser->GetHost();
         h->WasResized();
@@ -1428,11 +1438,11 @@ class HostClient : public CefClient,
     SendFrame(slot_->browser_id, kOpProgress, p, 4);
   }
 
-  // H3: the async create completes here. Bind the browser, ack kOpCreated,
+  // The async create completes here. Bind the browser, ack kOpCreated,
   // honor a deferred close, then catch the browser up on everything that
   // arrived while the create was in flight: visibility, a resize, and the ops
-  // kept in slot_->deferred, in order. No begin-frame pump to start (LAW 1 —
-  // CEF's internal frame timer drives paints).
+  // kept in slot_->deferred, in order. No begin-frame pump to start (CEF's
+  // internal frame timer drives paints).
   void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
     if (std::getenv("FLUTTER_CEF_DEBUG"))
       LogErr("[cef_host] OnAfterCreated wire=%u", slot_->browser_id);
@@ -1469,12 +1479,13 @@ class HostClient : public CefClient,
     }
   }
 
-  // Popups. macOS (main.mm:1444-1451) splits by disposition: a SIZED popup
-  // (CEF_WOD_NEW_POPUP — the window.open-with-features shape OAuth/"Sign in with
-  // Google" uses) gets a REAL native window so window.opener/postMessage/
-  // window.close work; everything else (target=_blank / plain new tab) diverts
-  // to kOpNewWindow and loads in-place. The native-window port is post-slice on
-  // Windows, so sized popups still divert in-tab — but that CANNOT complete the
+  // Popups. macOS (OnBeforePopup in host_client.mm) splits by disposition: a
+  // SIZED popup (CEF_WOD_NEW_POPUP — the window.open-with-features shape
+  // OAuth/"Sign in with Google" uses) gets a REAL native window so
+  // window.opener/postMessage/window.close work; everything else
+  // (target=_blank / plain new tab) diverts to kOpNewWindow and loads
+  // in-place. The native popup window is not ported to Windows yet, so sized
+  // popups still divert in-tab — but that CANNOT complete the
   // opener/postMessage handshake (it strands sign-in). Emit a distinct log per
   // CEF_WOD_NEW_POPUP so the regression is visible, not silent.
   bool OnBeforePopup(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, int,
@@ -1488,11 +1499,11 @@ class HostClient : public CefClient,
       if (!logged.exchange(true))
         SendLog(slot_->browser_id,
                 "OnBeforePopup: sized popup (CEF_WOD_NEW_POPUP) diverted in-tab "
-                "— native OAuth-popup window is post-slice on Windows; "
+                "— Windows has no native OAuth-popup window yet, so "
                 "window.open sign-in (opener/postMessage) will not complete "
-                "(macOS OpenNativeAuthPopup, main.mm:1444)");
+                "(macOS opens one: OpenNativeAuthPopup)");
     }
-    // Non-native case (matches macOS's non-popup branch, main.mm:1449-1451):
+    // Non-native case (matches macOS's non-popup branch):
     // load the target in this tile.
     if (!target_url.empty())
       SendUtf8(slot_->browser_id, kOpNewWindow,
@@ -1510,9 +1521,9 @@ class HostClient : public CefClient,
     return true;
   }
 
-  // Centralized per-browser teardown (main.mm:1510-1527): drop the routing
-  // entry, release the bridge under the slot lock (closing set FIRST so a
-  // racing paint can't re-mint), break the retain cycle.
+  // Centralized per-browser teardown (as the macOS OnBeforeClose): drop the
+  // routing entry, release the bridge under the slot lock (closing set FIRST so
+  // a racing paint can't re-mint), break the retain cycle.
   void OnBeforeClose(CefRefPtr<CefBrowser> browser) override {
     if (router_) router_->OnBeforeClose(browser);
     SetAuthoredDoc(slot_->browser_id, "", "");
@@ -1533,7 +1544,7 @@ class HostClient : public CefClient,
   }
 
   // Ctrl-key editing shortcuts as the FALLBACK they are in a real browser
-  // (main.mm OnKeyEvent). CefWebView sends Ctrl+C/X/V/A/Z/Y to the page as raw
+  // (as macOS OnKeyEvent). CefWebView sends Ctrl+C/X/V/A/Z/Y to the page as raw
   // keys, so an editor that owns its undo stack and selection (Monaco) handles
   // them in its keydown listener; Blink's own key bindings run the edit command
   // when the page doesn't. OnKeyEvent is called only for a key both left
@@ -1575,13 +1586,13 @@ class HostClient : public CefClient,
     return new AuthoredRequestHandler(std::move(html));
   }
 
-  // Navigation scheme allowlist (main.mm:1528-1565). Empty allowlist = allow
+  // Navigation scheme allowlist (as on macOS). Empty allowlist = allow
   // all. Main-frame only; kOpLoadTrusted's exact-URL exemptions are consumed
   // here.
   bool OnBeforeBrowse(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame,
                       CefRefPtr<CefRequest> request, bool, bool) override {
     // Clean up any pending message-router queries for the frame about to
-    // navigate (main.mm:1563) — otherwise a channel query in flight across a
+    // navigate (as on macOS) — otherwise a channel query in flight across a
     // navigation can misfire or leak its callback.
     if (router_) router_->OnBeforeBrowse(browser, frame);
     if (g_allowed_schemes.empty()) return false;  // allow
@@ -1618,9 +1629,9 @@ class HostClient : public CefClient,
 // The one CefApp, used for BOTH the browser process (CefInitialize) and every
 // re-exec'd sub-process (CefExecuteProcess). CEF calls GetBrowserProcessHandler
 // in the browser process and GetRenderProcessHandler in the render process, so
-// the SAME binary hosts both halves of CefMessageRouter (main.mm's split across
-// main.mm + process_helper.mm collapses here — Windows re-runs cef_host.exe as
-// the render subprocess, LAW 8). The renderer half owns a
+// the SAME binary hosts both halves of CefMessageRouter (the macOS split across
+// host_client.mm + the helper's process_helper.mm collapses here — Windows
+// re-runs cef_host.exe as the render subprocess). The renderer half owns a
 // CefMessageRouterRendererSide with the DEFAULT config (must match the
 // browser-side HostClient config); it injects window.cefQuery into every frame
 // and relays cefQuery calls to the browser process.
@@ -1635,7 +1646,7 @@ class HostApp : public CefApp,
     return this;
   }
 
-  // ---- Render-process half (process_helper.mm:24-57 counterpart) ----
+  // ---- Render-process half (the macOS HelperApp counterpart) ----
   // Render-process-only callback; create the renderer-side router here with the
   // default config (window.cefQuery / cefQueryCancel).
   void OnWebKitInitialized() override {
@@ -1714,7 +1725,7 @@ class HostApp : public CefApp,
       const CefString& process_type,
       CefRefPtr<CefCommandLine> command_line) override {
     (void)process_type;
-    // OSR establishment latency (main.mm:1578-1592): OSR views have no real
+    // OSR establishment latency (as on macOS): OSR views have no real
     // OS window, so Chromium backgrounds their renderers during first load.
     if (!std::getenv("FLUTTER_CEF_KEEP_BG_THROTTLE")) {
       command_line->AppendSwitch("disable-renderer-backgrounding");
@@ -1728,19 +1739,19 @@ class HostApp : public CefApp,
       command_line->AppendSwitch("disable-gpu-compositing");
     }
     // Verbose Chromium logging (browser + propagated to children) only when
-    // explicitly debugging (macOS main.mm:1627-1631 pattern).
+    // explicitly debugging (the macOS host's pattern).
     if (std::getenv("FLUTTER_CEF_DEBUG")) {
       command_line->AppendSwitch("enable-logging");
       command_line->AppendSwitchWithValue(
           "log-file", TempDirUtf8() + "cef_host_chromium.log");
       command_line->AppendSwitchWithValue("v", "1");
     }
-    // Agent-control CDP-over-pipe translation (S3, P9): the plugin passed the
+    // Agent-control CDP-over-pipe translation: the plugin passed the
     // two inherited pipe HANDLE values as --cdp-io-pipes=<read>,<write>; turn
     // them into Chromium's real switches. Browser process only (process_type
     // empty) — the renderer/GPU children never get the debugging pipe (and never
-    // inherited the handles). Mirrors macOS main.mm's --cdp-pipe injection.
-    // (disable-blink-features=AutomationControlled is post-slice.)
+    // inherited the handles). Mirrors the macOS --cdp-pipe injection in
+    // main.mm. (disable-blink-features=AutomationControlled is not ported.)
     if (process_type.empty() && !g_cdp_io_pipes.empty()) {
       command_line->AppendSwitch("remote-debugging-pipe");
       command_line->AppendSwitchWithValue("remote-debugging-io-pipes",
@@ -1749,9 +1760,9 @@ class HostApp : public CefApp,
   }
 
   // Announce readiness. Payload = {readyFlags, protocolVersion}
-  // (main.mm:1664-1682). Bit0 (ad-hoc/mock-keychain build) is a macOS-only
-  // concern — Windows sends 0. The plugin sends NOTHING until this arrives,
-  // then refuses on protocolVersion skew.
+  // (as the macOS OnContextInitialized). Bit0 (ad-hoc/mock-keychain build) is
+  // a macOS-only concern — Windows sends 0. The plugin sends NOTHING until this
+  // arrives, then refuses on protocolVersion skew.
   void OnContextInitialized() override {
     CEF_REQUIRE_UI_THREAD();
     if (std::getenv("FLUTTER_CEF_DEBUG"))
@@ -1787,15 +1798,15 @@ void DoCreateBrowser(std::shared_ptr<Slot> slot, std::string url) {
   }
   CefWindowInfo window_info;
   // The hidden per-process WS_POPUP window as the windowless parent so
-  // dialogs/menus/IMM degrade gracefully (PLAN §4.3; null works too — S5).
+  // dialogs/menus/IMM degrade gracefully (null works too for WebAuthn).
   window_info.SetAsWindowless(g_hidden_hwnd);
   // GPU OSR: the GPU process composites and hands OnAcceleratedPaint an NT
-  // shared handle (the S1 pixel path). Without GPU compositing Chromium falls
+  // shared handle (the GPU pixel path). Without GPU compositing Chromium falls
   // back to OnPaint, which the render handler uploads into the same bridge.
   window_info.shared_texture_enabled = true;
-  // LAW 1: external_begin_frame_enabled stays FALSE (default). With the
-  // external pump only the FIRST browser in the process ever paints (S4);
-  // CEF's internal frame timer at windowless_frame_rate drives paints.
+  // external_begin_frame_enabled stays FALSE (default). With the external
+  // pump only the FIRST browser in the process ever paints; CEF's internal
+  // frame timer at windowless_frame_rate drives paints.
   window_info.external_begin_frame_enabled = false;
   CefBrowserSettings settings;
   settings.windowless_frame_rate = 60;
@@ -1816,7 +1827,7 @@ void DoCreateBrowser(std::shared_ptr<Slot> slot, std::string url) {
     slot->trusted_pending.insert(NormalizeAuthoredUrl(url));
   }
   CefRefPtr<HostClient> client = new HostClient(slot);
-  // H3: ASYNC create. OnAfterCreated binds the browser and acks kOpCreated.
+  // ASYNC create. OnAfterCreated binds the browser and acks kOpCreated.
   // Document-start scripts + create-time JS channels ride into the renderer as
   // the browser's extra_info (see document_start.h) — the only channel that is
   // in place before the first document's scripts run.
@@ -1824,7 +1835,7 @@ void DoCreateBrowser(std::shared_ptr<Slot> slot, std::string url) {
       window_info, client, url, settings,
       TakeDocumentStartExtraInfo(wire_id, &slot->channels), nullptr);
   if (!dispatched) {
-    // H7: reclaim the slot + tell the plugin.
+    // Dispatch failed: reclaim the slot + tell the plugin.
     SendLog(wire_id, "createBrowser: CreateBrowser dispatch failed");
     SendFrame(wire_id, kOpCreateFailed, nullptr, 0);
     SetAuthoredDoc(wire_id, "", "");
@@ -1855,16 +1866,16 @@ void DoDisposeBrowser(uint32_t wire_id) {
   if (slot->browser) {
     slot->browser->GetHost()->CloseBrowser(true);
   } else {
-    slot->close_requested = true;  // H3 deferred-close intent
+    slot->close_requested = true;  // OnAfterCreated closes it on bind
     slot->deferred.clear();
   }
 }
 
-// LAW 4: every WasResized discards CEF's frame pool; late frames at the old
+// Every WasResized discards CEF's frame pool; late frames at the old
 // size still arrive and are refused by the plugin's size-gate (each present
 // carries its truthful dims). Producer-allocates: the bridge re-mints on the
-// first NEW-size paint, not here (main.mm DoResize:1828-1874, with
-// Invalidate standing in for SendExternalBeginFrame per LAW 1).
+// first NEW-size paint, not here (the macOS DoResize in browser_ops.mm, with
+// Invalidate standing in for SendExternalBeginFrame).
 void DoResize(const std::shared_ptr<Slot>& slot, int w, int h, double dpr) {
   if (w < 1 || w > 16384 || h < 1 || h > 16384) {
     SendLog(slot->browser_id, "resize: out-of-range dims " + std::to_string(w) +
@@ -1887,7 +1898,7 @@ void DoResize(const std::shared_ptr<Slot>& slot, int w, int h, double dpr) {
       slot->browser->GetHost()->WasResized();
       slot->browser->GetHost()->Invalidate(PET_VIEW);
     } else {
-      // F-2: hidden — no frame can result; defer the screen-info re-assert +
+      // Hidden — no frame can result; defer the screen-info re-assert +
       // repaint to the hidden->visible edge (DoSetVisible).
       if (dpr_changed) slot->needs_screen_info_on_show = true;
     }
@@ -1925,9 +1936,9 @@ void DoEditCommand(Slot& slot, int command) {
     default: break;
   }
 }
-// Off-screen render gating + the F-1 hidden->visible repaint keystone
-// (main.mm DoSetVisible:1962-1985, Invalidate in place of the external
-// begin-frame per LAW 1).
+// Off-screen render gating + the hidden->visible repaint kick that stops a
+// culled tile coming back blank (the macOS DoSetVisible in browser_ops.mm,
+// Invalidate in place of the external begin-frame).
 void DoSetVisible(const std::shared_ptr<Slot>& slot, bool visible) {
   const bool was_visible = slot->visible;
   slot->visible = visible;
@@ -1957,7 +1968,7 @@ void DoJsDialogResp(const std::shared_ptr<Slot>& slot, uint32_t id, bool ok,
   cb->Continue(ok, text);
 }
 
-// runJavaScriptReturningResult (main.mm DoEvalReturning:2001-2018, verbatim).
+// runJavaScriptReturningResult (the macOS DoEvalReturning, verbatim).
 // Evaluate the user expression and post its JSON result back through
 // window.cefQuery (-> HostClient::OnQuery -> kOpEvalResult "id:json",
 // correlated to the Dart Future). `code` is the trusted host's JS (same trust
@@ -1975,7 +1986,7 @@ void DoEvalReturning(Slot& slot, uint32_t id, const std::string& code) {
   frame->ExecuteJavaScript(js, "", 0);
 }
 
-// Registers a JS channel for one browser (UI thread; mirrors main.mm
+// Registers a JS channel for one browser (UI thread; mirrors the macOS
 // DoAddChannel). The slot exists from its create frame on, before the browser
 // binds; a channel registered by then rides into the page at load.
 void DoAddChannel(const std::shared_ptr<Slot>& slot, const std::string& name) {
@@ -1990,7 +2001,7 @@ void DoAddChannel(const std::shared_ptr<Slot>& slot, const std::string& name) {
   if (slot->browser) InjectChannelShim(slot->browser->GetMainFrame(), name);
 }
 
-// ---- Cookies (global manager = the shared profile jar; main.mm:2040-2140) ----
+// ---- Cookies (global manager = the shared profile jar, as on macOS) ----
 
 std::string JsonEscape(const std::string& s) {
   std::string out;
@@ -2068,7 +2079,7 @@ const char* SameSiteToString(cef_cookie_same_site_t v) {
   }
 }
 
-// COOKIE VERBS TAKE A WIRE ID, NOT A SLOT (parity with macOS main.mm). The jar is
+// COOKIE VERBS TAKE A WIRE ID, NOT A SLOT (parity with macOS). The jar is
 // process-global, so nothing here needs the browser — the id only routes the
 // reply/log. Requiring a live slot on the reader thread silently DROPPED any cookie
 // verb that raced the create (the slot is registered by a later TID_UI task): a
@@ -2123,7 +2134,7 @@ void DoShowDevTools(Slot& slot) {
                                         CefPoint());
 }
 
-// ---- IME (main.mm:2219-2248) ----
+// ---- IME (as on macOS) ----
 void DoImeSetComposition(Slot& slot, const std::string& text) {
   CefString t(text);
   uint32_t len = static_cast<uint32_t>(t.length());
@@ -2143,7 +2154,7 @@ void DoImeSetComposition(Slot& slot, const std::string& text) {
 }
 
 // type: 0=move 1=down 2=up 3=wheel 4=leave; button: 0=left 1=middle 2=right.
-// x/y logical (DIP) view coords, exactly like macOS (main.mm:2251-2285).
+// x/y logical (DIP) view coords, exactly like macOS.
 void DoPointer(Slot& slot, int type, int button, int click_count,
                uint32_t modifiers, double x, double y, double dx, double dy) {
   CefMouseEvent ev;
@@ -2180,7 +2191,7 @@ void DoPointer(Slot& slot, int type, int button, int click_count,
 // type: 0=rawkeydown 2=keyup 3=char (cef_key_event_type_t). The Dart side
 // sends REAL Windows virtual-key codes in windowsKeyCode on Windows (and the
 // Unicode codepoint for char events) — native CefKeyEvent semantics, no
-// translation needed (main.mm DoKey:2288-2305; character fields always set
+// translation needed (as the macOS DoKey; character fields always set
 // per the CEF t=11650 de-dup note, harmless on Windows).
 void DoKey(Slot& slot, int type, uint32_t modifiers, int32_t windows_key_code,
            int32_t native_key_code, uint32_t character) {
@@ -2195,7 +2206,8 @@ void DoKey(Slot& slot, int type, uint32_t modifiers, int32_t windows_key_code,
   slot.browser->GetHost()->SendKeyEvent(ev);
 }
 
-// C1: watchdog repaint re-kick (main.mm DoInvalidate:2310-2318). LAW 1: no
+// Force a repaint: the plugin's first-present watchdog sends kOpInvalidate
+// when a browser's first frame never arrived (the macOS DoInvalidate). No
 // SendExternalBeginFrame — the internal frame timer honors Invalidate.
 void DoInvalidate(const std::shared_ptr<Slot>& slot) {
   CEF_REQUIRE_UI_THREAD();
@@ -2223,7 +2235,7 @@ class ShutdownFlushCallback : public CefCompletionCallback {
 
 // Tear down the WHOLE process (kOpShutdown / pipe EOF): close every browser,
 // flush the cookie jar to disk, then quit the message loop. Per-slot cleanup
-// runs in OnBeforeClose (main.mm DoShutdown:2324-2335).
+// runs in OnBeforeClose (as the macOS DoShutdown in host_state.mm).
 //
 // WINDOWS COOKIE DURABILITY (no macOS analogue): unlike macOS — where the
 // implicit CefShutdown flush reliably persists the jar — a fast Windows teardown
@@ -2234,7 +2246,7 @@ class ShutdownFlushCallback : public CefCompletionCallback {
 // flushed, so we FlushStore here and defer the quit into its completion — that is
 // what makes "stay signed in" survive relaunch. A bounded fallback quits anyway
 // if the callback never fires, so teardown can't wedge inside the plugin reaper's
-// grace. macOS main.mm is unchanged (it does not need this).
+// grace. The macOS host does not need this.
 void DoShutdown() {
   CEF_REQUIRE_UI_THREAD();
   std::vector<std::shared_ptr<Slot>> slots;
@@ -2257,10 +2269,10 @@ void DoShutdown() {
   }
 }
 
-// Reader thread: decode frames, marshal onto the CEF UI thread (mirrors
-// main.mm IpcReadLoop; payload layouts PROTOCOL.md §2). Per-browser ops go
-// through PostBrowserOp, which holds an op that beats the browser's bind until
-// OnAfterCreated instead of dropping it.
+// Reader thread: decode frames, marshal onto the CEF UI thread (mirrors the
+// macOS IpcReadLoop in ipc_reader.mm; payload layouts PROTOCOL.md §2).
+// Per-browser ops go through PostBrowserOp, which holds an op that beats the
+// browser's bind until OnAfterCreated instead of dropping it.
 void IpcReadLoop() {
   HANDLE pipe = g_ipc_pipe.load();
   for (;;) {
@@ -2592,8 +2604,8 @@ void IpcReadLoop() {
 }
 
 // Create the ONE hidden window this host passes to SetAsWindowless(parent).
-// WS_POPUP, never shown. (PLAN §4.3: a null parent degrades dialogs/menus/
-// IMM; browser_platform_delegate_native_win.cc bails on !msg.hwnd.)
+// WS_POPUP, never shown. (A null parent degrades dialogs/menus/IMM;
+// browser_platform_delegate_native_win.cc bails on !msg.hwnd.)
 HWND CreateHiddenHostWindow() {
   WNDCLASSW wc = {};
   wc.lpfnWndProc = DefWindowProcW;
@@ -2608,7 +2620,7 @@ HWND CreateHiddenHostWindow() {
 
 // Entry point, invoked by CEF's bootstrap (bootstrapc.exe renamed to
 // cef_host.exe). sandbox_info is forwarded to both CefExecuteProcess and
-// CefInitialize (SPIKES.md S2).
+// CefInitialize, so the child processes run sandboxed.
 extern "C" CEF_BOOTSTRAP_EXPORT int RunConsoleMain(
     int argc,
     char* argv[],
@@ -2632,7 +2644,7 @@ extern "C" CEF_BOOTSTRAP_EXPORT int RunConsoleMain(
   std::string profile_dir = GetSwitch(args, "--profile-dir=");
   std::string allowed = GetSwitch(args, "--allowed-schemes=");
   bool ephemeral = HasFlag(args, "--ephemeral");
-  // Agent control (P9): "<read>,<write>" inherited-HANDLE values. Stored in the
+  // Agent control: "<read>,<write>" inherited-HANDLE values. Stored in the
   // file-global so OnBeforeCommandLineProcessing (called from CefInitialize
   // below) can inject the Chromium CDP-pipe switches. Empty when off.
   g_cdp_io_pipes = GetSwitch(args, "--cdp-io-pipes=");
@@ -2672,7 +2684,7 @@ extern "C" CEF_BOOTSTRAP_EXPORT int RunConsoleMain(
   }
 
   // Profile dir fallback: a per-pid ephemeral temp dir (defensive — the
-  // plugin always supplies --profile-dir, mirroring main.mm:34-35).
+  // plugin always supplies --profile-dir, mirroring the macOS main()).
   if (profile_dir.empty()) {
     profile_dir = TempDirUtf8() + "flutter_cef_ephem_" +
                   std::to_string(GetCurrentProcessId());
@@ -2680,8 +2692,8 @@ extern "C" CEF_BOOTSTRAP_EXPORT int RunConsoleMain(
   }
   CreateDirectoryW(Widen(profile_dir).c_str(), nullptr);  // ok if it exists
 
-  // Cross-process single-writer lock on a PERSISTENT profile dir (C2,
-  // main.mm:2786-2806): exclusive-open <profile>/.flutter_cef.lock; on
+  // Cross-process single-writer lock on a PERSISTENT profile dir (as the
+  // macOS main()): exclusive-open <profile>/.flutter_cef.lock; on
   // contention emit the machine-parseable kOpLog "profile-locked" and exit 2
   // (the plugin keys processGone("locked") on that pair). The handle is held
   // for the process lifetime — the OS drops it on exit. Ephemeral dirs are
@@ -2730,11 +2742,12 @@ extern "C" CEF_BOOTSTRAP_EXPORT int RunConsoleMain(
   // process is what makes login shared across the tiles on a profile
   // (CefCookieManager::GetGlobalManager -> this jar). persist_session_cookies
   // keeps session cookies across relaunch — set UNCONDITIONALLY, mirroring
-  // main.mm:2869 (harmless for an ephemeral host, whose dir the plugin's reaper
-  // deletes on teardown; required for a named profile's "stay signed in").
+  // the macOS main() (harmless for an ephemeral host, whose dir the plugin's
+  // reaper deletes on teardown; required for a named profile's "stay signed
+  // in").
   //
-  // AT-REST (SPIKES.md S2 / §7): Windows OSCrypt encrypts the cookie/login
-  // stores with DPAPI, which is ALWAYS available and signing-INDEPENDENT — so a
+  // AT-REST: Windows OSCrypt encrypts the cookie/login stores with DPAPI,
+  // which is ALWAYS available and signing-INDEPENDENT — so a
   // named profile persists directly here, with NO analogue of the macOS ad-hoc
   // "mock-keychain -> downgrade named profile to ephemeral" rule (there is no
   // readyFlags bit0 gate on Windows; OnContextInitialized sends 0). DPAPI is
@@ -2748,11 +2761,11 @@ extern "C" CEF_BOOTSTRAP_EXPORT int RunConsoleMain(
   else
     settings.log_severity = LOGSEVERITY_ERROR;
 
-  // no_sandbox and the sandbox_info passed here must agree (the S2-proven
-  // pair). Passing the real sandbox_info while no_sandbox=1 makes every child
-  // fail its mojo handshake ("Terminating current process after 15 seconds
-  // with no connection"), so the escape hatch passes nullptr. sandbox_info is
-  // always forwarded to CefExecuteProcess above: children must see it.
+  // no_sandbox and the sandbox_info passed here must agree. Passing the real
+  // sandbox_info while no_sandbox=1 makes every child fail its mojo handshake
+  // ("Terminating current process after 15 seconds with no connection"), so
+  // the escape hatch passes nullptr. sandbox_info is always forwarded to
+  // CefExecuteProcess above: children must see it.
   if (sandbox_info != nullptr && !sandboxed)
     LogErr("[cef_host] FLUTTER_CEF_NO_SANDBOX=1: running without the sandbox");
   if (!CefInitialize(main_args, settings, app,
@@ -2762,7 +2775,7 @@ extern "C" CEF_BOOTSTRAP_EXPORT int RunConsoleMain(
     return 10;
   }
 
-  // Reader thread (same model as macOS main.mm: reader posts to TID_UI via
+  // Reader thread (same model as the macOS host: reader posts to TID_UI via
   // CefPostTask; CefRunMessageLoop owns the main thread).
   std::thread reader;
   if (g_ipc_pipe.load() != INVALID_HANDLE_VALUE) reader = std::thread(IpcReadLoop);
@@ -2786,9 +2799,9 @@ extern "C" CEF_BOOTSTRAP_EXPORT int RunConsoleMain(
 
   // Teardown: invalidate the pipe FIRST (atomic exchange), THEN close — so a
   // late SendFrame from a CEF thread can't write into a recycled handle
-  // (mirrors main.mm:2910-2918 C3 ordering). Closing the pipe also unblocks
-  // the reader's ReadFile, bounding the join... except a reader blocked in
-  // ReadFile on a still-open pipe: cancel it explicitly first.
+  // (mirrors the macOS host's teardown ordering). Closing the pipe also
+  // unblocks the reader's ReadFile, bounding the join... except a reader
+  // blocked in ReadFile on a still-open pipe: cancel it explicitly first.
   {
     std::lock_guard<std::mutex> lock(g_ipc_write_mutex);
     HANDLE old = g_ipc_pipe.exchange(INVALID_HANDLE_VALUE);

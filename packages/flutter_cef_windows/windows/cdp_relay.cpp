@@ -160,8 +160,8 @@ bool CdpRelay::Start() {
     DLog("socket() failed");
     return false;
   }
-  // SO_EXCLUSIVEADDRUSE, NOT SO_REUSEADDR (PLAN §4.5): on Windows SO_REUSEADDR
-  // is a port-HIJACK primitive — it lets another same-user socket bind our
+  // SO_EXCLUSIVEADDRUSE, NOT SO_REUSEADDR: on Windows SO_REUSEADDR is a
+  // port-HIJACK primitive — it lets another same-user socket bind our
   // already-bound loopback port and intercept the client's next connection
   // (stealing the bearer token off the upgrade). Exclusive-use forbids that.
   BOOL on = TRUE;
@@ -537,9 +537,9 @@ void CdpRelay::FrameLoop(SOCKET fd) {
         assembling = !fin;
         if (fin) {
           if (assembling_text) {
-            // Single-tile passthrough: forward the CDP message verbatim. (The
-            // CEF-2b filterClientToPipe + rewriteOutgoingId hooks would go here
-            // for the N-tile follow-up — see the header comment.)
+            // Single-tile passthrough: forward the CDP message verbatim.
+            // (CdpRelay.swift's filterClientToPipe + rewriteOutgoingId would
+            // go here for the N-tile follow-up — see the header comment.)
             send_to_pipe_(std::string(msg.begin(), msg.end()));
           }
           msg.clear();
@@ -567,8 +567,8 @@ void CdpRelay::FrameLoop(SOCKET fd) {
 }
 
 void CdpRelay::DeliverToClient(const std::string& json) {
-  // Single-tile passthrough: deliver verbatim. (The CEF-2b demux + filter
-  // seam — demuxPipeToClient/filterPipeToClient — would gate this for N-tile.)
+  // Single-tile passthrough: deliver verbatim. (CdpRelay.swift's per-tile
+  // demuxPipeToClient/filterPipeToClient would gate this for N-tile.)
   std::vector<uint8_t> payload(json.begin(), json.end());
   std::lock_guard<std::mutex> lock(client_lock_);
   if (client_sock_ == INVALID_SOCKET) return;

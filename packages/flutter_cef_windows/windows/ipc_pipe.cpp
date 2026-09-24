@@ -11,7 +11,7 @@
 #include "cef_host_protocol.h"
 #include "current_user_sd.h"
 
-// PLAN §4.2/§7.6 pipe hardening needs a CSPRNG (BCryptGenRandom) and the token/
+// The pipe hardening needs a CSPRNG (BCryptGenRandom) and the token/
 // SID/SDDL APIs. Neither bcrypt.lib nor advapi32.lib is on this plugin's CMake
 // link line and that file is owned elsewhere — pull them in from the TU so the
 // build stays self-contained.
@@ -46,7 +46,7 @@ IpcPipe::~IpcPipe() {
 
 // static
 std::wstring IpcPipe::NextPipeName() {
-  // 128-bit CSPRNG name (PLAN §4.2/§7.6): a predictable pid_counter name lets a
+  // 128-bit CSPRNG name: a predictable pid_counter name lets a
   // same-user process pre-create (squat) the pipe before cef_host connects. An
   // unguessable name closes the race window entirely.
   uint8_t rnd[16] = {};
@@ -71,7 +71,7 @@ std::wstring IpcPipe::NextPipeName() {
 
 bool IpcPipe::Create(const std::wstring& pipe_name) {
   pipe_name_ = pipe_name;
-  // Explicit protected DACL granting ONLY the current user (PLAN §7.6): the
+  // Explicit protected DACL granting ONLY the current user: the
   // default named-pipe DACL is broader than we want, and an anonymous descriptor
   // gives no guarantee. Refuse to create an unsecured pipe.
   PSECURITY_DESCRIPTOR sd = nullptr;
@@ -169,8 +169,8 @@ void IpcPipe::ReaderMain(FrameHandler handler,
     if (!ReadFull(hdr, sizeof(hdr))) break;
     const uint32_t body_len = ReadU32BE(hdr);
     if (body_len < kMinBodyLen || body_len > kMaxBodyLen) {
-      // Desynced stream: unrecoverable, tear the whole transport down
-      // (main.mm:2343-2351 rule).
+      // Desynced stream: unrecoverable, tear the whole transport down (as the
+      // macOS host's IpcReadLoop in ipc_reader.mm does).
       PipeLog("bodyLen out of range — stream desynced, closing");
       break;
     }

@@ -1,9 +1,8 @@
 // flutter_cef Windows plugin — channel host.
 //
 // The verb/event contract is ../native/cef_host/PROTOCOL.md §3/§4
-// (transcribed from FlutterCefPlugin.swift). Architecture (P6 foundation +
-// the profile slice of P11 — mirrors CefProfileHost.swift + FlutterCefPlugin
-// .swift):
+// (transcribed from FlutterCefPlugin.swift). Architecture (mirrors
+// CefProfileHost.swift + FlutterCefPlugin.swift):
 //  - ONE cef_host.exe per PROFILE. A non-empty `profile` create arg -> a
 //    shared, persistent Host (keyed by profile name) reused by every session
 //    that names it; an absent/empty profile -> an ephemeral Host, shared by a
@@ -20,19 +19,20 @@
 //    parent Host by key.
 //  - Reader/watcher threads never touch the MethodChannel: they post
 //    HostEvents into a mutex+deque drained on the platform thread via a
-//    message-only HWND (PostMessage wakeup) — the slice-approved marshal.
+//    message-only HWND (PostMessage wakeup).
 //  - Event routing: every host->plugin frame carries a wire browser_id.
 //    browser_id 0 is process-level (kOpReady, kOpLog); >=1 routes to the
-//    Session bound to that id on that Host. The #1 generation guard now keys
-//    on the HOST's generation, so a dead host's straggler frames (posted
+//    Session bound to that id on that Host. The generation guard keys on
+//    the HOST's generation, so a dead host's straggler frames (posted
 //    during the reaper grace after a same-profile respawn) can't reach a
 //    session on the fresh host.
 //  - Handshake: nothing is sent until kOpReady; protocolVersion must equal
 //    kCefHostProtocolVersion (else processGone "protocolMismatch(host=vN)" for
 //    every session). Verbs
 //    issued before ready are queued on the Host and flushed on ready.
-//  - Present size-gate (LAW 4): a present is promoted only when its
-//    {srcW,srcH} matches round(logical*dpr) ±1 px for the CURRENT size.
+//  - Present size-gate: CEF still delivers late frames at the OLD size after
+//    a resize, so a present is promoted only when its {srcW,srcH} matches
+//    round(logical*dpr) ±1 px for the CURRENT size.
 //  - Teardown is two-tier: dispose ONE browser = kOpDisposeBrowser, host
 //    survives if other sessions remain; last session gone / host death = tear
 //    down the whole Host (reader/watcher/Job/pipe) via a bounded reaper.
@@ -74,7 +74,7 @@ namespace flutter_cef {
 
 class CdpRelay;  // windows/cdp_relay.h — winsock, pulled in only by the .cpp
 
-// Agent-control (P9) CDP-over-pipe transport for one host. Held via a
+// Agent-control CDP-over-pipe transport for one host. Held via a
 // shared_ptr so the always-on CDP reader thread (which delivers pipe messages
 // to the current relay) can safely outlive a Host erase during teardown — the
 // reader captures its own shared_ptr, so the transport (and its handles) stay
@@ -117,8 +117,8 @@ class FlutterCefPlugin : public flutter::Plugin {
   struct Host {
     // hosts_ map key: profile name, "~group~"+hostGroup or "~ephemeral~"+sessionId
     std::string key;
-    // Monotonic per-spawn identity (C1 host-object-identity analogue of macOS
-    // failHost, FlutterCefPlugin.swift:484-511). The reader/exit-watcher
+    // Monotonic per-spawn identity (the analogue of the host-object identity
+    // check in macOS failHost). The reader/exit-watcher
     // lambdas capture THIS value; a stale OLD-host event posted during the
     // reaper grace after a dispose+respawn of the SAME profile key carries a
     // generation that no longer matches the live host and is dropped.
@@ -162,7 +162,7 @@ class FlutterCefPlugin : public flutter::Plugin {
     int width = 800;
     int height = 600;
     double dpr = 1.0;
-    // The size-gate expectation: round(logical * dpr) (LAW 4).
+    // The size-gate expectation: round(logical * dpr), in physical px.
     uint32_t expected_pw = 0;
     uint32_t expected_ph = 0;
     uint64_t current_handle = 0;  // last promoted bridge handle
@@ -221,7 +221,7 @@ class FlutterCefPlugin : public flutter::Plugin {
     Kind kind = Kind::kFrame;
     std::string host_key;
     // The generation of the Host that owned the poster. Dropped on drain if it
-    // no longer matches the live host's generation (C1).
+    // no longer matches the live host's generation.
     uint64_t generation = 0;
     uint32_t browser_id = 0;
     uint8_t opcode = 0;
@@ -249,8 +249,8 @@ class FlutterCefPlugin : public flutter::Plugin {
   Host* HostForSession(const Session* session);
   // Resolve the live Host for `key`, or spawn a fresh one. nullptr on spawn
   // failure. An EXISTING host is reused verbatim (its --allowed-schemes etc.
-  // are process args fixed at its spawn — the reuse arg is ignored, macOS
-  // parity, FlutterCefPlugin.swift:456-471).
+  // are process args fixed at its spawn — the reuse arg is ignored, as in
+  // macOS resolveOrSpawnHost).
   Host* ResolveOrSpawnHost(const std::string& key,
                            const std::wstring& profile_dir, bool ephemeral,
                            const std::wstring& host_exe,
@@ -278,7 +278,7 @@ class FlutterCefPlugin : public flutter::Plugin {
   // the last.
   void DetachFromHost(const std::string& host_key, uint32_t browser_id);
 
-  // Agent control (P9). enableAgentControl starts (idempotently) the token-gated
+  // Agent control. enableAgentControl starts (idempotently) the token-gated
   // loopback CDP relay for the session's host and replies
   // `{wsUrl, token, port}` (the macOS return shape exactly); it errors if the
   // host was not created with agentControl:true. disableAgentControl tears the
@@ -324,7 +324,7 @@ class FlutterCefPlugin : public flutter::Plugin {
   void HandleSessionFrame(Session* session, uint8_t opcode,
                           const std::vector<uint8_t>& payload);
 
-  // C1 first-present watchdog (WM_TIMER on message_window_).
+  // First-present watchdog (WM_TIMER on message_window_).
   void ArmWatchdog(Session* session);
   void CancelWatchdog(Session* session);
   void OnWatchdogTimer(UINT_PTR timer_id);
@@ -343,9 +343,9 @@ class FlutterCefPlugin : public flutter::Plugin {
   static std::wstring ResolveCefHostPath();
   static std::wstring MakeEphemeralProfileDir();
   // Persistent + shared profile dir: %LOCALAPPDATA%\flutter_cef\profiles\
-  // <sanitize(name)>, created with a current-user-SID protected DACL (the #3
-  // pipe-hardening pattern). Empty string on an unusable name. See the .cpp
-  // for the DPAPI-at-rest note (SPIKES.md S2 / §7).
+  // <sanitize(name)>, created with a current-user-SID protected DACL (the
+  // IPC pipe's hardening pattern). Empty string on an unusable name. See
+  // the .cpp for the DPAPI-at-rest note.
   static std::wstring MakePersistentProfileDir(const std::string& profile);
   // Recursively delete a directory tree (best-effort). Safe on a missing path.
   static void DeleteDirRecursive(const std::wstring& dir);
