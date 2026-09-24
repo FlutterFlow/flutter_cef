@@ -68,10 +68,12 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     // The macOS FlutterPlugin protocol has no detachFromEngine hook (that's iOS-
     // only), so we observe NSApplication.willTerminateNotification directly — fires
     // regardless of how the host app wires its delegate. The closure captures
-    // `instance` strongly (intended: keep it alive to term so shutdownAllHosts can
-    // run), and removes itself so it can't fire twice. Idempotent: shutdownAllHosts
-    // tolerates an already-clean state, and CefProfileHost.shutdown() is itself
-    // idempotent, so this is safe even after normal per-tile teardown.
+    // `instance` weakly, and shutdownAllHosts removes the observer so it can't fire
+    // twice. Idempotent: shutdownAllHosts tolerates an already-clean state, and
+    // CefProfileHost.shutdown() is itself idempotent, so this is safe even after
+    // normal per-tile teardown. With no detach hook, the hosts of an engine torn
+    // down before the app quits keep running until the app exits; each cef_host
+    // then sees its IPC close and exits on its own.
     instance.terminateObserver = NotificationCenter.default.addObserver(
       forName: NSApplication.willTerminateNotification, object: nil, queue: .main
     ) { [weak instance] _ in
@@ -377,6 +379,14 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     // every session in the group, instead of one throwaway host per session.
     let hostGroup = (a["hostGroup"] as? String).flatMap { $0.isEmpty ? nil : $0 }
 
+    if namedProfile && !HostConfigPolicy.isValidProfileName(profile!) {
+      result(FlutterError(
+        code: "bad_args",
+        message: "profile names starting with \"~\" are reserved: \(profile!)",
+        details: nil))
+      return
+    }
+
     // Dispose any prior session with this id first (route teardown through its
     // host), so re-creating the same id is idempotent and doesn't trip the
     // single-view guard below on itself.
@@ -414,6 +424,13 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     let effectiveNamed = namedProfile && !adhocBlockedProfiles.contains(profile ?? "")
     let key = effectiveNamed
       ? profile! : Self.ephemeralKey(sessionId: sessionId, hostGroup: hostGroup)
+    // A shared host's scheme allowlist and CDP port are the first session's; don't
+    // hand this one weaker settings than it asked for.
+    if let refusal = joinRefusal(key: key, allowedSchemes: allowedSchemes,
+                                 enableCdp: enableCdp, agentControl: agentControl) {
+      result(refusal)
+      return
+    }
 
     guard let host = resolveOrSpawnHost(
       key: key, namedProfile: effectiveNamed ? profile : nil,
@@ -423,23 +440,6 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       result(FlutterError(code: "spawn_failed",
                           message: "failed to spawn cef_host", details: nil))
       return
-    }
-
-    // F.5 dev safety-rail: an ad-hoc (mock-keychain) host refuses a named
-    // persistent profile at kOpReady (nothing's been written, so no creds leak).
-    // When that fires, tear the host down and respawn an EPHEMERAL host for this
-    // same session, then re-issue createBrowser. Wired only for named profiles;
-    // an already-ephemeral host never refuses.
-    if effectiveNamed {
-      // C2: re-home the WHOLE shared host's sessions onto ephemeral hosts on refusal —
-      // not just this one. The closure captures the host, not a single sessionId, so a
-      // burst of tiles that all attached before kOpReady are all rescued.
-      host.onInsecureProfileRefused = { [weak self, weak host] in
-        DispatchQueue.main.async {
-          guard let self = self, let host = host, let prof = profile else { return }
-          self.respawnHostEphemeral(host, refusedProfile: prof)
-        }
-      }
     }
 
     let session = CefWebSession(
@@ -580,15 +580,29 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     let (profileDir, isEphemeral) = resolveProfileDir(namedProfile)
     let host = CefProfileHost(
       profileId: key, profileDir: profileDir, isEphemeral: isEphemeral)
+    // Callbacks go in before spawn() starts the threads that call them.
+    wireHost(host, namedProfile: namedProfile)
     guard host.spawn(cefHostPath: cefHostPath, enableCdp: enableCdp,
                      allowedSchemes: allowedSchemes, agentControl: agentControl)
     else {
       if isEphemeral { try? FileManager.default.removeItem(atPath: profileDir) }
       return nil
     }
-    wireHostDied(host)
     profiles[key] = host
     return host
+  }
+
+  /// Why this session can't join the host already running for `key`, as the
+  /// error create()/thaw reply with, or nil when it can (or none is running).
+  /// See HostConfigPolicy.
+  private func joinRefusal(key: String, allowedSchemes: String, enableCdp: Bool,
+                           agentControl: Bool) -> FlutterError? {
+    guard let host = profiles[key] else { return nil }
+    guard let why = HostConfigPolicy.joinRefusal(
+      requestedSchemes: allowedSchemes, requestedTcpCdp: enableCdp && !agentControl,
+      hostSchemes: host.allowedSchemes, hostHasTcpCdp: host.cdpPort > 0)
+    else { return nil }
+    return FlutterError(code: "host_config_mismatch", message: why, details: nil)
   }
 
   /// C1: install the host-died handler. When `cef_host` dies unexpectedly (its
@@ -614,7 +628,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       // buffer). If we just nil sessions[sid], the later Dart controller.dispose ->
       // disposeSession early-returns on the now-missing session, so the texture + surfaces
       // leak for the engine's lifetime — on EVERY host crash, exactly when recovery (a
-      // fresh create) happens most. (onBrowserFailed / respawn-failure already dispose;
+      // fresh create) happens most. (onBrowserGone / respawn-failure already dispose;
       // this path was the asymmetric leak.)
       sessions[sid]?.dispose()
       sessions[sid] = nil
@@ -631,7 +645,11 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     host.shutdown()
   }
 
-  private func wireHostDied(_ host: CefProfileHost) {
+  /// Install every callback `host` makes. Called once per host, before spawn(): the
+  /// host invokes them from its own threads, and a closure reassigned while another
+  /// thread reads it can tear. `namedProfile` wires the F.5 refusal, which only a
+  /// named-profile host can raise.
+  private func wireHost(_ host: CefProfileHost, namedProfile: String?) {
     host.onHostDied = { [weak self, weak host] status in
       dispatchPrecondition(condition: .onQueue(.main))
       guard let self = self, let host = host else { return }
@@ -669,21 +687,17 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
         self.failHost(host, reason: "protocolMismatch(host=v\(hostVersion))")
       }
     }
-    // H7: a SINGLE browser's create failed (host otherwise healthy) — drop just that
-    // session + emit processGone for it, so Dart stops waiting on a browser that will
-    // never paint (the host's create-pacer already advanced).
-    host.onBrowserFailed = { [weak self, weak host] browserId in
+    // One browser can't continue while the host is otherwise healthy (its create
+    // failed, or its renderer kept crashing or hung) — drop just that session and emit
+    // processGone for it, so Dart stops waiting on a browser that will never paint and
+    // can recreate it. disposeSession also shuts the host down when that was its last
+    // browser.
+    host.onBrowserGone = { [weak self, weak host] browserId, reason in
       DispatchQueue.main.async {
         guard let self = self, let host = host,
               let sid = self.sessionId(forBrowserId: browserId, on: host) else { return }
-        self.emit("processGone", ["sessionId": sid, "reason": "createFailed"])
-        let session = self.sessions[sid]
-        self.sessions[sid] = nil
-        self.sessionHost[sid] = nil
-        self.sessionKey[sid] = nil
-        self.sessionCreateArgs[sid] = nil
-        _ = host.removeBrowser(browserId)
-        session?.dispose()
+        self.emit("processGone", ["sessionId": sid, "reason": reason])
+        self.disposeSession(sid)
       }
     }
     // C1: a browser never painted its first frame despite a re-kick — surface
@@ -694,6 +708,19 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
         guard let self = self, let host = host,
               let sid = self.sessionId(forBrowserId: browserId, on: host) else { return }
         self.emit("paintStalled", ["sessionId": sid])
+      }
+    }
+    // F.5 dev safety-rail: an ad-hoc (mock-keychain) host refuses a named persistent
+    // profile at kOpReady (nothing's been written, so no creds leak). C2: re-home the
+    // WHOLE shared host's sessions onto ephemeral hosts — not just the one that
+    // spawned it — so a burst of tiles that all attached before kOpReady are all
+    // rescued.
+    if let profile = namedProfile {
+      host.onInsecureProfileRefused = { [weak self, weak host] in
+        DispatchQueue.main.async {
+          guard let self = self, let host = host else { return }
+          self.respawnHostEphemeral(host, refusedProfile: profile)
+        }
       }
     }
   }
@@ -740,12 +767,6 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       }
       return
     }
-    host.onInsecureProfileRefused = { [weak self, weak host] in
-      DispatchQueue.main.async {
-        guard let self = self, let host = host else { return }
-        self.respawnHostEphemeral(host, refusedProfile: key)
-      }
-    }
     for sid in victims {
       guard let session = sessions[sid], let a = sessionCreateArgs[sid] else { continue }
       _ = host.createBrowser(session, url: a.url, allowedSchemes: a.allowedSchemes)
@@ -777,6 +798,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       let (profileDir, isEphemeral) = resolveProfileDir(nil)
       let key = "~ephemeral~" + sid
       let host = CefProfileHost(profileId: key, profileDir: profileDir, isEphemeral: isEphemeral)
+      wireHost(host, namedProfile: nil)
       guard host.spawn(cefHostPath: cefHost, enableCdp: false,
                        allowedSchemes: args.allowedSchemes,
                        agentControl: args.agentControl) else {
@@ -792,7 +814,6 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
         session.dispose()
         continue
       }
-      wireHostDied(host)
       profiles[key] = host
       _ = host.createBrowser(session, url: args.url, allowedSchemes: args.allowedSchemes)
       sessionHost[sid] = host
@@ -962,6 +983,11 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     let effectiveNamed = namedProfile && !adhocBlockedProfiles.contains(profile ?? "")
     let key = effectiveNamed
       ? profile! : Self.ephemeralKey(sessionId: id, hostGroup: args.hostGroup)
+    if let refusal = joinRefusal(key: key, allowedSchemes: args.allowedSchemes,
+                                 enableCdp: args.enableCdp, agentControl: args.agentControl) {
+      result(refusal)
+      return
+    }
     guard let host = resolveOrSpawnHost(
       key: key, namedProfile: effectiveNamed ? profile : nil,
       cefHostPath: cefHost, enableCdp: args.enableCdp,
@@ -970,16 +996,6 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       result(FlutterError(code: "spawn_failed",
                           message: "failed to spawn cef_host", details: nil))
       return
-    }
-    // F.5 wiring, same as create(): an ad-hoc host refusing the named profile
-    // re-homes every session on it onto ephemeral hosts.
-    if effectiveNamed {
-      host.onInsecureProfileRefused = { [weak self, weak host] in
-        DispatchQueue.main.async {
-          guard let self = self, let host = host, let prof = profile else { return }
-          self.respawnHostEphemeral(host, refusedProfile: prof)
-        }
-      }
     }
     frozenSessions.remove(id)
     _ = host.createBrowser(session, url: url, allowedSchemes: args.allowedSchemes)

@@ -92,18 +92,16 @@ final class CdpRelay {
   private var ourBrowserContextId: String?
   private let filterLock = NSLock()
 
-  // CEF-2b multiplex: this relay's identity in the shared pipe's CDP id space (the
-  // owning browser's wire browserId). 0 for the CEF-2a passthrough / unit tests.
-  private let relayId: Int
-
   // CEF-2b multiplex: N relays share ONE browser-wide pipe with ONE CDP id space.
   // Session-routed traffic is demuxed by sessionId, but BROWSER-LEVEL commands
   // (no sessionId — Playwright's connect handshake) would collide. We rewrite
-  // EVERY outgoing command id to a globally-unique pipe id and demux responses
-  // back. pipeId = (relayId << 21) | localSeq is unique per relay because
-  // browserIds are strictly monotonic / never reused.
+  // EVERY outgoing command id to a pipe id taken from the host's shared
+  // allocator, so it is unique across the host's relays, and demux responses back.
+  // The mappings belong to one client connection: a new client clears them, so a
+  // late response to a departed client's command can't answer the newcomer's
+  // command that reused its id.
+  private let pipeIds: CdpPipeIds
   private var pipeIdToClientId: [Int: Int] = [:]
-  private var nextLocalId = 0
   private let multiplexLock = NSLock()
   // H2: this relay's OWN Target.attachToTarget pipe id (used to learn our page's CDP
   // session order-independently, instead of passively witnessing a fire-once
@@ -120,12 +118,14 @@ final class CdpRelay {
   private var selfAttachPipeId: Int?
   private var pendingAutoAttachClientIds: [Int] = []
   private var attachClientGeneration = 0  // the clientGeneration that issued the in-flight attach
-  private var clientGeneration = 0        // bumped on each client detach
+  private var clientGeneration = 0        // bumped on each client connect
 
-  init(sendToPipe: @escaping (String) -> Void, scopeTargetId: String? = nil, relayId: Int = 0) {
+  /// `pipeIds` is shared by every relay on the same pipe (one per host).
+  init(sendToPipe: @escaping (String) -> Void, scopeTargetId: String? = nil,
+       pipeIds: CdpPipeIds = CdpPipeIds()) {
     self.sendToPipe = sendToPipe
     self.scopeTargetId = scopeTargetId
-    self.relayId = relayId
+    self.pipeIds = pipeIds
     self.token = CdpRelay.randomToken()
   }
 
@@ -289,10 +289,7 @@ final class CdpRelay {
     }
     clientFd = fd
     clientLock.unlock()
-    // H2: stamp a fresh client identity. A self-attach response still in flight from a
-    // PRIOR client connection captured the old generation, so handleSelfAttachResponse
-    // will refuse to deliver its synthesized event / ack to THIS connection.
-    multiplexLock.lock(); clientGeneration &+= 1; multiplexLock.unlock()
+    let generation = noteClientConnected()
 
     let accept = Data((key + CdpRelay.wsGUID).utf8)
     let digest = Insecure.SHA1.hash(data: accept)
@@ -316,15 +313,33 @@ final class CdpRelay {
     if owned { close(fd) }
     // H2: the relay persists past this client — drop the in-flight attach so a late
     // self-attach response isn't delivered to the next client (a stale ack / spurious
-    // attachedToTarget). The generation is bumped at the NEXT connect, so even a
-    // response that races this reset is gated by attachClientGeneration. ourSessionId/
-    // allowedSessions stay (the page is unchanged; the next client re-issues
-    // setAutoAttach and we synthesize from the known session).
+    // attachedToTarget), and its id mappings. A client that connected in the meantime
+    // already reset them (noteClientConnected) and may have state of its own, so this
+    // only runs while the generation is still ours. ourSessionId/allowedSessions stay
+    // (the page is unchanged; the next client re-issues setAutoAttach and we synthesize
+    // from the known session).
     multiplexLock.lock()
-    selfAttachPipeId = nil
-    pendingAutoAttachClientIds.removeAll()
+    if clientGeneration == generation {
+      selfAttachPipeId = nil
+      pendingAutoAttachClientIds.removeAll()
+      pipeIdToClientId.removeAll()
+    }
     multiplexLock.unlock()
     dlog("[cef][relay] client detached")
+  }
+
+  /// A client connected: stamp a fresh client identity and forget the previous
+  /// client's in-flight commands. A self-attach response still in flight from a
+  /// PRIOR client connection captured the old generation, so handleSelfAttachResponse
+  /// will refuse to deliver its synthesized event / ack to THIS connection; any
+  /// other late response finds no mapping and is dropped. Internal so the standalone
+  /// tests can drive a reconnect. Returns the new generation.
+  @discardableResult
+  func noteClientConnected() -> Int {
+    multiplexLock.lock(); defer { multiplexLock.unlock() }
+    clientGeneration &+= 1
+    pipeIdToClientId.removeAll()
+    return clientGeneration
   }
 
   private func serveDiscovery(_ fd: Int32, path: String) {
@@ -810,8 +825,7 @@ final class CdpRelay {
     // resolves just queues its ack above (the single attachToTarget resolves the session
     // for both); issuing a second would leak its pipeId mapping and lose an ack.
     guard selfAttachPipeId == nil else { multiplexLock.unlock(); return }
-    let pipeId = (relayId << 21) | (nextLocalId & 0x1FFFFF)
-    nextLocalId &+= 1
+    let pipeId = pipeIds.take()
     selfAttachPipeId = pipeId
     attachClientGeneration = clientGeneration
     multiplexLock.unlock()
@@ -904,8 +918,7 @@ final class CdpRelay {
     guard scopeTargetId != nil else { return json }
     guard var m = parseJson(json), let clientId = m["id"] as? Int else { return json }
     multiplexLock.lock()
-    let pipeId = (relayId << 21) | (nextLocalId & 0x1FFFFF)
-    nextLocalId &+= 1
+    let pipeId = pipeIds.take()
     pipeIdToClientId[pipeId] = clientId
     multiplexLock.unlock()
     m["id"] = pipeId
@@ -945,4 +958,25 @@ final class CdpRelay {
   }
 
   private func writeRaw(_ fd: Int32, _ s: String) { _ = writeAll(fd, Array(s.utf8)) }
+}
+
+/// The CDP command ids the relays of one host put on its shared pipe. Chromium
+/// accepts only positive int32 ids, and one allocator per host keeps ids unique
+/// across its relays however many browsers the host has created. Ids start well
+/// above the small ones the debug pipe probe uses, and wrap back there after
+/// Int32.max; an id in flight for two billion commands isn't a concern.
+final class CdpPipeIds {
+  static let first = 1 << 20
+  private let lock = NSLock()
+  private var next: Int
+
+  /// `startingAt` exists for tests that exercise the wrap.
+  init(startingAt: Int = CdpPipeIds.first) { next = startingAt }
+
+  func take() -> Int {
+    lock.lock(); defer { lock.unlock() }
+    let id = next
+    next = next >= Int(Int32.max) ? CdpPipeIds.first : next + 1
+    return id
+  }
 }

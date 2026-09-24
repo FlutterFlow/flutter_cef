@@ -53,6 +53,7 @@
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -91,6 +92,7 @@
 #include "include/cef_keyboard_handler.h"
 #include "document_start.h"
 #include "mac_key_bindings.h"
+#include "renderer_messages.h"
 #include "include/cef_life_span_handler.h"
 #include "include/cef_permission_handler.h"
 #include "include/cef_render_handler.h"
@@ -115,48 +117,78 @@ namespace {
 // only because a closed-fd write is a safe no-op); the atomic makes it defined.
 std::atomic<int> g_ipc_fd{-1};
 
+// FLUTTER_CEF_DEBUG, read once in main() before anything runs: the per-frame
+// and per-tick diagnostics check it on hot paths.
+bool g_debug = false;
+
+// The eval id of the plugin's liveness ping (CefProfileHost.livenessPingId).
+// Answered natively by the renderer, not by page JS: see renderer_messages.h.
+constexpr uint32_t kLivenessPingId = 0xFFFFFFFFu;
+
+// The plugin's reader drops the connection on a frame body over this size, which
+// ends every browser on the host, so nothing larger is ever sent.
+constexpr uint32_t kMaxFrameBody = 64u << 20;
+// What a page may put in one message (an eval result, a channel post) or one
+// text field that goes out whole. Well under kMaxFrameBody.
+constexpr size_t kMaxPageMessage = 16u << 20;
+constexpr size_t kMaxPageText = 1u << 20;
+
 // ── Renderer crash-loop detector ─────────────────────────────────────────────
 // A renderer that dies is normally recoverable: OnRenderProcessTerminated
-// reloads and the fresh child takes over. But if the child can no longer be
-// SPAWNED at all, that reload re-crashes instantly and loops forever, and the
-// host never notices: the browser process is healthy, so the IPC pipe stays up,
-// no processGone is ever emitted, and the embedder sees a tile stuck on its last
-// frame with no signal and no way back. The observed trigger is the app bundle
-// being replaced under a running host (a rebuild/relaunch): every child then
-// SIGTRAPs at startup resolving the CEF framework it was launched from.
+// reloads and the fresh child takes over. But a page that crashes its renderer
+// on every load, or a child that can no longer be SPAWNED at all, re-crashes
+// instantly and loops forever with no signal to the embedder.
 //
-// So make the unrecoverable case LOOK like the recoverable one. Past a burst
-// threshold, exit deliberately: the pipe EOFs, the plugin reports processGone,
-// and the embedder's existing recreate funnel spawns a fresh host — which
-// re-resolves the binary from disk and therefore picks up the NEW bundle. A
-// silent wedge becomes the recovery path that already works.
-std::mutex g_renderer_crash_mutex;
-int g_renderer_crash_count = 0;
-std::chrono::steady_clock::time_point g_renderer_crash_window_start;
+// Counted per browser: one page crash-looping ends only its own browser
+// (kOpBrowserGone, and it is not reloaded again). When bursts span several
+// browsers at once the children themselves can't start (the observed trigger is
+// the app bundle being replaced under a running host), so the host exits: the
+// pipe EOFs, the plugin reports processGone, and the embedder's recreate path
+// spawns a fresh host from the new bundle.
 // Tuned to be unreachable by ordinary flakiness: an isolated renderer crash (or
 // a few across unrelated tabs) reloads normally and never trips this.
 constexpr int kRendererCrashBurstLimit = 4;
 constexpr std::chrono::seconds kRendererCrashWindow{10};
+// Browsers whose bursts overlap within kRendererCrashWindow before the host
+// gives up on its children.
+constexpr size_t kHostCrashLoopBrowsers = 2;
 
 void DoShutdown();  // defined below; the crash-loop exit reuses it
 
-/// Record a renderer death and report whether they are arriving as a burst —
-/// i.e. the reload is re-crashing rather than recovering. UI-thread only (the
-/// single caller is OnRenderProcessTerminated), but locked anyway since the
-/// counter is process-global across every slot: a stale-bundle host fails for
-/// ALL its browsers at once, which is exactly the signal we want to add up.
-bool NoteRendererCrashAndCheckLoop() {
-  const auto now = std::chrono::steady_clock::now();
-  std::lock_guard<std::mutex> lock(g_renderer_crash_mutex);
-  if (g_renderer_crash_count == 0 ||
-      now - g_renderer_crash_window_start > kRendererCrashWindow) {
-    // First death, or the previous burst aged out: start a fresh window so
-    // unrelated one-off crashes over a long session never accumulate.
-    g_renderer_crash_window_start = now;
-    g_renderer_crash_count = 1;
-    return false;
+/// One browser's renderer crash history. UI-thread only.
+struct CrashCounter {
+  int count = 0;
+  std::chrono::steady_clock::time_point window_start;
+
+  /// Records a renderer death; true when they arrive as a burst, i.e. the
+  /// reload is re-crashing rather than recovering.
+  bool NoteAndCheckBurst(std::chrono::steady_clock::time_point now) {
+    if (count == 0 || now - window_start > kRendererCrashWindow) {
+      // First death, or the previous burst aged out: unrelated one-off crashes
+      // over a long session never accumulate.
+      window_start = now;
+      count = 1;
+      return false;
+    }
+    return ++count >= kRendererCrashBurstLimit;
   }
-  return ++g_renderer_crash_count >= kRendererCrashBurstLimit;
+};
+
+// When each browser's crash burst was detected, by wire id. UI-thread only.
+std::map<uint32_t, std::chrono::steady_clock::time_point> g_crash_bursts;
+
+/// A browser's renderer crash-looped. True when bursts on other browsers
+/// overlap it, which means the host can't start children at all.
+bool NoteCrashBurstAndCheckHostLoop(uint32_t wire_id,
+                                    std::chrono::steady_clock::time_point now) {
+  g_crash_bursts[wire_id] = now;
+  for (auto it = g_crash_bursts.begin(); it != g_crash_bursts.end();) {
+    if (now - it->second > kRendererCrashWindow)
+      it = g_crash_bursts.erase(it);
+    else
+      ++it;
+  }
+  return g_crash_bursts.size() >= kHostCrashLoopBrowsers;
 }
 std::mutex g_ipc_write_mutex;
 
@@ -300,9 +332,21 @@ struct Slot {
   // about:blank-first (FLUTTER_CEF_BLANK_FIRST): the real URL to navigate to AFTER the
   // browser establishes on about:blank. Establishing on blank makes the first-frame GPU
   // handshake near-instant (so the create-pacer releases its slot fast), decoupling
-  // establishment from the real page's load time. Navigated + cleared on first paint.
-  // UI-thread only.
+  // establishment from the real page's load time. Navigated + cleared on first paint,
+  // or when the browser binds hidden (a hidden browser doesn't paint). UI-thread only.
   std::string pending_nav_url;
+  // A load that arrived after the create but before the browser bound
+  // (OnAfterCreated). Applied there. UI-thread only.
+  std::string nav_after_create;
+  // This browser's renderer crash history (see CrashCounter), and whether it
+  // crash-looped: it is then left alone, not reloaded again. UI-thread only.
+  CrashCounter crashes;
+  bool crash_looped = false;
+  // Nonce of each runJavaScriptReturningResult in flight, by eval id. Only a
+  // reply carrying its eval's nonce is passed on, so the page can't answer an
+  // eval it wasn't asked (though, running in the page, it can still alter the
+  // result of one it was). UI-thread only.
+  std::map<uint32_t, std::string> pending_evals;
   // The JS channels this browser's consumer registered, before create (they also
   // ride in extra_info) or after. Only these are injected into its pages and
   // honored from them: channels are per browser, not per host. UI-thread only.
@@ -342,7 +386,7 @@ void PumpBeginFrame(uint32_t wire_id) {
   if (!slot || !slot->browser) return;  // disposed mid-flight — let the pump die
   if (slot->visible) slot->browser->GetHost()->SendExternalBeginFrame();
   slot->diag_pump_ticks++;  // DIAG
-  if (std::getenv("FLUTTER_CEF_DEBUG") && slot->diag_pump_ticks % 120 == 0)
+  if (g_debug && slot->diag_pump_ticks % 120 == 0)
     SendLog(wire_id, "diag wire=" + std::to_string(wire_id) +
                          " pumpTicks=" + std::to_string(slot->diag_pump_ticks) +
                          " paints=" + std::to_string(slot->diag_paint_count) +
@@ -448,6 +492,15 @@ bool SchemeAllowed(const std::string& url) {
   return scheme == "about" || g_allowed_schemes.count(scheme) != 0;
 }
 
+// Windowed browsers the host opened besides the tiles: sign-in popups (keyed to
+// the tile that opened them, so disposing the tile closes them) and auth windows
+// (owner 0). By CefBrowser identifier. UI-thread only.
+struct WindowedBrowser {
+  CefRefPtr<CefBrowser> browser;
+  uint32_t owner_wire_id = 0;
+};
+std::map<int, WindowedBrowser> g_windowed_browsers;
+
 // Native popup windows open now (UI thread). A page gets one only from a user
 // gesture, and only this many at once, so it can't flood the screen with
 // focus-stealing windows.
@@ -457,6 +510,74 @@ constexpr int kMaxNativePopups = 4;
 bool NativePopupAllowed(const std::string& url, bool user_gesture) {
   return user_gesture && g_native_popups < kMaxNativePopups &&
          SchemeAllowed(url);
+}
+
+// Closes the windowed browsers `owner_wire_id` opened, or all of them when
+// owner_wire_id is 0. UI-thread only.
+void CloseWindowedBrowsers(uint32_t owner_wire_id) {
+  std::vector<CefRefPtr<CefBrowser>> doomed;
+  for (auto& kv : g_windowed_browsers) {
+    if (owner_wire_id == 0 || kv.second.owner_wire_id == owner_wire_id)
+      doomed.push_back(kv.second.browser);
+  }
+  for (auto& b : doomed) b->GetHost()->CloseBrowser(true);
+}
+
+// ── Shutdown ────────────────────────────────────────────────────────────────
+// CEF must not be shut down with browsers still open, so DoShutdown closes
+// every browser and quits the message loop only once the last one is gone
+// (OnBeforeClose), or after kShutdownCloseGrace if one never closes.
+bool g_shutting_down = false;       // UI-thread only
+int g_open_browsers = 0;            // tiles dispatched + windowed browsers; UI thread
+bool g_quit_posted = false;         // UI-thread only
+constexpr int64_t kShutdownCloseGraceMs = 2000;
+
+void QuitMessageLoopOnce() {
+  if (g_quit_posted) return;
+  g_quit_posted = true;
+  CefQuitMessageLoop();
+}
+
+/// A browser counted in g_open_browsers closed. UI-thread only.
+void NoteBrowserClosed() {
+  if (g_open_browsers > 0) --g_open_browsers;
+  if (g_shutting_down && g_open_browsers == 0) QuitMessageLoopOnce();
+}
+
+// If the UI thread is wedged (a hung GPU wait, say) the shutdown posted to it
+// never runs, the process lingers and keeps the profile's lock, and every
+// relaunch reports "locked". Armed wherever a shutdown is requested; exits the
+// process kHardExitSeconds later if its message loop hasn't quit by then. Once
+// it has, CefShutdown is running, which takes a second or so and longer on a
+// first launch, so the deadline moves out to kTeardownSeconds instead of
+// cutting that short (see ExtendHardExitForTeardown).
+constexpr int kHardExitSeconds = 6;
+constexpr int kTeardownSeconds = 30;
+std::once_flag g_hard_exit_armed;
+std::atomic<int64_t> g_hard_exit_at_ms{0};  // steady clock
+
+int64_t SteadyNowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+void ArmHardExit(const char* why) {
+  std::call_once(g_hard_exit_armed, [why] {
+    g_hard_exit_at_ms = SteadyNowMs() + kHardExitSeconds * 1000;
+    std::thread([why] {
+      for (int64_t left; (left = g_hard_exit_at_ms - SteadyNowMs()) > 0;)
+        std::this_thread::sleep_for(std::chrono::milliseconds(left));
+      fprintf(stderr, "[cef_host] still running after shutdown (%s); exiting now\n",
+              why);
+      _exit(0);
+    }).detach();
+  });
+}
+
+void ExtendHardExitForTeardown() {
+  ArmHardExit("teardown");
+  g_hard_exit_at_ms = SteadyNowMs() + kTeardownSeconds * 1000;
 }
 
 // Agent-control opt-in: when true (set from main() via --cdp-pipe BEFORE
@@ -557,8 +678,17 @@ bool ReadAll(int fd, void* buf, size_t len) {
 // frames (kOpReady, process-level kOpLog). bodyLen = 4 (browserId) + 1 (op) +
 // payloadLen, counting every byte after the length prefix.
 void SendFrame(uint32_t browser_id, uint8_t opcode, const void* payload,
-               uint32_t payload_len) {
+               size_t payload_len) {
   if (g_ipc_fd < 0) return;  // racy early-out; the authoritative check is under the lock
+  // Most payloads carry page-chosen text. One the plugin would refuse must not
+  // cost every browser on the host its connection, so it is dropped instead.
+  if (payload_len > kMaxFrameBody - 5) {
+    fprintf(stderr,
+            "[cef_host] dropped a %zu-byte frame (op 0x%02x, browser %u): over "
+            "the IPC frame limit\n",
+            payload_len, opcode, browser_id);
+    return;
+  }
   std::lock_guard<std::mutex> lock(g_ipc_write_mutex);
   // C3: SNAPSHOT the fd under the write lock and write to the snapshot, never re-loading
   // g_ipc_fd at write time. Teardown sets g_ipc_fd=-1 (exchange) and close()s the old fd
@@ -567,7 +697,7 @@ void SendFrame(uint32_t browser_id, uint8_t opcode, const void* payload,
   // into a closed/recycled fd.
   int fd = g_ipc_fd.load();
   if (fd < 0) return;
-  uint32_t body_len = 4 + 1 + payload_len;
+  uint32_t body_len = static_cast<uint32_t>(4 + 1 + payload_len);
   // Assemble the whole frame and write it in one WriteAll so a partial write
   // never leaves the peer with a length prefix it can't satisfy (stream desync).
   std::vector<uint8_t> frame(4 + body_len);
@@ -585,11 +715,33 @@ void SendFrame(uint32_t browser_id, uint8_t opcode, const void* payload,
 }
 
 void SendLog(uint32_t browser_id, const std::string& msg) {
-  SendFrame(browser_id, kOpLog, msg.data(), static_cast<uint32_t>(msg.size()));
+  SendFrame(browser_id, kOpLog, msg.data(), msg.size());
 }
 
 void SendUtf8(uint32_t browser_id, uint8_t op, const std::string& s) {
-  SendFrame(browser_id, op, s.data(), static_cast<uint32_t>(s.size()));
+  SendFrame(browser_id, op, s.data(), s.size());
+}
+
+// `s` cut to at most `max` bytes, on a UTF-8 character boundary, with a marker
+// when anything was cut.
+std::string TruncateUtf8(const std::string& s, size_t max) {
+  if (s.size() <= max) return s;
+  size_t end = max;
+  while (end > 0 && (static_cast<unsigned char>(s[end]) & 0xC0) == 0x80) --end;
+  return s.substr(0, end) + "…[truncated]";
+}
+
+// 128 random bits as hex.
+std::string RandomNonce() {
+  uint8_t bytes[16];
+  arc4random_buf(bytes, sizeof(bytes));
+  static const char kHex[] = "0123456789abcdef";
+  std::string out;
+  for (uint8_t b : bytes) {
+    out += kHex[b >> 4];
+    out += kHex[b & 0xf];
+  }
+  return out;
 }
 
 void SendLoadState(uint32_t browser_id, bool loading, bool back, bool forward) {
@@ -803,8 +955,20 @@ class HostRenderHandler : public CefRenderHandler {
     SendFrame(slot_->browser_id, kOpPresent, p, 12);
   }
 
+  // about:blank-first: the browser has established (first paint on about:blank) — now
+  // navigate to the real URL. The establishment slot has already been released by this
+  // paint, so the real page loads WITHOUT holding a serial slot (concurrent with the
+  // other tiles' loads). Fires once (pending_nav_url cleared). UI thread.
+  void ApplyBlankFirstNav() {
+    if (slot_->pending_nav_url.empty() || !slot_->browser) return;
+    std::string nav = slot_->pending_nav_url;
+    slot_->pending_nav_url.clear();
+    if (auto frame = slot_->browser->GetMainFrame()) frame->LoadURL(nav);
+  }
+
   void OnPaint(CefRefPtr<CefBrowser>, PaintElementType type, const RectList&,
                const void* buffer, int width, int height) override {
+    ApplyBlankFirstNav();
     std::lock_guard<std::mutex> lock(slot_->surface_mutex);
     // PRODUCER-ALLOCATES (software path): mint/resize the surface to the painted VIEW dims
     // before the guard, mirroring OnAcceleratedPaint — else the surface is never created and
@@ -1009,7 +1173,7 @@ class HostRenderHandler : public CefRenderHandler {
       return n > 0 ? n : 60;  // sample 1-in-N accelerated paints (default 60 ≈ 1/s; set 6 ≈ 10/s)
     }();
     if (view_src && (slot_->diag_paint_count % kDiagEvery) == 2 &&
-        std::getenv("FLUTTER_CEF_DEBUG") &&
+        g_debug &&
         IOSurfaceLock(view_src, kIOSurfaceLockReadOnly, nullptr) == kIOReturnSuccess) {
       const auto* base = static_cast<const uint8_t*>(IOSurfaceGetBaseAddress(view_src));
       const size_t bpr = IOSurfaceGetBytesPerRow(view_src);
@@ -1080,7 +1244,7 @@ class HostRenderHandler : public CefRenderHandler {
           const int cw = std::min(sw, dw), ch = std::min(sh, dh);
           // DIAG: a src≠dst blit crops (src>dst → top-left only) or partial-fills (src<dst →
           // stale margins). On a static page this single mismatched frame sticks. Log it.
-          if ((sw != dw || sh != dh) && std::getenv("FLUTTER_CEF_DEBUG")) {
+          if ((sw != dw || sh != dh) && g_debug) {
             char b[160];
             snprintf(b, sizeof(b), "blitmismatch src=%dx%d dst=%dx%d copy=%dx%d", sw, sh, dw, dh, cw, ch);
             SendLog(slot_->browser_id, b);
@@ -1136,15 +1300,7 @@ class HostRenderHandler : public CefRenderHandler {
                           const RectList&,
                           const CefAcceleratedPaintInfo& info) override {
     slot_->diag_paint_count++;  // DIAG
-    // about:blank-first: the browser has established (first paint on about:blank) — now
-    // navigate to the real URL. The establishment slot has already been released by this
-    // paint, so the real page loads WITHOUT holding a serial slot (concurrent with the
-    // other tiles' loads). Fires once (pending_nav_url cleared). UI thread.
-    if (!slot_->pending_nav_url.empty() && slot_->browser) {
-      std::string nav = slot_->pending_nav_url;
-      slot_->pending_nav_url.clear();
-      if (auto frame = slot_->browser->GetMainFrame()) frame->LoadURL(nav);
-    }
+    ApplyBlankFirstNav();
     IOSurfaceRef src =
         reinterpret_cast<IOSurfaceRef>(info.shared_texture_io_surface);
     if (!src) {
@@ -1368,7 +1524,8 @@ class HostPermissionHandler : public CefPermissionHandler {
 // FCPopupWindowDelegate (the NSWindowDelegate) is declared at global scope
 // between the two anonymous namespaces (ObjC decls can't live in a C++
 // namespace) — see near CefHostApplication above.
-static void OpenNativeAuthPopup(const CefString& url, const CefPopupFeatures& f,
+static void OpenNativeAuthPopup(const CefPopupFeatures& f,
+                                uint32_t owner_wire_id,
                                 CefWindowInfo& window_info,
                                 CefRefPtr<CefClient>& client);
 
@@ -1377,8 +1534,11 @@ class PopupClient : public CefClient,
                     public CefDisplayHandler,
                     public CefRequestHandler {
  public:
-  PopupClient(NSWindow* window, FCPopupWindowDelegate* delegate)
-      : window_([window retain]), delegate_([delegate retain]) {}
+  PopupClient(NSWindow* window, FCPopupWindowDelegate* delegate,
+              uint32_t owner_wire_id)
+      : window_([window retain]),
+        delegate_([delegate retain]),
+        owner_wire_id_(owner_wire_id) {}
 
   CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
   CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
@@ -1392,39 +1552,58 @@ class PopupClient : public CefClient,
     return main_frame && !SchemeAllowed(request->GetURL().ToString());
   }
 
-  // Nested windows opened from within the auth popup (consent screens, IdP hops)
-  // are part of the same flow — give sized popups their own native window too so
-  // opener/postMessage keeps working all the way down. Other dispositions fall
-  // through to CEF's default (rare in a sign-in flow).
+  // Nested windows opened from within the auth popup (consent screens, IdP hops,
+  // a target=_blank link) are part of the same flow — each gets its own native
+  // window and client so opener/postMessage keeps working all the way down.
+  // Without a client of its own a new window would share this one, and closing
+  // either would tear down the other's window.
   bool OnBeforePopup(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, int,
                      const CefString& target_url, const CefString&,
-                     WindowOpenDisposition disposition, bool user_gesture,
+                     WindowOpenDisposition, bool user_gesture,
                      const CefPopupFeatures& features, CefWindowInfo& window_info,
                      CefRefPtr<CefClient>& client, CefBrowserSettings&,
                      CefRefPtr<CefDictionaryValue>&, bool*) override {
-    if (!NativePopupAllowed(target_url.ToString(), user_gesture)) return true;
-    if (disposition == CEF_WOD_NEW_POPUP)
-      OpenNativeAuthPopup(target_url, features, window_info, client);
+    if (g_shutting_down ||
+        !NativePopupAllowed(target_url.ToString(), user_gesture))
+      return true;
+    OpenNativeAuthPopup(features, owner_wire_id_, window_info, client);
     return false;
   }
 
   void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
     ++g_native_popups;
+    ++g_open_browsers;
+    g_windowed_browsers[browser->GetIdentifier()] =
+        WindowedBrowser{browser, owner_wire_id_};
     if (delegate_) {
       delegate_->browser = browser.get();
       delegate_->alive = YES;
     }
+    // Its tile went away (or the host is shutting down) while it was created.
+    if (g_shutting_down || (owner_wire_id_ != 0 && !LookupWireId(owner_wire_id_)))
+      browser->GetHost()->CloseBrowser(true);
   }
 
-  bool DoClose(CefRefPtr<CefBrowser>) override {
-    // Close underway (JS window.close() or a user click). Flip the gate BEFORE
-    // CEF destroys the browser so any close-button press CEF synthesizes can't
-    // deref a dangling browser in windowShouldClose:.
+  bool DoClose(CefRefPtr<CefBrowser> browser) override {
+    // Close underway (JS window.close(), a user click, or its tile going away).
+    // Flip the gate BEFORE CEF destroys the browser so any close-button press
+    // can't deref a dangling browser in windowShouldClose:.
     if (delegate_) delegate_->alive = NO;
-    return false;  // allow the default close; OnBeforeClose then tears down the window
+    // The browser is destroyed with its view, and the view lives in a window
+    // this client keeps until OnBeforeClose, so CEF's default (asking the
+    // window to close) would never finish it. Take the view out of the window
+    // instead, on the next turn, out of CEF's close stack; OnBeforeClose then
+    // closes the window.
+    NSView* view = [CAST_CEF_WINDOW_HANDLE_TO_NSVIEW(
+        browser->GetHost()->GetWindowHandle()) retain];
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [view removeFromSuperview];
+      [view release];
+    });
+    return true;
   }
 
-  void OnBeforeClose(CefRefPtr<CefBrowser>) override {
+  void OnBeforeClose(CefRefPtr<CefBrowser> browser) override {
     // Runs inside CEF's teardown of the child NSView. Closing/releasing the
     // window synchronously here re-enters -[NSWindow __close] and can fire the
     // delegate against a half-destroyed browser (EXC_BAD_ACCESS). So: sever the
@@ -1432,6 +1611,8 @@ class PopupClient : public CefClient,
     // detach the delegate, and defer the window close + releases to the next
     // main-loop turn, out of the teardown stack.
     --g_native_popups;
+    g_windowed_browsers.erase(browser->GetIdentifier());
+    NoteBrowserClosed();
     NSWindow* win = window_;
     FCPopupWindowDelegate* del = delegate_;
     window_ = nil;
@@ -1456,24 +1637,63 @@ class PopupClient : public CefClient,
  private:
   NSWindow* window_;                 // MRC: retained in ctor, released in OnBeforeClose
   FCPopupWindowDelegate* delegate_;  // MRC: retained in ctor, released in OnBeforeClose
+  const uint32_t owner_wire_id_;     // the tile whose page opened it
   IMPLEMENT_REFCOUNTING(PopupClient);
 };
 
-// SPIKE (passkeys): a bare client for a windowed, CHROME-runtime browser. The
-// Chrome runtime manages its own native window, toolbar, and — crucially — the
-// full WebAuthn stack (Touch ID sheet, account picker, hybrid QR), none of which
-// exist in the Alloy/OSR runtime the tiles are forced into. So this needs no
-// handlers; it exists to prove a Campus-spawned window can complete a passkey
-// ceremony the OSR tile cannot.
-class AuthWindowClient : public CefClient {
+// The client of an auth window (kOpOpenAuthWindow): a windowed, CHROME-runtime
+// browser. The Chrome runtime manages its own native window, toolbar, and —
+// crucially — the full WebAuthn stack (Touch ID sheet, account picker, hybrid
+// QR), none of which exist in the Alloy/OSR runtime the tiles are forced into.
+// It is held to the host's scheme allowlist like a tile, and closed with the
+// host.
+class AuthWindowClient : public CefClient,
+                         public CefLifeSpanHandler,
+                         public CefRequestHandler {
+ public:
+  CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
+  CefRefPtr<CefRequestHandler> GetRequestHandler() override { return this; }
+
+  bool OnBeforeBrowse(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
+                      CefRefPtr<CefRequest> request, bool, bool) override {
+    const bool main_frame = !frame || frame->IsMain();
+    return main_frame && !SchemeAllowed(request->GetURL().ToString());
+  }
+
+  // Windows it opens stay inside the Chrome runtime's own window management;
+  // only ones the allowlist permits, from a user gesture.
+  bool OnBeforePopup(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, int,
+                     const CefString& target_url, const CefString&,
+                     WindowOpenDisposition, bool user_gesture,
+                     const CefPopupFeatures&, CefWindowInfo&,
+                     CefRefPtr<CefClient>&, CefBrowserSettings&,
+                     CefRefPtr<CefDictionaryValue>&, bool*) override {
+    return g_shutting_down || !user_gesture ||
+           !SchemeAllowed(target_url.ToString());
+  }
+
+  void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
+    ++g_open_browsers;
+    g_windowed_browsers[browser->GetIdentifier()] =
+        WindowedBrowser{browser, 0};
+    if (g_shutting_down) browser->GetHost()->CloseBrowser(true);
+  }
+
+  void OnBeforeClose(CefRefPtr<CefBrowser> browser) override {
+    g_windowed_browsers.erase(browser->GetIdentifier());
+    NoteBrowserClosed();
+  }
+
+ private:
   IMPLEMENT_REFCOUNTING(AuthWindowClient);
 };
 
-// SPIKE: open a real windowed Chrome-runtime browser at |url|, sharing THIS
-// process's cookie jar (global request context == the tile's named profile, since
-// profiles are per-cef_host-process via root_cache_path). Windowed + Chrome style
-// = the WebAuthn UI can actually draw. Env-triggered one-shot from OnAfterCreated.
+// Open a real windowed Chrome-runtime browser at |url| (kOpOpenAuthWindow),
+// sharing THIS process's cookie jar (global request context == the tile's named
+// profile, since profiles are per-cef_host-process via root_cache_path).
+// Windowed + Chrome style = the WebAuthn UI can actually draw.
 void OpenChromeAuthWindow(const std::string& url) {
+  if (g_shutting_down) return;
   CefWindowInfo wi;                             // default → windowed, CEF owns the NSWindow
   wi.runtime_style = CEF_RUNTIME_STYLE_CHROME;  // full Chrome UI + WebAuthn stack
   wi.bounds = CefRect(120, 100, 520, 760);      // a plausible sign-in window
@@ -1482,7 +1702,8 @@ void OpenChromeAuthWindow(const std::string& url) {
                                 nullptr, nullptr);  // nullptr ctx = shared cookies
 }
 
-static void OpenNativeAuthPopup(const CefString& url, const CefPopupFeatures& f,
+static void OpenNativeAuthPopup(const CefPopupFeatures& f,
+                                uint32_t owner_wire_id,
                                 CefWindowInfo& window_info,
                                 CefRefPtr<CefClient>& client) {
   // Runs on the CEF UI thread, which on macOS (CefRunMessageLoop) is the main
@@ -1507,7 +1728,7 @@ static void OpenNativeAuthPopup(const CefString& url, const CefPopupFeatures& f,
   // Host the popup browser windowed inside our content view: CEF renders + routes
   // native input for it, and keeps the window.opener relationship intact.
   window_info.SetAsChild((CefWindowHandle)[win contentView], CefRect(0, 0, w, h));
-  client = new PopupClient(win, del);  // retains win + del
+  client = new PopupClient(win, del, owner_wire_id);  // retains win + del
   [win makeKeyAndOrderFront:nil];
   [NSApp activateIgnoringOtherApps:YES];
   [win release];  // drop our alloc +1; PopupClient's retain keeps it alive
@@ -1696,7 +1917,7 @@ class HostClient : public CefClient,
     ph_ = new HostPermissionHandler(slot_);  // deny-default; owner opts in per tile
   }
   CefRefPtr<CefMessageRouterBrowserSide> router_;
-  CefRefPtr<CefRenderHandler> rh_;
+  CefRefPtr<HostRenderHandler> rh_;
   CefRefPtr<CefPermissionHandler> ph_;
   CefRefPtr<CefRenderHandler> GetRenderHandler() override { return rh_; }
   CefRefPtr<CefPermissionHandler> GetPermissionHandler() override { return ph_; }
@@ -1747,10 +1968,15 @@ class HostClient : public CefClient,
     json += "\"x\":" + std::to_string(params->GetXCoord()) + ",";
     json += "\"y\":" + std::to_string(params->GetYCoord()) + ",";
     json += "\"editable\":" + std::string(params->IsEditable() ? "true" : "false") + ",";
-    json += "\"linkUrl\":\"" + JsonEscape(params->GetLinkUrl().ToString()) + "\",";
-    json += "\"sourceUrl\":\"" + JsonEscape(params->GetSourceUrl().ToString()) + "\",";
-    json += "\"selectionText\":\"" + JsonEscape(params->GetSelectionText().ToString()) + "\",";
-    json += "\"misspelledWord\":\"" + JsonEscape(params->GetMisspelledWord().ToString()) + "\",";
+    // Page-chosen strings (a select-all on a huge page, a data: link) are cut
+    // to a size the menu can show; Chromium runs the command on the real ones.
+    auto text = [](const CefString& v) {
+      return JsonEscape(TruncateUtf8(v.ToString(), kMaxPageText));
+    };
+    json += "\"linkUrl\":\"" + text(params->GetLinkUrl()) + "\",";
+    json += "\"sourceUrl\":\"" + text(params->GetSourceUrl()) + "\",";
+    json += "\"selectionText\":\"" + text(params->GetSelectionText()) + "\",";
+    json += "\"misspelledWord\":\"" + text(params->GetMisspelledWord()) + "\",";
     json += "\"items\":" + SerializeMenuModel(model);
     json += "}";
 
@@ -1813,8 +2039,10 @@ class HostClient : public CefClient,
     uint32_t type = dialog_type == JSDIALOGTYPE_ALERT
                         ? 0
                         : (dialog_type == JSDIALOGTYPE_CONFIRM ? 1 : 2);
-    std::string msg = message_text.ToString();
-    std::string def = default_prompt_text.ToString();
+    // Cut to a size a dialog can show: an oversized frame would be dropped,
+    // leaving the page blocked on a dialog nobody sees.
+    std::string msg = TruncateUtf8(message_text.ToString(), kMaxPageText);
+    std::string def = TruncateUtf8(default_prompt_text.ToString(), kMaxPageText);
     std::vector<uint8_t> p(12 + msg.size() + def.size());
     uint32_t ml = static_cast<uint32_t>(msg.size());
     for (int i = 0; i < 4; ++i) {
@@ -1857,20 +2085,28 @@ class HostClient : public CefClient,
   void OnRenderProcessTerminated(CefRefPtr<CefBrowser> browser,
                                  TerminationStatus status, int /*error_code*/,
                                  const CefString& /*error_string*/) override {
-    SendLog(slot_->browser_id, "renderer terminated (status " +
-                                   std::to_string(status) + ") — reloading");
     if (router_) router_->OnRenderProcessTerminated(browser);
-    if (NoteRendererCrashAndCheckLoop()) {
-      // Reloading again would just re-crash: the children can't start. Exit so
-      // the embedder's processGone → recreate path takes over (see the detector).
-      SendLog(0,
-              "renderer crash LOOP (" + std::to_string(kRendererCrashBurstLimit) +
-                  " in " + std::to_string(kRendererCrashWindow.count()) +
-                  "s) — children cannot start; exiting so the host is respawned");
+    if (slot_->crash_looped) return;  // already reported; left alone
+    const auto now = std::chrono::steady_clock::now();
+    if (!slot_->crashes.NoteAndCheckBurst(now)) {
+      SendLog(slot_->browser_id, "renderer terminated (status " +
+                                     std::to_string(status) + ") — reloading");
+      if (browser) browser->ReloadIgnoreCache();
+      return;
+    }
+    // Reloading again would just re-crash. See the crash-loop detector.
+    slot_->crash_looped = true;
+    const std::string burst = std::to_string(kRendererCrashBurstLimit) +
+                              " renderer crashes in " +
+                              std::to_string(kRendererCrashWindow.count()) + "s";
+    if (NoteCrashBurstAndCheckHostLoop(slot_->browser_id, now)) {
+      SendLog(0, burst + " on several browsers — children cannot start; "
+                         "exiting so the host is respawned");
       DoShutdown();
       return;
     }
-    if (browser) browser->ReloadIgnoreCache();
+    SendLog(slot_->browser_id, burst + " — giving up on this browser");
+    SendUtf8(slot_->browser_id, kOpBrowserGone, "crashed");
   }
 
   // CefLoadHandler: spinner + back/forward enablement.
@@ -1945,8 +2181,9 @@ class HostClient : public CefClient,
                         int line) override {
     SendCodePlusUtf8(slot_->browser_id, kOpConsole,
                      static_cast<uint32_t>(level),
-                     source.ToString() + ":" + std::to_string(line) + "\t" +
-                         message.ToString());
+                     TruncateUtf8(source.ToString(), kMaxPageText) + ":" +
+                         std::to_string(line) + "\t" +
+                         TruncateUtf8(message.ToString(), kMaxPageText));
     return false;  // also keep CEF's default console logging
   }
   void OnLoadingProgressChange(CefRefPtr<CefBrowser>, double progress) override {
@@ -1969,31 +2206,32 @@ class HostClient : public CefClient,
     // H3: a dispose arrived during the async-create window and recorded intent — honor
     // it now (OnBeforeClose then does the normal map-erase + surface release + retain-
     // cycle break) so we don't leak a live orphan browser the Swift side already forgot.
-    if (slot_->close_requested) {
+    if (slot_->close_requested || g_shutting_down) {
       browser->GetHost()->CloseBrowser(true);
       return;
+    }
+    // A load that arrived while the browser was being created. Applied now, not
+    // at first paint: a browser created hidden doesn't paint.
+    if (!slot_->nav_after_create.empty()) {
+      const std::string nav = slot_->nav_after_create;
+      slot_->nav_after_create.clear();
+      if (auto frame = browser->GetMainFrame()) frame->LoadURL(nav);
     }
     // F-3: reconcile a visibility intent that arrived before the browser bound. A
     // setVisible(false) on a still-creating slot ran DoSetVisible with browser==null
     // (WasHidden skipped), so slot_->visible is already false but CEF never heard it —
     // the slot would establish VISIBLE and pump at 60fps off-screen until the next flip.
     // Honor the recorded intent now (mirrors the close_requested deferred-intent pattern).
-    if (!slot_->visible) browser->GetHost()->WasHidden(true);
+    if (!slot_->visible) {
+      browser->GetHost()->WasHidden(true);
+      // Hidden, it won't paint, so blank-first's load can't wait for a paint.
+      rh_->ApplyBlankFirstNav();
+    }
     // Start the external begin-frame pump now that the browser is bound. We turned the internal
     // frame timer OFF (external_begin_frame_enabled), so without this nothing ever paints.
     if (!slot_->begin_frame_pump_started) {
       slot_->begin_frame_pump_started = true;
       PumpBeginFrame(slot_->browser_id);
-    }
-    // SPIKE (passkeys): one-shot — open a windowed Chrome-runtime auth window on
-    // the first tile, so we can test whether a passkey ceremony completes there
-    // (it hangs in the OSR/Alloy tile). Off unless FLUTTER_CEF_SPIKE_AUTH_URL set.
-    static std::atomic<bool> s_auth_opened{false};
-    if (const char* au = std::getenv("FLUTTER_CEF_SPIKE_AUTH_URL")) {
-      bool expected = false;
-      if (s_auth_opened.compare_exchange_strong(expected, true)) {
-        OpenChromeAuthWindow(au);
-      }
     }
   }
 
@@ -2015,13 +2253,14 @@ class HostClient : public CefClient,
     // the flow at e.g. accounts.google.com/gsi/transform with no opener).
     // Like Chrome's popup blocker, only a user gesture opens one, and only to a
     // URL the tile itself may load.
+    if (g_shutting_down) return true;
     if (disposition == CEF_WOD_NEW_POPUP) {
       if (!NativePopupAllowed(target_url.ToString(), user_gesture)) {
         SendLog(slot_->browser_id, "blocked a popup (no user gesture, too many "
                                    "open, or a scheme outside the allowlist)");
         return true;
       }
-      OpenNativeAuthPopup(target_url, features, window_info, client);
+      OpenNativeAuthPopup(features, slot_->browser_id, window_info, client);
       return false;  // allow CEF to create the popup browser in our native window
     }
     // target=_blank / plain new tab: keep loading it in this single-view tile.
@@ -2046,20 +2285,49 @@ class HostClient : public CefClient,
 
   // CefMessageRouter wiring: the renderer half (process_helper.mm) injects
   // window.cefQuery; queries land here. We forward the request string to the
-  // host: "eval:<id>:<json>" for a runJavaScriptReturningResult result,
-  // "ch:<name>:<message>" for a JS-channel post.
+  // host: "eval:<id>:<nonce>:<json>" for a runJavaScriptReturningResult result
+  // (forwarded as "<id>:<json>"), "ch:<name>:<message>" for a JS-channel post.
+  //
+  // Both come from the page's own JS, so the page decides what they say: an eval
+  // result is only as trustworthy as the page it ran in. What is enforced: only
+  // the main frame (a cross-origin iframe can't post to the tile's channels or
+  // answer its evals), only channels this browser registered, only evals in
+  // flight with their nonce, and a size the IPC can carry.
   bool OnQuery(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame, int64_t,
                const CefString& request, bool,
                CefRefPtr<Callback> callback) override {
     std::string r = request.ToString();
-    // SECURITY: 'eval:' (host-eval result channel) and 'ch:' (campusHost bridge) are
-    // PRIVILEGED — they reach the trusted host eval/result path and the agent_ui reducer. The
-    // shim is injected per-frame, so a cross-origin / untrusted IFRAME could forge them. Honor
-    // them ONLY from the MAIN frame (the host-trusted document); refuse subframe queries.
-    const bool main_frame = !frame || frame->IsMain();
+    const bool main_frame = frame && frame->IsMain();
     if (r.rfind("eval:", 0) == 0) {
       if (!main_frame) { callback->Failure(403, "subframe"); return true; }
-      SendUtf8(slot_->browser_id, kOpEvalResult, r.substr(5));
+      // eval:<id>:<nonce>:<json>
+      const size_t id_end = r.find(':', 5);
+      const size_t nonce_end =
+          id_end == std::string::npos ? std::string::npos : r.find(':', id_end + 1);
+      if (nonce_end == std::string::npos) {
+        callback->Failure(400, "malformed");
+        return true;
+      }
+      const std::string id_str = r.substr(5, id_end - 5);
+      char* parse_end = nullptr;
+      const unsigned long id = std::strtoul(id_str.c_str(), &parse_end, 10);
+      auto it = (id_str.empty() || *parse_end != '\0')
+                    ? slot_->pending_evals.end()
+                    : slot_->pending_evals.find(static_cast<uint32_t>(id));
+      if (it == slot_->pending_evals.end() ||
+          r.compare(id_end + 1, nonce_end - id_end - 1, it->second) != 0) {
+        callback->Failure(403, "no such eval");
+        return true;
+      }
+      slot_->pending_evals.erase(it);
+      if (r.size() - nonce_end - 1 > kMaxPageMessage) {
+        SendUtf8(slot_->browser_id, kOpEvalResult,
+                 id_str + ":{\"ok\":false,\"v\":\"result too large\"}");
+        callback->Failure(413, "too large");
+        return true;
+      }
+      SendUtf8(slot_->browser_id, kOpEvalResult,
+               id_str + ":" + r.substr(nonce_end + 1));
       callback->Success(CefString());
       return true;
     }
@@ -2073,6 +2341,12 @@ class HostClient : public CefClient,
         callback->Failure(404, "no such channel");
         return true;
       }
+      if (r.size() - 3 > kMaxPageMessage) {
+        SendLog(slot_->browser_id, "dropped a " + std::to_string(r.size()) +
+                                       "-byte channel message: too large");
+        callback->Failure(413, "too large");
+        return true;
+      }
       SendUtf8(slot_->browser_id, kOpChannelMsg, r.substr(3));
       callback->Success(CefString());
       return true;
@@ -2083,6 +2357,14 @@ class HostClient : public CefClient,
                                 CefRefPtr<CefFrame> frame,
                                 CefProcessId source_process,
                                 CefRefPtr<CefProcessMessage> message) override {
+    // The renderer answered the liveness ping (see DoEvalReturning); reply as
+    // the plugin's ping eval would have.
+    if (message->GetName().ToString() == renderer_messages::kPong) {
+      if (frame && frame->IsMain())
+        SendUtf8(slot_->browser_id, kOpEvalResult,
+                 std::to_string(kLivenessPingId) + ":{\"ok\":true,\"v\":1}");
+      return true;
+    }
     return router_->OnProcessMessageReceived(browser, frame, source_process,
                                              message);
   }
@@ -2102,7 +2384,9 @@ class HostClient : public CefClient,
       if (kv.second.callback) kv.second.callback->Cancel();
     }
     slot_->media_requests.clear();
+    slot_->pending_evals.clear();
     SetAuthoredDoc(slot_->browser_id, "", "");
+    CloseWindowedBrowsers(slot_->browser_id);  // its sign-in popups go with it
     {
       std::lock_guard<std::mutex> lock(g_slots_mutex);
       g_slots_by_wire_id.erase(slot_->browser_id);
@@ -2118,6 +2402,7 @@ class HostClient : public CefClient,
       slot_->dst_mtl_sid = 0;
     }
     slot_->browser = nullptr;
+    NoteBrowserClosed();
   }
   // ⌘-key editing shortcuts, as the FALLBACK they are in a real browser. AppKit
   // turns ⌘Z/⌘A/⌘C… into undo:/selectAll:/copy: only after the page declined the
@@ -2323,11 +2608,16 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
     disabled_features.push_back("MachPortRendezvousValidatePeerRequirements");
     disabled_features.push_back("MachPortRendezvousEnforcePeerRequirements");
 #endif
-    // Verbose Chromium logging to /tmp only when explicitly debugging; off by
-    // default so a shipped build doesn't write logs behind the user's back.
-    if (std::getenv("FLUTTER_CEF_DEBUG")) {
+    // Verbose Chromium logging only when explicitly debugging; off by default so
+    // a shipped build doesn't write logs behind the user's back. The log is full
+    // of URLs, so it goes to the per-user temp dir under a per-process name, not
+    // a fixed shared path another user could pre-create or read.
+    if (g_debug) {
+      const std::string log_file =
+          std::string([NSTemporaryDirectory() UTF8String]) +
+          "cef_host_chromium_" + std::to_string(getpid()) + ".log";
       command_line->AppendSwitch("enable-logging");
-      command_line->AppendSwitchWithValue("log-file", "/tmp/cef_host_chromium.log");
+      command_line->AppendSwitchWithValue("log-file", log_file);
       command_line->AppendSwitchWithValue("v", "1");
     }
     // CDP WebSocket origin allow-list: Chromium M113+ rejects DevTools WS
@@ -2399,8 +2689,7 @@ class HostApp : public CefApp, public CefBrowserProcessHandler {
   // silently mis-parsing every later frame.
   void OnContextInitialized() override {
     CEF_REQUIRE_UI_THREAD();
-    if (std::getenv("FLUTTER_CEF_DEBUG"))
-      fprintf(stderr, "[cef_host] OnContextInitialized\n");
+    if (g_debug) fprintf(stderr, "[cef_host] OnContextInitialized\n");
     uint8_t ready_flags = 0;
 #ifdef CEF_HOST_ADHOC
     ready_flags |= 0x01;  // bit0 = ad-hoc / mock-keychain build
@@ -2420,6 +2709,8 @@ struct EarlyNav {
   bool trusted;
 };
 std::map<uint32_t, EarlyNav> g_early_nav;
+// The largest view side (DIP) a create or resize accepts.
+constexpr int kMaxViewDim = 16384;
 // Channels registered before their browser's create frame arrived. UI-thread only.
 std::map<uint32_t, std::set<std::string>> g_early_channels;
 uint32_t g_max_created_wire_id = 0;
@@ -2433,6 +2724,7 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr,
                      std::string url) {
   CEF_REQUIRE_UI_THREAD();
   if (wire_id > g_max_created_wire_id) g_max_created_wire_id = wire_id;
+  if (g_shutting_down) return;
   // A load that beat this (paced) create frame here supersedes the create URL.
   bool early_trusted = false;
   bool early_untrusted = false;
@@ -2575,8 +2867,10 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr,
     [slot->dst_mtl release];
     slot->dst_mtl = nil;
     slot->dst_mtl_sid = 0;
+  } else {
+    ++g_open_browsers;  // until its OnBeforeClose
   }
-  if (std::getenv("FLUTTER_CEF_DEBUG"))
+  if (g_debug)
     fprintf(stderr, "[cef_host] createBrowser wire=%u dispatched=%d\n", wire_id,
             dispatched);
 }
@@ -2595,6 +2889,7 @@ void DoDisposeBrowser(uint32_t wire_id) {
     g_early_channels.erase(wire_id);
     return;
   }
+  CloseWindowedBrowsers(wire_id);
   if (slot->browser) {
     slot->browser->GetHost()->CloseBrowser(true);
   } else {
@@ -2607,7 +2902,7 @@ void DoDisposeBrowser(uint32_t wire_id) {
 }
 
 void DoResize(const std::shared_ptr<Slot>& slot, int w, int h, double dpr) {
-  if (w < 1 || w > 16384 || h < 1 || h > 16384) {
+  if (w < 1 || w > kMaxViewDim || h < 1 || h > kMaxViewDim) {
     SendLog(slot->browser_id, "resize: out-of-range dims " + std::to_string(w) +
                                   "x" + std::to_string(h));
     return;
@@ -2658,10 +2953,11 @@ void DoNavigate(const std::shared_ptr<Slot>& slot, const std::string& url) {
   if (!slot->browser) {
     // The slot exists but the browser is not yet BOUND (OnAfterCreated pending) — e.g. a
     // loadHtmlString that arrived right behind a queued createBrowser in a shared-host burst
-    // (6 agent_ui tiles created at once). Defer instead of dropping: the first-paint handler
-    // applies pending_nav_url once the browser binds, and a trusted load keeps its armed
-    // exemption in trusted_pending. Dropping here is exactly why such a burst stayed blank.
-    slot->pending_nav_url = url;
+    // (6 agent_ui tiles created at once). Defer instead of dropping: OnAfterCreated loads
+    // it, and a trusted load keeps its armed exemption in trusted_pending. Dropping here is
+    // exactly why such a burst stayed blank. It supersedes a blank-first deferred load.
+    slot->nav_after_create = url;
+    slot->pending_nav_url.clear();
     return;
   }
   CefRefPtr<CefFrame> f = slot->browser->GetMainFrame();
@@ -2909,10 +3205,23 @@ void DoJsDialogResp(const std::shared_ptr<Slot>& slot, uint32_t id, bool ok,
 // ALWAYS REPLIES. Resolved by wire id on TID_UI (FIFO behind a queued create, like
 // DoNavigateByWireId); with no browser/frame to run in, answer {ok:false} rather
 // than return silently — a silent return left the caller's future pending forever.
+// Evals in flight per browser beyond which the oldest are forgotten (their
+// replies then refused). The Dart side fails a pending eval on navigation, so
+// only a page that never answers leaves entries behind.
+constexpr size_t kMaxPendingEvals = 1024;
+
 void DoEvalReturning(uint32_t wire_id, uint32_t id, const std::string& code) {
   auto slot = LookupWireId(wire_id);
   CefRefPtr<CefFrame> frame =
       (slot && slot->browser) ? slot->browser->GetMainFrame() : nullptr;
+  if (id == kLivenessPingId) {
+    // Asked of the renderer itself, not the page. No frame: nothing is
+    // answering, so no reply either.
+    if (frame)
+      frame->SendProcessMessage(
+          PID_RENDERER, CefProcessMessage::Create(renderer_messages::kPing));
+    return;
+  }
   if (!frame) {
     SendUtf8(wire_id, kOpEvalResult,
              std::to_string(id) + ":{\"ok\":false,\"v\":\"no browser\"}");
@@ -2924,8 +3233,13 @@ void DoEvalReturning(uint32_t wire_id, uint32_t id, const std::string& code) {
   // than eval() it so it still works under a strict page CSP (eval would be
   // blocked); the Dart side fails any pending result on navigation so a malformed
   // expression that wedges this callback can't leak a completer forever.
+  // The nonce ties the reply to this request (see Slot::pending_evals).
+  const std::string nonce = RandomNonce();
+  slot->pending_evals[id] = nonce;
+  if (slot->pending_evals.size() > kMaxPendingEvals)
+    slot->pending_evals.erase(slot->pending_evals.begin());
   std::string js =
-      "window.cefQuery({request:'eval:" + std::to_string(id) +
+      "window.cefQuery({request:'eval:" + std::to_string(id) + ":" + nonce +
       ":'+(function(){try{return JSON.stringify({ok:true,v:(" + code +
       "\n)});}catch(e){return JSON.stringify({ok:false,v:String(e)});}})(),"
       "persistent:false,onSuccess:function(){},onFailure:function(){}});";
@@ -3307,11 +3621,21 @@ void DoInvalidate(const std::shared_ptr<Slot>& slot) {
   }
 }
 
-// Tear down the WHOLE process: close every browser, then quit the message loop.
+// Tear down the WHOLE process: close every browser, then quit the message loop
+// once the last has closed (NoteBrowserClosed), or after kShutdownCloseGraceMs.
 // Each browser's per-slot cleanup (maps, surface, retain-cycle break) runs in
 // OnBeforeClose as CEF processes the CloseBrowser(true). Sent when the host
 // disposes the last browser, on socket loss, or on parent death.
 void DoShutdown() {
+  CEF_REQUIRE_UI_THREAD();
+  if (g_shutting_down) return;
+  g_shutting_down = true;
+  ArmHardExit("shutdown");
+#ifdef CEF_HOST_ADHOC
+  // Test hook (ad-hoc builds only): a wedged UI thread, for the hard-exit test.
+  if (std::getenv("FLUTTER_CEF_TEST_WEDGE_UI_ON_SHUTDOWN"))
+    for (;;) std::this_thread::sleep_for(std::chrono::hours(1));
+#endif
   std::vector<std::shared_ptr<Slot>> slots;
   {
     std::lock_guard<std::mutex> lock(g_slots_mutex);
@@ -3319,9 +3643,19 @@ void DoShutdown() {
     for (auto& kv : g_slots_by_wire_id) slots.push_back(kv.second);
   }
   for (auto& slot : slots) {
-    if (slot->browser) slot->browser->GetHost()->CloseBrowser(true);
+    if (slot->browser) {
+      slot->browser->GetHost()->CloseBrowser(true);
+    } else {
+      slot->close_requested = true;  // OnAfterCreated closes it
+    }
   }
-  CefQuitMessageLoop();
+  CloseWindowedBrowsers(0);
+  if (g_open_browsers == 0) {
+    QuitMessageLoopOnce();
+    return;
+  }
+  CefPostDelayedTask(TID_UI, base::BindOnce(&QuitMessageLoopOnce),
+                     kShutdownCloseGraceMs);
 }
 
 // Reader thread: decode frames, marshal onto the CEF UI thread.
@@ -3354,10 +3688,11 @@ void IpcReadLoop() {
       case kOpCreateBrowser: {
         // Producer-allocates: no sid on the wire. {u32 w}{u32 h}{f64 dpr}{utf8 url}.
         if (plen < 16) break;
-        int w = static_cast<int>(ReadU32BE(p));
-        int h = static_cast<int>(ReadU32BE(p + 4));
+        // Clamped to the sizes a resize accepts.
+        int w = static_cast<int>(std::min<uint32_t>(ReadU32BE(p), kMaxViewDim));
+        int h = static_cast<int>(std::min<uint32_t>(ReadU32BE(p + 4), kMaxViewDim));
         double dpr = ReadF64BE(p + 8);
-        if (dpr <= 0.0 || dpr > 8.0) dpr = 1.0;  // guard a bad/forged dpr
+        if (!(dpr > 0.0 && dpr <= 8.0)) dpr = 1.0;  // bad/forged, NaN included
         std::string url(reinterpret_cast<const char*>(p + 16), plen - 16);
         if (url.empty()) url = "about:blank";
         CefPostTask(TID_UI,
@@ -3371,6 +3706,7 @@ void IpcReadLoop() {
         CefPostTask(TID_UI, base::BindOnce(&DoDisposeBrowser, wire_id));
         break;
       case kOpShutdown:
+        ArmHardExit("kOpShutdown");
         CefPostTask(TID_UI, base::BindOnce(&DoShutdown));
         return;
       case kOpResize: {
@@ -3380,7 +3716,7 @@ void IpcReadLoop() {
         int w = static_cast<int>(ReadU32BE(p));
         int h = static_cast<int>(ReadU32BE(p + 4));
         double dpr = (plen >= 16) ? ReadF64BE(p + 8) : 0.0;
-        if (dpr < 0.0 || dpr > 8.0) dpr = 0.0;  // guard a bad/forged dpr
+        if (!(dpr >= 0.0 && dpr <= 8.0)) dpr = 0.0;  // bad/forged, NaN included
         CefPostTask(TID_UI, base::BindOnce(&DoResize, slot, w, h, dpr));
         break;
       }
@@ -3453,7 +3789,10 @@ void IpcReadLoop() {
       case kOpSetZoom: {
         if (!slot) break;
         if (plen < 8) break;
-        CefPostTask(TID_UI, base::BindOnce(&DoSetZoom, slot, ReadF64BE(p)));
+        const double level = ReadF64BE(p);
+        if (!std::isfinite(level)) break;
+        CefPostTask(TID_UI, base::BindOnce(&DoSetZoom, slot,
+                                           std::clamp(level, -10.0, 10.0)));
         break;
       }
       case kOpEditCommand: {
@@ -3629,6 +3968,11 @@ void IpcReadLoop() {
         uint32_t mods = ReadU32BE(p + 4);
         double x = ReadF64BE(p + 8), y = ReadF64BE(p + 16);
         double dx = ReadF64BE(p + 24), dy = ReadF64BE(p + 32);
+        // type 0-4, button 0-2 (DoPointer casts them to CEF enums); coordinates
+        // are cast to int, which is undefined for NaN/inf.
+        if (type > 4 || button > 2 || !std::isfinite(x) || !std::isfinite(y) ||
+            !std::isfinite(dx) || !std::isfinite(dy))
+          break;
         CefPostTask(TID_UI, base::BindOnce(&DoPointer, slot, type, button,
                                            clicks, mods, x, y, dx, dy));
         break;
@@ -3637,6 +3981,7 @@ void IpcReadLoop() {
         if (!slot) break;
         if (plen < 20) break;
         int type = p[0];
+        if (type > KEYEVENT_CHAR) break;  // cast to cef_key_event_type_t
         uint32_t mods = ReadU32BE(p + 4);
         int32_t wkc = static_cast<int32_t>(ReadU32BE(p + 8));
         int32_t nkc = static_cast<int32_t>(ReadU32BE(p + 12));
@@ -3664,6 +4009,7 @@ void IpcReadLoop() {
     }
   }
   // Parent died / socket closed: quit.
+  ArmHardExit("IPC closed");
   CefPostTask(TID_UI, base::BindOnce(&DoShutdown));
 }
 
@@ -3682,7 +4028,10 @@ void WatchParentDeath(pid_t parent) {
   struct kevent out;
   const int n = kevent(kq, nullptr, 0, &out, 1, nullptr);  // blocks until exit
   close(kq);
-  if (n > 0) CefPostTask(TID_UI, base::BindOnce(&DoShutdown));
+  if (n > 0) {
+    ArmHardExit("parent exited");
+    CefPostTask(TID_UI, base::BindOnce(&DoShutdown));
+  }
 }
 
 // ---- Arg parsing ----
@@ -3737,6 +4086,7 @@ int ConnectUnixSocket(const std::string& path) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
+  g_debug = std::getenv("FLUTTER_CEF_DEBUG") != nullptr;
   // Raise the open-file limit early. A busy shared host runs many OSR browsers, each holding
   // sockets/pipes plus IOSurfaces, against macOS's low default soft limit (256) — and an
   // fd-heavy campus reaches the documented non-fatal WebRTC select() fd>=1024 fault. Lift the
@@ -3809,12 +4159,17 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  if (!ipc_path.empty()) {
-    g_ipc_fd = ConnectUnixSocket(ipc_path);
-    if (g_ipc_fd < 0) {
-      fprintf(stderr, "[cef_host] failed to connect IPC socket %s\n",
-              ipc_path.c_str());
-    }
+  // Without its IPC connection the host could never be driven or told to stop
+  // (and would still take the profile's lock below), so it doesn't start.
+  if (ipc_path.empty()) {
+    fprintf(stderr, "[cef_host] --ipc=<socket path> is required\n");
+    return 1;
+  }
+  g_ipc_fd = ConnectUnixSocket(ipc_path);
+  if (g_ipc_fd < 0) {
+    fprintf(stderr, "[cef_host] failed to connect IPC socket %s: %s\n",
+            ipc_path.c_str(), strerror(errno));
+    return 1;
   }
 
   // Defense-in-depth (Swift is the real gate): CDP is an unauthenticated
@@ -3848,10 +4203,11 @@ int main(int argc, char* argv[]) {
   // spawn two cef_host on it. Chromium's own profile singleton then fails the
   // SECOND CefInitialize (-> EOF, silent dead profile) with possible cache
   // corruption if the lock races. Take an advisory exclusive flock on
-  // <profile_dir>/.flutter_cef.lock FIRST; on contention (or any failure
-  // opening/locking it) report a distinct, machine-parseable signal and exit
-  // with code 2 so Swift surfaces a real "profile already in use" error instead
-  // of the generic crash/EOF path. Only for a real persistent profile — an
+  // <profile_dir>/.flutter_cef.lock FIRST; on contention report a distinct,
+  // machine-parseable signal and exit with code 2 so Swift surfaces a real
+  // "profile already in use" error instead of the generic crash/EOF path. A lock
+  // file that can't be opened at all (a missing or unwritable dir) is not
+  // contention: exit 3, which the plugin reports as a failed start. Only for a real persistent profile — an
   // ephemeral throwaway dir is per-pid, so it can never contend. The fd is held
   // open (never closed) for the process lifetime: the lock releases when the
   // process exits (closing it early, or letting an RAII guard close it, would
@@ -3860,10 +4216,11 @@ int main(int argc, char* argv[]) {
     const std::string lock_path = profile_dir + "/.flutter_cef.lock";
     int lock_fd = open(lock_path.c_str(), O_CREAT | O_RDWR, 0600);
     if (lock_fd < 0) {
-      SendLog(0, "profile-locked");
+      const std::string why = strerror(errno);
+      SendLog(0, "profile-lock-failed: cannot open " + lock_path + ": " + why);
       fprintf(stderr, "[cef_host] cannot open profile lock %s: %s\n",
-              lock_path.c_str(), strerror(errno));
-      return 2;
+              lock_path.c_str(), why.c_str());
+      return 3;
     }
     if (flock(lock_fd, LOCK_EX | LOCK_NB) != 0) {
       SendLog(0, "profile-locked");
@@ -3969,12 +4326,12 @@ int main(int argc, char* argv[]) {
       fprintf(stderr, "[cef_host] CefInitialize failed\n");
       return 1;
     }
-    if (std::getenv("FLUTTER_CEF_DEBUG"))
+    if (g_debug)
       fprintf(stderr, "[cef_host] CefInitialize OK (fd=%d)\n", g_ipc_fd.load());
-    std::thread reader;
-    if (g_ipc_fd >= 0) reader = std::thread(&IpcReadLoop);
+    std::thread reader(&IpcReadLoop);
     std::thread(&WatchParentDeath, getppid()).detach();
     CefRunMessageLoop();
+    ExtendHardExitForTeardown();
     if (reader.joinable()) {
       shutdown(g_ipc_fd, SHUT_RDWR);  // unblock the reader's blocking read
       reader.join();

@@ -122,6 +122,9 @@ final class CefWebSession: NSObject, FlutterTexture {
   // dialogs the page is blocked on, and DevTools, whose debugger can pause it.
   var livenessDialogsOpen = 0
   var livenessDevToolsOpened = false
+  // The host has told the plugin this browser is gone (same lock), so it isn't
+  // reported twice while the plugin drops the session.
+  var goneReported = false
 
   private weak var registry: FlutterTextureRegistry?
   private var width: Int
@@ -226,6 +229,7 @@ final class CefWebSession: NSObject, FlutterTexture {
     livenessPingRepliedAt = 0
     livenessDialogsOpen = 0
     livenessDevToolsOpened = false
+    goneReported = false
   }
 
   // MARK: FlutterTexture
@@ -236,7 +240,7 @@ final class CefWebSession: NSObject, FlutterTexture {
     bufferLock.lock()
     defer { bufferLock.unlock() }
     diagCopyCount += 1  // DIAG — logged BEFORE the nil guard so a nil-buffer session shows
-    if ProcessInfo.processInfo.environment["FLUTTER_CEF_DEBUG"] != nil
+    if CefProfileHost.debugEnabled
       && diagCopyCount % 120 == 0 {
       let liveSid = pixelBuffer.flatMap { CVPixelBufferGetIOSurface($0) }.map { IOSurfaceGetID($0.takeUnretainedValue()) } ?? 0
       NSLog("[cefdiag] copy bid=\(browserId) tex=\(textureId) hasPB=\(pixelBuffer != nil) liveSurf=\(liveSid) inFlight=\(resizeInFlight)")
@@ -272,7 +276,7 @@ final class CefWebSession: NSObject, FlutterTexture {
     }
     let curW = width, curH = height, curD = dpr
     bufferLock.unlock()
-    if ProcessInfo.processInfo.environment["FLUTTER_CEF_DEBUG"] != nil {
+    if CefProfileHost.debugEnabled {
       NSLog("[cefdiag-rsz] bid=\(browserId) req=\(w)x\(h)@\(d) cur=\(curW)x\(curH)@\(curD) "
         + "blocked=\(blocked) same=\(same) wedged=\(wedged)")
     }
@@ -777,7 +781,7 @@ final class CefWebSession: NSObject, FlutterTexture {
             promotedSid = psid
             promotedW = srcW > 0 ? srcW : Int((Double(width) * dpr).rounded())
             promotedH = srcH > 0 ? srcH : Int((Double(height) * dpr).rounded())
-            if ProcessInfo.processInfo.environment["FLUTTER_CEF_DEBUG"] != nil {
+            if CefProfileHost.debugEnabled {
               NSLog("[cefdiag-resize] bid=\(browserId) ADOPT psid=\(psid) src=\(srcW)x\(srcH) "
                 + "logical=\(width)x\(height) dpr=\(dpr)")
             }
@@ -788,7 +792,7 @@ final class CefWebSession: NSObject, FlutterTexture {
       let tid = textureId
       bufferLock.unlock()
       diagPresentCount += 1  // DIAG
-      if ProcessInfo.processInfo.environment["FLUTTER_CEF_DEBUG"] != nil
+      if CefProfileHost.debugEnabled
         && diagPresentCount % 120 == 0 {
         NSLog("[cefdiag] present bid=\(browserId) tex=\(tid) count=\(diagPresentCount)")
       }

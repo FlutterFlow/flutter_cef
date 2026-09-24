@@ -148,20 +148,19 @@ enum CdpRelayFilterTests {
     tokNo("tab (not SP) between scheme and token", "/devtools/browser", ["authorization": "Bearer\t\(tok)"])
 
     // ════ CEF-2b MULTIPLEX (P2-step2): N relays share ONE browser-wide pipe ════
-    // Two scoped relays with distinct wire ids (browserIds 1 & 2). This is PLAN
+    // Two scoped relays on one host share its pipe-id allocator. This is PLAN
     // Test I: feed each relay traffic for both tiles and assert ZERO cross-leak.
-    let relayA = CdpRelay(sendToPipe: { _ in }, scopeTargetId: "TILE-A", relayId: 1)
-    let relayB = CdpRelay(sendToPipe: { _ in }, scopeTargetId: "TILE-B", relayId: 2)
+    let hostIds = CdpPipeIds()
+    let relayA = CdpRelay(sendToPipe: { _ in }, scopeTargetId: "TILE-A", pipeIds: hostIds)
+    let relayB = CdpRelay(sendToPipe: { _ in }, scopeTargetId: "TILE-B", pipeIds: hostIds)
 
-    // ── id-rewrite namespacing: pipeId = (relayId<<21)|localSeq, globally unique ──
+    // ── id rewrite: every pipe id comes from the host's one allocator ──
     let aPid1 = topId(relayA.rewriteOutgoingId(#"{"id":1,"method":"Browser.getVersion"}"#))!
     let aPid2 = topId(relayA.rewriteOutgoingId(#"{"id":1,"method":"Browser.getVersion"}"#))!
     let bPid1 = topId(relayB.rewriteOutgoingId(#"{"id":1,"method":"Browser.getVersion"}"#))!
-    check("mux: relayA pipeId is namespaced to relayId 1 (high bits)", aPid1 >> 21 == 1)
-    check("mux: relayB pipeId is namespaced to relayId 2 (high bits)", bPid1 >> 21 == 2)
-    check("mux: same client id 1 on two relays -> DIFFERENT pipe ids (no collision)", aPid1 != bPid1)
-    check("mux: per-relay local seq advances", aPid2 == aPid1 + 1)
-    check("mux: low 21 bits are the local sequence (first == 0)", (aPid1 & 0x1FFFFF) == 0)
+    check("mux: same client id 1 on two relays -> DIFFERENT pipe ids (no collision)",
+      Set([aPid1, aPid2, bPid1]).count == 3)
+    check("mux: pipe ids start above the debug probe's small ids", aPid1 >= CdpPipeIds.first)
     check("mux: rewrite is a no-op for a message with no top-level int id",
       relayA.rewriteOutgoingId(#"{"method":"Page.enable","sessionId":"SESS-A"}"#) == #"{"method":"Page.enable","sessionId":"SESS-A"}"#)
 
@@ -193,6 +192,30 @@ enum CdpRelayFilterTests {
     check("mux: relayB forwards its own page event (SESS-B)", relayB.demuxPipeToClient(evtB) != nil)
     check("mux: relayB drops the sibling's page event (SESS-A)", relayB.demuxPipeToClient(evtA) == nil)
     check("mux: malformed pipe line fails closed (drop)", relayA.demuxPipeToClient("{not json") == nil)
+
+    // ── pipe ids stay positive int32 however many browsers the host has made ──
+    // The old scheme put the browserId in the high bits, so browser 1024 minted
+    // 2147483648, which Chromium rejects. The allocator wraps inside int32 instead.
+    let nearMax = CdpPipeIds(startingAt: Int(Int32.max) - 1)
+    let late = CdpRelay(sendToPipe: { _ in }, scopeTargetId: "TILE-L", pipeIds: nearMax)
+    let lateIds = (0..<3).map { _ in
+      topId(late.rewriteOutgoingId(#"{"id":7,"method":"Browser.getVersion"}"#))!
+    }
+    check("pipe ids: never exceed Int32.max", lateIds.allSatisfy { $0 > 0 && $0 <= Int(Int32.max) })
+    check("pipe ids: wrap back to the start of the range",
+      lateIds == [Int(Int32.max) - 1, Int(Int32.max), CdpPipeIds.first])
+
+    // ── a reconnecting client never gets its predecessor's late response ──
+    // agent-browser reconnects per command, so client 2 reuses client 1's ids.
+    let rc = CdpRelay(sendToPipe: { _ in }, scopeTargetId: "TILE-R")
+    rc.noteClientConnected()
+    let oldPid = topId(rc.rewriteOutgoingId(#"{"id":5,"method":"Runtime.evaluate","sessionId":"S"}"#))!
+    rc.noteClientConnected()
+    let newPid = topId(rc.rewriteOutgoingId(#"{"id":5,"method":"Runtime.evaluate","sessionId":"S"}"#))!
+    check("reconnect: a departed client's late response is dropped",
+      rc.demuxPipeToClient("{\"id\":\(oldPid),\"result\":{\"v\":\"old\"}}") == nil)
+    check("reconnect: the new client's own response still arrives with its id",
+      topId(rc.demuxPipeToClient("{\"id\":\(newPid),\"result\":{\"v\":\"new\"}}")) == 5)
 
     print(failures == 0
       ? "\n==== CdpRelay filter: ALL PASS ===="

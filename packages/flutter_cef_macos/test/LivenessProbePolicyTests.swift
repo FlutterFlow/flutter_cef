@@ -103,17 +103,14 @@ enum LivenessProbePolicyTests {
     check("DevTools opened → no ping (its debugger can pause the page)", !may(devTools: true))
     check("a CDP client can attach → no ping", !may(cdp: true))
 
-    func gpu(started: UInt64, firstPresent: UInt64) -> Bool {
-      LivenessProbePolicy.gpuRestarted(gpuStartedUs: started, firstPresentUs: firstPresent)
+    func gpu(first: Int32, now: Int32) -> Bool {
+      LivenessProbePolicy.gpuReplaced(firstPid: first, currentPid: now)
     }
-    check("GPU process older than the first frame → the original",
-          !gpu(started: 1_000, firstPresent: 2_000))
-    check("GPU process started after the first frame → replaced",
-          gpu(started: 3_000, firstPresent: 2_000))
-    check("GPU process restarted before anything painted → not flagged",
-          !gpu(started: 3_000, firstPresent: 0))
-    check("no GPU process (gone, not yet relaunched) → not flagged",
-          !gpu(started: 0, firstPresent: 2_000))
+    check("the GPU process that painted the first frame → not replaced",
+          !gpu(first: 501, now: 501))
+    check("a different GPU process → replaced", gpu(first: 501, now: 777))
+    check("GPU process unknown at the first frame → not flagged", !gpu(first: 0, now: 777))
+    check("no GPU process (gone, not yet relaunched) → not flagged", !gpu(first: 501, now: 0))
 
     print(failures == 0
       ? "\nALL LivenessProbePolicy TESTS PASSED"

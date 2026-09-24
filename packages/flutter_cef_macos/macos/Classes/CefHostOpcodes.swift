@@ -3,7 +3,7 @@
 /// The cef_host wire protocol version this plugin speaks; a host announcing
 /// another is refused.
 enum CefHostProtocol {
-  static let version: UInt8 = 9
+  static let version: UInt8 = 10
 }
 
 /// cef_host wire opcodes.
@@ -67,6 +67,9 @@ enum CefOp {
   /// {u32 id}{utf8 json} right-click: Chromium's menu model and params, for the
   /// plugin's consumer to draw; answer with kOpContextMenuCommand
   static let contextMenu: UInt8 = 0x40
+  /// {utf8 reason} this one browser can't continue (its renderer keeps
+  /// crashing); the process survives and the plugin drops the session
+  static let browserGone: UInt8 = 0x42
 
   // ---- plugin -> cef_host ----
   /// {u8 type}{u8 button}{u8 clickCount}{u8 pad}{u32 modifiers}{f64 x}{f64

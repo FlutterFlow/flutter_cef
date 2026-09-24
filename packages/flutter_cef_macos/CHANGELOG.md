@@ -55,6 +55,42 @@
   than 4 native popups open; popup windows gate their own navigations too.
 * Security: a navigate parked for a not-yet-created browser no longer arms the
   `data:`/`file:` trusted-load exemption.
+* Protocol v10: `opBrowserGone` (0x42, upstream, utf8 reason) ends one
+  browser's session; the plugin sends `processGone(reason)` and disposes it.
+  The prebuilt must be republished.
+* A renderer crash loop ends only its browser (`opBrowserGone "crashed"`);
+  `cef_host` shuts down only when two browsers crash-loop within 10 s.
+* The liveness ping (eval id `UInt32.max`) is a renderer process message
+  (`renderer_messages.h`) answered by the renderer, not page JS. An unanswered
+  ping ends that browser, not the host. A replaced GPU process is detected by
+  pid, not by start time against the wall clock.
+* Eval replies are `eval:<id>:<nonce>:<json>`; an id not in flight or a wrong
+  nonce is refused.
+* `SendFrame` drops a frame over the plugin's 64 MiB limit instead of sending
+  it. Channel messages and eval results over 16 MiB are refused; console,
+  dialog and context-menu strings are cut at 1 MiB.
+* Shutdown closes every browser (tiles, popups, auth windows) and quits the
+  loop after the last `OnBeforeClose` or a 2 s grace. A watchdog thread
+  `_exit`s 6 s after shutdown starts, 30 s once `CefShutdown` runs.
+* Popups are tracked by the tile that opened them and closed with it.
+  `PopupClient::DoClose` takes the view out of its window, so a popup closed
+  by `window.close()` finishes closing. `FLUTTER_CEF_SPIKE_AUTH_URL` is gone;
+  `opOpenAuthWindow` windows are held to the scheme allowlist and a gesture.
+* Startup: no `--ipc` or a failed connect exits 1; failing to open the
+  profile lock logs `profile-lock-failed` and exits 3.
+* IPC values are checked: view sides 1–16384, finite dpr and zoom, enum
+  ranges. A navigate for a browser still being created is applied in
+  `OnAfterCreated`, not at first paint.
+* The plugin refuses to join a running host whose scheme allowlist is wider,
+  or that has TCP CDP the view didn't ask for (`host_config_mismatch`), and
+  reserves `~`-prefixed profile names. Host callbacks are installed once,
+  before spawn.
+* Agent control: `enableAgentControl` re-checks the session after its async
+  setup, so a dispose in between no longer leaks a relay. CDP pipe ids come
+  from one per-host allocator that stays within int32, and a relay forgets its
+  id mappings when a new client connects.
+* Tests: `test/run_host_config_tests.sh`, and `test/run_host_lifecycle_test.sh`
+  (needs a built host; skips without one).
 
 ## 0.2.0
 

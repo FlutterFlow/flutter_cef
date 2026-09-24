@@ -56,10 +56,12 @@ enum LivenessProbePolicy {
   /// relaunches a GPU process that dies (under memory pressure, say), but off-screen
   /// rendering never presents again after that: every browser on the host is frozen, with
   /// JS still answering, so neither the nudge nor the ping sees it. The first frame needed
-  /// the original GPU process, so one that started after it is a replacement.
-  /// - gpuStartedUs: wall-clock start of the current GPU process, 0 if there is none.
-  /// - firstPresentUs: wall-clock time of the host's first frame, 0 if it hasn't painted.
-  static func gpuRestarted(gpuStartedUs: UInt64, firstPresentUs: UInt64) -> Bool {
-    gpuStartedUs != 0 && firstPresentUs != 0 && gpuStartedUs > firstPresentUs
+  /// the original GPU process, so a different one now is a replacement. Compares pids
+  /// rather than start times, so a wall-clock step can't fake a replacement.
+  /// - firstPid: the GPU process running at the host's first frame, 0 if unknown.
+  /// - currentPid: the GPU process running now, 0 if there is none (between a death and
+  ///   its relaunch).
+  static func gpuReplaced(firstPid: Int32, currentPid: Int32) -> Bool {
+    firstPid != 0 && currentPid != 0 && currentPid != firstPid
   }
 }

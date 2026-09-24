@@ -50,6 +50,7 @@ PROBES=(
   "samesite|samesite_probe|120|stdout|default|-|setCookie stores Secure / HttpOnly / SameSite"
   "surface_handoff|surface_handoff_probe|120|stdout|default|-|frames arrive over a Mach port, not a global IOSurface"
   "wedge_recovery|wedge_recovery_probe|400|stdout|default|-|a wedged renderer is recovered without killing healthy tiles"
+  "host_robustness|host_robustness_probe|480|stdout|default|-|one page can't take down the other tiles on its host"
   "alert|alert_probe|90|json:/tmp/cef_alert_probe.json|default|-|answering a JS alert unblocks the page"
   "channel|channel_probe|60|json:/tmp/cef_channel_probe.json|default|-|page-to-app JS channel delivers"
   "channel_shared|channel_probe_shared|60|json:/tmp/cef_channel_probe_shared.json|default|shared|two views on one host: each channel message reaches its own view"
