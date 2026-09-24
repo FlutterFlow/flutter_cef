@@ -47,7 +47,6 @@ const _html = '''<!doctype html><meta charset="utf-8">
 // isolation gives each its own renderer process and killing one can't take
 // the other with it.
 const _sentinelUrl = 'https://flutter-cef-sentinel.test/';
-const _victimUrl = 'https://flutter-cef-victim.test/';
 
 void main() => runApp(const MaterialApp(home: ProbeApp()));
 
@@ -209,33 +208,64 @@ class _ProbeAppState extends State<ProbeApp> {
       _check('probe ran to completion', false, '$e\n$st');
     }
     await c.dispose();
-    await _crashLoop();
+    await _crashLoops();
     _finish();
   }
 
+  /// Polls [done] until it is true or [within] has passed.
+  Future<bool> _waitFor(bool Function() done, Duration within) async {
+    final sw = Stopwatch()..start();
+    while (!done()) {
+      if (sw.elapsed >= within) return false;
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }
+    return true;
+  }
+
   /// A tile whose renderer keeps crashing ends alone; its neighbour on the
-  /// same host carries on.
-  Future<void> _crashLoop() async {
-    const group = 'windows-smoke-crash-loop';
+  /// same host carries on. FLUTTER_CEF_SMOKE_CRASH_ROUNDS runs it more than
+  /// once, each round on a fresh host.
+  Future<void> _crashLoops() async {
+    final rounds =
+        int.tryParse(
+          Platform.environment['FLUTTER_CEF_SMOKE_CRASH_ROUNDS'] ?? '',
+        ) ??
+        1;
+    for (var round = 1; round <= rounds; round++) {
+      await _crashLoop(round);
+    }
+  }
+
+  Future<void> _crashLoop(int round) async {
+    final tag = 'crash loop $round';
+    final group = 'windows-smoke-crash-loop-$round';
     final sentinel = CefWebController(hostGroup: group);
     final victim = CefWebController(hostGroup: group);
+    // A timeline of the victim's side, printed with the result.
+    final clock = Stopwatch()..start();
+    void event(String what) =>
+        _log('  $tag +${clock.elapsedMilliseconds}ms $what');
     String? sentinelGone;
     final victimGone = Completer<String>();
-    final sentinelLoaded = Completer<void>();
-    final victimLoaded = Completer<void>();
+    var sentinelLoaded = false;
+    var victimFinishes = 0;
     sentinel.onProcessGone = (r) => sentinelGone ??= r;
+    sentinel.onPageFinished = (_) => sentinelLoaded = true;
     victim.onProcessGone = (r) {
+      event('victim processGone($r)');
       if (!victimGone.isCompleted) victimGone.complete(r);
     };
-    sentinel.onPageFinished = (_) {
-      if (!sentinelLoaded.isCompleted) sentinelLoaded.complete();
-    };
     victim.onPageFinished = (_) {
-      if (!victimLoaded.isCompleted) victimLoaded.complete();
+      victimFinishes++;
+      event('victim pageFinished');
     };
-    var victimLoads = 0;
-    victim.onPageStarted = (_) => victimLoads++;
+    victim.onLoadError = (e) => event('victim loadError ${e.errorText}');
     try {
+      // The sentinel is served at an https origin and the victim is a data:
+      // page: different sites, so each gets its own renderer. A data: page
+      // also reloads without the network. (An authored victim loses its
+      // document at the first navigate, so its reloads went to DNS and came
+      // back as error pages, which report no pageStarted.)
       await sentinel.create(
         url: _sentinelUrl,
         html: _html,
@@ -244,40 +274,49 @@ class _ProbeAppState extends State<ProbeApp> {
         height: 240,
       );
       await victim.create(
-        url: _victimUrl,
+        url: 'about:blank',
         html: _html,
-        htmlBaseUrl: _victimUrl,
         width: 320,
         height: 240,
       );
-      final loaded =
-          await Future.wait([sentinelLoaded.future, victimLoaded.future])
-              .then((_) => true)
-              .timeout(const Duration(seconds: 60), onTimeout: () => false);
-      _check('crash loop: both tiles load', loaded);
+      _check(
+        '$tag: both tiles load',
+        await _waitFor(
+          () => sentinelLoaded && victimFinishes > 0,
+          const Duration(seconds: 60),
+        ),
+      );
 
       // chrome://kill is a renderer debug URL: Chromium ends the tile's
       // renderer (exit code 1, no crash dump) and cef_host reloads the page.
-      // Four deaths within 10 s and the host gives up on the tile.
-      for (var i = 0; i < 8 && !victimGone.isCompleted; i++) {
+      // Each kill waits for that reload to finish, or for processGone, before
+      // the next, so every kill lands on a live, loaded page; one that shows
+      // neither within 5 s is sent again. Four deaths within 10 s and the host
+      // gives up on the tile.
+      var kills = 0;
+      while (!victimGone.isCompleted &&
+          clock.elapsed < const Duration(seconds: 90)) {
+        final finishes = victimFinishes;
+        kills++;
+        event('kill $kills');
         await victim.navigate('chrome://kill');
-        await victimGone.future
-            .then((_) {})
-            .timeout(const Duration(seconds: 1), onTimeout: () {});
+        await _waitFor(
+          () => victimGone.isCompleted || victimFinishes > finishes,
+          const Duration(seconds: 5),
+        );
       }
-      final gone = await victimGone.future.timeout(
-        const Duration(seconds: 15),
-        onTimeout: () => '<none; the victim loaded $victimLoads times>',
-      );
+      final gone = victimGone.isCompleted
+          ? await victimGone.future
+          : '<none after $kills kills>';
       _check(
-        'crash loop: the crash-looping tile gets processGone(crashed)',
+        '$tag: the crash-looping tile gets processGone(crashed)',
         gone == 'crashed',
         gone,
       );
 
       final before = await _presents(sentinel);
       _check(
-        'crash loop: the other tile on the host keeps painting',
+        '$tag: the other tile on the host keeps painting',
         await _presentsPast(
           sentinel,
           before,
@@ -288,14 +327,14 @@ class _ProbeAppState extends State<ProbeApp> {
       final four = await sentinel
           .runJavaScriptReturningResult('2 + 2')
           .timeout(const Duration(seconds: 10));
-      _check('crash loop: the other tile answers evals', '$four' == '4', four);
+      _check('$tag: the other tile answers evals', '$four' == '4', four);
       _check(
-        'crash loop: the other tile gets no processGone',
+        '$tag: the other tile gets no processGone',
         sentinelGone == null,
         sentinelGone,
       );
     } catch (e, st) {
-      _check('crash loop case ran to completion', false, '$e\n$st');
+      _check('$tag: ran to completion', false, '$e\n$st');
     }
     await sentinel.dispose();
     await victim.dispose();

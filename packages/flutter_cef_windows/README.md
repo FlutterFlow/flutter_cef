@@ -68,6 +68,14 @@ rasterizer) when there is none. `<select>` dropdowns are drawn over the view.
 Chromium paints in software. It is how CI covers the software path, and it
 helps tell a GPU-driver problem from a page problem.
 
+## Logs
+
+The plugin writes its own log lines and those of every `cef_host` (renderer
+crashes, a host giving up on a tile, pipe failures) with `OutputDebugString`,
+so a debugger or DebugView shows them. Set `FLUTTER_CEF_LOG_FILE` to a file
+path to have them appended there as well, each with a millisecond tick; CI
+uses it to print the host's side of the smoke test.
+
 ## Layout
 
 - `lib/flutter_cef_windows.dart` — `registerWith()` endorsing the shared

@@ -1,3 +1,13 @@
+## Unreleased
+
+* `FLUTTER_CEF_LOG_FILE=<path>` appends the plugin's and every `cef_host`'s log
+  lines to that file, each with a millisecond tick, as well as sending them to
+  `OutputDebugString`.
+* CI: the smoke test's crash-loop case kills the tile's renderer only once the
+  previous reload has finished, re-sends a kill that didn't take, and uses a
+  `data:` page so a reload never goes to the network. It runs 3 rounds per
+  compositing mode and prints the host's crash-loop log lines.
+
 ## 0.1.0
 
 * Authored documents at a real origin (`kOpSetAuthoredHtml` 0x3f and the
