@@ -166,8 +166,9 @@ Map<String, String> generatedFiles(String root) => {
       macosHeaderPath: cppHeader(Platform.macos),
       macosSwiftPath: swiftFile(),
       windowsHeaderPath: cppHeader(Platform.windows),
-      windowsDocPath:
-          withDocTable(File('$root/$windowsDocPath').readAsStringSync()),
+      windowsDocPath: withDocTable(File('$root/$windowsDocPath')
+          .readAsStringSync()
+          .replaceAll('\r\n', '\n')),
     };
 
 void main(List<String> args) {
@@ -175,7 +176,10 @@ void main(List<String> args) {
   var stale = false;
   generatedFiles('.').forEach((path, content) {
     final file = File(path);
-    if (file.existsSync() && file.readAsStringSync() == content) return;
+    if (file.existsSync() &&
+        file.readAsStringSync().replaceAll('\r\n', '\n') == content) {
+      return;
+    }
     if (check) {
       stderr.writeln('stale: $path');
       stale = true;

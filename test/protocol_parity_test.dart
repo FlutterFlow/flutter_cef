@@ -23,8 +23,11 @@ void main() {
   });
 
   test('the generated files match the spec', () {
+    // A Windows checkout may have converted the line endings.
+    String read(String path) =>
+        File(path).readAsStringSync().replaceAll('\r\n', '\n');
     generatedFiles('.').forEach((path, content) {
-      expect(File(path).readAsStringSync(), content,
+      expect(read(path), content,
           reason: '$path is stale: run dart run tool/protocol/generate.dart');
     });
   });
@@ -41,7 +44,7 @@ void main() {
     final offenders = <String>[];
     for (final entity in Directory('packages').listSync(recursive: true)) {
       if (entity is! File) continue;
-      final path = entity.path;
+      final path = entity.path.replaceAll(r'\', '/');
       if (!RegExp(r'\.(mm|cc|cpp|h|swift)$').hasMatch(path)) continue;
       if (path.contains('/build/') || path.contains('/prebuilt/')) continue;
       if (generated.contains(path)) continue;
