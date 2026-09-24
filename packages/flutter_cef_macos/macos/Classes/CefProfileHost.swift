@@ -10,6 +10,40 @@
 // Split out of CefWebSession: the session keeps only its texture/IOSurface and
 // per-view verbs; everything process/socket/reader-shaped lives here, so several
 // views sharing one `profile:` share one host -> one cookie jar -> one login.
+//
+// The class is split over several files: this one holds the stored state, the
+// send path and teardown; the extensions hold the rest.
+//   CefProfileHost+Ipc.swift           spawn, the socket, the reader thread,
+//                                      host death
+//   CefProfileHost+CreatePacing.swift  browser creates, the establishment
+//                                      window, the first-present watchdog
+//   CefProfileHost+Liveness.swift      the steady-state liveness sweep
+//   CefProfileHost+Cdp.swift           agent control: the CDP pipe, relays,
+//                                      targetId resolution
+// Its members are internal rather than private only so those files can reach
+// them. Nothing outside CefProfileHost*.swift should.
+//
+// Threads and locks. The plugin calls in on the main thread; the IPC reader
+// (acceptAndRead), the CDP reader (readCdpLoop) and timer blocks on global
+// queues call in from theirs. Each lock guards:
+//   writeLock       the pipe (connFd, pendingFrames), the lifecycle flags
+//                   (running, crashed, diedFired, ready, refused), the create
+//                   queues (pendingCreates, createEnqueued, createSendQueue,
+//                   createInFlight) and the process handles (process,
+//                   spawnedPid)
+//   browsersLock    browsers, nextBrowserId, each session's liveness fields,
+//                   hostPainted, gpuPidAtFirstPresent, cdpClientsCanPause,
+//                   livenessSweepStarted
+//   presentLock     the first-present watchdog: firstPresentPending,
+//                   hiddenBrowsers, watchdogArmed
+//   targetIdLock    pendingTargetId, targetIdEpoch
+//   cdpHandlerLock  onCdpMessage, cdpRelays, agentControlEpoch, cdpClosed
+//   cdpWriteLock    writes to cdpWriteFd
+// Order: cdpHandlerLock before browsersLock, and writeLock before a session's
+// bufferLock. browsersLock and presentLock are never held together. Callbacks,
+// relay stops and waiter completions run with no lock held. wedgeEnded belongs
+// to the liveness sweep, which runs one pass at a time. The rest is set in
+// spawn() before the threads start, or in teardown after they are joined.
 
 import Foundation
 import IOSurface
@@ -18,7 +52,7 @@ final class CefProfileHost {
   // Eval id of the liveness ping. Dart's eval ids count up from 0 and never reach it.
   // cef_host answers it from the renderer itself, not the page (kLivenessPingId).
   static let livenessPingId: UInt32 = .max
-  private static let livenessPingReplyPrefix = Array("\(livenessPingId):".utf8)
+  static let livenessPingReplyPrefix = Array("\(livenessPingId):".utf8)
 
   /// FLUTTER_CEF_DEBUG, read once: the environment is rebuilt on every read, and
   /// some of the checks run per frame.
@@ -34,11 +68,11 @@ final class CefProfileHost {
   // requested for ephemeral hosts (named+CDP is rejected upstream). Reported
   // back to Dart in each create() result. NOT used by the pipe (agent-control)
   // path — that speaks CDP over inherited fds 3/4, not a TCP port.
-  private(set) var cdpPort: Int = 0
+  var cdpPort: Int = 0
   // The --allowed-schemes this host was spawned with. Like cdpPort it is fixed for
   // the process, so a session joining a running host is checked against both
   // (HostConfigPolicy). Set in spawn() on the main thread, read there too.
-  private(set) var allowedSchemes = ""
+  var allowedSchemes = ""
 
   // Agent-control / pipe mode (CEF-1). When true, cef_host was launched via
   // posix_spawn so it inherits two CDP pipes (child reads CDP on fd 3, writes on
@@ -46,18 +80,18 @@ final class CefProfileHost {
   // makes it speak NUL-delimited JSON over those fds instead of a TCP port. Off
   // by default; when off, spawn() takes the existing Foundation.Process launch
   // and behavior is byte-identical to the pre-pipe path.
-  private(set) var agentControl = false
+  var agentControl = false
   // Parent-side CDP pipe ends (valid only when agentControl). cdpWriteFd =
   // cmd_pipe[1] (we write CDP here; child reads it on fd 3). cdpReadFd =
   // out_pipe[0] (we read CDP here; child writes it on fd 4). -1 when unused.
-  private var cdpWriteFd: Int32 = -1
-  private var cdpReadFd: Int32 = -1
-  private let cdpWriteLock = NSLock()  // serializes send(json) writes to cdpWriteFd
-  private var cdpReaderStarted = false
+  var cdpWriteFd: Int32 = -1
+  var cdpReadFd: Int32 = -1
+  let cdpWriteLock = NSLock()  // serializes send(json) writes to cdpWriteFd
+  var cdpReaderStarted = false
   // Signaled when the CDP reader thread exits, so shutdown() can join it before
   // closing cdpReadFd (closing an fd a thread is blocked on is a use-after-free —
   // mirrors readerDone for the IPC reader).
-  private let cdpReaderDone = DispatchSemaphore(value: 0)
+  let cdpReaderDone = DispatchSemaphore(value: 0)
   // Invoked (off the CDP reader thread) for each complete CDP message (one
   // NUL-delimited UTF-8 JSON line, NUL stripped). Set by the plugin/relay; the
   // CEF-1 validation hook installs a temporary one to prove the round-trip.
@@ -70,32 +104,32 @@ final class CefProfileHost {
   // sessionId, plus a per-relay CDP-id rewrite for browser-level commands — see
   // CdpRelay's multiplex note). Held strongly here; each relay's pipe-send closure
   // captures self weakly (no cycle).
-  private var cdpRelays: [UInt32: CdpRelay] = [:]
+  var cdpRelays: [UInt32: CdpRelay] = [:]
   // Bumped per browser by disableAgentControl (cdpHandlerLock), so an enable whose
   // targetId resolve was in flight when the tile went away doesn't install a relay
   // nobody will ever stop.
-  private var agentControlEpoch: [UInt32: Int] = [:]
+  var agentControlEpoch: [UInt32: Int] = [:]
   // Set by shutdown()/handleHostDeath() (cdpHandlerLock): no relay is installed after.
-  private var cdpClosed = false
+  var cdpClosed = false
   // The CDP command ids every relay on this host's pipe uses.
-  private let cdpPipeIds = CdpPipeIds()
+  let cdpPipeIds = CdpPipeIds()
   // Guards onCdpMessage and cdpRelays. CEF-2a/b mutates onCdpMessage LIVE (enable/
   // disable on the main thread) while the CDP reader thread reads it per message,
   // so — unlike CEF-1, which only set it before the reader started — both must be
   // synchronized. A plain closure property is a fat (ptr+context) value; a concurrent
   // read during a write can tear it and call into freed context.
-  private let cdpHandlerLock = NSLock()
+  let cdpHandlerLock = NSLock()
   // Pending browserId→targetId resolutions (kOpResolveTargetId round-trip), keyed by
   // browserId. Set on the plugin thread, fulfilled on the reader thread (kOpTargetId)
   // or a timeout; guarded by targetIdLock. The completion fires exactly once.
-  private var pendingTargetId: [UInt32: [(String?) -> Void]] = [:]
+  var pendingTargetId: [UInt32: [(String?) -> Void]] = [:]
   // Per-browser resolve epoch, bumped on each fresh in-flight resolve. A resolve's 5s
   // timeout captures its epoch and only fulfills if still current — so an EARLY
   // response (which doesn't cancel the timer) can't let the stale timer clobber a
   // LATER resolve for the same browser (e.g. re-enabling agent-control within 5s of a
   // prior enable/disable). Guarded by targetIdLock.
-  private var targetIdEpoch: [UInt32: Int] = [:]
-  private let targetIdLock = NSLock()
+  var targetIdEpoch: [UInt32: Int] = [:]
+  let targetIdLock = NSLock()
 
   // Process + IPC machinery (hoisted from CefWebSession).
   // `process` backs the default Foundation.Process launch; `spawnedPid` backs
@@ -104,40 +138,39 @@ final class CefProfileHost {
   // process == nil && spawnedPid > 0 => pipe path (kill()/waitpid()).
   // This keeps the hardened default path's process handling byte-identical while
   // the pipe path reuses the same teardown/crash-surfacing seams via the pid.
-  private var process: Process?
-  private var spawnedPid: pid_t = 0
+  var process: Process?
+  var spawnedPid: pid_t = 0
   /// Where cef_host sends its tile surfaces (see SurfacePort). Set in spawn()
   /// before the reader starts and never replaced; close() makes it inert.
-  private(set) var surfacePort: SurfacePort?
-  private var listenFd: Int32 = -1
-  private var connFd: Int32 = -1
-  private var socketPath = ""
-  private let writeLock = NSLock()
-  private var pendingFrames: [[UInt8]] = []  // queued until the pipe connects
-  private var running = false
+  var surfacePort: SurfacePort?
+  var listenFd: Int32 = -1
+  var connFd: Int32 = -1
+  var socketPath = ""
+  let writeLock = NSLock()
+  var pendingFrames: [[UInt8]] = []  // queued until the pipe connects
+  var running = false
   // C1: set true (under writeLock) when the host dies unexpectedly — reader EOF
   // while running, or a writeAll to a dead pipe. Distinct from `running=false`
-  // (clean shutdown()): `crashed` forces hasLiveBrowser false so the named
-  // profile reopens, and gates onHostDied to fire once.
-  private var crashed = false
-  private var readerStarted = false
-  private let readerDone = DispatchSemaphore(value: 0)  // signaled when the
+  // (clean shutdown()): `crashed` stops the pacer, the sweeps and agent control
+  // on a dead host.
+  var crashed = false
+  var readerStarted = false
+  let readerDone = DispatchSemaphore(value: 0)  // signaled when the
   // acceptAndRead thread exits, so shutdown() can join it before freeing state.
 
   // Browser multiplexing. `browsers`/`nextBrowserId` are guarded by
-  // `browsersLock`; `createEnqueued`/`pendingCreates`/`ready`/`refused`/`adhocHost`
-  // are guarded by `writeLock` (they gate the send path).
-  private let browsersLock = NSLock()
-  private var browsers: [UInt32: CefWebSession] = [:]
-  private var nextBrowserId: UInt32 = 1
-  private var ready = false
+  // `browsersLock`; `createEnqueued`/`pendingCreates`/`ready`/`refused` are
+  // guarded by `writeLock` (they gate the send path).
+  let browsersLock = NSLock()
+  var browsers: [UInt32: CefWebSession] = [:]
+  var nextBrowserId: UInt32 = 1
+  var ready = false
   // The host refused its named profile at kOpReady (ad-hoc build, see F.5): it
   // never becomes ready, so a create that lands before the plugin moves the
   // sessions off it stays queued instead of loading the profile.
-  private var refused = false
-  private var pendingCreates: [() -> Void] = []  // createBrowser closures queued until ready
-  private var adhocHost = false  // host reported a mock-keychain (ad-hoc) build
-  private var createEnqueued: Set<UInt32> = []  // browserIds whose create has been sent
+  var refused = false
+  var pendingCreates: [() -> Void] = []  // createBrowser closures queued until ready
+  var createEnqueued: Set<UInt32> = []  // browserIds whose create has been sent
 
   // Per-host create pacing (guarded by writeLock). A BURST of kOpCreateBrowser frames
   // would otherwise make cef_host run a pile of browser creates concurrently, each doing
@@ -155,9 +188,9 @@ final class CefProfileHost {
   // simultaneously. `createAckTimeout` is the per-browser paint backstop so a
   // bound-but-never-painting browser can't hold its slot forever. `createInFlight` is the
   // set of browserIds currently occupying an establishment slot.
-  private var createSendQueue: [(id: UInt32, session: CefWebSession, url: String)] = []
-  private var createInFlight: Set<UInt32> = []
-  private let maxCreateInFlight: Int = {
+  var createSendQueue: [(id: UInt32, session: CefWebSession, url: String)] = []
+  var createInFlight: Set<UInt32> = []
+  let maxCreateInFlight: Int = {
     if let s = ProcessInfo.processInfo.environment["FLUTTER_CEF_ESTAB_WINDOW"],
        let n = Int(s), n > 0 { return n }
     return 3  // K=3: ~3x faster cascade than strict serial on BOTH median and last-tile
@@ -165,7 +198,7 @@ final class CefProfileHost {
               // 20 real sites). The rare all-animation-burst knock-out is caught by the
               // watchdog→recreate (never blank). See docs/history/osr-many-views.md.
   }()
-  private let createAckTimeout: TimeInterval = {
+  let createAckTimeout: TimeInterval = {
     if let s = ProcessInfo.processInfo.environment["FLUTTER_CEF_CREATE_TIMEOUT_MS"],
        let ms = Double(s) { return ms / 1000.0 }
     return 8  // backstop for a browser that binds but never first-paints; generous so a
@@ -176,19 +209,80 @@ final class CefProfileHost {
   // kOpPresent: if none arrives within the deadline we re-kick via kOpInvalidate, then (if
   // still blank) surface paintStalled to Dart — converting a silent never-painted tile
   // into self-healing-or-signalled.
-  private let presentLock = NSLock()
-  private var firstPresentPending: Set<UInt32> = []
+  let presentLock = NSLock()
+  var firstPresentPending: Set<UInt32> = []
   // C1: browsers the host has hidden (WasHidden(true) via kOpSetVisible). A hidden CEF
   // browser stops producing frames entirely, so it legitimately never sends kOpPresent —
   // the watchdog must NOT treat that as a stall (work_canvas creates tiles already
   // off-screen as a normal lazy-spawn pattern). Guarded by presentLock.
-  private var hiddenBrowsers: Set<UInt32> = []
+  var hiddenBrowsers: Set<UInt32> = []
   // At most one live checkFirstPresent chain per browserId. The watchdog re-arms itself
   // (repeating paintStalled signal) and noteVisibility re-arms on unhide, so without this
   // a hide/show flap of a still-blank tile would accumulate parallel chains (each one
   // re-kicking + logging + emitting paintStalled every firstPaintGrace forever). Guarded
   // by presentLock; cleared when a chain terminates (paint / hidden / dead / dispose).
-  private var watchdogArmed: Set<UInt32> = []
+  var watchdogArmed: Set<UInt32> = []
+
+  /// Total grace for a browser to deliver its FIRST frame before the watchdog declares it
+  /// stalled (→ consumer recreates). Cancelled the instant ANY frame arrives, so this only
+  /// bounds the GENUINELY-blank case — it does NOT slow content that paints quickly.
+  /// Must be generous: a heavy real site (WebGL, 3D, huge bundle) can take several seconds
+  /// to composite its first frame, and recreating it just restarts that heavy load (churn).
+  /// Env-tunable.
+  let firstPaintGrace: TimeInterval = {
+    if let s = ProcessInfo.processInfo.environment["FLUTTER_CEF_FIRSTPAINT_MS"],
+       let ms = Double(s) { return ms / 1000.0 }
+    return 10.0
+  }()
+
+  /// How many present frames a browser must deliver before the pacer admits the next
+  /// create. Gating on the bare first frame advances too eagerly — a 1-frame-old browser
+  /// gets knocked back out by the next create's first-frame GPU allocation (paints 1-2
+  /// frames then stops). Requiring a few consecutive frames proves it's stably producing
+  /// before the next contends. Adaptive + fast: a healthy 60fps tile trips this in a few
+  /// frames (~tens of ms) vs a fixed time settle. Env-tunable.
+  let estabStableFrames: Int = {
+    if let s = ProcessInfo.processInfo.environment["FLUTTER_CEF_ESTAB_FRAMES"],
+       let n = Int(s), n > 0 { return n }
+    return 6
+  }()
+  /// Settle window after a browser's FIRST paint as the OTHER pacer-advance trigger (the
+  /// pacer advances on stable-frames OR this settle, whichever comes first). The frame
+  /// threshold is the fast path for continuously-animating content (hits it in ~tens of
+  /// ms); the settle is the path for STATIC content that paints a short burst on load then
+  /// idles (a real website) and would never reach the frame threshold. Env-tunable.
+  let estabSettle: TimeInterval = {
+    if let s = ProcessInfo.processInfo.environment["FLUTTER_CEF_ESTAB_SETTLE_MS"],
+       let ms = Double(s) { return ms / 1000.0 }
+    return 0.4
+  }()
+
+  // F-6 steady-state liveness sweep (CefProfileHost+Liveness.swift).
+  let livenessStalenessNs: UInt64 = {
+    if let s = ProcessInfo.processInfo.environment["FLUTTER_CEF_LIVENESS_MS"],
+       let ms = Double(s), ms > 0 { return UInt64(ms * 1_000_000) }
+    return 10_000_000_000  // 10s — generous; a wedge is rare + a healthy idle page only
+                           // costs one forced repaint per window.
+  }()
+  let livenessGraceNs: UInt64 = 3_000_000_000  // 3s after the nudge → declare wedged
+  let livenessSweepInterval: TimeInterval = 2.0
+  var livenessSweepStarted = false  // guarded by browsersLock
+  // A stalled browser whose renderer leaves the JS ping unanswered this long is hung.
+  // Chrome's own hang monitor waits about as long before offering to kill a page.
+  let livenessHangNs: UInt64 = {
+    if let s = ProcessInfo.processInfo.environment["FLUTTER_CEF_HANG_MS"],
+       let ms = Double(s), ms > 0 { return UInt64(ms * 1_000_000) }
+    return 15_000_000_000
+  }()
+  // Whether any browser on this host has presented, and the pid of the GPU process
+  // that was running then (0 = not looked up yet, or none), both guarded by
+  // browsersLock. A different GPU pid later means Chromium replaced that process.
+  var hostPainted = false
+  var gpuPidAtFirstPresent: pid_t = 0
+  var wedgeEnded = false  // sweep-only (one pass at a time, each scheduling the next)
+  // Set at spawn when a CDP client (agent control, or the TCP port) can reach the
+  // pages; browsersLock-guarded.
+  var cdpClientsCanPause = false
 
   // The plugin sets each callback below once, before spawn() starts the threads
   // that call them, and never reassigns it: a closure is two words, and a write
@@ -214,7 +308,7 @@ final class CefProfileHost {
   // contract) from a generic crash, emit `processGone` to Dart, and drop the
   // host so the profile_in_use guard unblocks. Fires at most once per host.
   var onHostDied: ((Int32) -> Void)?
-  private var diedFired = false  // guarded by writeLock; one onHostDied per host
+  var diedFired = false  // guarded by writeLock; one onHostDied per host
 
   // One browser can't continue while the host is otherwise fine — its create
   // failed ("createFailed"), its renderer kept crashing or hung ("crashed") — so
@@ -230,816 +324,6 @@ final class CefProfileHost {
     self.profileId = profileId
     self.profileDir = profileDir
     self.isEphemeral = isEphemeral
-  }
-
-  // MARK: Spawn
-
-  /// Bind the Unix socket and launch cef_host for this profile. Argv always
-  /// carries `--ipc` and `--profile-dir=<profileDir>`; `--cdp-port=<port>` is
-  /// added only when `enableCdp` (port picked here). `--allowed-schemes` is a
-  /// process arg shared by every browser in the profile — it's taken from the
-  /// first browser that triggered this spawn. Returns false on failure.
-  ///
-  /// `agentControl` (CEF-1) switches the LAUNCH MECHANISM only: when true we use
-  /// posix_spawn instead of Foundation.Process so cef_host inherits two CDP pipes
-  /// on fds 3/4 (Foundation.Process can't place arbitrary fds), and we add the
-  /// `--cdp-pipe` flag so the native side injects the `remote-debugging-pipe`
-  /// Chromium switch. Everything else (Unix-socket IPC, reader thread, dispose
-  /// ordering, crash surfacing) is identical to the default path; `enableCdp`
-  /// (TCP) and `agentControl` (pipe) are independent transports and the pipe
-  /// path never picks/passes a `--cdp-port`.
-  func spawn(cefHostPath: String, enableCdp: Bool, allowedSchemes: String,
-             agentControl: Bool = false) -> Bool {
-    self.agentControl = agentControl
-    self.allowedSchemes = allowedSchemes
-    // Randomized name (not just the predictable profileId) in the per-user 0700
-    // temp dir, so another same-UID process can't pre-bind it.
-    let rnd = String(format: "%08x", UInt32.random(in: 0 ... UInt32.max))
-    socketPath = NSTemporaryDirectory() + "wccef-\(sanitizedSocketTag())-\(rnd).sock"
-    guard socketPath.utf8CString.count <= 104 else {
-      NSLog("[cef] socket path exceeds sun_path (104); aborting")
-      return false
-    }
-    unlink(socketPath)
-    listenFd = socket(AF_UNIX, SOCK_STREAM, 0)
-    guard listenFd >= 0 else { NSLog("[cef] socket() failed"); return false }
-    // Close-on-exec so the listening fd never leaks into the spawned cef_host (or
-    // its CEF helper subprocesses). Foundation.Process spawns CLOEXEC-default, but
-    // the posix_spawn path (attrp=nil) would otherwise inherit it; the child
-    // connects via --ipc by path and never needs the listener. Harmless on both.
-    fcntl(listenFd, F_SETFD, FD_CLOEXEC)
-    var addr = sockaddr_un()
-    addr.sun_family = sa_family_t(AF_UNIX)
-    let pathC = socketPath.utf8CString
-    withUnsafeMutablePointer(to: &addr.sun_path) { raw in
-      raw.withMemoryRebound(to: CChar.self, capacity: 104) { dst in
-        pathC.withUnsafeBufferPointer { src in
-          dst.update(from: src.baseAddress!, count: min(pathC.count, 104))
-        }
-      }
-    }
-    let len = socklen_t(MemoryLayout<sockaddr_un>.size)
-    let bound = withUnsafePointer(to: &addr) {
-      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(listenFd, $0, len) }
-    }
-    guard bound == 0 else { NSLog("[cef] bind() failed: \(errno)"); return false }
-    listen(listenFd, 1)
-
-    // Per-process args only: per-view geometry/url now ride kOpCreateBrowser. The
-    // cache path is always the resolved --profile-dir (ephemeral = throwaway temp).
-    guard let surfaces = SurfacePort() else { return false }
-    surfacePort = surfaces
-    var args = [
-      "--ipc=\(socketPath)",
-      "--profile-dir=\(profileDir)",
-      "--surface-port=\(surfaces.name)",
-    ]
-    // Mark the throwaway-temp case so the host's CDP / mock-keychain guards fire
-    // only for a real persistent profile (--profile-dir is set for both).
-    if isEphemeral {
-      args.append("--ephemeral=1")
-    }
-    if !allowedSchemes.isEmpty {
-      args.append("--allowed-schemes=\(allowedSchemes)")
-    }
-    if agentControl || enableCdp {
-      // A CDP client can pause the page in the debugger, which the liveness ping can't
-      // tell from a hang.
-      browsersLock.lock(); cdpClientsCanPause = true; browsersLock.unlock()
-    }
-    if agentControl {
-      // Agent-control / pipe mode: CDP rides inherited fds 3/4 (set up below in
-      // launchViaPosixSpawn), NOT a TCP port. --cdp-pipe is a no-value flag the
-      // native side detects to inject Chromium's "remote-debugging-pipe" switch
-      // (NUL-delimited JSON). cdpPort stays 0 — there is no listening socket, so
-      // it's never reported to Dart. Mutually exclusive with --cdp-port here:
-      // the pipe IS the transport for this path.
-      args.append("--cdp-pipe")
-    } else if enableCdp {
-      // Chrome DevTools Protocol (CDP) over TCP: pick a free 127.0.0.1 port and
-      // pass it via --cdp-port; cef_host sets CefSettings.remote_debugging_port
-      // and CEF binds it (localhost-only, M113+). UNAUTHENTICATED — any local
-      // client that reaches the port fully drives the page — so this is opt-in,
-      // never on by default, and rejected for named profiles (it could read the
-      // shared jar). The port is reported back to Dart in the create() result.
-      let port = Self.pickFreeTcpPort()
-      if port >= 1024 {
-        cdpPort = port
-        args.append("--cdp-port=\(port)")
-      }
-    }
-
-    let launched =
-      agentControl
-        ? launchViaPosixSpawn(cefHostPath: cefHostPath, args: args)
-        : launchViaProcess(cefHostPath: cefHostPath, args: args)
-    guard launched else {
-      surfaces.close()
-      return false
-    }
-    surfaces.senderPid = hostPid()
-
-    running = true
-    readerStarted = true
-    Thread.detachNewThread { [weak self] in self?.acceptAndRead() }
-    startLivenessSweep()  // F-6: steady-state post-establishment liveness watchdog
-    // Agent-control: drain CDP off fd 3/4's parent ends on a dedicated reader,
-    // splitting the NUL-delimited JSON stream into messages. Started only after
-    // a successful spawn (the fds exist). Joined in shutdown() before close.
-    // Install the (debug-only) validation handler BEFORE starting the reader so
-    // the reader never observes a half-installed onCdpMessage (the only path that
-    // mutates it in CEF-1); in normal flow it's a no-op and onCdpMessage stays
-    // nil. The probe-send loop it kicks off is fine to start first — the response
-    // just buffers in the pipe until the reader drains it.
-    if agentControl && cdpReadFd >= 0 {
-      maybeRunCdpValidation()
-      cdpReaderStarted = true
-      Thread.detachNewThread { [weak self] in self?.readCdpLoop() }
-    }
-    return true
-  }
-
-  /// Default launch: Foundation.Process (unchanged behavior). Sets `process`.
-  private func launchViaProcess(cefHostPath: String, args: [String]) -> Bool {
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: cefHostPath)
-    p.arguments = args
-    do {
-      try p.run()
-      process = p
-    } catch {
-      NSLog("[cef] failed to spawn cef_host at \(cefHostPath): \(error)")
-      return false
-    }
-    return true
-  }
-
-  /// Agent-control launch: posix_spawn so cef_host inherits the two CDP pipes on
-  /// fds 3 (child reads CDP) and 4 (child writes CDP) — Foundation.Process can't
-  /// place arbitrary fds. Builds the pipes, dup2s the child ends onto 3/4 via
-  /// posix_spawn_file_actions (dup2 auto-clears CLOEXEC on the targets so they
-  /// survive exec), closes the originals in the child, marks the parent ends
-  /// CLOEXEC so cef_host's own renderer/GPU helper spawns don't inherit them, and
-  /// captures the pid for teardown/crash-surfacing. Sets `spawnedPid`,
-  /// `cdpReadFd`, `cdpWriteFd`. Returns false (cleaning up any half-built state)
-  /// on failure. Recipe verified against Chromium DevToolsPipeHandler + Puppeteer.
-  private func launchViaPosixSpawn(cefHostPath: String, args: [String]) -> Bool {
-    // cmd_pipe: parent writes CDP -> child reads on fd 3.
-    // out_pipe: child writes CDP on fd 4 -> parent reads.
-    var cmdPipe: [Int32] = [-1, -1]
-    var outPipe: [Int32] = [-1, -1]
-    guard pipe(&cmdPipe) == 0 else {
-      NSLog("[cef] cdp pipe() (cmd) failed: \(errno)")
-      return false
-    }
-    guard pipe(&outPipe) == 0 else {
-      NSLog("[cef] cdp pipe() (out) failed: \(errno)")
-      close(cmdPipe[0]); close(cmdPipe[1])
-      return false
-    }
-    var cmdRead = cmdPipe[0], cmdWrite = cmdPipe[1]
-    var outRead = outPipe[0], outWrite = outPipe[1]
-
-    // Helper to close all four pipe ends on a bail-out (before fds are adopted).
-    func closeAll() {
-      close(cmdRead); close(cmdWrite); close(outRead); close(outWrite)
-    }
-
-    // CRITICAL fd-collision guard: pipe() hands out the lowest free fds, and in a
-    // GUI app 0/1/2 are open so the FIRST pipe can land exactly on fds 3 and/or 4
-    // — our dup2 TARGETS. If a source fd already equals 3 or 4, the
-    // adddup2(src,target)+addclose(src) pair would either no-op the dup2 (POSIX:
-    // dup2 with oldfd==newfd does nothing AND does not clear FD_CLOEXEC) and then
-    // close the fd we meant to keep, or close a sibling end. So first relocate any
-    // end sitting on 3/4 to a high fd (>=10) via F_DUPFD; now all four sources are
-    // >=5 and the dup2/close plan onto 3/4 is unambiguous. (We don't need them
-    // CLOEXEC here — addclose removes the originals in the child, and the parent
-    // closes them right after spawn.)
-    func relocateAwayFromTargets(_ fd: inout Int32) -> Bool {
-      while fd == 3 || fd == 4 {
-        let hi = fcntl(fd, F_DUPFD, 10)
-        if hi < 0 { return false }
-        close(fd)
-        fd = hi
-      }
-      return true
-    }
-    guard relocateAwayFromTargets(&cmdRead), relocateAwayFromTargets(&cmdWrite),
-          relocateAwayFromTargets(&outRead), relocateAwayFromTargets(&outWrite)
-    else {
-      NSLog("[cef] cdp pipe fd relocation failed: \(errno)")
-      closeAll()
-      return false
-    }
-
-    // File actions: place the child read-end on fd 3 and write-end on fd 4, then
-    // close the originals in the child. adddup2 onto a target auto-clears
-    // FD_CLOEXEC on that target, so fds 3/4 survive exec (the originals do not).
-    // posix_spawn_file_actions_t is `void *` on Darwin -> an optional raw pointer
-    // in Swift; _init allocates it, _destroy frees it.
-    var fa: posix_spawn_file_actions_t?
-    guard posix_spawn_file_actions_init(&fa) == 0 else {
-      NSLog("[cef] posix_spawn_file_actions_init failed: \(errno)")
-      closeAll()
-      return false
-    }
-    posix_spawn_file_actions_adddup2(&fa, cmdRead, 3)
-    posix_spawn_file_actions_adddup2(&fa, outWrite, 4)
-    posix_spawn_file_actions_addclose(&fa, cmdRead)
-    posix_spawn_file_actions_addclose(&fa, cmdWrite)
-    posix_spawn_file_actions_addclose(&fa, outRead)
-    posix_spawn_file_actions_addclose(&fa, outWrite)
-
-    // Build a NULL-terminated C argv: [cefHostPath, args..., NULL]. strdup each
-    // so the C strings outlive the Swift String bridging during posix_spawn.
-    var cargv: [UnsafeMutablePointer<CChar>?] = []
-    cargv.append(strdup(cefHostPath))
-    for a in args { cargv.append(strdup(a)) }
-    cargv.append(nil)
-    defer { for p in cargv where p != nil { free(p) } }
-
-    var pid: pid_t = 0
-    let rc = posix_spawn(&pid, cefHostPath, &fa, nil, cargv, environ)
-    posix_spawn_file_actions_destroy(&fa)
-    guard rc == 0 else {
-      NSLog("[cef] posix_spawn cef_host at \(cefHostPath) failed: \(rc)")
-      closeAll()
-      return false
-    }
-    spawnedPid = pid
-    // Parent keeps the OPPOSITE ends from the child and closes the child's ends
-    // (now duped onto 3/4 in the child). Mark the kept ends CLOEXEC so they don't
-    // leak into any further exec the parent (the host app) might do — and, since
-    // cef_host launches its OWN renderer/GPU helper subprocesses, only the
-    // top-level browser process we just spawned inherits 3/4; those helpers are
-    // launched by CEF and get default-closed 3/4 (correct, per the design).
-    close(cmdRead)   // child's read end
-    close(outWrite)  // child's write end
-    cdpWriteFd = cmdWrite
-    cdpReadFd = outRead
-    _ = fcntl(cdpWriteFd, F_SETFD, FD_CLOEXEC)
-    _ = fcntl(cdpReadFd, F_SETFD, FD_CLOEXEC)
-    // SIGPIPE guard on the WRITE end (H2 discipline, pipe edition): the IPC conn
-    // fd uses the SO_NOSIGPIPE socket option, but pipe fds don't take it, so a
-    // write to a cef_host that closed its CDP read end (it died) would otherwise
-    // raise SIGPIPE and kill the whole host APP. F_SETNOSIGPIPE is the Darwin
-    // per-fd equivalent: the write returns -1/EPIPE and writeAll reports failure
-    // instead. (CLOEXEC was set above — note F_SETFD/F_SETNOSIGPIPE are distinct
-    // fcntl commands, so neither overwrites the other.)
-    _ = fcntl(cdpWriteFd, F_SETNOSIGPIPE, 1)
-    return true
-  }
-
-  // MARK: Browser multiplexing
-
-  /// Allocate a wire browserId for `session`, register it, and (if the host is
-  /// ready) send the kOpCreateBrowser; otherwise queue it until kOpReady. Returns
-  /// the assigned browserId. `allowedSchemes` is accepted for call-site symmetry
-  /// but NOT used here — it's a process arg fixed at spawn (shared by every
-  /// browser in the profile), not part of the kOpCreateBrowser payload (A.4).
-  func createBrowser(_ session: CefWebSession, url: String, allowedSchemes: String) -> UInt32 {
-    browsersLock.lock()
-    let id = nextBrowserId
-    // browserIds are STRICTLY MONOTONIC and never reused: nextBrowserId only ever
-    // increments (never reset/decremented) and a disposed id is never recycled, so
-    // guard it — the slot we're about to hand out must be FREE (never previously
-    // registered). H8: a UInt32 wrap (or any bug) reusing an id would SILENTLY
-    // overwrite a live sibling's slot in a release build (the old guard was a
-    // debug-only `assert`, compiled out) → the reader misroutes that wire id's frames
-    // (paint/cookies/CDP/relay) to the wrong tile. Make it a hard runtime invariant (a
-    // free, non-reserved slot). Unreachable in practice (2^32 creates per host), so
-    // fail-fast >> silent corruption.
-    precondition(id != 0 && browsers[id] == nil,
-                 "cef browserId space exhausted/occupied — refusing to corrupt cross-tile routing")
-    nextBrowserId += 1
-    browsers[id] = session
-    browsersLock.unlock()
-    session.attach(host: self, browserId: id)
-
-    writeLock.lock()
-    let isReady = ready
-    if !isReady {
-      // Queue until kOpReady; the safety-rail (F.5) may refuse to flush these. The
-      // payload is built at FLUSH time inside sendCreate from the session's LIVE
-      // surfaceId/geometry — a resize during the pre-ready spawn window
-      // reallocates the IOSurface (freeing the old global id) and updates the
-      // size, so capturing them now would ship a since-freed id and a stale size.
-      pendingCreates.append { [weak self, weak session] in
-        guard let self = self, let session = session else { return }
-        self.enqueueCreate(id, session, url)
-      }
-    }
-    writeLock.unlock()
-    if isReady { enqueueCreate(id, session, url) }
-    return id
-  }
-
-  /// Send a kOpCreateBrowser frame and mark the browserId as enqueued so its
-  /// pre-connect resizes are no longer dropped. The payload is assembled HERE
-  /// (not at createBrowser time) so it carries the session's current surfaceId +
-  /// geometry: {u32 w}{u32 h}{f64 dpr}{u32 iosurfaceId}{utf8 url}. allowedSchemes
-  /// is NOT here — it's a process arg fixed at spawn (A.4).
-  private func sendCreate(_ id: UInt32, _ session: CefWebSession, _ url: String) {
-    writeLock.lock()
-    // Read the session's LIVE geometry + surfaceId AND write the create frame in a
-    // single writeLock section, so a racing resize can neither slip between the
-    // surfaceId read and the create write, nor order its kOpResize ahead of the
-    // create on the wire (cef_host drops a resize for a not-yet-created browser).
-    // Any resize after this lands after the create, so cef_host has a slot and
-    // self-heals the surface via DoResize. (writeLock→bufferLock here is safe: no
-    // path holds bufferLock then takes writeLock.)
-    // H4: read (w, h, dpr, surfaceId) as ONE atomic snapshot rather than four separate
-    // bufferLock acquisitions — otherwise a resize interleaving between the reads could
-    // ship e.g. old width + new surfaceId, blitting the first paint into a mis-sized
-    // surface. (create-pacing widened this window: a browser can sit queued for N×
-    // spacing, giving layout resizes more time to interleave.)
-    let g = session.createSnapshot()
-    var payload = [UInt8]()
-    appendU32(&payload, UInt32(g.w))
-    appendU32(&payload, UInt32(g.h))
-    appendF64(&payload, Double(g.dpr))
-    // Producer-allocates: no sid — cef_host mints its own surface on first paint and the
-    // consumer adopts it from the present. (Sending only geometry also dissolves the
-    // resize-before-create / since-freed-sid race the snapshot was guarding.)
-    payload.append(contentsOf: Array(url.utf8))
-    createEnqueued.insert(id)
-    var frame = frameBytes(id, CefOp.createBrowser, payload)
-    // Create ON an authored document: its kOpSetAuthoredHtml goes out as ONE write
-    // with, and ahead of, the create — cef_host stores it on its reader thread, so
-    // it is in place before the browser's first request can be made.
-    if let authored = session.authoredPayload(for: url) {
-      frame = frameBytes(id, CefOp.setAuthoredHtml, authored) + frame
-    }
-    // Same for the document-start config: cef_host folds it into the browser's
-    // creation info, which is the only way it reaches the renderer in time for
-    // the FIRST document.
-    if let docStart = session.documentStartPayload() {
-      frame = frameBytes(id, CefOp.setDocumentStart, docStart) + frame
-    }
-    var ok = true
-    if connFd < 0 {
-      pendingFrames.append(frame)
-    } else {
-      ok = frame.withUnsafeBytes { writeAll(connFd, $0.baseAddress!, frame.count) }
-    }
-    writeLock.unlock()
-    // H2: surface a dead pipe (unlocked first — handleHostDeath re-takes writeLock).
-    if !ok { handleHostDeath() }
-  }
-
-  /// Enqueue a create for PACED sending instead of writing its kOpCreateBrowser
-  /// frame immediately. See `createSendQueue`: many tiles on one shared host
-  /// created in a burst would otherwise hand cef_host's single UI thread a pile of
-  /// blocking CreateBrowserSync calls at once. Idempotent pump kicks the pacer.
-  private func enqueueCreate(_ id: UInt32, _ session: CefWebSession, _ url: String) {
-    writeLock.lock()
-    createSendQueue.append((id, session, url))
-    writeLock.unlock()
-    pumpCreateQueue()
-  }
-
-  /// Send the NEXT queued create and wait for that browser's FIRST PAINT (firstPresentArrived,
-  /// off kOpPresent) before sending the following one — so each browser's first-frame GPU
-  /// allocation completes before the next one contends, serializing establishment and
-  /// avoiding the concurrent-first-frame race. `createAckTimeout` backstops a browser that
-  /// binds but never paints so it can't stall the queue forever. A create whose browser was
-  /// disposed while queued is skipped.
-  private func pumpCreateQueue() {
-    // Fill the sliding window: dispatch creates while a slot is free. Each dispatched
-    // browser holds its slot until its first paint (or backstop) releases it via
-    // advanceCreatePacer, which re-pumps.
-    while true {
-      writeLock.lock()
-      // H6: never pump on a dead/dying host — the queue was abandoned in
-      // shutdown()/handleHostDeath(); pumping would sendCreate into a closed pipe and a
-      // stuck slot could wedge a reused host.
-      if !running || crashed || createInFlight.count >= maxCreateInFlight ||
-          createSendQueue.isEmpty {
-        writeLock.unlock()
-        return
-      }
-      let next = createSendQueue.removeFirst()
-      createInFlight.insert(next.id)
-      writeLock.unlock()
-
-      browsersLock.lock()
-      let stillLive = browsers[next.id] != nil
-      browsersLock.unlock()
-      guard stillLive else {
-        // Disposed while queued — free the slot and continue filling (no recursion;
-        // a "close all tiles" mid-burst could skip many disposed creates).
-        writeLock.lock(); createInFlight.remove(next.id); writeLock.unlock()
-        continue
-      }
-
-      // Arm the watchdog (insert into firstPresentPending) BEFORE sendCreate so a first
-      // kOpPresent can never be observed before the id is registered as pending (which would
-      // leave a healthy painting tile stuck "pending" → false perpetual paintStalled).
-      armFirstPresentWatchdog(next.id)  // C1
-      sendCreate(next.id, next.session, next.url)
-      // Release this slot on the browser's FIRST PAINT (firstPresentArrived, in the
-      // reader); this timer is only the backstop if it binds but never paints in time.
-      DispatchQueue.global().asyncAfter(deadline: .now() + createAckTimeout) { [weak self] in
-        self?.advanceCreatePacer(after: next.id, timedOut: true)
-      }
-    }
-  }
-
-  /// H3: the in-flight create for `browserId` completed (kOpCreated), failed
-  /// (kOpCreateFailed), or timed out — release the pacer and send the next queued create.
-  /// Idempotent: only the FIRST of {ack, timeout} for the current in-flight id advances.
-  private func advanceCreatePacer(after browserId: UInt32, timedOut: Bool) {
-    writeLock.lock()
-    // Idempotent: only the FIRST of {first-paint, timeout} for this id frees its slot.
-    guard createInFlight.remove(browserId) != nil else { writeLock.unlock(); return }
-    writeLock.unlock()
-    if timedOut {
-      NSLog("[cef] profile '\(profileId)': create-ack timeout for browser \(browserId) — freeing establishment slot")
-    }
-    // Refill the freed slot OFF the reader thread (advanceCreatePacer is called from it on
-    // first paint): pumpCreateQueue -> sendCreate writes to the same pipe the reader reads,
-    // and the reader must never block on a write.
-    DispatchQueue.global().async { [weak self] in self?.pumpCreateQueue() }
-  }
-
-  /// This one browser can't continue (its create failed, its renderer kept crashing,
-  /// or it hung): the plugin emits processGone(`reason`) and drops the session, and
-  /// the pacer advances so the rest of a burst still proceeds. Reported once per
-  /// browser; the host and its other browsers carry on.
-  private func reportBrowserGone(_ browserId: UInt32, _ reason: String) {
-    browsersLock.lock()
-    guard let s = browsers[browserId], !s.goneReported else { browsersLock.unlock(); return }
-    s.goneReported = true
-    browsersLock.unlock()
-    firstPresentArrived(browserId)  // cancel the C1 watchdog for a browser that won't paint
-    onBrowserGone?(browserId, reason)
-    advanceCreatePacer(after: browserId, timedOut: false)
-  }
-
-  // MARK: C1 first-present watchdog
-
-  /// Total grace for a browser to deliver its FIRST frame before the watchdog declares it
-  /// stalled (→ consumer recreates). Cancelled the instant ANY frame arrives, so this only
-  /// bounds the GENUINELY-blank case — it does NOT slow content that paints quickly.
-  /// Must be generous: a heavy real site (WebGL, 3D, huge bundle) can take several seconds
-  /// to composite its first frame, and recreating it just restarts that heavy load (churn).
-  /// Env-tunable.
-  private let firstPaintGrace: TimeInterval = {
-    if let s = ProcessInfo.processInfo.environment["FLUTTER_CEF_FIRSTPAINT_MS"],
-       let ms = Double(s) { return ms / 1000.0 }
-    return 10.0
-  }()
-
-  /// Arm the first-present watchdog for a freshly-sent create: after `firstPaintGrace`
-  /// with no frame at all, run a liveness check.
-  private func armFirstPresentWatchdog(_ browserId: UInt32) {
-    presentLock.lock()
-    firstPresentPending.insert(browserId)
-    let already = watchdogArmed.contains(browserId)
-    if !already { watchdogArmed.insert(browserId) }
-    presentLock.unlock()
-    guard !already else { return }  // a chain is already live for this id
-    DispatchQueue.global().asyncAfter(deadline: .now() + firstPaintGrace) { [weak self] in
-      self?.checkFirstPresent(browserId)
-    }
-  }
-
-  /// Reader: a browser painted its first frame — cancel its watchdog. (Advancing the
-  /// create pacer is NOT done here: the pacer advances on a SETTLE delay after first
-  /// paint — see the reader — because a 1-frame-old browser isn't stably established yet
-  /// and would be knocked out by the next create's contention.)
-  private func firstPresentArrived(_ browserId: UInt32) {
-    presentLock.lock()
-    firstPresentPending.remove(browserId)
-    watchdogArmed.remove(browserId)  // the chain ends; an unhide may re-arm a fresh one
-    presentLock.unlock()
-  }
-
-  /// How many present frames a browser must deliver before the pacer admits the next
-  /// create. Gating on the bare first frame advances too eagerly — a 1-frame-old browser
-  /// gets knocked back out by the next create's first-frame GPU allocation (paints 1-2
-  /// frames then stops). Requiring a few consecutive frames proves it's stably producing
-  /// before the next contends. Adaptive + fast: a healthy 60fps tile trips this in a few
-  /// frames (~tens of ms) vs a fixed time settle. Env-tunable.
-  private let estabStableFrames: Int = {
-    if let s = ProcessInfo.processInfo.environment["FLUTTER_CEF_ESTAB_FRAMES"],
-       let n = Int(s), n > 0 { return n }
-    return 6
-  }()
-  /// Settle window after a browser's FIRST paint as the OTHER pacer-advance trigger (the
-  /// pacer advances on stable-frames OR this settle, whichever comes first). The frame
-  /// threshold is the fast path for continuously-animating content (hits it in ~tens of
-  /// ms); the settle is the path for STATIC content that paints a short burst on load then
-  /// idles (a real website) and would never reach the frame threshold. Env-tunable.
-  private let estabSettle: TimeInterval = {
-    if let s = ProcessInfo.processInfo.environment["FLUTTER_CEF_ESTAB_SETTLE_MS"],
-       let ms = Double(s) { return ms / 1000.0 }
-    return 0.4
-  }()
-
-  /// C1: track WasHidden state (peeked from kOpSetVisible). A hidden browser produces no
-  /// frames, so the watchdog suspends rather than flagging it stalled. On UNHIDE, re-arm
-  /// the watchdog for a browser that's still blank, so a genuinely-stuck now-visible tile
-  /// is still caught.
-  private func noteVisibility(_ browserId: UInt32, visible: Bool) {
-    presentLock.lock()
-    if !visible {
-      hiddenBrowsers.insert(browserId)
-      presentLock.unlock()
-      // A browser hidden BEFORE its first paint produces no frames (PumpBeginFrame gates
-      // on slot->visible), so it would never advance the create-pacer via first-paint and
-      // the watchdog suspends it too — pinning its establishment slot until the backstop.
-      // A hidden tile isn't contending the first-frame GPU allocator, so it must not count
-      // against the window: free its slot now (idempotent no-op if it already painted /
-      // wasn't in flight). This is the dominant case — work_canvas creates tiles off-screen.
-      advanceCreatePacer(after: browserId, timedOut: false)
-      return
-    }
-    hiddenBrowsers.remove(browserId)
-    // Re-arm only if still blank AND no chain is already live (dedup across flapping).
-    let reArm = firstPresentPending.contains(browserId) && !watchdogArmed.contains(browserId)
-    if reArm { watchdogArmed.insert(browserId) }
-    presentLock.unlock()
-    guard reArm else { return }
-    DispatchQueue.global().asyncAfter(deadline: .now() + firstPaintGrace) { [weak self] in
-      self?.checkFirstPresent(browserId)
-    }
-  }
-
-  /// Liveness check for a browser that hasn't produced its first frame within the grace.
-  /// PATIENCE, not destruction: the create-pacer serializes establishment so a blank tile
-  /// is almost always merely SLOW (heavy page, saturated GPU), not dead — and the
-  /// begin-frame pump keeps running, so it paints on its own once resources free. So we:
-  ///   1) advance the pacer ONCE (a slow tile must not block the rest of the queue), then
-  ///   2) send a cheap re-kick and REPORT paintStalled — a REPEATING signal (re-armed each
-  ///      grace while still blank) so the consumer owns recovery policy (e.g. a bounded,
-  ///      backed-off recreate) without this layer ever churning a still-loading page.
-  /// `firstPresentArrived` (real first frame) removes it from the pending set, ending the
-  /// loop. Suspended (not retired) while hidden; re-armed on unhide.
-  private func checkFirstPresent(_ browserId: UInt32) {
-    presentLock.lock()
-    let stillBlank = firstPresentPending.contains(browserId)
-    let hidden = hiddenBrowsers.contains(browserId)
-    // This chain terminates on paint or hide (re-armed fresh on unhide); release the
-    // single-instance flag so a later unhide can start one new chain. The continuing
-    // (still-blank, visible) path below keeps it armed by NOT clearing here.
-    if !stillBlank || hidden { watchdogArmed.remove(browserId) }
-    presentLock.unlock()
-    guard stillBlank else { return }  // it painted — nothing to do
-    guard !hidden else { return }     // hidden by design — suspended; re-armed on unhide
-    browsersLock.lock(); let live = browsers[browserId] != nil; browsersLock.unlock()
-    writeLock.lock(); let healthy = running && !crashed; writeLock.unlock()
-    guard live, healthy else { firstPresentArrived(browserId); return }
-    // Unblock the queue once (idempotent: only the in-flight id advances).
-    advanceCreatePacer(after: browserId, timedOut: false)
-    // Cheap nudge (harmless if it's just slow; helps a merely-dropped first frame).
-    send(browserId, CefOp.invalidate, [])
-    NSLog("[cef] profile '\(profileId)': browser \(browserId) still blank after \(Int(firstPaintGrace))s — reporting paintStalled (consumer may recreate)")
-    onPaintStalled?(browserId)
-    // Re-arm: keep watching on a backoff until it paints (firstPresentArrived clears it).
-    DispatchQueue.global().asyncAfter(deadline: .now() + firstPaintGrace) { [weak self] in
-      self?.checkFirstPresent(browserId)
-    }
-  }
-
-  // ── F-6: steady-state liveness watchdog ─────────────────────────────────────────────
-  // The first-paint watchdog above RETIRES at first paint (firstPresentArrived), so a
-  // browser that painted ≥1 frame then WEDGES (renderer/GPU stall inside a shared host
-  // that keeps the pipe alive, so no processGone) had NO detector — silent blank until
-  // relaunch. This periodic sweep covers steady state. A static page legitimately idles
-  // (no presents), so staleness alone isn't a wedge: a discriminating kOpInvalidate is sent
-  // first (a healthy page repaints → a present lands → cleared); only if no present follows
-  // within the grace is paintStalled reported, routing into the consumer's BOUNDED recover.
-  // Decision logic is in LivenessProbePolicy (standalone-unit-tested).
-  private let livenessStalenessNs: UInt64 = {
-    if let s = ProcessInfo.processInfo.environment["FLUTTER_CEF_LIVENESS_MS"],
-       let ms = Double(s), ms > 0 { return UInt64(ms * 1_000_000) }
-    return 10_000_000_000  // 10s — generous; a wedge is rare + a healthy idle page only
-                           // costs one forced repaint per window.
-  }()
-  private let livenessGraceNs: UInt64 = 3_000_000_000  // 3s after the nudge → declare wedged
-  private let livenessSweepInterval: TimeInterval = 2.0
-  private var livenessSweepStarted = false  // guarded by browsersLock
-  // A stalled browser whose renderer leaves the JS ping unanswered this long is hung.
-  // Chrome's own hang monitor waits about as long before offering to kill a page.
-  private let livenessHangNs: UInt64 = {
-    if let s = ProcessInfo.processInfo.environment["FLUTTER_CEF_HANG_MS"],
-       let ms = Double(s), ms > 0 { return UInt64(ms * 1_000_000) }
-    return 15_000_000_000
-  }()
-  // Whether any browser on this host has presented, and the pid of the GPU process
-  // that was running then (0 = not looked up yet, or none), both guarded by
-  // browsersLock. A different GPU pid later means Chromium replaced that process.
-  private var hostPainted = false
-  private var gpuPidAtFirstPresent: pid_t = 0
-  private var wedgeEnded = false  // sweep-only (one pass at a time, each scheduling the next)
-  // Set at spawn when a CDP client (agent control, or the TCP port) can reach the
-  // pages; browsersLock-guarded.
-  private var cdpClientsCanPause = false
-
-  /// The page's JS dialog `bid` was answered, so its renderer runs again.
-  func noteDialogAnswered(_ bid: UInt32) {
-    browsersLock.lock()
-    if let s = browsers[bid], s.livenessDialogsOpen > 0 { s.livenessDialogsOpen -= 1 }
-    browsersLock.unlock()
-  }
-
-  /// DevTools opened on `bid`. Its debugger can pause the page for as long as the
-  /// user likes, so the liveness ping leaves that browser alone from now on.
-  func noteDevToolsOpened(_ bid: UInt32) {
-    browsersLock.lock()
-    if let s = browsers[bid] { s.livenessDevToolsOpened = true; s.livenessPingSentAt = 0 }
-    browsersLock.unlock()
-  }
-
-  /// Start the periodic liveness sweep once (idempotent). Called after the reader is up.
-  private func startLivenessSweep() {
-    browsersLock.lock()
-    let already = livenessSweepStarted
-    livenessSweepStarted = true
-    browsersLock.unlock()
-    guard !already else { return }
-    scheduleLivenessSweep()
-  }
-
-  private func scheduleLivenessSweep() {
-    writeLock.lock(); let alive = running && !crashed; writeLock.unlock()
-    guard alive else { return }  // host gone → stop sweeping
-    DispatchQueue.global().asyncAfter(deadline: .now() + livenessSweepInterval) { [weak self] in
-      self?.livenessSweep()
-    }
-  }
-
-  private func livenessSweep() {
-    guard !wedgeEnded else { return }
-    let now = DispatchTime.now().uptimeNanoseconds
-    // 1) Snapshot ESTABLISHED browsers + their liveness state under browsersLock.
-    browsersLock.lock()
-    var cands: [(bid: UInt32, sinceLast: UInt64, nudgedAt: UInt64,
-                 pingSentAt: UInt64, pingRepliedAt: UInt64, mayPing: Bool)] = []
-    for (bid, s) in browsers where s.firstPresentSeen && !s.goneReported {
-      let mayPing = LivenessProbePolicy.mayPing(
-        dialogsOpen: s.livenessDialogsOpen, devToolsOpened: s.livenessDevToolsOpened,
-        cdpClientsCanPause: cdpClientsCanPause)
-      if !mayPing { s.livenessPingSentAt = 0 }
-      cands.append((bid, now &- s.lastPresentNs, s.livenessNudgedAt,
-                    mayPing ? s.livenessPingSentAt : 0, s.livenessPingRepliedAt, mayPing))
-    }
-    let firstGpuPid = gpuPidAtFirstPresent
-    browsersLock.unlock()
-    // A replaced GPU process leaves every browser on this host frozen for good.
-    if firstGpuPid != 0 {
-      let gpuPid = Self.gpuProcessPid(of: hostPid())
-      if LivenessProbePolicy.gpuReplaced(firstPid: firstGpuPid, currentPid: gpuPid) {
-        endWedgedHost("GPU process \(gpuPid) replaced \(firstGpuPid), which painted the first frame")
-        return
-      }
-    }
-    if !cands.isEmpty {
-      // 2) Exclude hidden (legitimately frameless) + still-first-paint-pending (the first-
-      //    paint watchdog owns those). presentLock is taken AFTER releasing browsersLock —
-      //    never nested — matching the host's browsersLock→presentLock order, so no deadlock.
-      presentLock.lock()
-      let hidden = hiddenBrowsers
-      let pending = firstPresentPending
-      presentLock.unlock()
-      // A ping that went out before a browser was hidden says nothing about it now.
-      browsersLock.lock()
-      for c in cands where c.pingSentAt != 0 && (hidden.contains(c.bid) || pending.contains(c.bid)) {
-        browsers[c.bid]?.livenessPingSentAt = 0
-      }
-      browsersLock.unlock()
-      for c in cands where !hidden.contains(c.bid) && !pending.contains(c.bid) {
-        // A renderer that has left the liveness ping unanswered this long is hung. The
-        // nudge can't tell: the browser re-presents its last frame even for a hung renderer.
-        // Only this browser is dropped: its siblings on the host are fine.
-        if LivenessProbePolicy.pingAction(
-             nowNs: now, pingSentNs: c.pingSentAt, pingRepliedNs: c.pingRepliedAt,
-             pingIntervalNs: livenessStalenessNs, hangNs: livenessHangNs) == .hung {
-          NSLog("[cef] profile '\(profileId)': browser \(c.bid)'s renderer left the liveness ping unanswered for \(livenessHangNs / 1_000_000_000)s — reporting it gone")
-          reportBrowserGone(c.bid, "crashed")
-          continue
-        }
-        let nudged = c.nudgedAt != 0
-        let action = LivenessProbePolicy.evaluate(
-          sinceLastPresentNs: c.sinceLast, stalenessThresholdNs: livenessStalenessNs,
-          nudged: nudged, sinceNudgeNs: nudged ? (now &- c.nudgedAt) : UInt64(0),
-          nudgeGraceNs: livenessGraceNs)
-        switch action {
-        case .healthy:
-          break
-        case .nudge:
-          // A browser that has PAINTED but produced no frame for a while: nudge it once with a
-          // full-view repaint. A genuinely wedged/evicted VISIBLE surface has real damage to
-          // repair, so this produces a present (recovered → healthy next cycle). A STATIC idle
-          // page (a counter, a finished form) has nothing new to paint, so it produces NO present
-          // — and that is HEALTHY, not wedged (it is showing correct content; the begin-frame
-          // pump simply has nothing to draw). See .declareStalled.
-          send(c.bid, CefOp.invalidate, [])
-          browsersLock.lock(); browsers[c.bid]?.livenessNudgedAt = now; browsersLock.unlock()
-          // Ping the renderer too, at most once per staleness window: a static page answers
-          // it, a hung renderer doesn't (checked at the top of the loop).
-          if LivenessProbePolicy.pingAction(
-               nowNs: now, pingSentNs: c.pingSentAt, pingRepliedNs: c.pingRepliedAt,
-               pingIntervalNs: livenessStalenessNs, hangNs: livenessHangNs) == .ping,
-             c.mayPing {
-            let id = Self.livenessPingId
-            var p: [UInt8] = [UInt8(id >> 24 & 0xff), UInt8(id >> 16 & 0xff),
-                              UInt8(id >> 8 & 0xff), UInt8(id & 0xff)]
-            p.append(contentsOf: Array("1".utf8))
-            browsersLock.lock(); browsers[c.bid]?.livenessPingSentAt = now; browsersLock.unlock()
-            send(c.bid, CefOp.evalReturning, p)
-          }
-        case .declareStalled:
-          // The nudge above did NOT extract a frame. For an ESTABLISHED (already-painted) tile
-          // this means STATIC-IDLE, not wedged — escalating to onPaintStalled here recreate-
-          // looped every static tile (counter / status / checklist): paintStalled → recover →
-          // paint → idle → paintStalled, ~every 10s, forever (observed: 36 stalls / 33 browsers
-          // in one session). A converged idle tile is healthy by definition; we keep serving its
-          // last good frame. Do NOT recreate. (Never-painted tiles are owned by the separate
-          // first-paint watchdog via firstPresentPending; genuine renderer death is caught by
-          // OnRenderProcessTerminated; eviction-while-hidden by the F-1 un-hide repaint.) Leave
-          // nudgedAt set so we don't re-nudge every cycle; a real future repaint clears it.
-          //
-          // A VISIBLE renderer that HANGS post-establishment (a deadlock that keeps the process
-          // alive, so OnRenderProcessTerminated never fires) looks the same here, so it is caught
-          // by the JS ping sent with the nudge instead. A replaced GPU process, which leaves JS
-          // answering but the view frozen, is caught by the GPU check above.
-          if Self.debugEnabled {
-            NSLog("[cef] profile '\(profileId)': browser \(c.bid) idle (no frames) — accepting as healthy-static (not recreating)")
-          }
-        }
-      }
-    }
-    scheduleLivenessSweep()
-  }
-
-  func hostPid() -> pid_t {
-    writeLock.lock(); defer { writeLock.unlock() }
-    return process?.processIdentifier ?? spawnedPid
-  }
-
-  /// Looks up the GPU process that painted the host's first frame; see
-  /// [gpuPidAtFirstPresent].
-  private func recordGpuProcess() {
-    let pid = Self.gpuProcessPid(of: hostPid())
-    browsersLock.lock()
-    if gpuPidAtFirstPresent == 0 { gpuPidAtFirstPresent = pid }
-    browsersLock.unlock()
-  }
-
-  /// The pid of `host`'s GPU process, or 0 if it has none. It runs as the generic
-  /// `cef_host Helper`, so it is told apart by `--type=gpu-process`.
-  private static func gpuProcessPid(of host: pid_t) -> pid_t {
-    guard host > 0 else { return 0 }
-    // Size the buffer from a first call: a host with many renderers has more
-    // children than any fixed guess.
-    let needed = proc_listpids(UInt32(PROC_PPID_ONLY), UInt32(host), nil, 0)
-    guard needed > 0 else { return 0 }
-    var pids = [pid_t](repeating: 0, count: Int(needed) / MemoryLayout<pid_t>.size + 16)
-    let bytes = proc_listpids(UInt32(PROC_PPID_ONLY), UInt32(host), &pids,
-                              Int32(pids.count * MemoryLayout<pid_t>.size))
-    guard bytes > 0 else { return 0 }
-    let marker = "--type=gpu-process"
-    var args = [UInt8](repeating: 0, count: 64 * 1024)
-    for pid in pids.prefix(Int(bytes) / MemoryLayout<pid_t>.size) where pid > 0 {
-      var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
-      var size = args.count
-      guard sysctl(&mib, 3, &args, &size, nil, 0) == 0 else { continue }
-      let isGpu = args.withUnsafeBytes { buf in
-        marker.withCString { memmem(buf.baseAddress, size, $0, strlen($0)) != nil }
-      }
-      if isGpu { return pid }
-    }
-    return 0
-  }
-
-  /// Waits (polling) until `pid` has exited, for at most `timeout` seconds. Doesn't
-  /// reap it; its owner does.
-  static func waitForExit(_ pid: pid_t, timeout: TimeInterval) {
-    guard pid > 0 else { return }
-    let deadline = Date().addingTimeInterval(timeout)
-    while Date() < deadline {
-      var info = proc_bsdinfo()
-      let n = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size))
-      // Gone, or a zombie waiting to be reaped: either way it has stopped running.
-      if n != Int32(MemoryLayout<proc_bsdinfo>.size) || info.pbi_status == UInt32(SZOMB) { return }
-      usleep(50_000)
-    }
-  }
-
-  /// Ends a host whose browsers can't paint again. The plugin then reports
-  /// processGone("crashed") for each of them, and the consumer's recreate path
-  /// starts a fresh host, the same way it recovers from a real crash.
-  private func endWedgedHost(_ why: String) {
-    writeLock.lock()
-    let alive = running && !crashed
-    writeLock.unlock()
-    let pid = hostPid()
-    guard alive, pid > 0, !wedgeEnded else { return }
-    wedgeEnded = true
-    NSLog("[cef] profile '\(profileId)': \(why) — ending cef_host \(pid) so its views are recreated")
-    kill(pid, SIGKILL)
   }
 
   /// Frame `[u32 bodyLen=4+1+payload.count][u32 browserId][op][payload]` and
@@ -1070,21 +354,6 @@ final class CefProfileHost {
     // discarded and a dead pipe was indistinguishable from success. Surface it
     // (unlocked first: handleHostDeath re-takes writeLock).
     if !ok { handleHostDeath() }
-  }
-
-  /// Whether this host currently has a LIVE browser — a registered browser AND
-  /// a host that hasn't died. Used by the P1 single-view-per-named-profile
-  /// guard (`FlutterCefPlugin.create`). Consulting liveness (not just map
-  /// emptiness) is what lets a named profile reopen after a `cef_host` crash:
-  /// C1's onHostDied path clears `browsers` on main, but the `crashed` flag is
-  /// the belt-and-suspenders guard against any racing teardown ordering (M1).
-  var hasLiveBrowser: Bool {
-    writeLock.lock()
-    let dead = crashed
-    writeLock.unlock()
-    if dead { return false }
-    browsersLock.lock(); defer { browsersLock.unlock() }
-    return !browsers.isEmpty
   }
 
   /// Whether cef_host ever announced kOpReady at our protocol version. A host that
@@ -1273,389 +542,11 @@ final class CefProfileHost {
     if !socketPath.isEmpty { unlink(socketPath) }
   }
 
-  // MARK: Subprocess + IPC
-
-  /// Ask the OS for a free TCP port on 127.0.0.1 (bind :0, read it back, close).
-  /// Brief TOCTOU window until cef_host's CEF binds it — acceptable on loopback.
-  /// Returns 0 on failure.
-  private static func pickFreeTcpPort() -> Int {
-    let fd = socket(AF_INET, SOCK_STREAM, 0)
-    guard fd >= 0 else { return 0 }
-    defer { close(fd) }
-    var addr = sockaddr_in()
-    addr.sin_family = sa_family_t(AF_INET)
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1")
-    addr.sin_port = 0
-    let bound = withUnsafePointer(to: &addr) {
-      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-        Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-      }
-    }
-    guard bound == 0 else { return 0 }
-    var assigned = sockaddr_in()
-    var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-    let got = withUnsafeMutablePointer(to: &assigned) {
-      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-        getsockname(fd, $0, &len)
-      }
-    }
-    guard got == 0 else { return 0 }
-    return Int(UInt16(bigEndian: assigned.sin_port))
-  }
-
-  /// Wait for cef_host to connect and return the accepted fd; nil when the host
-  /// exits first, shutdown() begins, or accept() fails. Polls instead of blocking
-  /// in accept(): Darwin's shutdown() of a listening socket fails (ENOTCONN) and
-  /// wakes nothing, so a blocked accept() outlived a host that died before
-  /// connecting — no death was reported, and shutdown()'s join timed out.
-  private func acceptHost() -> Int32? {
-    var pfd = pollfd(fd: listenFd, events: Int16(POLLIN), revents: 0)
-    while true {
-      let r = poll(&pfd, 1, 100)
-      if r > 0 {
-        let fd = accept(listenFd, nil, nil)
-        return fd >= 0 ? fd : nil
-      }
-      if r < 0 && errno != EINTR { return nil }
-      writeLock.lock()
-      let stopping = !running
-      writeLock.unlock()
-      if stopping || hostExited() { return nil }
-    }
-  }
-
-  /// Whether cef_host has exited. Doesn't reap it: handleHostDeath() does that
-  /// and reads its exit status.
-  private func hostExited() -> Bool {
-    writeLock.lock()
-    let p = process, pid = spawnedPid
-    writeLock.unlock()
-    if let p = p { return !p.isRunning }
-    guard pid > 0 else { return false }
-    var info = siginfo_t()
-    return waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT) == 0
-      && info.si_pid == pid
-  }
-
-  private func acceptAndRead() {
-    defer { readerDone.signal() }  // let shutdown() join us on every exit path
-    guard let fd = acceptHost() else {
-      // No connection and no clean shutdown in flight is a dead host too:
-      // cef_host exited before connecting (e.g. a crash during CefInitialize, or
-      // a FLUTTER_CEF_HOST that isn't cef_host), or accept() failed.
-      // handleHostDeath() no-ops on a clean shutdown (running==false). The C2
-      // cache-lock loss connects first (it SendLogs "profile-locked" then exits
-      // 2), so it usually surfaces via the read-loop EOF below; either way
-      // handleHostDeath() reads the real exit status.
-      NSLog("[cef] cef_host for profile '\(profileId)' never connected")
-      handleHostDeath()
-      return
-    }
-    // After accept(), guard the conn fd against SIGPIPE (H2): a write() to a
-    // peer-closed socket would otherwise raise SIGPIPE and kill the whole host
-    // APP, not just fail the write. With SO_NOSIGPIPE the write returns -1/EPIPE
-    // and writeAll() reports failure, which we route to handleHostDeath().
-    var one: Int32 = 1
-    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
-    // Close-on-exec: accept() does NOT inherit the listener's CLOEXEC, and the
-    // agent-control launch (launchViaPosixSpawn, attrp=nil) does not set
-    // POSIX_SPAWN_CLOEXEC_DEFAULT — so without this, this host's accepted IPC fd would
-    // leak into a LATER agent-control cef_host spawn (cross-profile fd leak that keeps
-    // this socket's refcount > 0 and delays its EOF teardown).
-    _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
-    // Bring the pipe up and drain anything queued before it connected — all under
-    // writeLock so a concurrent send can't interleave with the flush. Unlike the
-    // old per-view path, geometry is NOT re-synced here: each browser's
-    // kOpCreateBrowser carries its current geometry, and pre-create resizes were
-    // dropped in send(); the queued frames are early control ops + the creates
-    // that fall through after kOpReady.
-    writeLock.lock()
-    connFd = fd
-    var flushOk = true
-    for f in pendingFrames {
-      if !(f.withUnsafeBytes { writeAll(fd, $0.baseAddress!, f.count) }) {
-        flushOk = false
-        break
-      }
-    }
-    pendingFrames.removeAll()
-    writeLock.unlock()
-    // A flush write that failed means the pipe is already dead (H2) — treat it
-    // as a host death rather than spinning into the read loop on a broken fd.
-    if !flushOk { handleHostDeath(); return }
-    while running {
-      var hdr = [UInt8](repeating: 0, count: 4)
-      if !readAll(fd, &hdr, 4) { break }
-      let bodyLen = (Int(hdr[0]) << 24) | (Int(hdr[1]) << 16) | (Int(hdr[2]) << 8) | Int(hdr[3])
-      // Minimum valid body is 5 bytes (4 browserId + 1 op + 0 payload).
-      // H9: a malformed/oversized length means a wire desync and tears down EVERY
-      // browser on this host — log the rejected length first so it isn't a silent,
-      // breadcrumb-less all-tiles crash (the IPC peer is trusted, so this only fires
-      // on a genuine framing bug).
-      if bodyLen <= 4 || bodyLen > (64 << 20) {
-        NSLog("[cef] profile '\(profileId)': rejecting malformed IPC frame, bodyLen=\(bodyLen) — tearing down host")
-        break
-      }
-      var body = [UInt8](repeating: 0, count: bodyLen)
-      if !readAll(fd, &body, bodyLen) { break }
-      let bid = beU32(body, 0)
-      let op = body[4]
-      let payload = Array(body[5...])  // empty slice when bodyLen == 5 (no payload)
-      if bid == 0 {
-        handleProcessFrame(op, payload)
-      } else if op == CefOp.targetId {
-        // CEF-2b: a targetId resolution result — route to the pending completion,
-        // not the session.
-        handleTargetId(bid, String(bytes: payload, encoding: .utf8))
-      } else if op == CefOp.evalResult,
-                payload.starts(with: Self.livenessPingReplyPrefix) {
-        // The liveness sweep's own ping, not the page's: the renderer answered.
-        browsersLock.lock()
-        if let s = browsers[bid] {
-          s.livenessPingSentAt = 0
-          s.livenessPingRepliedAt = DispatchTime.now().uptimeNanoseconds
-        }
-        browsersLock.unlock()
-      } else if op == CefOp.created {
-        // Bind ack — intentionally does NOT advance the pacer anymore. We gate the
-        // next create on this browser's first PAINT (firstPresentArrived), not its bind,
-        // so establishment is serialized. kOpCreateFailed / the paint-timeout backstop
-        // still advance for the bound-but-never-painted / failed cases. The session
-        // re-sends a hide the host dropped before this browser's slot existed.
-        browsersLock.lock()
-        let session = browsers[bid]
-        browsersLock.unlock()
-        if let session = session {
-          DispatchQueue.main.async { session.browserCreated(bid) }
-        }
-      } else if op == CefOp.createFailed {
-        reportBrowserGone(bid, "createFailed")
-      } else if op == CefOp.browserGone {
-        // cef_host gave up on this browser (its renderer kept crashing); the process
-        // and its other browsers are fine.
-        reportBrowserGone(bid, String(bytes: payload, encoding: .utf8) ?? "crashed")
-      } else {
-        browsersLock.lock()
-        let session = browsers[bid]
-        // C1: detect the FIRST present under the browsersLock we already hold, via a
-        // per-session flag, so the watchdog-cancel (presentLock) fires once per browser
-        // instead of acquiring a second lock on every (up to 60fps) present frame.
-        var firstPaint = false
-        var reachedStableFrames = false
-        if op == CefOp.present, let s = session {
-          s.presentCount += 1
-          if s.presentCount == 1 { s.firstPresentSeen = true; firstPaint = true }
-          if !hostPainted {
-            hostPainted = true
-            // The first frame needed a working GPU process: remember which one it was
-            // (off the reader, since it walks the host's children).
-            DispatchQueue.global().async { [weak self] in self?.recordGpuProcess() }
-          }
-          if s.presentCount == estabStableFrames { reachedStableFrames = true }
-          // F-6: any present clears the liveness-stall state — the browser is alive.
-          s.lastPresentNs = DispatchTime.now().uptimeNanoseconds
-          s.livenessNudgedAt = 0
-        } else if op == CefOp.pageStart, let s = session {
-          // The ping's reply can be lost with the document it ran in, and a navigation
-          // dismisses the page's dialogs.
-          s.livenessPingSentAt = 0
-          s.livenessDialogsOpen = 0
-        } else if op == CefOp.jsDialog, let s = session {
-          // The renderer waits on the dialog, so it can't answer the ping until then.
-          s.livenessDialogsOpen += 1
-          s.livenessPingSentAt = 0
-        }
-        browsersLock.unlock()
-        if firstPaint {
-          if Self.debugEnabled {
-            NSLog("[cef] FIRSTPAINT browser \(bid)")  // one-shot, timestamped — cascade probe
-          }
-          // A browser that painted ANY frame is alive + has content (NOT blank) — cancel
-          // the watchdog now. (Gating the cancel on the frame threshold falsely recreated
-          // STATIC real sites that paint a short burst < threshold then idle.)
-          firstPresentArrived(bid)
-          // Pacer settle path: admit the next create after the settle window — covers
-          // static content that won't reach the frame threshold. The threshold below is
-          // the faster path for continuously-animating content; whichever fires first
-          // wins (advanceCreatePacer is idempotent).
-          let id = bid
-          DispatchQueue.global().asyncAfter(deadline: .now() + estabSettle) { [weak self] in
-            self?.advanceCreatePacer(after: id, timedOut: false)
-          }
-        }
-        if reachedStableFrames { advanceCreatePacer(after: bid, timedOut: false) }
-        session?.handleFrame(op, payload)
-      }
-    }
-    // C1: the loop exited. If `running` is still true this was NOT a clean
-    // shutdown() (which clears `running` BEFORE shutting the fds down) — the
-    // host died (EOF/ECONNRESET on the peer, or a malformed frame). Surface it.
-    // shutdown() flips `running` false first, so its fd-close-driven read EOF
-    // lands here with `running==false` and is correctly ignored.
-    handleHostDeath()
-  }
-
-  /// C1/H2: the host has (apparently) died — the reader hit EOF while running,
-  /// accept()/the pre-ready flush failed, or a send's writeAll failed. Fire
-  /// `onHostDied` ONCE on the main thread (the plugin's maps are main-thread
-  /// confined — H3), passing the process exit status so the plugin can tell a
-  /// cache-lock loss (status 2 — C2 contract) from a generic crash. A clean
-  /// shutdown() (running==false) is not a death and is ignored.
-  private func handleHostDeath() {
-    writeLock.lock()
-    // Ignore clean teardown, and fire at most once: both the reader-exit path
-    // and a writeAll-failure (possibly concurrent, on the main thread) can land
-    // here. Set `crashed` synchronously so hasLiveBrowser flips immediately.
-    guard running, !diedFired else { writeLock.unlock(); return }
-    diedFired = true
-    crashed = true  // forces hasLiveBrowser false so the named profile reopens
-    // H6: abandon paced creates — the host is gone. Sessions stay in `browsers`, so
-    // the onHostDied → plugin path still emits processGone for each queued one.
-    createSendQueue.removeAll()
-    createInFlight.removeAll()
-    let p = process
-    // H5: TAKE the posix_spawn pid (zero it) so this reaper is the SOLE owner of its
-    // waitpid — a later terminateProcess()/shutdown() then sees 0 and won't
-    // double-reap a pid this thread is about to harvest (which could kill an
-    // OS-recycled pid). If it's wedged and we can't reap within the grace window
-    // below, we SIGKILL + reap it ourselves so it never leaks as a zombie/orphan.
-    let pid = spawnedPid
-    spawnedPid = 0
-    // Abandon pre-kOpReady queued creates too — symmetric with the createSendQueue/
-    // createInFlight teardown above; the onHostDied path still emits processGone for the
-    // sessions left in `browsers`.
-    pendingCreates.removeAll()
-    let died = onHostDied
-    writeLock.unlock()
-    surfacePort?.close()
-    // The host is gone: tear down CDP relays (free their localhost listeners +
-    // clients) and FAIL any in-flight targetId waiters so enableAgentControl
-    // callers don't hang forever. Mirrors shutdown()'s teardown — snapshot under
-    // each lock, act OUTSIDE it (stop()/completions may block + take other locks).
-    // Idempotent: a later shutdown()/terminate finds the dicts already empty.
-    cdpHandlerLock.lock()
-    cdpClosed = true
-    let deadRelays = Array(cdpRelays.values)
-    cdpRelays.removeAll()
-    onCdpMessage = nil
-    cdpHandlerLock.unlock()
-    for r in deadRelays { r.stop() }
-    targetIdLock.lock()
-    let strandedWaiters = pendingTargetId.values.flatMap { $0 }
-    pendingTargetId.removeAll()
-    targetIdEpoch.removeAll()
-    targetIdLock.unlock()
-    for w in strandedWaiters { w(nil) }  // nil = resolution failed (host died)
-    // Resolve the exit status + invoke onHostDied off the caller's thread: this
-    // can be the MAIN thread (a writeAll failure in send()/sendCreate()), and
-    // terminationStatus traps if read while the process is still running — so we
-    // must not busy-wait here. Hop to a background queue, wait briefly for the
-    // process to actually exit (EOF usually means it already has), then deliver
-    // on main (the plugin's maps are main-thread confined — H3). Generic-crash
-    // status (-1) if it outlives the grace window.
-    //
-    // Two launch paths: `process` (Foundation.Process) exposes isRunning/
-    // terminationStatus; the posix_spawn path has only `pid`, so we poll waitpid
-    // (WNOHANG) and extract the exit code via WEXITSTATUS so the C2 cache-lock
-    // signal (exit 2 -> "locked") matches Process.terminationStatus's semantics.
-    DispatchQueue.global().async { [weak self] in
-      var status: Int32 = -1
-      if let p = p {
-        for _ in 0 ..< 20 {  // up to ~1s
-          if !p.isRunning { status = p.terminationStatus; break }
-          usleep(50_000)
-        }
-      } else if pid > 0 {
-        // We already TOOK ownership of `pid` (zeroed spawnedPid under writeLock), so
-        // we are the only thread that may waitpid it here.
-        var reaped = false
-        for _ in 0 ..< 20 {  // up to ~1s
-          var raw: Int32 = 0
-          let r = waitpid(pid, &raw, WNOHANG)
-          if r == pid {
-            // Reaped. Mirror terminationStatus: exit code, or -1 if signaled.
-            status = (raw & 0o177) == 0 ? ((raw >> 8) & 0xff) : -1
-            reaped = true; break
-          } else if r < 0 {
-            reaped = true; break  // ECHILD / already gone — nothing to hand back.
-          }
-          usleep(50_000)
-        }
-        // H5: still alive after the grace window (a wedged child that didn't exit on
-        // EOF). Don't merely hand it back — the clean-shutdown path may never call
-        // terminateProcess() again, leaving a zombie/orphan cef_host. SIGKILL + reap it
-        // right here. We exclusively own this pid (spawnedPid was zeroed above) and it
-        // is still unreaped, so it can't be a recycled or relaunched pid.
-        if !reaped {
-          kill(pid, SIGKILL)
-          var raw: Int32 = 0
-          waitpid(pid, &raw, 0)  // blocking reap, off the main thread
-        }
-      }
-      DispatchQueue.main.async { died?(status) }
-    }
-  }
-
-  /// Process/profile-level inbound frames (browserId 0): kOpReady (carries the
-  /// ad-hoc build flag, gates the create flush) and process logs.
-  private func handleProcessFrame(_ op: UInt8, _ payload: [UInt8]) {
-    switch op {
-    case CefOp.ready:
-      // Protocol handshake FIRST: refuse a version-skewed host before anything is
-      // flushed to it. Byte 1 is the host's wire-protocol version; a legacy 1-byte
-      // payload (pre-handshake host) reads as v0 and is refused the same way —
-      // same-framing semantic drift would otherwise mis-parse or silently drop
-      // frames (frozen/blank tiles with no breadcrumb).
-      let hostVersion: UInt8 = payload.count >= 2 ? payload[1] : 0
-      if hostVersion != CefHostProtocol.version {
-        NSLog("[cef] REFUSING cef_host for profile '\(profileId)': wire-protocol " +
-              "version \(hostVersion) != expected \(CefHostProtocol.version). The " +
-              "resolved cef_host binary does not match this plugin build " +
-              "(FLUTTER_CEF_HOST override / stale from-source build / stale embed?).")
-        writeLock.lock()
-        pendingCreates.removeAll()  // never flushed — the plugin fails the sessions via processGone
-        writeLock.unlock()
-        onProtocolMismatch?(hostVersion)
-        return
-      }
-      let flags = payload.first ?? 0
-      let adhoc = (flags & 0x01) != 0
-      // F.5 dev safety-rail: an ad-hoc (mock-keychain) host must NOT load a named
-      // persistent profile unless explicitly allowed, because at-rest creds
-      // wouldn't be protected. Nothing has been written yet (no browser was
-      // created), so refusing here leaks nothing. The plugin respawns an
-      // ephemeral host for the session and re-issues createBrowser.
-      let allowInsecure =
-        ProcessInfo.processInfo.environment["FLUTTER_CEF_ALLOW_INSECURE_PROFILE"] == "1"
-      writeLock.lock()
-      adhocHost = adhoc
-      let refuse = adhoc && !isEphemeral && !allowInsecure
-      refused = refuse
-      ready = !refuse
-      let creates = refuse ? [] : pendingCreates
-      pendingCreates.removeAll()
-      writeLock.unlock()
-      if refuse {
-        NSLog("[cef] refusing persistent profile '\(profileId)' under an ad-hoc " +
-              "(mock-keychain) cef_host build; downgrading to ephemeral. Set " +
-              "FLUTTER_CEF_ALLOW_INSECURE_PROFILE=1 to override.")
-        onInsecureProfileRefused?()
-        return
-      }
-      for c in creates { c() }
-    case CefOp.log:
-      let msg = String(bytes: payload, encoding: .utf8) ?? ""
-      NSLog("[cef_host:\(profileId)] \(msg)")
-    default:
-      break
-    }
-  }
-
   // MARK: Wire helpers
 
   // Length-prefixed wire frame: [u32 bodyLen][u32 browserId][op][payload], where
   // bodyLen = 4 + 1 + payload.count. Pure — no lock.
-  private func frameBytes(_ browserId: UInt32, _ op: UInt8, _ payload: [UInt8]) -> [UInt8] {
+  func frameBytes(_ browserId: UInt32, _ op: UInt8, _ payload: [UInt8]) -> [UInt8] {
     var frame = [UInt8]()
     frame.reserveCapacity(9 + payload.count)
     appendU32(&frame, UInt32(4 + 1 + payload.count))
@@ -1665,21 +556,21 @@ final class CefProfileHost {
     return frame
   }
 
-  private func appendU32(_ a: inout [UInt8], _ v: UInt32) {
+  func appendU32(_ a: inout [UInt8], _ v: UInt32) {
     a.append(UInt8((v >> 24) & 0xff))
     a.append(UInt8((v >> 16) & 0xff))
     a.append(UInt8((v >> 8) & 0xff))
     a.append(UInt8(v & 0xff))
   }
 
-  private func appendF64(_ a: inout [UInt8], _ v: Double) {
+  func appendF64(_ a: inout [UInt8], _ v: Double) {
     let bits = v.bitPattern
     for shift in stride(from: 56, through: 0, by: -8) {
       a.append(UInt8((bits >> UInt64(shift)) & 0xff))
     }
   }
 
-  private func beU32(_ b: [UInt8], _ o: Int) -> UInt32 {
+  func beU32(_ b: [UInt8], _ o: Int) -> UInt32 {
     return (UInt32(b[o]) << 24) | (UInt32(b[o + 1]) << 16)
       | (UInt32(b[o + 2]) << 8) | UInt32(b[o + 3])
   }
@@ -1687,271 +578,12 @@ final class CefProfileHost {
   // A filesystem-safe tag for the socket name derived from the profileId (which
   // for ephemeral hosts is "~ephemeral~"+sessionId — chars not in sun_path-safe
   // set get collapsed).
-  private func sanitizedSocketTag() -> String {
+  func sanitizedSocketTag() -> String {
     let allowed = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
     return String(profileId.map { allowed.contains($0) ? $0 : "_" })
   }
 
-  // MARK: CDP over pipe (agent-control)
-
-  /// Send one CDP message to cef_host: UTF-8 JSON followed by a single 0x00 NUL
-  /// (the ASCIIZ framing Chromium's DevToolsPipeHandler and Puppeteer's
-  /// PipeTransport use). Serialized under cdpWriteLock; writeAll handles short
-  /// writes. Safe to call before the round-trip is proven — a dead/absent pipe
-  /// (fd < 0, or EPIPE caught harmlessly via the write end's F_SETNOSIGPIPE) just
-  /// drops the message. No-op when not in agent-control mode.
-  func sendCdp(_ json: String) {
-    guard agentControl else { return }
-    cdpWriteLock.lock()
-    let fd = cdpWriteFd
-    var bytes = Array(json.utf8)
-    bytes.append(0)  // NUL terminator
-    if fd >= 0 {
-      _ = bytes.withUnsafeBytes { writeAll(fd, $0.baseAddress!, bytes.count) }
-    }
-    cdpWriteLock.unlock()
-  }
-
-  /// CEF-2b: deliver one CDP pipe message to EVERY live relay. Snapshot the relays
-  /// under cdpHandlerLock, then call deliverToClient OUTSIDE the lock on each —
-  /// deliverToClient does blocking IO and takes the relay's own locks, so holding
-  /// cdpHandlerLock across it would invert the lock order (and could deadlock /
-  /// stall the reader). Each relay demuxes its own traffic (sessionId + CDP-id
-  /// rewrite); a sibling relay drops what isn't its.
-  private func deliverCdpToRelays(_ msg: String) {
-    cdpHandlerLock.lock()
-    let relays = Array(cdpRelays.values)
-    cdpHandlerLock.unlock()
-    for r in relays { r.deliverToClient(msg) }
-  }
-
-  /// CEF-2b: start (lazily) a token-gated CDP relay SCOPED to `browserId`'s tile and
-  /// return the brokered endpoint Campus hands an agent. Async: first resolves the
-  /// browser's CDP targetId (round-trip to cef_host), then creates a relay whose
-  /// Target-domain filter exposes only that tile, then starts it (so no client ever
-  /// sees an unscoped relay). Requires agent-control (pipe) mode and a live host.
-  /// N tiles in the same shared cef_host can be agent-controlled concurrently — one
-  /// relay per browserId, all sharing the one browser-wide pipe. Idempotent for the
-  /// same tile. The completion fires exactly once.
-  func enableAgentControl(browserId: UInt32,
-                          completion: @escaping ((wsUrl: String, token: String, port: Int)?) -> Void) {
-    writeLock.lock(); let alive = running && !crashed; writeLock.unlock()
-    guard agentControl, alive, browserId > 0 else { completion(nil); return }
-
-    // Idempotent fast-path: this tile already has a relay — hand back its endpoint.
-    cdpHandlerLock.lock()
-    if let r = cdpRelays[browserId] {
-      cdpHandlerLock.unlock()
-      completion(endpoint(r))
-      return
-    }
-    let epoch = agentControlEpoch[browserId] ?? 0
-    cdpHandlerLock.unlock()
-
-    resolveTargetId(browserId) { [weak self] tid in
-      guard let self = self, let tid = tid, !tid.isEmpty else { completion(nil); return }
-      self.cdpHandlerLock.lock()
-      // Re-check under the lock: a concurrent enable for the SAME browserId could
-      // have raced us between the fast-path check and here.
-      if let r = self.cdpRelays[browserId] {
-        self.cdpHandlerLock.unlock()
-        completion(self.endpoint(r))
-        return
-      }
-      // The tile was disposed (or agent control switched off) while the targetId
-      // resolved: removeBrowser has already run its disableAgentControl, so a relay
-      // installed now would keep a token-bearing listener open with no owner.
-      self.browsersLock.lock(); let live = self.browsers[browserId] != nil; self.browsersLock.unlock()
-      guard live, !self.cdpClosed, (self.agentControlEpoch[browserId] ?? 0) == epoch else {
-        self.cdpHandlerLock.unlock()
-        completion(nil)
-        return
-      }
-      let relay = CdpRelay(sendToPipe: { [weak self] in self?.sendCdp($0) },
-                           scopeTargetId: tid, pipeIds: self.cdpPipeIds)
-      guard relay.start() else { self.cdpHandlerLock.unlock(); completion(nil); return }
-      // Install the fan-out pipe → relays handler ONCE, when the first relay appears,
-      // CHAINING any prior handler (preserves the debug CEF-1 validation probe) rather
-      // than clobbering it. Subsequent relays just join cdpRelays; deliverCdpToRelays
-      // snapshots the dict per message, so it picks them up automatically.
-      if self.cdpRelays.isEmpty {
-        let prior = self.onCdpMessage
-        self.onCdpMessage = { [weak self] msg in prior?(msg); self?.deliverCdpToRelays(msg) }
-      }
-      self.cdpRelays[browserId] = relay
-      self.cdpHandlerLock.unlock()
-      completion(self.endpoint(relay))
-    }
-  }
-
-  /// The brokered endpoint for a relay: token-free discovery url + the secret as a
-  /// query (see CdpRelay security model).
-  private func endpoint(_ r: CdpRelay) -> (wsUrl: String, token: String, port: Int) {
-    ("ws://127.0.0.1:\(r.port)/devtools/browser?token=\(r.token)", r.token, Int(r.port))
-  }
-
-  /// CEF-2b: resolve `browserId`'s CDP targetId via cef_host (Target.getTargetInfo).
-  /// All waiters for that browserId fire exactly once — on the response or a 5s
-  /// timeout, whichever removes the entry first. Concurrent calls for the SAME
-  /// browserId COALESCE onto one in-flight resolve (a second call appends its waiter
-  /// rather than overwriting the first — so no waiter is silently dropped).
-  private func resolveTargetId(_ browserId: UInt32, _ completion: @escaping (String?) -> Void) {
-    targetIdLock.lock()
-    let first = pendingTargetId[browserId] == nil
-    pendingTargetId[browserId, default: []].append(completion)
-    let epoch = (targetIdEpoch[browserId] ?? 0) + (first ? 1 : 0)
-    if first { targetIdEpoch[browserId] = epoch }
-    targetIdLock.unlock()
-    guard first else { return }  // a resolve is already in flight for this browser
-    send(browserId, CefOp.resolveTargetId, [])
-    // The page target may not have COMMITTED when the first probe fires — common
-    // for a tile force-spawned in a burst, where GPU/page init is async after
-    // create(). cef_host then finds no targetInfo and never sends kOpTargetId, so the
-    // old fire-once probe silently timed out to nil (empty `webview snapshot`).
-    // Re-probe within the deadline so a late-committing page still resolves. Each
-    // kOpResolveTargetId uses a fresh per-browser DevTools message id (see the
-    // 33858fb fix), so extra probes are harmless; handleTargetId removes the entry
-    // on the first reply, stopping the retries.
-    scheduleTargetIdRetry(browserId, epoch, attemptsLeft: 9)  // ~9 × 0.5s ≈ 4.5s
-    DispatchQueue.global().asyncAfter(deadline: .now() + 5) { [weak self] in
-      self?.timeoutTargetId(browserId, epoch)  // fulfill with nil only if still this resolve
-    }
-  }
-
-  /// Re-send kOpResolveTargetId every 0.5s while this exact resolve is still pending
-  /// (not yet answered by handleTargetId, not superseded by a newer epoch), up to
-  /// `attemptsLeft` times — so a page that commits a second or two after create()
-  /// still resolves its targetId instead of the fire-once probe missing it.
-  private func scheduleTargetIdRetry(_ browserId: UInt32, _ epoch: Int, attemptsLeft: Int) {
-    guard attemptsLeft > 0 else { return }
-    DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) { [weak self] in
-      guard let self = self else { return }
-      self.targetIdLock.lock()
-      let stillPending =
-        self.targetIdEpoch[browserId] == epoch && self.pendingTargetId[browserId] != nil
-      self.targetIdLock.unlock()
-      guard stillPending else { return }  // resolved or superseded — stop
-      self.send(browserId, CefOp.resolveTargetId, [])
-      self.scheduleTargetIdRetry(browserId, epoch, attemptsLeft: attemptsLeft - 1)
-    }
-  }
-
-  /// Fulfill all pending targetId waiters for a browser with a real result (reader
-  /// thread). The matching resolve's timer is left to no-op via the epoch guard.
-  private func handleTargetId(_ browserId: UInt32, _ tid: String?) {
-    targetIdLock.lock()
-    let waiters = pendingTargetId.removeValue(forKey: browserId)
-    targetIdLock.unlock()
-    waiters?.forEach { $0(tid) }
-  }
-
-  /// A resolve's own 5s timeout: fulfill its still-pending waiters with nil — but
-  /// ONLY if a fresh resolve hasn't superseded it (epoch bumped). Without this guard
-  /// an early response leaves the timer armed and it would clobber the NEXT resolve.
-  private func timeoutTargetId(_ browserId: UInt32, _ epoch: Int) {
-    targetIdLock.lock()
-    guard targetIdEpoch[browserId] == epoch,
-          let waiters = pendingTargetId.removeValue(forKey: browserId) else {
-      targetIdLock.unlock(); return
-    }
-    targetIdLock.unlock()
-    waiters.forEach { $0(nil) }
-  }
-
-  /// CEF-2a/b: tear down `browserId`'s relay (closes the listener + any client,
-  /// invalidates the token). Idempotent — a no-op if that tile has no relay. When
-  /// the LAST relay goes, drop the fan-out onCdpMessage too. The pipe itself stays
-  /// up (the tile keeps running). The relay is stopped OUTSIDE the lock: stop() may
-  /// block briefly on a stuck client and takes the relay's own locks.
-  func disableAgentControl(browserId: UInt32) {
-    cdpHandlerLock.lock()
-    agentControlEpoch[browserId, default: 0] += 1
-    let relay = cdpRelays.removeValue(forKey: browserId)
-    if cdpRelays.isEmpty { onCdpMessage = nil }
-    cdpHandlerLock.unlock()
-    relay?.stop()
-  }
-
-  /// CDP reader thread: drain cdpReadFd (parent end of out_pipe; child writes CDP
-  /// on fd 4) and split the byte stream on 0x00 into complete UTF-8 JSON messages,
-  /// delivering each (NUL stripped) to `onCdpMessage`. Exits on EOF/error (the
-  /// host died or shutdown closed the fd). Signals cdpReaderDone on every exit so
-  /// shutdown() can join before closing the fd (mirrors acceptAndRead/readerDone).
-  /// A CDP message can exceed one read(), and one read() can carry several
-  /// messages or straddle a boundary, so we accumulate across reads.
-  private func readCdpLoop() {
-    defer { cdpReaderDone.signal() }
-    let fd = cdpReadFd
-    if fd < 0 { return }
-    var acc = [UInt8]()
-    var chunk = [UInt8](repeating: 0, count: 64 << 10)
-    while true {
-      let n = chunk.withUnsafeMutableBytes { read(fd, $0.baseAddress!, $0.count) }
-      if n <= 0 { break }  // EOF (0) or error (<0): host gone / fd closed.
-      var start = 0
-      for i in 0 ..< n {
-        if chunk[i] == 0 {
-          acc.append(contentsOf: chunk[start ..< i])
-          if let msg = String(bytes: acc, encoding: .utf8) {
-            // Snapshot the handler under the lock, then invoke OUTSIDE it (the
-            // handler may run for a while / take other locks).
-            cdpHandlerLock.lock(); let handler = onCdpMessage; cdpHandlerLock.unlock()
-            handler?(msg)
-          }
-          acc.removeAll(keepingCapacity: true)
-          start = i + 1
-        }
-      }
-      if start < n { acc.append(contentsOf: chunk[start ..< n]) }
-      // Bound the accumulator (mirrors the IPC reader's frame cap): a malformed
-      // never-NUL-terminated stream shouldn't grow memory unbounded. The peer is
-      // our own cef_host (M113+ always NUL-frames), so this is defensive.
-      if acc.count > (64 << 20) { break }
-    }
-  }
-
-  /// CEF-1 validation gate: prove the pipe round-trips end to end. Only when
-  /// agent-control AND FLUTTER_CEF_DEBUG is set, install a temporary CDP handler
-  /// and send {"id":1,"method":"Browser.getVersion"}; the first response line is
-  /// NSLogged. Behind the debug env so it never runs in normal flow, and it
-  /// chains (does not clobber) any handler a relay later installs. cef_host's CDP
-  /// endpoint comes up shortly after launch, so a couple of retries cover the
-  /// race between our write and DevToolsPipeHandler being ready.
-  private func maybeRunCdpValidation() {
-    guard agentControl, Self.debugEnabled else { return }
-    cdpHandlerLock.lock()
-    let prior = onCdpMessage
-    var logged = false
-    onCdpMessage = { [weak self] msg in
-      prior?(msg)
-      guard let self = self, !logged else { return }
-      // Only the response to our probe (id:1) proves the round-trip; ignore any
-      // unsolicited CDP events that may arrive first.
-      if msg.contains("\"id\":1") {
-        logged = true
-        NSLog("[cef][cdp-pipe:\(self.profileId)] Browser.getVersion round-trip OK: \(msg)")
-        // Do NOT restore onCdpMessage here. enableAgentControl may have chained the relay
-        // fan-out ON TOP of this probe handler (it captures the then-current handler as
-        // its own `prior`); overwriting back to OUR captured `prior` (the pre-probe
-        // handler, usually nil) would silently DROP that fan-out so relays receive no
-        // pipe messages. The handler is harmless once `logged`: it forwards to `prior`
-        // and short-circuits the id:1 check.
-      }
-    }
-    cdpHandlerLock.unlock()
-    // Retry a few times in case DevToolsPipeHandler isn't reading fd 3 yet.
-    let probe = "{\"id\":1,\"method\":\"Browser.getVersion\"}"
-    DispatchQueue.global().async { [weak self] in
-      for _ in 0 ..< 10 {
-        guard let self = self else { return }
-        if logged { return }
-        self.sendCdp(probe)
-        usleep(200_000)  // 200ms between attempts (~2s total)
-      }
-    }
-  }
-
-  private func readAll(_ fd: Int32, _ buf: inout [UInt8], _ len: Int) -> Bool {
+  func readAll(_ fd: Int32, _ buf: inout [UInt8], _ len: Int) -> Bool {
     var off = 0
     while off < len {
       let n = buf.withUnsafeMutableBytes { ptr -> Int in
@@ -1968,7 +600,7 @@ final class CefProfileHost {
     return true
   }
 
-  private func writeAll(_ fd: Int32, _ buf: UnsafeRawPointer, _ len: Int) -> Bool {
+  func writeAll(_ fd: Int32, _ buf: UnsafeRawPointer, _ len: Int) -> Bool {
     var off = 0
     while off < len {
       let n = write(fd, buf.advanced(by: off), len - off)

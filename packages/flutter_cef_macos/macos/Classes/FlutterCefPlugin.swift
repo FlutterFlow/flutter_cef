@@ -549,7 +549,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     session.setDocumentStart(
       scripts: a["documentStartScripts"] as? [String] ?? [],
       channels: a["channels"] as? [String] ?? [])
-    _ = host.createBrowser(session, url: url, allowedSchemes: allowedSchemes)
+    _ = host.createBrowser(session, url: url)
     sessions[sessionId] = session
     sessionHost[sessionId] = host
     sessionKey[sessionId] = key
@@ -605,13 +605,6 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     return FlutterError(code: "host_config_mismatch", message: why, details: nil)
   }
 
-  /// C1: install the host-died handler. When `cef_host` dies unexpectedly (its
-  /// reader hit EOF while running, or a write hit a dead pipe — see
-  /// CefProfileHost.handleHostDeath), tell every session on this host that its
-  /// process is gone, drop those sessions and the host so the profile_in_use
-  /// guard unblocks (hasLiveBrowser also goes false via the host's crashed flag),
-  /// and reap the process. `onHostDied` is dispatched on the main thread by the
-  /// host, so the unlocked dictionaries are touched only here on main (H3).
   /// Fail every session attached to `host` (emit processGone with `reason` + dispose),
   /// drop the host from the profile registry, and reap it. Main-thread only (the maps
   /// are main-thread confined — H3). Shared by the host-death and protocol-mismatch
@@ -769,7 +762,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     }
     for sid in victims {
       guard let session = sessions[sid], let a = sessionCreateArgs[sid] else { continue }
-      _ = host.createBrowser(session, url: a.url, allowedSchemes: a.allowedSchemes)
+      _ = host.createBrowser(session, url: a.url)
       sessionHost[sid] = host
       sessionKey[sid] = key
     }
@@ -815,7 +808,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
         continue
       }
       profiles[key] = host
-      _ = host.createBrowser(session, url: args.url, allowedSchemes: args.allowedSchemes)
+      _ = host.createBrowser(session, url: args.url)
       sessionHost[sid] = host
       sessionKey[sid] = key
     }
@@ -998,7 +991,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       return
     }
     frozenSessions.remove(id)
-    _ = host.createBrowser(session, url: url, allowedSchemes: args.allowedSchemes)
+    _ = host.createBrowser(session, url: url)
     sessionHost[id] = host
     sessionKey[id] = key
     // sessionCreateArgs keeps the ORIGINAL url: a later thaw without an
