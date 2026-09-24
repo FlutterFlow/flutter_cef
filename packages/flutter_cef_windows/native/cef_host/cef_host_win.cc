@@ -128,11 +128,10 @@ std::set<std::string> g_allowed_schemes;
 // pre-P9 launch). Mirrors macOS main.mm's --cdp-pipe translation.
 std::string g_cdp_io_pipes;
 
-// Registered JS channel names (UI-thread-only; mirrors main.mm:352-356). On
-// each MAIN-frame load OnLoadStart injects a window.<name>.postMessage shim
-// that routes to the browser process over window.cefQuery (the
-// CefMessageRouter channel; the renderer half lives in HostApp below).
-std::set<std::string> g_channels;
+// JS channels: on each MAIN-frame load OnLoadStart injects a
+// window.<name>.postMessage shim for each of the browser's Slot::channels,
+// routed to the browser process over window.cefQuery (the CefMessageRouter
+// channel; the renderer half lives in HostApp below). As on macOS.
 
 // document_start::IsValidChannelName (DoAddChannel drops invalid names).
 using document_start::IsValidChannelName;
@@ -163,7 +162,9 @@ void SetDocumentStart(uint32_t wire_id, document_start::Config config) {
 
 // The browser's creation info carrying its document-start config to every
 // renderer that hosts it, or null when it has none. Consumes the parked entry.
-CefRefPtr<CefDictionaryValue> TakeDocumentStartExtraInfo(uint32_t wire_id) {
+// Adds the config's channels to `channels`.
+CefRefPtr<CefDictionaryValue> TakeDocumentStartExtraInfo(
+    uint32_t wire_id, std::set<std::string>* channels) {
   document_start::Config config;
   {
     std::lock_guard<std::mutex> lock(g_doc_start_mutex);
@@ -172,6 +173,7 @@ CefRefPtr<CefDictionaryValue> TakeDocumentStartExtraInfo(uint32_t wire_id) {
     config = std::move(it->second);
     g_doc_start.erase(it);
   }
+  channels->insert(config.channels.begin(), config.channels.end());
   auto to_list = [](const std::vector<std::string>& v) {
     CefRefPtr<CefListValue> list = CefListValue::Create();
     for (size_t i = 0; i < v.size(); ++i) list->SetString(i, v[i]);
@@ -461,6 +463,12 @@ struct Slot {
   // The URL to navigate to once the browser binds (a navigate that raced a
   // still-queued create — main.mm:1876-1888 deferral). UI-thread only.
   std::string pending_nav_url;
+
+  // The JS channels this browser's consumer registered, before create (they
+  // also ride in extra_info) or after. Only these are injected into its pages
+  // and honored from them: channels are per browser, not per host. UI-thread
+  // only.
+  std::set<std::string> channels;
 
   uint64_t diag_paint_count = 0;  // DIAG (FLUTTER_CEF_DEBUG logging)
 };
@@ -1025,6 +1033,14 @@ class HostClient : public CefClient,
         callback->Failure(403, "subframe");
         return true;
       }
+      // Only a channel this browser's consumer registered. The page can call
+      // window.cefQuery itself, shim or not.
+      const size_t name_end = r.find(':', 3);
+      if (name_end == std::string::npos ||
+          slot_->channels.count(r.substr(3, name_end - 3)) == 0) {
+        callback->Failure(404, "no such channel");
+        return true;
+      }
       SendUtf8(slot_->browser_id, kOpChannelMsg, r.substr(3));
       callback->Success(CefString());
       return true;
@@ -1055,7 +1071,7 @@ class HostClient : public CefClient,
       // SECURITY (main.mm:1339-1343): install the JS-channel shims ONLY into
       // the MAIN frame — injecting the privileged window.<name> bridge into a
       // cross-origin subframe would hand an untrusted iframe that bridge.
-      for (const auto& name : g_channels) InjectChannelShim(frame, name);
+      for (const auto& name : slot_->channels) InjectChannelShim(frame, name);
     }
   }
   void OnLoadEnd(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame,
@@ -1425,9 +1441,15 @@ class HostApp : public CefApp,
 // Create a windowless browser (kOpCreateBrowser). CEF UI thread.
 // Producer-allocates: no surface/bridge is created here — the first
 // OnAcceleratedPaint mints the bridge sized to the actual painted frame.
+// Channels registered before their browser's create frame arrived, and the
+// highest wire id a create has been seen for. UI-thread only.
+std::map<uint32_t, std::set<std::string>> g_early_channels;
+uint32_t g_max_created_wire_id = 0;
+
 void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr,
                      std::string url) {
   CEF_REQUIRE_UI_THREAD();
+  if (wire_id > g_max_created_wire_id) g_max_created_wire_id = wire_id;
   // Wire-id reuse guard (main.mm:1696-1708): a collision would let the OLD
   // browser's OnBeforeClose erase the NEW slot. Fail loudly.
   {
@@ -1444,6 +1466,13 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr,
   slot->width = w < 1 ? 1 : w;
   slot->height = h < 1 ? 1 : h;
   slot->dpr = dpr;
+  {
+    auto early = g_early_channels.find(wire_id);
+    if (early != g_early_channels.end()) {
+      slot->channels = std::move(early->second);
+      g_early_channels.erase(early);
+    }
+  }
   {
     std::lock_guard<std::mutex> lock(g_slots_mutex);
     g_slots_by_wire_id[wire_id] = slot;
@@ -1485,8 +1514,8 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr,
   // the browser's extra_info (see document_start.h) — the only channel that is
   // in place before the first document's scripts run.
   bool dispatched = CefBrowserHost::CreateBrowser(
-      window_info, client, url, settings, TakeDocumentStartExtraInfo(wire_id),
-      nullptr);
+      window_info, client, url, settings,
+      TakeDocumentStartExtraInfo(wire_id, &slot->channels), nullptr);
   if (!dispatched) {
     // H7: reclaim the slot + tell the plugin (main.mm:1786-1805).
     SendLog(wire_id, "createBrowser: CreateBrowser dispatch failed");
@@ -1516,6 +1545,7 @@ void DoDisposeBrowser(uint32_t wire_id) {
     // Never created, or already closed: drop whatever was parked for it.
     SetAuthoredDoc(wire_id, "", "");
     SetDocumentStart(wire_id, {});
+    g_early_channels.erase(wire_id);
     return;
   }
   if (slot->browser) {
@@ -1690,23 +1720,25 @@ void DoEvalReturning(const std::shared_ptr<Slot>& slot, uint32_t id,
   frame->ExecuteJavaScript(js, "", 0);
 }
 
-// Register a JS channel (main.mm DoAddChannel:2019-2035, verbatim). Registers
-// process-globally: OnLoadStart injects every g_channels entry into each
-// freshly-loaded MAIN frame, so the shim lands on the next load. Null-safe on
-// `slot` (a shared host may still be queuing this session's create). Also
-// injects into the registering session's CURRENT frame, covering registration
-// after the page already loaded.
-void DoAddChannel(const std::shared_ptr<Slot>& slot, const std::string& name) {
+// Registers a JS channel for one browser (UI thread; mirrors main.mm
+// DoAddChannel). Resolved by wire id here, not on the reader thread: on a shared
+// host the browser's create may still be queued, so a channel for an id above
+// every create seen is parked for it.
+void DoAddChannel(uint32_t wire_id, const std::string& name) {
+  CEF_REQUIRE_UI_THREAD();
   if (!IsValidChannelName(name)) {
-    if (slot)
-      SendLog(slot->browser_id,
-              "addJavaScriptChannel: rejected invalid name '" + name +
-                  "' (must be a JS identifier)");
+    SendLog(wire_id, "addJavaScriptChannel: rejected invalid name '" + name +
+                         "' (must be a JS identifier)");
     return;
   }
-  g_channels.insert(name);
-  if (slot && slot->browser)
-    InjectChannelShim(slot->browser->GetMainFrame(), name);
+  auto slot = LookupWireId(wire_id);
+  if (!slot) {
+    if (wire_id > g_max_created_wire_id) g_early_channels[wire_id].insert(name);
+    return;
+  }
+  slot->channels.insert(name);
+  // Inject into the current page too, for a channel registered after it loaded.
+  if (slot->browser) InjectChannelShim(slot->browser->GetMainFrame(), name);
 }
 
 // ---- Cookies (global manager = the shared profile jar; main.mm:2040-2140) ----
@@ -2241,14 +2273,13 @@ void IpcReadLoop() {
         break;
       }
       case kOpAddChannel: {
-        // Do NOT require `slot` (main.mm:2483-2494): on a shared host a
-        // session's create may still be queued when this arrives; dropping it
-        // is exactly why a peer session's window.<name> shim was never
-        // injected. DoAddChannel registers the name process-globally
-        // (OnLoadStart injects it on the next load) and, if the browser already
-        // exists, into its current frame.
+        // Do NOT require `slot`: on a shared host a session's create may still
+        // be queued when this arrives; dropping it is exactly why a peer
+        // session's window.<name> shim was never injected. DoAddChannel
+        // resolves the browser on the UI thread and parks the channel until its
+        // create.
         std::string name(reinterpret_cast<const char*>(p), plen);
-        CefPostTask(TID_UI, base::BindOnce(&DoAddChannel, slot, name));
+        CefPostTask(TID_UI, base::BindOnce(&DoAddChannel, wire_id, name));
         break;
       }
       case kOpResolveTargetId: {

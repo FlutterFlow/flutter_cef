@@ -13,7 +13,8 @@
 // Cases, each on its own ephemeral host:
 //   * an idle static page is left alone (no processGone in 35s);
 //   * a page waiting on an open alert() is left alone (its renderer can't answer
-//     the liveness ping, but it isn't hung);
+//     the liveness ping, but it isn't hung), and answering the alert doesn't take
+//     the host down;
 //   * killing the GPU process reports processGone("crashed") within 10s;
 //   * stopping the renderer (SIGSTOP) reports processGone("crashed") within 45s.
 //
@@ -138,6 +139,12 @@ class _ProbeAppState extends State<ProbeApp> {
         waiting,
       );
       answer.complete();
+      final answered = await _goneWithin(gone, const Duration(seconds: 3));
+      _check(
+        'answering the alert leaves the host up',
+        answered == null,
+        answered,
+      );
       await c.dispose();
 
       (c, gone) = await _open(_animated);

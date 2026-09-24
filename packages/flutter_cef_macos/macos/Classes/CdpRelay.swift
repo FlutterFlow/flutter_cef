@@ -677,9 +677,38 @@ final class CdpRelay {
     // Session-routed command (flatten): allow only for our (allowed) sessions. The
     // brief lock is released before any error IO (H4).
     if let s = sid {
-      filterLock.lock(); let allowed = allowedSessions.contains(s); filterLock.unlock()
-      if allowed { return json }
-      sendClientError(id, "Session with given id not found"); return nil
+      filterLock.lock()
+      let allowed = allowedSessions.contains(s)
+      let detachAllowed = (params?["sessionId"] as? String).map(allowedSessions.contains) ?? true
+      filterLock.unlock()
+      guard allowed else { sendClientError(id, "Session with given id not found"); return nil }
+      // A page session answers Target.* for the whole browser: on our session,
+      // getTargets lists sibling tiles and attachToTarget attaches to one, whose
+      // session we would then learn from the attachedToTarget event. Only what drives
+      // our own page and its sub-targets goes through.
+      if let method = method, method.hasPrefix("Target.") {
+        let qTid = params?["targetId"] as? String
+        switch method {
+        case "Target.setAutoAttach":  // our page's frames and workers
+          guard (params?["flatten"] as? Bool) == true else {
+            sendClientError(id, "non-flatten setAutoAttach is not permitted"); return nil
+          }
+          return json
+        case "Target.detachFromTarget":
+          guard detachAllowed, qTid == nil || qTid == scopeTargetId else {
+            sendClientError(id, "No session with given id found"); return nil
+          }
+          return json
+        case "Target.getTargetInfo", "Target.activateTarget", "Target.closeTarget":
+          guard qTid == nil || qTid == scopeTargetId else {
+            sendClientError(id, "No target with given id found"); return nil
+          }
+          return json
+        default:
+          sendClientError(id, "\(method) is not permitted"); return nil
+        }
+      }
+      return json
     }
 
     // Browser-level Target.* control: explicit allow-list, scoped to our target.

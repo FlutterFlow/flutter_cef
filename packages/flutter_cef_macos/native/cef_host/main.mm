@@ -382,6 +382,10 @@ struct Slot {
   // establishment from the real page's load time. Navigated + cleared on first paint.
   // UI-thread only.
   std::string pending_nav_url;
+  // The JS channels this browser's consumer registered, before create (they also
+  // ride in extra_info) or after. Only these are injected into its pages and
+  // honored from them: channels are per browser, not per host. UI-thread only.
+  std::set<std::string> channels;
 };
 
 // Routing map from a wire browser id to its Slot. MUTATED ONLY ON THE CEF UI
@@ -452,6 +456,45 @@ static bool EnsureMetal() {
 // exemption in the browser's Slot::trusted_pending so their load isn't refused.
 std::set<std::string> g_allowed_schemes;
 
+std::string LowerScheme(const std::string& url, size_t* colon_out = nullptr) {
+  const size_t colon = url.find(':');
+  if (colon_out) *colon_out = colon;
+  std::string scheme =
+      colon == std::string::npos ? std::string() : url.substr(0, colon);
+  std::transform(scheme.begin(), scheme.end(), scheme.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  return scheme;
+}
+
+// Whether a page may take a top-level browser to `url` under g_allowed_schemes
+// (true when no allowlist is set). `about:` (the blank placeholder) is always
+// allowed. `view-source:` is judged by what it wraps: viewing the source of a
+// page you were already allowed to LOAD grants no new reach (it renders bytes as
+// text and runs nothing), whereas refusing it silently breaks Chromium's own View
+// Page Source menu command. `view-source:file:///…` stays refused, because `file`
+// is not in the allowlist. Nesting is not recursive in Chromium
+// (`view-source:view-source:` is rejected upstream), so one unwrap is the whole
+// story.
+bool SchemeAllowed(const std::string& url) {
+  if (g_allowed_schemes.empty()) return true;
+  size_t colon = std::string::npos;
+  const std::string scheme = LowerScheme(url, &colon);
+  if (scheme == "view-source")
+    return g_allowed_schemes.count(LowerScheme(url.substr(colon + 1))) != 0;
+  return scheme == "about" || g_allowed_schemes.count(scheme) != 0;
+}
+
+// Native popup windows open now (UI thread). A page gets one only from a user
+// gesture, and only this many at once, so it can't flood the screen with
+// focus-stealing windows.
+int g_native_popups = 0;
+constexpr int kMaxNativePopups = 4;
+
+bool NativePopupAllowed(const std::string& url, bool user_gesture) {
+  return user_gesture && g_native_popups < kMaxNativePopups &&
+         SchemeAllowed(url);
+}
+
 // Agent-control opt-in: when true (set from main() via --cdp-pipe BEFORE
 // CefInitialize, read back in OnBeforeCommandLineProcessing), cef_host exposes
 // CDP over inherited fds (3=read / 4=write, Chromium's DevToolsPipeHandler)
@@ -461,10 +504,10 @@ std::set<std::string> g_allowed_schemes;
 // default; when off, behavior is byte-identical to the pre-pipe path.
 bool g_cdp_pipe = false;
 
-// Registered JS channel names (UI-thread-only). On each frame load we inject a
-// window.<name>.postMessage shim that routes to the host over window.cefQuery
-// (the CefMessageRouter channel — renderer half lives in process_helper.mm).
-std::set<std::string> g_channels;
+// JS channels: on each main-frame load we inject a window.<name>.postMessage shim
+// for each of the browser's Slot::channels, routed to the host over
+// window.cefQuery (the CefMessageRouter channel — renderer half lives in
+// process_helper.mm).
 
 // A JS channel name is interpolated into the injected shim's source — see
 // document_start::IsValidChannelName (DoAddChannel drops invalid names).
@@ -492,7 +535,9 @@ void SetDocumentStart(uint32_t wire_id, document_start::Config config) {
 
 // The browser's creation info carrying its document-start config to every
 // renderer that hosts it, or null when it has none. Consumes the parked entry.
-CefRefPtr<CefDictionaryValue> TakeDocumentStartExtraInfo(uint32_t wire_id) {
+// Adds the config's channels to `channels`.
+CefRefPtr<CefDictionaryValue> TakeDocumentStartExtraInfo(
+    uint32_t wire_id, std::set<std::string>* channels) {
   document_start::Config config;
   {
     std::lock_guard<std::mutex> lock(g_doc_start_mutex);
@@ -501,6 +546,7 @@ CefRefPtr<CefDictionaryValue> TakeDocumentStartExtraInfo(uint32_t wire_id) {
     config = std::move(it->second);
     g_doc_start.erase(it);
   }
+  channels->insert(config.channels.begin(), config.channels.end());
   auto to_list = [](const std::vector<std::string>& v) {
     CefRefPtr<CefListValue> list = CefListValue::Create();
     for (size_t i = 0; i < v.size(); ++i) list->SetString(i, v[i]);
@@ -1364,13 +1410,23 @@ static void OpenNativeAuthPopup(const CefString& url, const CefPopupFeatures& f,
 
 class PopupClient : public CefClient,
                     public CefLifeSpanHandler,
-                    public CefDisplayHandler {
+                    public CefDisplayHandler,
+                    public CefRequestHandler {
  public:
   PopupClient(NSWindow* window, FCPopupWindowDelegate* delegate)
       : window_([window retain]), delegate_([delegate retain]) {}
 
   CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
   CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
+  CefRefPtr<CefRequestHandler> GetRequestHandler() override { return this; }
+
+  // The popup runs the page's code in a window of its own, so it is held to the
+  // tile's scheme allowlist too.
+  bool OnBeforeBrowse(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
+                      CefRefPtr<CefRequest> request, bool, bool) override {
+    const bool main_frame = !frame || frame->IsMain();
+    return main_frame && !SchemeAllowed(request->GetURL().ToString());
+  }
 
   // Nested windows opened from within the auth popup (consent screens, IdP hops)
   // are part of the same flow — give sized popups their own native window too so
@@ -1378,16 +1434,18 @@ class PopupClient : public CefClient,
   // through to CEF's default (rare in a sign-in flow).
   bool OnBeforePopup(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, int,
                      const CefString& target_url, const CefString&,
-                     WindowOpenDisposition disposition, bool,
+                     WindowOpenDisposition disposition, bool user_gesture,
                      const CefPopupFeatures& features, CefWindowInfo& window_info,
                      CefRefPtr<CefClient>& client, CefBrowserSettings&,
                      CefRefPtr<CefDictionaryValue>&, bool*) override {
+    if (!NativePopupAllowed(target_url.ToString(), user_gesture)) return true;
     if (disposition == CEF_WOD_NEW_POPUP)
       OpenNativeAuthPopup(target_url, features, window_info, client);
     return false;
   }
 
   void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
+    ++g_native_popups;
     if (delegate_) {
       delegate_->browser = browser.get();
       delegate_->alive = YES;
@@ -1409,6 +1467,7 @@ class PopupClient : public CefClient,
     // browser pointer NOW (any stray windowShouldClose: then sees nil and no-ops),
     // detach the delegate, and defer the window close + releases to the next
     // main-loop turn, out of the teardown stack.
+    --g_native_popups;
     NSWindow* win = window_;
     FCPopupWindowDelegate* del = delegate_;
     window_ = nil;
@@ -1876,7 +1935,7 @@ class HostClient : public CefClient,
       // privileged campusHost bridge (window.<name> -> window.cefQuery 'ch:'); injecting them
       // into cross-origin SUBFRAMES would hand an untrusted embedded iframe that bridge. (The
       // previous code injected into every frame.) OnQuery also refuses subframe 'ch:'/'eval:'.
-      for (const auto& name : g_channels) InjectChannelShim(frame, name);
+      for (const auto& name : slot_->channels) InjectChannelShim(frame, name);
     }
   }
   void OnLoadEnd(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame,
@@ -1981,7 +2040,7 @@ class HostClient : public CefClient,
   // navigation delegate rather than a separate window.
   bool OnBeforePopup(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, int,
                      const CefString& target_url, const CefString&,
-                     WindowOpenDisposition disposition, bool,
+                     WindowOpenDisposition disposition, bool user_gesture,
                      const CefPopupFeatures& features, CefWindowInfo& window_info,
                      CefRefPtr<CefClient>& client, CefBrowserSettings&,
                      CefRefPtr<CefDictionaryValue>&, bool*) override {
@@ -1990,7 +2049,14 @@ class HostClient : public CefClient,
     // can postMessage the credential back to us. Give it a native window — the
     // in-tab diversion below can never complete that handshake (it would strand
     // the flow at e.g. accounts.google.com/gsi/transform with no opener).
+    // Like Chrome's popup blocker, only a user gesture opens one, and only to a
+    // URL the tile itself may load.
     if (disposition == CEF_WOD_NEW_POPUP) {
+      if (!NativePopupAllowed(target_url.ToString(), user_gesture)) {
+        SendLog(slot_->browser_id, "blocked a popup (no user gesture, too many "
+                                   "open, or a scheme outside the allowlist)");
+        return true;
+      }
       OpenNativeAuthPopup(target_url, features, window_info, client);
       return false;  // allow CEF to create the popup browser in our native window
     }
@@ -2035,6 +2101,14 @@ class HostClient : public CefClient,
     }
     if (r.rfind("ch:", 0) == 0) {
       if (!main_frame) { callback->Failure(403, "subframe"); return true; }
+      // Only a channel this browser's consumer registered. The page can call
+      // window.cefQuery itself, shim or not.
+      const size_t name_end = r.find(':', 3);
+      if (name_end == std::string::npos ||
+          slot_->channels.count(r.substr(3, name_end - 3)) == 0) {
+        callback->Failure(404, "no such channel");
+        return true;
+      }
       SendUtf8(slot_->browser_id, kOpChannelMsg, r.substr(3));
       callback->Success(CefString());
       return true;
@@ -2145,38 +2219,8 @@ class HostClient : public CefClient,
           host_trusted = true;
         }
       }
-      if (main_frame && !host_trusted) {
-        const size_t colon = url.find(':');
-        std::string scheme =
-            colon == std::string::npos ? std::string() : url.substr(0, colon);
-        std::transform(scheme.begin(), scheme.end(), scheme.begin(),
-                       [](unsigned char c) { return std::tolower(c); });
-        // `view-source:` is judged by what it wraps: viewing the source of a
-        // page you were already allowed to LOAD grants no new reach (it renders
-        // bytes as text and runs nothing), whereas refusing it silently breaks
-        // Chromium's own View Page Source menu command. `view-source:file:///…`
-        // stays refused, because `file` is not in the allowlist.
-        //
-        // Nesting is not recursive in Chromium (`view-source:view-source:` is
-        // rejected upstream), so one unwrap is the whole story.
-        if (scheme == "view-source") {
-          const std::string inner = url.substr(colon + 1);
-          const size_t inner_colon = inner.find(':');
-          std::string inner_scheme = inner_colon == std::string::npos
-                                         ? std::string()
-                                         : inner.substr(0, inner_colon);
-          std::transform(inner_scheme.begin(), inner_scheme.end(),
-                         inner_scheme.begin(),
-                         [](unsigned char c) { return std::tolower(c); });
-          if (g_allowed_schemes.count(inner_scheme) == 0) {
-            return true;  // cancel — the wrapped scheme is not permitted
-          }
-        } else if (scheme != "about" &&
-                   g_allowed_schemes.count(scheme) == 0) {
-          // `about:` (blank placeholder) is always allowed; anything else must
-          // be in the host allowlist or the navigation is refused.
-          return true;  // cancel
-        }
+      if (main_frame && !host_trusted && !SchemeAllowed(url)) {
+        return true;  // cancel — the scheme is not permitted
       }
     }
     if (router_) router_->OnBeforeBrowse(browser, frame);
@@ -2412,6 +2456,8 @@ struct EarlyNav {
   bool trusted;
 };
 std::map<uint32_t, EarlyNav> g_early_nav;
+// Channels registered before their browser's create frame arrived. UI-thread only.
+std::map<uint32_t, std::set<std::string>> g_early_channels;
 uint32_t g_max_created_wire_id = 0;
 
 // Create a windowless browser for a CefWebView (kOpCreateBrowser). Runs on the
@@ -2425,11 +2471,13 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr,
   if (wire_id > g_max_created_wire_id) g_max_created_wire_id = wire_id;
   // A load that beat this (paced) create frame here supersedes the create URL.
   bool early_trusted = false;
+  bool early_untrusted = false;
   {
     auto early = g_early_nav.find(wire_id);
     if (early != g_early_nav.end()) {
       url = early->second.url;
       early_trusted = early->second.trusted;
+      early_untrusted = !early->second.trusted;
       g_early_nav.erase(early);
     }
   }
@@ -2451,6 +2499,13 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr,
   slot->width = w < 1 ? 1 : w;
   slot->height = h < 1 ? 1 : h;
   slot->dpr = dpr;
+  {
+    auto early = g_early_channels.find(wire_id);
+    if (early != g_early_channels.end()) {
+      slot->channels = std::move(early->second);
+      g_early_channels.erase(early);
+    }
+  }
   // PRODUCER-ALLOCATES: no surface is created here. slot->surface stays nullptr until the first
   // OnAcceleratedPaint, where EnsureSurfaceForPaint mints it sized to the actual painted view.
   // The consumer adopts that surface's id from the first present.
@@ -2508,7 +2563,9 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr,
   // create the browser directly on its authored document in ONE step (no
   // about:blank + later loadHtmlString, which raced blank). Identical trust model
   // to a post-create loadTrusted; only the timing (at create) differs.
-  if (!g_allowed_schemes.empty() &&
+  // A plain navigate that arrived before the create replaced its URL above; it
+  // is not host content, so it stays gated like any navigate.
+  if (!g_allowed_schemes.empty() && !early_untrusted &&
       (create_url.rfind("data:", 0) == 0 ||
        create_url.rfind("file:", 0) == 0)) {
     slot->trusted_pending.insert(create_url);
@@ -2534,7 +2591,7 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr,
   // in place before the first document's scripts run.
   bool dispatched = CefBrowserHost::CreateBrowser(
       window_info, client, create_url, settings,
-      TakeDocumentStartExtraInfo(wire_id), nullptr);
+      TakeDocumentStartExtraInfo(wire_id, &slot->channels), nullptr);
   if (!dispatched) {
     // H7: the create couldn't even be dispatched — OnAfterCreated/OnBeforeClose will
     // never fire, so reclaim the slot + the looked-up IOSurface (+1 ref) here (else
@@ -2571,6 +2628,7 @@ void DoDisposeBrowser(uint32_t wire_id) {
     SetAuthoredDoc(wire_id, "", "");
     SetDocumentStart(wire_id, {});
     g_early_nav.erase(wire_id);
+    g_early_channels.erase(wire_id);
     return;
   }
   if (slot->browser) {
@@ -2878,8 +2936,11 @@ void DoJsDialogResp(const std::shared_ptr<Slot>& slot, uint32_t id, bool ok,
                     const std::string& text) {
   auto it = slot->dialogs.find(id);
   if (it == slot->dialogs.end()) return;
-  it->second->Continue(ok, text);
+  // Out of the map before Continue(): it can re-enter OnResetDialogState, which
+  // clears the map under the iterator (answering any alert crashed the host).
+  CefRefPtr<CefJSDialogCallback> callback = it->second;
   slot->dialogs.erase(it);
+  callback->Continue(ok, text);
 }
 // ALWAYS REPLIES. Resolved by wire id on TID_UI (FIFO behind a queued create, like
 // DoNavigateByWireId); with no browser/frame to run in, answer {ok:false} rather
@@ -2906,22 +2967,24 @@ void DoEvalReturning(uint32_t wire_id, uint32_t id, const std::string& code) {
       "persistent:false,onSuccess:function(){},onFailure:function(){}});";
   frame->ExecuteJavaScript(js, "", 0);
 }
-void DoAddChannel(const std::shared_ptr<Slot>& slot, const std::string& name) {
+// Registers a JS channel for one browser (UI thread). Resolved by wire id here,
+// not on the reader thread: on a shared host the browser's create may still be
+// queued, so a channel for an id above every create seen is parked for it.
+void DoAddChannel(uint32_t wire_id, const std::string& name) {
+  CEF_REQUIRE_UI_THREAD();
   if (!IsValidChannelName(name)) {
-    if (slot)
-      SendLog(slot->browser_id, "addJavaScriptChannel: rejected invalid name '" +
-                                    name + "' (must be a JS identifier)");
+    SendLog(wire_id, "addJavaScriptChannel: rejected invalid name '" + name +
+                         "' (must be a JS identifier)");
     return;
   }
-  // Register process-globally: OnLoadStart injects every g_channels entry into
-  // each freshly-loaded frame, so the shim lands on the next load. This also
-  // keeps the op null-safe — if `slot` is somehow absent the registration still
-  // takes (defense; the Swift session now buffers addChannel until attach(), so
-  // in practice the op carries a valid browserId and `slot` is set).
-  g_channels.insert(name);
-  // Inject into the registering session's CURRENT frame too, covering the case
-  // where the channel is registered after its page has already loaded.
-  if (slot && slot->browser) InjectChannelShim(slot->browser->GetMainFrame(), name);
+  auto slot = LookupWireId(wire_id);
+  if (!slot) {
+    if (wire_id > g_max_created_wire_id) g_early_channels[wire_id].insert(name);
+    return;
+  }
+  slot->channels.insert(name);
+  // Inject into the current page too, for a channel registered after it loaded.
+  if (slot->browser) InjectChannelShim(slot->browser->GetMainFrame(), name);
 }
 // Cookie ops act on the GLOBAL cookie manager (= the shared profile jar), so a
 // login in one browser is visible to every browser sharing this profile. They
@@ -3519,12 +3582,10 @@ void IpcReadLoop() {
         // Do NOT require `slot`: on a shared host a session's createBrowser may
         // still be queued (pendingCreates) when this op arrives, and dropping it
         // here is exactly why a peer/secondary session's window.<name> shim was
-        // never injected (campus.emit silently dead). DoAddChannel registers the
-        // name in the process-global g_channels — OnLoadStart injects it into the
-        // frame once the browser loads — and injects into the current frame only
-        // if the browser already exists.
+        // never injected (campus.emit silently dead). DoAddChannel resolves the
+        // browser on the UI thread and parks the channel until its create.
         std::string name(reinterpret_cast<const char*>(p), plen);
-        CefPostTask(TID_UI, base::BindOnce(&DoAddChannel, slot, name));
+        CefPostTask(TID_UI, base::BindOnce(&DoAddChannel, wire_id, name));
         break;
       }
       case kOpSetCookie: {
