@@ -1697,6 +1697,13 @@ class HostApp : public CefApp,
       command_line->AppendSwitch("disable-renderer-backgrounding");
       command_line->AppendSwitch("disable-backgrounding-occluded-windows");
     }
+    // FLUTTER_CEF_SOFTWARE_COMPOSITING=1 turns the GPU off, so frames arrive
+    // through OnPaint as they do on a machine with no usable GPU. CI uses it to
+    // cover that path, and it tells a GPU-driver bug from a page bug.
+    if (EnvFlag("FLUTTER_CEF_SOFTWARE_COMPOSITING")) {
+      command_line->AppendSwitch("disable-gpu");
+      command_line->AppendSwitch("disable-gpu-compositing");
+    }
     // Verbose Chromium logging (browser + propagated to children) only when
     // explicitly debugging (macOS main.mm:1627-1631 pattern).
     if (std::getenv("FLUTTER_CEF_DEBUG")) {

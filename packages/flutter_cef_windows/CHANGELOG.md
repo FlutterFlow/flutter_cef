@@ -50,8 +50,10 @@
   tokens. The agent-control relay caps connections that haven't authenticated.
 * Rendering: software-composited frames (no GPU, Remote Desktop, VMs) are
   uploaded into the shared texture, `<select>` dropdowns are drawn, and the
-  host falls back to a WARP device.
-* CI builds and runs `pipe_probe` and a runtime smoke test of the example app.
+  host falls back to a WARP device. `FLUTTER_CEF_SOFTWARE_COMPOSITING=1`
+  forces the software path.
+* CI builds and runs `pipe_probe` and a runtime smoke test of the example app,
+  each with and without software compositing.
 * Protocol v5 (`kOpSetAudioMuted` and `kOpSetPumpInterval` on Windows).
 
 # 0.1.0

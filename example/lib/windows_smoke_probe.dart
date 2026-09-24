@@ -4,9 +4,10 @@
 // with this entry point and runs it against the cef_host it just built, so a
 // change that compiles but can't paint, round-trip or recover fails CI instead
 // of merging. It checks, on one view:
-//   * the first frame reaches the texture (sessionStats().presentCount > 0) —
-//     on a CI runner there is no GPU, so this also covers the software paint
-//     path;
+//   * the first frame reaches the texture (sessionStats().presentCount > 0);
+//     CI runs the probe twice, the second time with
+//     FLUTTER_CEF_SOFTWARE_COMPOSITING=1, so the software paint path is
+//     covered too;
 //   * runJavaScriptReturningResult and a JS channel round-trip;
 //   * a resize is followed by frames at the new size;
 //   * setAudioMuted / setFrameInterval are accepted, and a verb Windows can't
@@ -72,8 +73,11 @@ class _ProbeAppState extends State<ProbeApp> {
       (await c.sessionStats())?.presentCount ?? -1;
 
   /// Waits until [c] has presented more than [floor] frames.
-  Future<bool> _presentsPast(CefWebController c, int floor,
-      {Duration within = const Duration(seconds: 30)}) async {
+  Future<bool> _presentsPast(
+    CefWebController c,
+    int floor, {
+    Duration within = const Duration(seconds: 30),
+  }) async {
     final sw = Stopwatch()..start();
     while (sw.elapsed < within) {
       if (await _presents(c) > floor) return true;
@@ -88,21 +92,32 @@ class _ProbeAppState extends State<ProbeApp> {
     c.onProcessGone = (reason) => gone = reason;
     try {
       final received = Completer<String>();
-      await c.addJavaScriptChannel('smoke', onMessageReceived: (m) {
-        if (!received.isCompleted) received.complete(m);
-      });
+      await c.addJavaScriptChannel(
+        'smoke',
+        onMessageReceived: (m) {
+          if (!received.isCompleted) received.complete(m);
+        },
+      );
       final texture = await c.create(
-          url: 'about:blank', html: _html, width: 320, height: 240);
+        url: 'about:blank',
+        html: _html,
+        width: 320,
+        height: 240,
+      );
       _check('create returns a texture', texture != null, texture);
 
-      // A cold CEF start on a CI runner (no GPU) can take a while.
+      // A cold CEF start on a CI runner can take a while.
       _check(
-          'first frame reaches the texture',
-          await _presentsPast(c, 0, within: const Duration(seconds: 90)),
-          await c.sessionStats());
+        'first frame reaches the texture',
+        await _presentsPast(c, 0, within: const Duration(seconds: 90)),
+        await c.sessionStats(),
+      );
       final stats = await c.sessionStats();
-      _check('sessionStats reports the first present',
-          stats != null && stats.firstPresentSeen && !stats.frozen, stats);
+      _check(
+        'sessionStats reports the first present',
+        stats != null && stats.firstPresentSeen && !stats.frozen,
+        stats,
+      );
 
       final two = await c
           .runJavaScriptReturningResult('1 + 1')
@@ -110,8 +125,10 @@ class _ProbeAppState extends State<ProbeApp> {
       _check('eval round-trip', '$two' == '2', two);
 
       await c.executeJavaScript('smoke.postMessage("hello")');
-      final msg = await received.future
-          .timeout(const Duration(seconds: 10), onTimeout: () => '<timeout>');
+      final msg = await received.future.timeout(
+        const Duration(seconds: 10),
+        onTimeout: () => '<timeout>',
+      );
       _check('JS channel round-trip', msg == 'hello', msg);
 
       await c.resize(400, 300);
@@ -121,13 +138,17 @@ class _ProbeAppState extends State<ProbeApp> {
       while (!resized && sw.elapsed.inSeconds < 15) {
         await Future<void>.delayed(const Duration(milliseconds: 100));
         final surface = await c.getFrameSurface();
-        resized = await _presents(c) > beforeResize &&
+        resized =
+            await _presents(c) > beforeResize &&
             surface != null &&
             surface.width == 400 &&
             surface.height == 300;
       }
-      _check('frames at the new size after resize', resized,
-          await c.getFrameSurface());
+      _check(
+        'frames at the new size after resize',
+        resized,
+        await c.getFrameSurface(),
+      );
 
       await c.setAudioMuted(true);
       await c.setFrameInterval(33);
@@ -140,17 +161,24 @@ class _ProbeAppState extends State<ProbeApp> {
         unsupported = e;
       }
       _check(
-          'an unsupported verb fails as unsupported',
-          unsupported is PlatformException && unsupported.code == 'unsupported',
-          unsupported);
+        'an unsupported verb fails as unsupported',
+        unsupported is PlatformException && unsupported.code == 'unsupported',
+        unsupported,
+      );
 
       _check('freeze', await c.freeze(), await c.sessionStats());
-      _check('sessionStats says frozen',
-          (await c.sessionStats())?.frozen == true, await c.sessionStats());
+      _check(
+        'sessionStats says frozen',
+        (await c.sessionStats())?.frozen == true,
+        await c.sessionStats(),
+      );
       final frozenAt = await _presents(c);
       _check('thaw', await c.thaw(), await c.sessionStats());
-      _check('frames resume after thaw', await _presentsPast(c, frozenAt),
-          await c.sessionStats());
+      _check(
+        'frames resume after thaw',
+        await _presentsPast(c, frozenAt),
+        await c.sessionStats(),
+      );
 
       _check('no processGone', gone.isEmpty, gone);
     } catch (e, st) {
@@ -168,8 +196,9 @@ class _ProbeAppState extends State<ProbeApp> {
     if (out != null && out.isNotEmpty) {
       File(out).writeAsStringSync('${_lines.join('\n')}\n$result\n');
     }
-    Future<void>.delayed(const Duration(milliseconds: 300))
-        .then((_) => exit(_pass ? 0 : 1));
+    Future<void>.delayed(
+      const Duration(milliseconds: 300),
+    ).then((_) => exit(_pass ? 0 : 1));
   }
 
   @override

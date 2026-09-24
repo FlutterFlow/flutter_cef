@@ -124,34 +124,53 @@ jobs:
       - name: Build and run pipe_probe (cef_host against a stub plugin)
         # Reuses the cef_host build tree the example build just configured.
         # pipe_probe drives the host over the pipe: handshake, create, first
-        # frame, a navigation, shutdown.
+        # frame, a navigation, shutdown. The second run turns the GPU off and
+        # checks the frames came through OnPaint, the software path.
         shell: pwsh
         timeout-minutes: 10
         run: |
           $build = (Resolve-Path "example\build\windows\x64\plugins\flutter_cef_windows\cef_host_build").Path
+          $runner = (Resolve-Path "example\build\windows\x64\runner\Debug").Path
           & "packages\flutter_cef_windows\native\cef_host\build_cef_host.bat" "$build" "$build" pipe_probe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & "$build\pipe_probe.exe" (Resolve-Path "example\build\windows\x64\runner\Debug").Path
-          exit $LASTEXITCODE
+          & "$build\pipe_probe.exe" $runner
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Output "== pipe_probe, software compositing"
+          $env:FLUTTER_CEF_SOFTWARE_COMPOSITING = "1"
+          $env:FLUTTER_CEF_DEBUG = "1"
+          $log = Join-Path $env:RUNNER_TEMP "pipe_probe_software.txt"
+          & "$build\pipe_probe.exe" $runner | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Select-String -Path $log -Pattern "OnPaint \(software\)" -Quiet)) {
+            Write-Output "no software-painted frame: the GPU path was used"
+            exit 1
+          }
       - name: Runtime smoke test (example app, real cef_host)
-        # Runs the app against the cef_host it just built: first frame (the
-        # runner has no GPU, so Chromium paints in software), eval, a JS
-        # channel, resize, freeze/thaw. See example/lib/windows_smoke_probe.dart.
+        # Runs the app against the cef_host it just built: first frame, eval, a
+        # JS channel, resize, freeze/thaw. Once as the runner composites, once
+        # with the GPU off (software paint). See
+        # example/lib/windows_smoke_probe.dart.
         shell: pwsh
         timeout-minutes: 15
         run: |
           cd example
           flutter build windows --debug -t lib/windows_smoke_probe.dart
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $out = Join-Path $env:RUNNER_TEMP "windows_smoke.txt"
-          $env:FLUTTER_CEF_PROBE_OUT = $out
-          $p = Start-Process -FilePath "build\windows\x64\runner\Debug\flutter_cef_example.exe" -PassThru
-          $timedOut = -not $p.WaitForExit(240000)
-          if ($timedOut) {
-            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-            Get-Process cef_host -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          $failed = $false
+          foreach ($mode in @("default", "software")) {
+            if ($mode -eq "software") { $env:FLUTTER_CEF_SOFTWARE_COMPOSITING = "1" }
+            $out = Join-Path $env:RUNNER_TEMP "windows_smoke_$mode.txt"
+            $env:FLUTTER_CEF_PROBE_OUT = $out
+            $p = Start-Process -FilePath "build\windows\x64\runner\Debug\flutter_cef_example.exe" -PassThru
+            $timedOut = -not $p.WaitForExit(240000)
+            if ($timedOut) {
+              Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+              Get-Process cef_host -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            }
+            Write-Output "== smoke test, $mode compositing"
+            if (Test-Path $out) { Get-Content $out }
+            if ($timedOut) { Write-Output "timed out after 240 s"; $failed = $true }
+            elseif (-not (Test-Path $out)) { Write-Output "no result file at $out"; $failed = $true }
+            elseif (-not (Select-String -Path $out -Pattern "CEF_PROBE_RESULT PASS" -Quiet)) { $failed = $true }
           }
-          if (Test-Path $out) { Get-Content $out }
-          if ($timedOut) { Write-Output "smoke test timed out after 240 s"; exit 1 }
-          if (-not (Test-Path $out)) { Write-Output "no result file at $out"; exit 1 }
-          if (-not (Select-String -Path $out -Pattern "CEF_PROBE_RESULT PASS" -Quiet)) { exit 1 }
+          if ($failed) { exit 1 }

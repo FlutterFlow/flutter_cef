@@ -58,6 +58,10 @@ into the same shared texture, so tiles still render. The host creates its
 D3D11 device on the hardware adapter and falls back to WARP (the software
 rasterizer) when there is none. `<select>` dropdowns are drawn over the view.
 
+`FLUTTER_CEF_SOFTWARE_COMPOSITING=1` turns the GPU off for every host, so
+Chromium paints in software. It is how CI covers the software path, and it
+helps tell a GPU-driver problem from a page problem.
+
 ## Layout
 
 - `lib/flutter_cef_windows.dart` — `registerWith()` endorsing the shared
