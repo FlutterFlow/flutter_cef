@@ -112,6 +112,12 @@
     stock CEF framework, for contributors without the patched from-source one.
   * CI compiles `cef_host` and the macOS plugin, and warns when no prebuilt is
     published for the sources.
+* **One protocol definition**: the `cef_host` opcodes and protocol versions
+  live in `tool/protocol/spec.dart`, and `tool/protocol/generate.dart` writes
+  the macOS host header, the Swift constants and the Windows header from it.
+  Before, four hand-kept copies had drifted: Windows still documented 0x1e as
+  reserved, while macOS uses it. `test/protocol_parity_test.dart` checks the
+  copies and that no opcode is defined anywhere else.
 
 ## 0.2.0
 

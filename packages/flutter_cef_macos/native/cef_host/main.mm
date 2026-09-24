@@ -104,92 +104,9 @@
 #include "include/wrapper/cef_library_loader.h"
 #include "include/wrapper/cef_message_router.h"
 
+#include "cef_host_opcodes.h"  // generated from tool/protocol/spec.dart
+
 namespace {
-
-// ---- Wire protocol version ----
-// Announced in kOpReady's payload (byte 1; byte 0 stays the ready-flags byte) so the
-// Swift plugin can REFUSE a host speaking a different protocol instead of silently
-// mis-parsing frames (frozen/blank tiles with no breadcrumb). The content-hash
-// distribution keeps host + plugin matched on the normal path; this catches the skew
-// vectors that bypass it (FLUTTER_CEF_HOST env override, a stale from-source build, a
-// stale embedded copy). BUMP THIS on any semantic change to the kOp wire protocol
-// below, together with CefProfileHost.protocolVersion (Swift side) — the two must
-// stay equal. Hosts predating the handshake send a 1-byte payload and read as v0.
-// v9: tile surfaces are private and handed over by Mach port (--surface-port).
-constexpr uint8_t kCefHostProtocolVersion = 9;
-
-// ---- Opcodes ----
-constexpr uint8_t kOpPresent = 0x01;
-constexpr uint8_t kOpReady = 0x02;
-constexpr uint8_t kOpCursor = 0x03;
-constexpr uint8_t kOpLog = 0x04;
-constexpr uint8_t kOpLoadState = 0x05;  // {loading,back,forward : u8}
-constexpr uint8_t kOpTitle = 0x06;      // {utf8}
-constexpr uint8_t kOpUrl = 0x07;        // {utf8} main-frame address
-constexpr uint8_t kOpLoadErr = 0x08;    // {code:u32}{utf8 "url\ntext"}
-constexpr uint8_t kOpConsole = 0x09;    // {level:u32}{utf8 "source:line\tmsg"}
-constexpr uint8_t kOpPageStart = 0x0a;  // {utf8 url} main frame load started
-constexpr uint8_t kOpPageFinish = 0x0b; // {utf8 url} main frame load finished
-constexpr uint8_t kOpProgress = 0x0c;   // {u32 percent 0-100}
-constexpr uint8_t kOpNewWindow = 0x0d;  // {utf8 url} popup / target=_blank
-constexpr uint8_t kOpFindResult = 0x0e; // {u32 count}{u32 activeOrdinal}{u8 final}
-constexpr uint8_t kOpJsDialog = 0x0f;   // {u32 id}{u32 type}{u32 msgLen}{msg}{default}
-constexpr uint8_t kOpEvalResult = 0x16; // {utf8 "id:json"} runJavaScriptReturningResult
-constexpr uint8_t kOpChannelMsg = 0x17; // {utf8 "name:message"} JS channel -> host
-constexpr uint8_t kOpDownload = 0x18;   // {utf8 suggestedName} a download started
-constexpr uint8_t kOpImeBounds = 0x19;  // {u32 x}{u32 y}{u32 w}{u32 h} caret rect (DIP)
-constexpr uint8_t kOpCookies = 0x1a;    // {u32 id}{utf8 json-array} visitAllCookies result
-constexpr uint8_t kOpTargetId = 0x1b;   // {utf8 targetId} -> plugin: this browser's CDP targetId (CEF-2b)
-constexpr uint8_t kOpCreated = 0x1c;    // {} H3: OnAfterCreated — browser is up; host's pacer sends the next create
-constexpr uint8_t kOpCreateFailed = 0x1d; // {} H7: async CreateBrowser dispatch failed; host drops the session
-constexpr uint8_t kOpMediaRequest = 0x1e; // {u32 id}{u32 requested}{utf8 origin} page called getUserMedia and there is NO stored decision -> host prompts
-constexpr uint8_t kOpMediaState = 0x1f;   // {u8 videoActive}{u8 audioActive}{u8 setting 0=ask 1=allow} page media status -> URL-bar "in use" / "allowed" indicator
-constexpr uint8_t kOpContextMenu = 0x40;  // {u32 id}{utf8 json} right-click in the page: Chromium's OWN menu model + params, for the host to draw in Flutter (OSR has no window to put a native menu in)
-constexpr uint8_t kOpPointer = 0x10;
-constexpr uint8_t kOpResize = 0x11;          // {u32 w}{u32 h}{f64 dpr} — producer-allocates: no sid
-constexpr uint8_t kOpKey = 0x12;
-constexpr uint8_t kOpCreateBrowser = 0x13;  // {u32 w}{u32 h}{f64 dpr}{utf8 url}; producer-allocates (no sid); frame browserId = NEW id
-constexpr uint8_t kOpShutdown = 0x14;       // {} tear down the whole PROCESS (all browsers); frame browserId 0
-constexpr uint8_t kOpDisposeBrowser = 0x15;  // {} close ONE browser (target = frame browserId); process survives
-constexpr uint8_t kOpNavigate = 0x20;
-constexpr uint8_t kOpReload = 0x21;
-constexpr uint8_t kOpStop = 0x22;
-constexpr uint8_t kOpBack = 0x23;
-constexpr uint8_t kOpForward = 0x24;
-constexpr uint8_t kOpExecuteJs = 0x25;  // {utf8 code}
-constexpr uint8_t kOpSetZoom = 0x26;    // {f64 level} (factor = 1.2^level)
-constexpr uint8_t kOpFind = 0x27;       // {u8 fwd}{u8 matchCase}{u8 findNext}{utf8}
-constexpr uint8_t kOpStopFind = 0x28;   // {u8 clearSelection}
-constexpr uint8_t kOpJsDialogResp = 0x29;  // {u32 id}{u8 ok}{utf8 text}
-constexpr uint8_t kOpEvalReturning = 0x2a;  // {u32 id}{utf8 code}
-constexpr uint8_t kOpAddChannel = 0x2b;     // {utf8 name} register a JS channel
-constexpr uint8_t kOpSetCookie = 0x2c;      // {utf8 url\0name\0value\0domain\0path[\0secure(0|1)\0httpOnly(0|1)\0sameSite(unspecified|none|lax|strict)]}
-constexpr uint8_t kOpClearCookies = 0x2d;   // {} delete all cookies
-constexpr uint8_t kOpVisitCookies = 0x2e;   // {u32 id}{utf8 url} enumerate (url empty = all)
-constexpr uint8_t kOpDeleteCookie = 0x2f;   // {utf8 url\0name} delete one
-constexpr uint8_t kOpImeSetComp = 0x30;     // {utf8 text} IME composition update
-constexpr uint8_t kOpImeCommit = 0x31;      // {utf8 text} commit composed text
-constexpr uint8_t kOpImeCancel = 0x32;      // {} cancel composition
-constexpr uint8_t kOpShowDevTools = 0x33;   // {} or {u32 x}{u32 y} open DevTools in a window; with a point, opened INSPECTING the element there (the right-click "Inspect" path)
-constexpr uint8_t kOpLoadTrusted = 0x34;    // {utf8 url} host content-load, exempt from allowlist
-constexpr uint8_t kOpSetVisible = 0x35;     // {u8 visible} -> CefBrowserHost::WasHidden(!visible)
-constexpr uint8_t kOpResolveTargetId = 0x36;  // {} resolve this browser's CDP targetId (CEF-2b) -> kOpTargetId
-constexpr uint8_t kOpInvalidate = 0x37;       // {} C1: force a repaint (Invalidate PET_VIEW) to re-kick a stalled first frame
-constexpr uint8_t kOpMediaResponse = 0x3c;    // {u32 id}{u8 allow}{u8 remember} answer a kOpMediaRequest prompt; remembered per-origin ONLY when `remember` (a human chose) — never for a defensive auto-deny
-constexpr uint8_t kOpSetMediaSetting = 0x3d;  // {u8 value} rewrite the CURRENT origin's camera+mic content setting (0=ask/default 1=allow 2=block) — the URL-bar "site settings" path; no reload, it applies next time the page asks
-constexpr uint8_t kOpEditCommand = 0x38;      // {u8 cmd} run a focused-frame edit command (0=copy 1=cut 2=paste 3=selectAll 4=undo 5=redo)
-constexpr uint8_t kOpOpenAuthWindow = 0x39;   // {utf8 url} open a windowed Chrome-runtime browser for a WebAuthn/Touch ID ceremony the OSR tile can't host (shares the tile's cookie jar)
-constexpr uint8_t kOpSetAudioMuted = 0x3a;    // {u8 muted} -> CefBrowserHost::SetAudioMuted; a hidden AND muted page regains intensive wake-up throttling (audible pages are exempt)
-constexpr uint8_t kOpSetPumpInterval = 0x3b;  // {u16 BE ms} visible begin-frame cadence for this slot, clamped to [8, 250]; hidden slots stay on the 100ms no-op poll
-// {utf8 baseUrl}\0{utf8 html}: an AUTHORED document to serve as the main-frame
-// response for exactly `baseUrl` (empty html clears it). Store-only — the load is a
-// following kOpCreateBrowser / kOpLoadTrusted for that URL. See g_authored.
-constexpr uint8_t kOpSetAuthoredHtml = 0x3f;
-// Document-start scripts + JS channel names for the browser created right behind
-// it (see document_start.h for the payload). Store-only, like kOpSetAuthoredHtml:
-// DoCreateBrowser folds it into the browser's extra_info for the renderer.
-constexpr uint8_t kOpSetDocumentStart = 0x41;
-constexpr uint8_t kOpContextMenuCommand = 0x3e;  // {u32 id}{u32 commandId} run the chosen command from a kOpContextMenu (commandId 0 = dismissed); Chromium executes it, so copy/paste/back/spellcheck behave exactly as in Chrome
 
 // ---- Shared runtime state ----
 // Atomic: the reader thread reads it (ReadAll), SendFrame on any thread reads it,

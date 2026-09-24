@@ -95,6 +95,22 @@ signing posture: ad-hoc (`-`) keeps `entitlements.plist` (with `get-task-allow`,
 for debugging); a real identity uses `entitlements.release.plist` (no
 `get-task-allow`). Your host app **must not be App-Sandboxed**.
 
+## The wire protocol
+
+The plugin and `cef_host` talk over a byte stream of opcode frames. Every
+opcode and each platform's protocol version is defined once, in
+`tool/protocol/spec.dart`. To add or change one, edit the spec and run
+
+```sh
+dart run tool/protocol/generate.dart
+```
+
+which rewrites `cef_host_opcodes.h` (macOS and Windows), `CefHostOpcodes.swift`
+and the opcode table in the Windows `PROTOCOL.md`. Bump the platform's version
+in the spec for any change the other side can't ignore.
+`test/protocol_parity_test.dart` fails on a stale copy or an opcode defined by
+hand.
+
 ## Running checks locally (exactly as CI does)
 
 CI (`.github/workflows/ci.yaml`, `macos-14`, Flutter **3.38.8 / stable**) runs

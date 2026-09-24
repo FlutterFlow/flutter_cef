@@ -5,7 +5,7 @@
 //
 // Wire frame (both directions): [u32 bodyLen BE][u32 browserId BE][u8 op][payload],
 // where bodyLen = 4 + 1 + payloadLen. browserId 0 is process/profile-level
-// (opReady, process logs, opShutdown). See native/cef_host/main.mm.
+// (kOpReady, process logs, kOpShutdown). See native/cef_host/main.mm.
 //
 // Split out of CefWebSession: the session keeps only its texture/IOSurface and
 // per-view verbs; everything process/socket/reader-shaped lives here, so several
@@ -15,40 +15,10 @@ import Foundation
 import IOSurface
 
 final class CefProfileHost {
-  // IPC opcodes this host layer needs to NAME (process-level + control). The
-  // full per-view opcode table lives on CefWebSession; these must match
-  // native/cef_host/main.mm.
-  static let opCreateBrowser: UInt8 = 0x13
-  static let opDisposeBrowser: UInt8 = 0x15
-  static let opShutdown: UInt8 = 0x14
-  static let opReady: UInt8 = 0x02
-  static let opLog: UInt8 = 0x04
-  static let opResize: UInt8 = 0x11
-  static let opTargetId: UInt8 = 0x1b         // cef_host -> us: a browser's CDP targetId (CEF-2b)
-  static let opResolveTargetId: UInt8 = 0x36  // us -> cef_host: resolve this browser's CDP targetId
-  static let opPresent: UInt8 = 0x01          // cef_host -> us: a browser painted a frame (C1 watchdog peek)
-  static let opCreated: UInt8 = 0x1c          // cef_host -> us: OnAfterCreated — advance the create pacer (H3)
-  static let opCreateFailed: UInt8 = 0x1d     // cef_host -> us: create dispatch failed — drop the session (H7)
-  static let opInvalidate: UInt8 = 0x37       // us -> cef_host: force a repaint to re-kick a stalled first frame (C1)
-  static let opSetAuthoredHtml: UInt8 = 0x3f  // us -> cef_host: {url}\0{html} served as the main-frame response for url
-  static let opSetDocumentStart: UInt8 = 0x41 // us -> cef_host: document-start scripts + channels, ahead of opCreateBrowser
-  static let opSetVisible: UInt8 = 0x35       // us -> cef_host: WasHidden(!visible); peeked to make the C1 watchdog visibility-aware
-  static let opEvalResult: UInt8 = 0x16       // cef_host -> us: "id:json"; the liveness ping's reply stops here
-  static let opPageStart: UInt8 = 0x0a        // cef_host -> us: main-frame load started; drops an outstanding liveness ping
-  static let opEvalReturning: UInt8 = 0x2a    // us -> cef_host: {u32 id}{js}; the liveness sweep's renderer-hang ping
-  static let opJsDialog: UInt8 = 0x0f         // cef_host -> us: the page opened a JS dialog; its renderer waits on it
   // Eval id of the liveness ping. Dart's eval ids count up from 0 and never reach it.
   static let livenessPingId: UInt32 = .max
   private static let livenessPingReplyPrefix = Array("\(livenessPingId):".utf8)
 
-  // Expected kOp wire-protocol version, announced by the host in opReady's payload
-  // (byte 1; a 1-byte payload = a host predating the handshake = v0). Must equal
-  // kCefHostProtocolVersion in native/cef_host/main.mm — bump BOTH on any semantic
-  // wire change. A mismatched host is refused at the handshake (onProtocolMismatch →
-  // processGone) instead of silently mis-parsing frames into frozen/blank tiles; the
-  // skew vectors are FLUTTER_CEF_HOST overrides, stale from-source builds, and stale
-  // embedded copies (the content-hash fetch can't drift on the normal path).
-  static let protocolVersion: UInt8 = 9
 
   // Profile identity / config.
   let profileId: String
@@ -148,7 +118,7 @@ final class CefProfileHost {
   private var adhocHost = false  // host reported a mock-keychain (ad-hoc) build
   private var createEnqueued: Set<UInt32> = []  // browserIds whose create has been sent
 
-  // Per-host create pacing (guarded by writeLock). A BURST of opCreateBrowser frames
+  // Per-host create pacing (guarded by writeLock). A BURST of kOpCreateBrowser frames
   // would otherwise make cef_host run a pile of browser creates concurrently, each doing
   // its first-frame GPU shared-image allocation against the one shared GPU/Viz process at
   // the same instant — that allocation RACES and the losers silently Stop() (permanent
@@ -157,7 +127,7 @@ final class CefProfileHost {
   // concurrent ESTABLISHMENT was the problem). So we admit creates through a SLIDING
   // WINDOW: at most `maxCreateInFlight` browsers may be establishing (awaiting first paint)
   // at once, and we gate each slot's release on that browser's FIRST PAINT
-  // (firstPresentArrived), NOT the bind ack (opCreated). Window=1 is strict serial. A
+  // (firstPresentArrived), NOT the bind ack (kOpCreated). Window=1 is strict serial. A
   // window of K is materially safer than "K all-at-once": only the K still-establishing
   // browsers contend the first-frame allocator (established ones just blit from an existing
   // surface), and the K creates stagger by create+first-paint latency rather than firing
@@ -182,13 +152,13 @@ final class CefProfileHost {
   }()
 
   // C1 first-present watchdog (guarded by presentLock). browserIds awaiting their FIRST
-  // opPresent: if none arrives within the deadline we re-kick via opInvalidate, then (if
+  // kOpPresent: if none arrives within the deadline we re-kick via kOpInvalidate, then (if
   // still blank) surface paintStalled to Dart — converting a silent never-painted tile
   // into self-healing-or-signalled.
   private let presentLock = NSLock()
   private var firstPresentPending: Set<UInt32> = []
-  // C1: browsers the host has hidden (WasHidden(true) via opSetVisible). A hidden CEF
-  // browser stops producing frames entirely, so it legitimately never sends opPresent —
+  // C1: browsers the host has hidden (WasHidden(true) via kOpSetVisible). A hidden CEF
+  // browser stops producing frames entirely, so it legitimately never sends kOpPresent —
   // the watchdog must NOT treat that as a stall (work_canvas creates tiles already
   // off-screen as a normal lazy-spawn pattern). Guarded by presentLock.
   private var hiddenBrowsers: Set<UInt32> = []
@@ -205,7 +175,7 @@ final class CefProfileHost {
   var onInsecureProfileRefused: (() -> Void)?
 
   // Invoked (off the reader thread) when the host announces a kOp wire-protocol
-  // version other than [protocolVersion] in its opReady payload. The host is
+  // version other than [CefHostProtocol.version] in its kOpReady payload. The host is
   // refused before ANY create flushes (nothing was mis-parsed); the plugin emits
   // processGone("protocolMismatch") for every attached session and tears the host
   // down. Deliberately NO auto-respawn: respawning would re-resolve the same
@@ -287,7 +257,7 @@ final class CefProfileHost {
     guard bound == 0 else { NSLog("[cef] bind() failed: \(errno)"); return false }
     listen(listenFd, 1)
 
-    // Per-process args only: per-view geometry/url now ride opCreateBrowser. The
+    // Per-process args only: per-view geometry/url now ride kOpCreateBrowser. The
     // cache path is always the resolved --profile-dir (ephemeral = throwaway temp).
     guard let surfaces = SurfacePort() else { return false }
     surfacePort = surfaces
@@ -495,10 +465,10 @@ final class CefProfileHost {
   // MARK: Browser multiplexing
 
   /// Allocate a wire browserId for `session`, register it, and (if the host is
-  /// ready) send the opCreateBrowser; otherwise queue it until opReady. Returns
+  /// ready) send the kOpCreateBrowser; otherwise queue it until kOpReady. Returns
   /// the assigned browserId. `allowedSchemes` is accepted for call-site symmetry
   /// but NOT used here — it's a process arg fixed at spawn (shared by every
-  /// browser in the profile), not part of the opCreateBrowser payload (A.4).
+  /// browser in the profile), not part of the kOpCreateBrowser payload (A.4).
   func createBrowser(_ session: CefWebSession, url: String, allowedSchemes: String) -> UInt32 {
     browsersLock.lock()
     let id = nextBrowserId
@@ -523,7 +493,7 @@ final class CefProfileHost {
     writeLock.lock()
     let isReady = ready
     if !isReady {
-      // Queue until opReady; the safety-rail (F.5) may refuse to flush these. The
+      // Queue until kOpReady; the safety-rail (F.5) may refuse to flush these. The
       // payload is built at FLUSH time inside sendCreate from the session's LIVE
       // surfaceId/geometry — a resize during the pre-ready spawn window
       // reallocates the IOSurface (freeing the old global id) and updates the
@@ -538,7 +508,7 @@ final class CefProfileHost {
     return id
   }
 
-  /// Send an opCreateBrowser frame and mark the browserId as enqueued so its
+  /// Send a kOpCreateBrowser frame and mark the browserId as enqueued so its
   /// pre-connect resizes are no longer dropped. The payload is assembled HERE
   /// (not at createBrowser time) so it carries the session's current surfaceId +
   /// geometry: {u32 w}{u32 h}{f64 dpr}{u32 iosurfaceId}{utf8 url}. allowedSchemes
@@ -547,7 +517,7 @@ final class CefProfileHost {
     writeLock.lock()
     // Read the session's LIVE geometry + surfaceId AND write the create frame in a
     // single writeLock section, so a racing resize can neither slip between the
-    // surfaceId read and the create write, nor order its opResize ahead of the
+    // surfaceId read and the create write, nor order its kOpResize ahead of the
     // create on the wire (cef_host drops a resize for a not-yet-created browser).
     // Any resize after this lands after the create, so cef_host has a slot and
     // self-heals the surface via DoResize. (writeLock→bufferLock here is safe: no
@@ -567,18 +537,18 @@ final class CefProfileHost {
     // resize-before-create / since-freed-sid race the snapshot was guarding.)
     payload.append(contentsOf: Array(url.utf8))
     createEnqueued.insert(id)
-    var frame = frameBytes(id, Self.opCreateBrowser, payload)
-    // Create ON an authored document: its opSetAuthoredHtml goes out as ONE write
+    var frame = frameBytes(id, CefOp.createBrowser, payload)
+    // Create ON an authored document: its kOpSetAuthoredHtml goes out as ONE write
     // with, and ahead of, the create — cef_host stores it on its reader thread, so
     // it is in place before the browser's first request can be made.
     if let authored = session.authoredPayload(for: url) {
-      frame = frameBytes(id, Self.opSetAuthoredHtml, authored) + frame
+      frame = frameBytes(id, CefOp.setAuthoredHtml, authored) + frame
     }
     // Same for the document-start config: cef_host folds it into the browser's
     // creation info, which is the only way it reaches the renderer in time for
     // the FIRST document.
     if let docStart = session.documentStartPayload() {
-      frame = frameBytes(id, Self.opSetDocumentStart, docStart) + frame
+      frame = frameBytes(id, CefOp.setDocumentStart, docStart) + frame
     }
     var ok = true
     if connFd < 0 {
@@ -591,7 +561,7 @@ final class CefProfileHost {
     if !ok { handleHostDeath() }
   }
 
-  /// Enqueue a create for PACED sending instead of writing its opCreateBrowser
+  /// Enqueue a create for PACED sending instead of writing its kOpCreateBrowser
   /// frame immediately. See `createSendQueue`: many tiles on one shared host
   /// created in a burst would otherwise hand cef_host's single UI thread a pile of
   /// blocking CreateBrowserSync calls at once. Idempotent pump kicks the pacer.
@@ -603,7 +573,7 @@ final class CefProfileHost {
   }
 
   /// Send the NEXT queued create and wait for that browser's FIRST PAINT (firstPresentArrived,
-  /// off opPresent) before sending the following one — so each browser's first-frame GPU
+  /// off kOpPresent) before sending the following one — so each browser's first-frame GPU
   /// allocation completes before the next one contends, serializing establishment and
   /// avoiding the concurrent-first-frame race. `createAckTimeout` backstops a browser that
   /// binds but never paints so it can't stall the queue forever. A create whose browser was
@@ -637,7 +607,7 @@ final class CefProfileHost {
       }
 
       // Arm the watchdog (insert into firstPresentPending) BEFORE sendCreate so a first
-      // opPresent can never be observed before the id is registered as pending (which would
+      // kOpPresent can never be observed before the id is registered as pending (which would
       // leave a healthy painting tile stuck "pending" → false perpetual paintStalled).
       armFirstPresentWatchdog(next.id)  // C1
       sendCreate(next.id, next.session, next.url)
@@ -649,8 +619,8 @@ final class CefProfileHost {
     }
   }
 
-  /// H3: the in-flight create for `browserId` completed (opCreated), failed
-  /// (opCreateFailed), or timed out — release the pacer and send the next queued create.
+  /// H3: the in-flight create for `browserId` completed (kOpCreated), failed
+  /// (kOpCreateFailed), or timed out — release the pacer and send the next queued create.
   /// Idempotent: only the FIRST of {ack, timeout} for the current in-flight id advances.
   private func advanceCreatePacer(after browserId: UInt32, timedOut: Bool) {
     writeLock.lock()
@@ -735,7 +705,7 @@ final class CefProfileHost {
     return 0.4
   }()
 
-  /// C1: track WasHidden state (peeked from opSetVisible). A hidden browser produces no
+  /// C1: track WasHidden state (peeked from kOpSetVisible). A hidden browser produces no
   /// frames, so the watchdog suspends rather than flagging it stalled. On UNHIDE, re-arm
   /// the watchdog for a browser that's still blank, so a genuinely-stuck now-visible tile
   /// is still caught.
@@ -791,7 +761,7 @@ final class CefProfileHost {
     // Unblock the queue once (idempotent: only the in-flight id advances).
     advanceCreatePacer(after: browserId, timedOut: false)
     // Cheap nudge (harmless if it's just slow; helps a merely-dropped first frame).
-    send(browserId, Self.opInvalidate, [])
+    send(browserId, CefOp.invalidate, [])
     NSLog("[cef] profile '\(profileId)': browser \(browserId) still blank after \(Int(firstPaintGrace))s — reporting paintStalled (consumer may recreate)")
     onPaintStalled?(browserId)
     // Re-arm: keep watching on a backoff until it paints (firstPresentArrived clears it).
@@ -805,7 +775,7 @@ final class CefProfileHost {
   // browser that painted ≥1 frame then WEDGES (renderer/GPU stall inside a shared host
   // that keeps the pipe alive, so no processGone) had NO detector — silent blank until
   // relaunch. This periodic sweep covers steady state. A static page legitimately idles
-  // (no presents), so staleness alone isn't a wedge: a discriminating opInvalidate is sent
+  // (no presents), so staleness alone isn't a wedge: a discriminating kOpInvalidate is sent
   // first (a healthy page repaints → a present lands → cleared); only if no present follows
   // within the grace is paintStalled reported, routing into the consumer's BOUNDED recover.
   // Decision logic is in LivenessProbePolicy (standalone-unit-tested).
@@ -927,7 +897,7 @@ final class CefProfileHost {
           // page (a counter, a finished form) has nothing new to paint, so it produces NO present
           // — and that is HEALTHY, not wedged (it is showing correct content; the begin-frame
           // pump simply has nothing to draw). See .declareStalled.
-          send(c.bid, Self.opInvalidate, [])
+          send(c.bid, CefOp.invalidate, [])
           browsersLock.lock(); browsers[c.bid]?.livenessNudgedAt = now; browsersLock.unlock()
           // Ping the renderer too, at most once per staleness window: a static page answers
           // it, a hung renderer doesn't (checked at the top of the loop).
@@ -940,7 +910,7 @@ final class CefProfileHost {
                               UInt8(id >> 8 & 0xff), UInt8(id & 0xff)]
             p.append(contentsOf: Array("1".utf8))
             browsersLock.lock(); browsers[c.bid]?.livenessPingSentAt = now; browsersLock.unlock()
-            send(c.bid, Self.opEvalReturning, p)
+            send(c.bid, CefOp.evalReturning, p)
           }
         case .declareStalled:
           // The nudge above did NOT extract a frame. For an ESTABLISHED (already-painted) tile
@@ -1032,20 +1002,20 @@ final class CefProfileHost {
   }
 
   /// Frame `[u32 bodyLen=4+1+payload.count][u32 browserId][op][payload]` and
-  /// write it, or queue it if the pipe isn't up yet. A pre-connect opResize whose
+  /// write it, or queue it if the pipe isn't up yet. A pre-connect kOpResize whose
   /// browserId hasn't had its create enqueued is DROPPED — that create carries
   /// the current geometry, so replaying the resize could reference a since-freed
   /// IOSurface id.
   func send(_ browserId: UInt32, _ op: UInt8, _ payload: [UInt8]) {
     // C1: peek visibility so the first-present watchdog doesn't flag an intentionally
     // hidden (WasHidden) browser as stalled — it produces no frames by design.
-    if op == Self.opSetVisible, let v = payload.first {
+    if op == CefOp.setVisible, let v = payload.first {
       noteVisibility(browserId, visible: v != 0)
     }
     let frame = frameBytes(browserId, op, payload)
     writeLock.lock()
     if connFd < 0 {
-      if op == Self.opResize && !createEnqueued.contains(browserId) {
+      if op == CefOp.resize && !createEnqueued.contains(browserId) {
         writeLock.unlock()
         return
       }
@@ -1076,7 +1046,7 @@ final class CefProfileHost {
     return !browsers.isEmpty
   }
 
-  /// Whether cef_host ever announced opReady at our protocol version. A host that
+  /// Whether cef_host ever announced kOpReady at our protocol version. A host that
   /// died before that never created a browser, so the plugin reports its
   /// sessions' deaths as `createFailed`, not `crashed`.
   var everReady: Bool {
@@ -1084,7 +1054,7 @@ final class CefProfileHost {
     return ready
   }
 
-  /// Close ONE browser (opDisposeBrowser) and unregister it under lock. Returns
+  /// Close ONE browser (kOpDisposeBrowser) and unregister it under lock. Returns
   /// the number of browsers still registered on this host afterward.
   func removeBrowser(_ browserId: UInt32) -> Int {
     // CEF-2b: if this tile was agent-controlled, tear down ITS relay (its scoped
@@ -1092,7 +1062,7 @@ final class CefProfileHost {
     // a no-op when there's no relay for this id. Does its own locking + stops the
     // relay outside cdpHandlerLock.
     disableAgentControl(browserId: browserId)
-    send(browserId, Self.opDisposeBrowser, [])
+    send(browserId, CefOp.disposeBrowser, [])
     surfacePort?.forget(browserId: browserId)
     browsersLock.lock()
     browsers[browserId] = nil
@@ -1119,16 +1089,16 @@ final class CefProfileHost {
 
   // MARK: Teardown
 
-  /// Tear down the WHOLE process: opShutdown(0), stop the reader thread (flag it,
+  /// Tear down the WHOLE process: kOpShutdown(0), stop the reader thread (flag it,
   /// wake its blocking read() by shutting down the conn fd — a reader still waiting
   /// for the host to connect sees the flag at its next poll — wait for it to
   /// exit), close the fds, unlink the socket, drop an ephemeral profile dir, and
   /// terminate cef_host. Closing an fd a thread is blocked on, or freeing state
   /// under the reader, is a use-after-free — the join makes teardown deterministic.
   func shutdown() {
-    // Clear `running` FIRST (before the opShutdown write and before closing the
+    // Clear `running` FIRST (before the kOpShutdown write and before closing the
     // fds): this is a CLEAN teardown, so neither the reader's read-EOF nor a
-    // failed opShutdown write should be mistaken for a crash — handleHostDeath()
+    // failed kOpShutdown write should be mistaken for a crash — handleHostDeath()
     // guards on `running`, so flipping it false here keeps onHostDied from firing
     // on the shutdown path (C1).
     writeLock.lock()
@@ -1139,8 +1109,8 @@ final class CefProfileHost {
     createSendQueue.removeAll()
     createInFlight.removeAll()
     writeLock.unlock()
-    // Also abandon pre-opReady queued creates (pendingCreates is browsersLock-guarded, not
-    // writeLock) so a host dying between spawn and opReady tears down all THREE create-state
+    // Also abandon pre-kOpReady queued creates (pendingCreates is browsersLock-guarded, not
+    // writeLock) so a host dying between spawn and kOpReady tears down all THREE create-state
     // queues symmetrically — the old asymmetry left these closures dangling.
     browsersLock.lock()
     pendingCreates.removeAll()
@@ -1155,7 +1125,7 @@ final class CefProfileHost {
     onCdpMessage = nil
     cdpHandlerLock.unlock()
     for r in relays { r.stop() }
-    send(0, Self.opShutdown, [])
+    send(0, CefOp.shutdown, [])
     writeLock.lock()
     let c = connFd
     writeLock.unlock()
@@ -1351,9 +1321,9 @@ final class CefProfileHost {
     // Bring the pipe up and drain anything queued before it connected — all under
     // writeLock so a concurrent send can't interleave with the flush. Unlike the
     // old per-view path, geometry is NOT re-synced here: each browser's
-    // opCreateBrowser carries its current geometry, and pre-create resizes were
+    // kOpCreateBrowser carries its current geometry, and pre-create resizes were
     // dropped in send(); the queued frames are early control ops + the creates
-    // that fall through after opReady.
+    // that fall through after kOpReady.
     writeLock.lock()
     connFd = fd
     var flushOk = true
@@ -1388,11 +1358,11 @@ final class CefProfileHost {
       let payload = Array(body[5...])  // empty slice when bodyLen == 5 (no payload)
       if bid == 0 {
         handleProcessFrame(op, payload)
-      } else if op == Self.opTargetId {
+      } else if op == CefOp.targetId {
         // CEF-2b: a targetId resolution result — route to the pending completion,
         // not the session.
         handleTargetId(bid, String(bytes: payload, encoding: .utf8))
-      } else if op == Self.opEvalResult,
+      } else if op == CefOp.evalResult,
                 payload.starts(with: Self.livenessPingReplyPrefix) {
         // The liveness sweep's own ping, not the page's: the renderer answered.
         browsersLock.lock()
@@ -1401,10 +1371,10 @@ final class CefProfileHost {
           s.livenessPingRepliedAt = DispatchTime.now().uptimeNanoseconds
         }
         browsersLock.unlock()
-      } else if op == Self.opCreated {
+      } else if op == CefOp.created {
         // Bind ack — intentionally does NOT advance the pacer anymore. We gate the
         // next create on this browser's first PAINT (firstPresentArrived), not its bind,
-        // so establishment is serialized. opCreateFailed / the paint-timeout backstop
+        // so establishment is serialized. kOpCreateFailed / the paint-timeout backstop
         // still advance for the bound-but-never-painted / failed cases. The session
         // re-sends a hide the host dropped before this browser's slot existed.
         browsersLock.lock()
@@ -1413,7 +1383,7 @@ final class CefProfileHost {
         if let session = session {
           DispatchQueue.main.async { session.browserCreated(bid) }
         }
-      } else if op == Self.opCreateFailed {
+      } else if op == CefOp.createFailed {
         handleCreateFailed(bid)  // H7
       } else {
         browsersLock.lock()
@@ -1423,7 +1393,7 @@ final class CefProfileHost {
         // instead of acquiring a second lock on every (up to 60fps) present frame.
         var firstPaint = false
         var reachedStableFrames = false
-        if op == Self.opPresent, let s = session {
+        if op == CefOp.present, let s = session {
           s.presentCount += 1
           if s.presentCount == 1 { s.firstPresentSeen = true; firstPaint = true }
           if firstPresentWallUs == 0 { firstPresentWallUs = Self.wallClockUs() }
@@ -1431,12 +1401,12 @@ final class CefProfileHost {
           // F-6: any present clears the liveness-stall state — the browser is alive.
           s.lastPresentNs = DispatchTime.now().uptimeNanoseconds
           s.livenessNudgedAt = 0
-        } else if op == Self.opPageStart, let s = session {
+        } else if op == CefOp.pageStart, let s = session {
           // The ping's reply can be lost with the document it ran in, and a navigation
           // dismisses the page's dialogs.
           s.livenessPingSentAt = 0
           s.livenessDialogsOpen = 0
-        } else if op == Self.opJsDialog, let s = session {
+        } else if op == CefOp.jsDialog, let s = session {
           // The renderer waits on the dialog, so it can't answer the ping until then.
           s.livenessDialogsOpen += 1
           s.livenessPingSentAt = 0
@@ -1500,7 +1470,7 @@ final class CefProfileHost {
     let died = onHostDied
     writeLock.unlock()
     surfacePort?.close()
-    // Abandon pre-opReady queued creates too (pendingCreates is browsersLock-guarded) —
+    // Abandon pre-kOpReady queued creates too (pendingCreates is browsersLock-guarded) —
     // symmetric with the createSendQueue/createInFlight teardown above; the onHostDied path
     // still emits processGone for the sessions left in `browsers`.
     browsersLock.lock()
@@ -1573,20 +1543,20 @@ final class CefProfileHost {
     }
   }
 
-  /// Process/profile-level inbound frames (browserId 0): opReady (carries the
+  /// Process/profile-level inbound frames (browserId 0): kOpReady (carries the
   /// ad-hoc build flag, gates the create flush) and process logs.
   private func handleProcessFrame(_ op: UInt8, _ payload: [UInt8]) {
     switch op {
-    case Self.opReady:
+    case CefOp.ready:
       // Protocol handshake FIRST: refuse a version-skewed host before anything is
       // flushed to it. Byte 1 is the host's wire-protocol version; a legacy 1-byte
       // payload (pre-handshake host) reads as v0 and is refused the same way —
       // same-framing semantic drift would otherwise mis-parse or silently drop
       // frames (frozen/blank tiles with no breadcrumb).
       let hostVersion: UInt8 = payload.count >= 2 ? payload[1] : 0
-      if hostVersion != Self.protocolVersion {
+      if hostVersion != CefHostProtocol.version {
         NSLog("[cef] REFUSING cef_host for profile '\(profileId)': wire-protocol " +
-              "version \(hostVersion) != expected \(Self.protocolVersion). The " +
+              "version \(hostVersion) != expected \(CefHostProtocol.version). The " +
               "resolved cef_host binary does not match this plugin build " +
               "(FLUTTER_CEF_HOST override / stale from-source build / stale embed?).")
         writeLock.lock()
@@ -1619,7 +1589,7 @@ final class CefProfileHost {
         return
       }
       for c in creates { c() }
-    case Self.opLog:
+    case CefOp.log:
       let msg = String(bytes: payload, encoding: .utf8) ?? ""
       NSLog("[cef_host:\(profileId)] \(msg)")
     default:
@@ -1771,13 +1741,13 @@ final class CefProfileHost {
     if first { targetIdEpoch[browserId] = epoch }
     targetIdLock.unlock()
     guard first else { return }  // a resolve is already in flight for this browser
-    send(browserId, Self.opResolveTargetId, [])
+    send(browserId, CefOp.resolveTargetId, [])
     // The page target may not have COMMITTED when the first probe fires — common
     // for a tile force-spawned in a burst, where GPU/page init is async after
-    // create(). cef_host then finds no targetInfo and never sends opTargetId, so the
+    // create(). cef_host then finds no targetInfo and never sends kOpTargetId, so the
     // old fire-once probe silently timed out to nil (empty `webview snapshot`).
     // Re-probe within the deadline so a late-committing page still resolves. Each
-    // opResolveTargetId uses a fresh per-browser DevTools message id (see the
+    // kOpResolveTargetId uses a fresh per-browser DevTools message id (see the
     // 33858fb fix), so extra probes are harmless; handleTargetId removes the entry
     // on the first reply, stopping the retries.
     scheduleTargetIdRetry(browserId, epoch, attemptsLeft: 9)  // ~9 × 0.5s ≈ 4.5s
@@ -1786,7 +1756,7 @@ final class CefProfileHost {
     }
   }
 
-  /// Re-send opResolveTargetId every 0.5s while this exact resolve is still pending
+  /// Re-send kOpResolveTargetId every 0.5s while this exact resolve is still pending
   /// (not yet answered by handleTargetId, not superseded by a newer epoch), up to
   /// `attemptsLeft` times — so a page that commits a second or two after create()
   /// still resolves its targetId instead of the fire-once probe missing it.
@@ -1799,7 +1769,7 @@ final class CefProfileHost {
         self.targetIdEpoch[browserId] == epoch && self.pendingTargetId[browserId] != nil
       self.targetIdLock.unlock()
       guard stillPending else { return }  // resolved or superseded — stop
-      self.send(browserId, Self.opResolveTargetId, [])
+      self.send(browserId, CefOp.resolveTargetId, [])
       self.scheduleTargetIdRetry(browserId, epoch, attemptsLeft: attemptsLeft - 1)
     }
   }

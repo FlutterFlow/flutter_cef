@@ -3,7 +3,7 @@
 //
 // Mirrors the flutter_embed transport (macos/Runner/FlutterEmbed): the host
 // allocates a global IOSurface + CVPixelBuffer, registers a FlutterTexture, and
-// the owning CefProfileHost tells cef_host (via opCreateBrowser) to bind a
+// the owning CefProfileHost tells cef_host (via kOpCreateBrowser) to bind a
 // browser to that IOSurface id. cef_host paints the page into the IOSurface and
 // sends a "present" frame; we then poke the engine to re-sample the texture.
 // Because the page renders off-screen, it keeps updating even when the tile isn't
@@ -22,72 +22,6 @@ import FlutterMacOS
 import IOSurface
 
 final class CefWebSession: NSObject, FlutterTexture {
-  // IPC opcodes (must match native/cef_host/main.mm). Process-level + control
-  // ops (ready/log/create/dispose/shutdown) live on CefProfileHost; this list is
-  // the per-view ops a session names directly.
-  private static let opPresent: UInt8 = 0x01
-  private static let opLog: UInt8 = 0x04
-  private static let opCursor: UInt8 = 0x03
-  private static let opLoadState: UInt8 = 0x05
-  private static let opTitle: UInt8 = 0x06
-  private static let opUrl: UInt8 = 0x07
-  private static let opLoadErr: UInt8 = 0x08
-  private static let opConsole: UInt8 = 0x09
-  private static let opPageStart: UInt8 = 0x0a
-  private static let opPageFinish: UInt8 = 0x0b
-  private static let opProgress: UInt8 = 0x0c
-  private static let opNewWindow: UInt8 = 0x0d
-  private static let opPointer: UInt8 = 0x10
-  private static let opResize: UInt8 = 0x11
-  private static let opInvalidate: UInt8 = 0x37  // us -> cef_host: force a repaint (re-kick a stuck resize)
-  private static let opEditCommand: UInt8 = 0x38 // us -> cef_host: {u8 cmd} run a focused-frame edit command (copy/cut/paste/selectAll/undo/redo)
-  private static let opKey: UInt8 = 0x12
-  private static let opFindResult: UInt8 = 0x0e
-  private static let opJsDialog: UInt8 = 0x0f
-  private static let opEvalResult: UInt8 = 0x16
-  private static let opChannelMsg: UInt8 = 0x17
-  private static let opDownload: UInt8 = 0x18
-  private static let opImeBounds: UInt8 = 0x19
-  private static let opCookies: UInt8 = 0x1a
-  // cef_host -> us: a page called getUserMedia and the site has no remembered
-  // decision, so the host must show a permission prompt. {u32 id}{u32 mask}{utf8 origin}
-  private static let opMediaRequest: UInt8 = 0x1e
-  private static let opContextMenu: UInt8 = 0x40
-  // cef_host -> us: {u8 videoActive}{u8 audioActive}{u8 setting 0=ask 1=allow}
-  private static let opMediaState: UInt8 = 0x1f
-  private static let opNavigate: UInt8 = 0x20
-  private static let opReload: UInt8 = 0x21
-  private static let opStop: UInt8 = 0x22
-  private static let opBack: UInt8 = 0x23
-  private static let opForward: UInt8 = 0x24
-  private static let opExecuteJs: UInt8 = 0x25
-  private static let opSetZoom: UInt8 = 0x26
-  private static let opFind: UInt8 = 0x27
-  private static let opStopFind: UInt8 = 0x28
-  private static let opJsDialogResp: UInt8 = 0x29
-  private static let opEvalReturning: UInt8 = 0x2a
-  private static let opAddChannel: UInt8 = 0x2b
-  private static let opSetCookie: UInt8 = 0x2c
-  private static let opClearCookies: UInt8 = 0x2d
-  private static let opVisitCookies: UInt8 = 0x2e
-  private static let opDeleteCookie: UInt8 = 0x2f
-  private static let opImeSetComp: UInt8 = 0x30
-  private static let opImeCommit: UInt8 = 0x31
-  private static let opImeCancel: UInt8 = 0x32
-  private static let opShowDevTools: UInt8 = 0x33
-  private static let opLoadTrusted: UInt8 = 0x34
-  private static let opSetVisible: UInt8 = 0x35
-  // us -> cef_host: answer a permission prompt {u32 id}{u8 allow}{u8 remember};
-  // remembered per-origin only when a human chose, exactly like a browser.
-  private static let opMediaResponse: UInt8 = 0x3c
-  private static let opContextMenuCommand: UInt8 = 0x3e
-  // us -> cef_host: {u8 0=ask 1=allow 2=block} rewrite this site's remembered
-  // camera/mic decision (the URL-bar "site settings" path). No reload.
-  private static let opSetMediaSetting: UInt8 = 0x3d
-  private static let opOpenAuthWindow: UInt8 = 0x39
-  private static let opSetAudioMuted: UInt8 = 0x3a    // {u8 muted} -> CefBrowserHost::SetAudioMuted
-  private static let opSetPumpInterval: UInt8 = 0x3b  // {u16 BE ms} visible begin-frame cadence
-
   // Event callbacks (fired off the main thread). The registrar relays each to a
   // Dart channel message.
   var onCursor: ((Int) -> Void)?
@@ -175,7 +109,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   var presentCount = 0
   // F-6 steady-state liveness watchdog (guarded by CefProfileHost.browsersLock, like
   // presentCount). `lastPresentNs` = the most recent present's uptime; `livenessNudgedAt`
-  // = uptime of an outstanding discriminating opInvalidate (0 = none). The host's periodic
+  // = uptime of an outstanding discriminating kOpInvalidate (0 = none). The host's periodic
   // sweep reads these to catch a browser that painted ≥1 frame then WEDGED (the first-paint
   // watchdog retires at first paint, so post-establishment wedges had no detector).
   var lastPresentNs: UInt64 = 0
@@ -230,13 +164,13 @@ final class CefWebSession: NSObject, FlutterTexture {
   private var wantsHidden = false
 
   /// The live IOSurface id this session's buffer is backed by, or 0 before
-  /// allocation. The host reads this to build the opCreateBrowser payload.
+  /// allocation. The host reads this to build the kOpCreateBrowser payload.
   var surfaceId: UInt32 {
     bufferLock.lock(); defer { bufferLock.unlock() }
     return pixelBuffer.flatMap { CVPixelBufferGetIOSurface($0) }
       .map { IOSurfaceGetID($0.takeUnretainedValue()) } ?? 0
   }
-  // Geometry, exposed for the host's opCreateBrowser payload. width/height/dpr are
+  // Geometry, exposed for the host's kOpCreateBrowser payload. width/height/dpr are
   // mutated by resize() on the main thread and read by the host on its reader
   // thread, so guard them with bufferLock.
   var w: Int { bufferLock.lock(); defer { bufferLock.unlock() }; return width }
@@ -264,7 +198,7 @@ final class CefWebSession: NSObject, FlutterTexture {
     self.browserId = browserId
     // Flush channels registered before the wire id existed (and re-send them on a
     // re-home to a new host) now that sendFrame can route with a valid browserId.
-    for name in channels { sendFrame(Self.opAddChannel, Array(name.utf8)) }
+    for name in channels { sendFrame(CefOp.addChannel, Array(name.utf8)) }
   }
 
   /// Freeze support: unbind from the (already-unregistered, about-to-close)
@@ -329,7 +263,7 @@ final class CefWebSession: NSObject, FlutterTexture {
     // adopt), resizeInFlight would stay true forever and the `blocked` guard would drop every
     // later resize — the tile would stop tracking its size. Past a grace, clear the flag so this
     // newer size goes out. (Producer-allocates: there's no consumer pending buffer to drop; the
-    // newest opResize + the producer's next paint converge the surface.)
+    // newest kOpResize + the producer's next paint converge the surface.)
     let wedged = ResizeSupersedePolicy.shouldClearWedged(
       inFlight: resizeInFlight, elapsedNs: nowNs() &- resizeSentAtNs, graceNs: 450_000_000)
     if wedged {
@@ -353,7 +287,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   }
 
   /// PRODUCER-ALLOCATES: send the DESIRED geometry only — cef_host re-rasters, mints a new
-  /// surface sized to its own paint, and presents the new id, which handleFrame(opPresent)
+  /// surface sized to its own paint, and presents the new id, which handleFrame(kOpPresent)
   /// adopts. No consumer-side IOSurface allocation, no pending-buffer handoff (the producer
   /// presents a sid only once it's painted, so adopt-on-change is always non-blank). We keep
   /// serving the current pixelBuffer (the old surface, held alive by its CVPixelBuffer) until
@@ -373,7 +307,7 @@ final class CefWebSession: NSObject, FlutterTexture {
     appendU32(&payload, UInt32(w))
     appendU32(&payload, UInt32(h))
     appendF64(&payload, Double(d))  // cef_host updates slot->dpr → re-renders at new density
-    sendFrame(Self.opResize, payload)
+    sendFrame(CefOp.resize, payload)
     // Re-kick if cef_host hasn't produced a new-size paint (and thus a new present to adopt).
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
       self?.resizeWatchdog(gen)
@@ -382,7 +316,7 @@ final class CefWebSession: NSObject, FlutterTexture {
 
   /// Re-kick a wedged resize. Bails immediately if a newer resize has gone out (gen advanced)
   /// or this one already promoted (not in flight). Otherwise cef_host hasn't yet painted into
-  /// the new (pending) surface — nudge it to repaint (opInvalidate), retrying every ~80ms.
+  /// the new (pending) surface — nudge it to repaint (kOpInvalidate), retrying every ~80ms.
   /// Under ALWAYS-LATEST promotion the resulting paint into the pending surface promotes it on
   /// sid match (handleFrame), so this re-kick is what rescues a STATIC page (one frame per
   /// resize) whose single post-resize frame was dropped. No force-promote needed: we never have
@@ -394,7 +328,7 @@ final class CefWebSession: NSObject, FlutterTexture {
       inFlight: resizeInFlight, gen: gen, currentGen: resizeGen)
     // SELF-HEAL a wedged resize whose adopt never landed (producer freed the surface racing the
     // present, or a dropped frame with no follow-up paint). Without this, resizeInFlight would
-    // stay true until the NEXT resize() call — blocking coalescing + re-kicking opInvalidate
+    // stay true until the NEXT resize() call — blocking coalescing + re-kicking kOpInvalidate
     // forever. Clearing is safe under producer-allocates: always-latest adopts on the next
     // present regardless of the flag. (Previously this clear lived ONLY in resize(), so a tile
     // the user stopped interacting with could stay wedged-in-flight indefinitely.)
@@ -406,14 +340,14 @@ final class CefWebSession: NSObject, FlutterTexture {
     }
     bufferLock.unlock()
     // If a paint already landed in the pending surface, handleFrame promoted it + cleared
-    // resizeInFlight → `active` is false → stop. Otherwise re-kick (opInvalidate forces cef_host
+    // resizeInFlight → `active` is false → stop. Otherwise re-kick (kOpInvalidate forces cef_host
     // to repaint the pending surface; the 16ms begin-frame pump also drives it), and the next
     // present promotes via sid match. The texture meanwhile keeps serving the last good surface
     // scaled to the tile (momentarily soft if the box grew) — never blank, never frozen-wrong.
     guard active else { return }
-    // While hidden the pump is gated off, so opInvalidate can't paint — skip the nudge but keep
+    // While hidden the pump is gated off, so kOpInvalidate can't paint — skip the nudge but keep
     // the watchdog alive; the native un-hide repaint (F-1) drives a real present that promotes.
-    if !isHidden { sendFrame(Self.opInvalidate, []) }
+    if !isHidden { sendFrame(CefOp.invalidate, []) }
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
       self?.resizeWatchdog(gen)
     }
@@ -434,7 +368,7 @@ final class CefWebSession: NSObject, FlutterTexture {
 
   func navigate(_ url: String) {
     setAuthoredDoc(nil)  // a plain navigate wants the real site (cef_host clears too)
-    sendFrame(Self.opNavigate, Array(url.utf8))
+    sendFrame(CefOp.navigate, Array(url.utf8))
   }
 
   // MARK: Authored document at a real origin (loadHtmlString(baseUrl:))
@@ -443,10 +377,10 @@ final class CefWebSession: NSObject, FlutterTexture {
   /// document has that URL's origin instead of a `data:` URL's opaque one. Kept on
   /// the session (not just sent once) because EVERY create of this browser —
   /// first, deferred, or a re-home after a host crash — must put the frame on the
-  /// wire ahead of its opCreateBrowser: see `CefProfileHost.sendCreate`.
+  /// wire ahead of its kOpCreateBrowser: see `CefProfileHost.sendCreate`.
   private let authoredLock = NSLock()
   private var authoredDoc: (url: String, html: String)?
-  // The opSetDocumentStart payload (see setDocumentStart), or nil when the
+  // The kOpSetDocumentStart payload (see setDocumentStart), or nil when the
   // session has neither document-start scripts nor create-time channels. Fixed
   // at create; guarded by authoredLock (read by the host's create sender).
   private var documentStart: [UInt8]?
@@ -454,7 +388,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   /// Document-start scripts + JS channel names, installed by the renderer at
   /// JS-context creation of every main-frame document — ahead of page scripts.
   /// Wire payload: a sequence of items {u8 kind}{u32 len BE}{utf8}, kind 0 = a
-  /// channel name, 1 = a script. Must reach cef_host ahead of opCreateBrowser
+  /// channel name, 1 = a script. Must reach cef_host ahead of kOpCreateBrowser
   /// (it rides in the browser's creation info), so it is sent by sendCreate.
   func setDocumentStart(scripts: [String], channels: [String]) {
     var payload = [UInt8]()
@@ -482,7 +416,7 @@ final class CefWebSession: NSObject, FlutterTexture {
     authoredLock.lock(); authoredDoc = doc; authoredLock.unlock()
   }
 
-  /// The opSetAuthoredHtml payload ({url}\0{html}) if this session has an authored
+  /// The kOpSetAuthoredHtml payload ({url}\0{html}) if this session has an authored
   /// document for `url`, else nil.
   func authoredPayload(for url: String) -> [UInt8]? {
     authoredLock.lock(); defer { authoredLock.unlock() }
@@ -494,8 +428,8 @@ final class CefWebSession: NSObject, FlutterTexture {
   /// host-trusted navigation. Two frames, in this order, from this one thread.
   func loadAuthored(url: String, html: String) {
     setAuthoredDoc((url, html))
-    sendFrame(CefProfileHost.opSetAuthoredHtml, Array(url.utf8) + [0] + Array(html.utf8))
-    sendFrame(Self.opLoadTrusted, Array(url.utf8))
+    sendFrame(CefOp.setAuthoredHtml, Array(url.utf8) + [0] + Array(html.utf8))
+    sendFrame(CefOp.loadTrusted, Array(url.utf8))
   }
 
   /// Open a windowed Chrome-runtime browser at |url| for a WebAuthn / Touch ID
@@ -511,34 +445,34 @@ final class CefWebSession: NSObject, FlutterTexture {
       NSLog("[flutter_cef] openAuthWindow refused non-http(s) URL")
       return
     }
-    sendFrame(Self.opOpenAuthWindow, Array(url.utf8))
+    sendFrame(CefOp.openAuthWindow, Array(url.utf8))
   }
 
   /// A host content-injection load (loadHtmlString -> data:, loadFile -> file:):
   /// exempt from the navigation scheme allowlist, unlike `navigate`.
   func loadTrusted(_ url: String) {
     setAuthoredDoc(nil)
-    sendFrame(Self.opLoadTrusted, Array(url.utf8))
+    sendFrame(CefOp.loadTrusted, Array(url.utf8))
   }
 
-  func reload() { sendFrame(Self.opReload) }
-  func stopLoad() { sendFrame(Self.opStop) }
-  func goBack() { sendFrame(Self.opBack) }
-  func goForward() { sendFrame(Self.opForward) }
+  func reload() { sendFrame(CefOp.reload) }
+  func stopLoad() { sendFrame(CefOp.stop) }
+  func goBack() { sendFrame(CefOp.back) }
+  func goForward() { sendFrame(CefOp.forward) }
   func executeJavaScript(_ code: String) {
-    sendFrame(Self.opExecuteJs, Array(code.utf8))
+    sendFrame(CefOp.executeJs, Array(code.utf8))
   }
 
   func setZoomLevel(_ level: Double) {
     var p = [UInt8]()
     appendF64(&p, level)
-    sendFrame(Self.opSetZoom, p)
+    sendFrame(CefOp.setZoom, p)
   }
 
   /// Run a browser edit command (0=copy 1=cut 2=paste 3=selectAll 4=undo
   /// 5=redo) on the focused frame in the cef_host subprocess.
   func editCommand(_ command: Int) {
-    sendFrame(Self.opEditCommand, [UInt8(truncatingIfNeeded: command)])
+    sendFrame(CefOp.editCommand, [UInt8(truncatingIfNeeded: command)])
   }
 
   /// Pause/resume frame production in the cef_host subprocess. `false` calls
@@ -550,14 +484,14 @@ final class CefWebSession: NSObject, FlutterTexture {
     bufferLock.lock()
     hidden = !visible
     bufferLock.unlock()
-    sendFrame(Self.opSetVisible, [visible ? 1 : 0])
+    sendFrame(CefOp.setVisible, [visible ? 1 : 0])
   }
 
-  /// cef_host has bound browser `bid` (opCreated). cef_host registers a browser's
-  /// slot only as it creates the browser, and drops an opSetVisible that arrives
+  /// cef_host has bound browser `bid` (kOpCreated). cef_host registers a browser's
+  /// slot only as it creates the browser, and drops a kOpSetVisible that arrives
   /// before that: a hide sent right after create() returns — or flushed ahead of the
   /// create on a cold host, where control frames go out at connect and creates at
-  /// opReady — was lost, and the page painted while this side believed it hidden.
+  /// kOpReady — was lost, and the page painted while this side believed it hidden.
   /// Re-send the consumer's hide now that the slot exists, and resync `hidden` to it
   /// (a thawed browser comes up shown, whatever the freeze left there). Main thread,
   /// like setVisible, so a later setVisible's frame always goes out after this one.
@@ -567,7 +501,7 @@ final class CefWebSession: NSObject, FlutterTexture {
     let live = textureId != 0  // dispose() zeroes it
     if live { hidden = wantsHidden }
     bufferLock.unlock()
-    if live && wantsHidden { sendFrame(Self.opSetVisible, [0]) }
+    if live && wantsHidden { sendFrame(CefOp.setVisible, [0]) }
   }
 
   /// Owner opt-in for camera/mic (getUserMedia) on this browser. Deny-default in
@@ -582,7 +516,7 @@ final class CefWebSession: NSObject, FlutterTexture {
     appendU32(&p, UInt32(truncatingIfNeeded: id))
     p.append(allow ? 1 : 0)
     p.append(remember ? 1 : 0)
-    sendFrame(Self.opMediaResponse, p)
+    sendFrame(CefOp.mediaResponse, p)
   }
 
   /// Answer a context menu. `commandId` 0 means dismissed without choosing —
@@ -592,13 +526,13 @@ final class CefWebSession: NSObject, FlutterTexture {
     var p = [UInt8]()
     appendU32(&p, UInt32(truncatingIfNeeded: id))
     appendU32(&p, UInt32(truncatingIfNeeded: commandId))
-    sendFrame(Self.opContextMenuCommand, p)
+    sendFrame(CefOp.contextMenuCommand, p)
   }
 
   /// Rewrite this site's remembered camera/mic decision (0 = ask again, 1 =
   /// allow, 2 = block). No reload — it applies next time the page asks.
   func setMediaSetting(_ value: Int) {
-    sendFrame(Self.opSetMediaSetting, [UInt8(clamping: value)])
+    sendFrame(CefOp.setMediaSetting, [UInt8(clamping: value)])
   }
 
 
@@ -606,7 +540,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   /// page regains Chromium's intensive wake-up throttling (audible pages are
   /// exempt), so muting on hide keeps a background tile's timers cheap.
   func setAudioMuted(_ muted: Bool) {
-    sendFrame(Self.opSetAudioMuted, [muted ? 1 : 0])
+    sendFrame(CefOp.setAudioMuted, [muted ? 1 : 0])
   }
 
   /// Set the visible begin-frame pump interval (ms) — the OSR frame clock for
@@ -614,17 +548,17 @@ final class CefWebSession: NSObject, FlutterTexture {
   /// [8, 250]. Hidden tiles produce no frames regardless.
   func setFrameInterval(_ ms: Int) {
     let clamped = UInt16(clamping: ms)
-    sendFrame(Self.opSetPumpInterval, [UInt8(clamped >> 8), UInt8(clamped & 0xff)])
+    sendFrame(CefOp.setPumpInterval, [UInt8(clamped >> 8), UInt8(clamped & 0xff)])
   }
 
   func find(_ text: String, forward: Bool, matchCase: Bool, findNext: Bool) {
     var p: [UInt8] = [forward ? 1 : 0, matchCase ? 1 : 0, findNext ? 1 : 0]
     p.append(contentsOf: Array(text.utf8))
-    sendFrame(Self.opFind, p)
+    sendFrame(CefOp.find, p)
   }
 
   func stopFind(_ clearSelection: Bool) {
-    sendFrame(Self.opStopFind, [clearSelection ? 1 : 0])
+    sendFrame(CefOp.stopFind, [clearSelection ? 1 : 0])
   }
 
   func respondJsDialog(id: Int, ok: Bool, text: String) {
@@ -632,7 +566,7 @@ final class CefWebSession: NSObject, FlutterTexture {
     appendU32(&p, UInt32(truncatingIfNeeded: id))
     p.append(ok ? 1 : 0)
     p.append(contentsOf: Array(text.utf8))
-    sendFrame(Self.opJsDialogResp, p)
+    sendFrame(CefOp.jsDialogResp, p)
     host?.noteDialogAnswered(browserId)
   }
 
@@ -640,13 +574,13 @@ final class CefWebSession: NSObject, FlutterTexture {
     var p = [UInt8]()
     appendU32(&p, UInt32(truncatingIfNeeded: id))
     p.append(contentsOf: Array(code.utf8))
-    sendFrame(Self.opEvalReturning, p)
+    sendFrame(CefOp.evalReturning, p)
   }
 
   func addChannel(_ name: String) {
     channels.insert(name)
     // Ship now only if we already have a wire id; otherwise attach() flushes it.
-    if browserId != 0 { sendFrame(Self.opAddChannel, Array(name.utf8)) }
+    if browserId != 0 { sendFrame(CefOp.addChannel, Array(name.utf8)) }
   }
 
   func setCookie(url: String, name: String, value: String, domain: String,
@@ -657,20 +591,20 @@ final class CefWebSession: NSObject, FlutterTexture {
     let payload = [url, name, value, domain, path,
                    secure ? "1" : "0", httpOnly ? "1" : "0", sameSite]
       .joined(separator: "\u{0}")
-    sendFrame(Self.opSetCookie, Array(payload.utf8))
+    sendFrame(CefOp.setCookie, Array(payload.utf8))
   }
 
-  func clearCookies() { sendFrame(Self.opClearCookies) }
+  func clearCookies() { sendFrame(CefOp.clearCookies) }
 
   func visitCookies(id: Int, url: String) {
     var payload = [UInt8]()
     appendU32(&payload, UInt32(truncatingIfNeeded: id))
     payload.append(contentsOf: Array(url.utf8))
-    sendFrame(Self.opVisitCookies, payload)
+    sendFrame(CefOp.visitCookies, payload)
   }
 
   func deleteCookie(url: String, name: String) {
-    sendFrame(Self.opDeleteCookie, Array((url + "\u{0}" + name).utf8))
+    sendFrame(CefOp.deleteCookie, Array((url + "\u{0}" + name).utf8))
   }
 
   /// Open DevTools. With a point (page DIP coords) it opens INSPECTING the
@@ -678,24 +612,24 @@ final class CefWebSession: NSObject, FlutterTexture {
   func showDevTools(inspectAt: (x: Int, y: Int)? = nil) {
     host?.noteDevToolsOpened(browserId)
     guard let at = inspectAt else {
-      sendFrame(Self.opShowDevTools)
+      sendFrame(CefOp.showDevTools)
       return
     }
     var p = [UInt8]()
     appendU32(&p, UInt32(truncatingIfNeeded: max(0, at.x)))
     appendU32(&p, UInt32(truncatingIfNeeded: max(0, at.y)))
-    sendFrame(Self.opShowDevTools, p)
+    sendFrame(CefOp.showDevTools, p)
   }
 
   func imeSetComposition(_ text: String) {
-    sendFrame(Self.opImeSetComp, Array(text.utf8))
+    sendFrame(CefOp.imeSetComp, Array(text.utf8))
   }
 
   func imeCommitText(_ text: String) {
-    sendFrame(Self.opImeCommit, Array(text.utf8))
+    sendFrame(CefOp.imeCommit, Array(text.utf8))
   }
 
-  func imeCancelComposition() { sendFrame(Self.opImeCancel) }
+  func imeCancelComposition() { sendFrame(CefOp.imeCancel) }
 
   // type: 0=move 1=down 2=up 3=wheel; button: 0=left 1=middle 2=right.
   func sendPointer(type: Int, button: Int, clickCount: Int, modifiers: UInt32,
@@ -707,7 +641,7 @@ final class CefWebSession: NSObject, FlutterTexture {
     p.append(0)
     appendU32(&p, modifiers)
     appendF64(&p, x); appendF64(&p, y); appendF64(&p, dx); appendF64(&p, dy)
-    sendFrame(Self.opPointer, p)
+    sendFrame(CefOp.pointer, p)
   }
 
   // type: 0=rawkeydown 2=keyup 3=char.
@@ -720,15 +654,15 @@ final class CefWebSession: NSObject, FlutterTexture {
     appendU32(&p, UInt32(bitPattern: windowsKeyCode))
     appendU32(&p, UInt32(bitPattern: nativeKeyCode))
     appendU32(&p, character)
-    sendFrame(Self.opKey, p)
+    sendFrame(CefOp.key, p)
   }
 
   /// Release the texture + buffers. The process/socket teardown (and the
-  /// opDisposeBrowser/opShutdown signalling + reader join) is the owning
+  /// kOpDisposeBrowser/kOpShutdown signalling + reader join) is the owning
   /// CefProfileHost's job — by the time this runs the host has already
   /// unregistered this browser, so there's no reader racing the free.
   func dispose() {
-    // Zero textureId under bufferLock so a reader-thread opPresent can't read it
+    // Zero textureId under bufferLock so a reader-thread kOpPresent can't read it
     // torn or schedule a frame for an id we're about to unregister (it re-reads
     // under the lock on main). unregisterTexture itself runs on the main thread.
     bufferLock.lock()
@@ -794,7 +728,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   }
 
   /// Read (w, h, dpr) as ONE consistent tuple under a single bufferLock acquisition — the host
-  /// builds opCreateBrowser from this. Producer-allocates: no surface id (cef_host mints its own).
+  /// builds kOpCreateBrowser from this. Producer-allocates: no surface id (cef_host mints its own).
   func createSnapshot() -> (w: Int, h: Int, dpr: CGFloat) {
     bufferLock.lock(); defer { bufferLock.unlock() }
     return (width, height, dpr)
@@ -807,7 +741,7 @@ final class CefWebSession: NSObject, FlutterTexture {
   /// start at 0 (the old per-view switch read from offset 1, after the op byte).
   func handleFrame(_ op: UInt8, _ payload: [UInt8]) {
     switch op {
-    case Self.opPresent:
+    case CefOp.present:
       // Count FIRST: a present that arrives but fails to adopt is still proof
       // the producer is painting, which is what liveness asks about.
       notePresent()
@@ -876,25 +810,25 @@ final class CefWebSession: NSObject, FlutterTexture {
           self.maybeSendNextResize()
         }
       }
-    case Self.opLog:
+    case CefOp.log:
       // Per-browser diagnostic from cef_host (paint/renderer/resize/etc.). Surface
       // it with this session's context (process-level logs go via the host).
       NSLog("[cef_host:\(sessionId)] \(String(bytes: payload, encoding: .utf8) ?? "")")
-    case Self.opCursor:
+    case CefOp.cursor:
       if payload.count >= 4 {
         let c = (Int(payload[0]) << 24) | (Int(payload[1]) << 16)
           | (Int(payload[2]) << 8) | Int(payload[3])
         onCursor?(c)
       }
-    case Self.opLoadState:
+    case CefOp.loadState:
       if payload.count >= 3 {
         onLoadState?(payload[0] != 0, payload[1] != 0, payload[2] != 0)
       }
-    case Self.opTitle:
+    case CefOp.title:
       onTitle?(String(bytes: payload, encoding: .utf8) ?? "")
-    case Self.opUrl:
+    case CefOp.url:
       onUrl?(String(bytes: payload, encoding: .utf8) ?? "")
-    case Self.opLoadErr:
+    case CefOp.loadErr:
       if payload.count >= 4 {
         let code = readU32(payload, 0)
         let s = String(bytes: payload[4...], encoding: .utf8) ?? ""
@@ -903,24 +837,24 @@ final class CefWebSession: NSObject, FlutterTexture {
         onLoadError?(code, parts.count > 0 ? String(parts[0]) : "",
                      parts.count > 1 ? String(parts[1]) : "")
       }
-    case Self.opConsole:
+    case CefOp.console:
       if payload.count >= 4 {
         onConsole?(readU32(payload, 0),
                    String(bytes: payload[4...], encoding: .utf8) ?? "")
       }
-    case Self.opPageStart:
+    case CefOp.pageStart:
       onPageStarted?(String(bytes: payload, encoding: .utf8) ?? "")
-    case Self.opPageFinish:
+    case CefOp.pageFinish:
       onPageFinished?(String(bytes: payload, encoding: .utf8) ?? "")
-    case Self.opProgress:
+    case CefOp.progress:
       if payload.count >= 4 { onProgress?(readU32(payload, 0)) }
-    case Self.opNewWindow:
+    case CefOp.newWindow:
       onNewWindow?(String(bytes: payload, encoding: .utf8) ?? "")
-    case Self.opFindResult:
+    case CefOp.findResult:
       if payload.count >= 9 {
         onFindResult?(readU32(payload, 0), readU32(payload, 4), payload[8] != 0)
       }
-    case Self.opJsDialog:
+    case CefOp.jsDialog:
       if payload.count >= 12 {
         let type = readU32(payload, 4)
         let msgLen = readU32(payload, 8)
@@ -931,37 +865,37 @@ final class CefWebSession: NSObject, FlutterTexture {
             : ""
         onJsDialog?(readU32(payload, 0), type, msg, def)
       }
-    case Self.opEvalResult:
+    case CefOp.evalResult:
       onEvalResult?(String(bytes: payload, encoding: .utf8) ?? "")
-    case Self.opChannelMsg:
+    case CefOp.channelMsg:
       onChannelMsg?(String(bytes: payload, encoding: .utf8) ?? "")
-    case Self.opDownload:
+    case CefOp.download:
       onDownload?(String(bytes: payload, encoding: .utf8) ?? "")
-    case Self.opImeBounds:
+    case CefOp.imeBounds:
       if payload.count >= 16 {
         onImeBounds?(readU32(payload, 0), readU32(payload, 4),
                      readU32(payload, 8), readU32(payload, 12))
       }
-    case Self.opCookies:
+    case CefOp.cookies:
       if payload.count >= 4 {
         onCookies?(readU32(payload, 0),
                    String(bytes: payload[4...], encoding: .utf8) ?? "[]")
       }
-    case Self.opMediaRequest:
+    case CefOp.mediaRequest:
       if payload.count >= 8 {
         let origin = payload.count > 8
             ? (String(bytes: payload[8...], encoding: .utf8) ?? "")
             : ""
         onMediaRequest?(readU32(payload, 0), readU32(payload, 4), origin)
       }
-    case Self.opContextMenu:
+    case CefOp.contextMenu:
       if payload.count >= 4 {
         let json = payload.count > 4
             ? (String(bytes: payload[4...], encoding: .utf8) ?? "{}")
             : "{}"
         onContextMenu?(readU32(payload, 0), json)
       }
-    case Self.opMediaState:
+    case CefOp.mediaState:
       if payload.count >= 3 {
         onMediaState?(payload[0] != 0, payload[1] != 0, Int(payload[2]))
       }

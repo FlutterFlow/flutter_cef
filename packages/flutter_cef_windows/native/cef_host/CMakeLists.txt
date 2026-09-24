@@ -73,6 +73,7 @@ endif()
 add_library(cef_host SHARED
   cef_host_win.cc
   cef_host_protocol.h
+  cef_host_opcodes.h
   document_start.h
 )
 SET_LIBRARY_TARGET_PROPERTIES(cef_host)

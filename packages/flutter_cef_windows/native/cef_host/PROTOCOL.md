@@ -1,25 +1,20 @@
 # flutter_cef Windows wire + channel contract (slice)
 
-TRANSCRIBED from the macOS reference implementation — do not invent. Sources
-(line numbers as of branch `feat/windows-port-p0`):
+The opcodes and protocol versions of both platforms are defined once, in
+`tool/protocol/spec.dart`, and generated into each package (§2). The rest of
+this document was transcribed from the macOS implementation (line numbers are
+from branch `feat/windows-port-p0` and have drifted):
 
-- `packages/flutter_cef_macos/native/cef_host/main.mm` — opcode table
-  (`kOp*`, main.mm:111-164), framing (main.mm:40-45, 416-446), read-loop
-  payload decoding (main.mm:2338-2603).
+- `packages/flutter_cef_macos/native/cef_host/main.mm` — framing and read-loop
+  payload decoding.
 - `packages/flutter_cef_macos/macos/Classes/FlutterCefPlugin.swift` — channel
-  verb dispatch (`handle`, FlutterCefPlugin.swift:111-242) and native->Dart
-  events (`emit` sites, FlutterCefPlugin.swift:359-430, 490, 521, 531, 541,
-  554-558).
-- `packages/flutter_cef_macos/macos/Classes/CefWebSession.swift:28-73` and
-  `CefProfileHost.swift:21-42` — the Swift copies of the opcode table (must
-  match main.mm; they do).
+  verb dispatch (`handle`) and native->Dart events (`emit` sites).
 - `lib/src/cef_web_controller.dart` — the exact channel-arg maps Dart sends
   (cited per verb below).
 
-The Windows host + plugin speak EXACTLY this protocol with **one payload
-difference**: `kOpPresent` (see below). Opcode numbers, framing, byte order,
-and every other payload are copied verbatim. Protocol version byte = **3**
-(main.mm:108, CefProfileHost.swift:42).
+The Windows host + plugin speak the macOS protocol with two payload
+differences, `kOpPresent` and `kOpShowDevTools` (§2), and their own protocol
+version.
 
 ---
 
@@ -65,84 +60,86 @@ main.mm:2338-2357):
 - Unknown opcode at either end: log ONCE per opcode value and drop the
   frame — never kill the stream (main.mm:2583-2598).
 
-## 2. Opcode table (numbers verbatim from main.mm:111-164)
+## 2. Opcode table
 
-Direction `H<-C` = cef_host -> plugin (event), `H->C` = plugin -> cef_host
-(command). Payload layouts are exactly the macOS ones except where marked
-**WINDOWS**.
+Generated from `tool/protocol/spec.dart`, like `cef_host_opcodes.h`; edit the
+spec and run `dart run tool/protocol/generate.dart`. Payloads match macOS except
+kOpPresent (a D3D bridge handle instead of an IOSurface id) and kOpShowDevTools
+(no inspect point). A short frame is dropped, not fatal.
 
-### cef_host -> plugin (0x01-0x1d)
+<!-- BEGIN GENERATED OPCODES (tool/protocol/generate.dart) -->
 
-| Op | Name | Payload | Source |
-|---|---|---|---|
-| 0x01 | kOpPresent | **WINDOWS**: `{u64 bridgeHandle BE}{u32 srcW BE}{u32 srcH BE}` = 16 bytes. bridgeHandle = the DXGI **legacy** shared handle (`IDXGIResource::GetSharedHandle`) of the host-minted `MISC_SHARED` bridge texture; srcW/srcH = the PHYSICAL px dims of the frame actually composited (the size-gate signal). macOS reference is 12 bytes `{u32 iosurfaceId}{u32 srcW}{u32 srcH}` — same semantics, different token width. | main.mm:654-665 (semantics + size gate), SPIKES.md S1/S4, LAW 10 |
-| 0x02 | kOpReady | `{u8 readyFlags}{u8 protocolVersion}` on browserId 0. readyFlags bit0 = ad-hoc/mock-keychain build (macOS-only concern; Windows sends 0). protocolVersion = 4 (Windows-only numbering — see cef_host_protocol.h). Sent from `OnContextInitialized`, BEFORE any browser exists. | main.mm:1664-1682 |
-| 0x03 | kOpCursor | `{u32 cef_cursor_type_t}` | main.mm:1456-1466 |
-| 0x04 | kOpLog | `{utf8 message}` (browserId 0 = process-level) | main.mm:448-450 |
-| 0x05 | kOpLoadState | `{u8 loading}{u8 canGoBack}{u8 canGoForward}` | main.mm:115, 456-462 |
-| 0x06 | kOpTitle | `{utf8 title}` | main.mm:116 |
-| 0x07 | kOpUrl | `{utf8 main-frame url}` | main.mm:117 |
-| 0x08 | kOpLoadErr | `{u32 code}{utf8 "url\ntext"}` | main.mm:118, 464-474 |
-| 0x09 | kOpConsole | `{u32 level}{utf8 "source:line\tmsg"}` | main.mm:119 |
-| 0x0a | kOpPageStart | `{utf8 url}` main frame load started | main.mm:120 |
-| 0x0b | kOpPageFinish | `{utf8 url}` main frame load finished | main.mm:121 |
-| 0x0c | kOpProgress | `{u32 percent 0-100}` | main.mm:122, 1396 |
-| 0x0d | kOpNewWindow | `{utf8 url}` popup / target=_blank | main.mm:123 |
-| 0x0e | kOpFindResult | `{u32 count}{u32 activeOrdinal}{u8 final}` = 9 bytes | main.mm:124, 1274 |
-| 0x0f | kOpJsDialog | `{u32 id}{u32 type}{u32 msgLen}{msg utf8}{defaultText utf8}` | main.mm:125, 1300 |
-| 0x16 | kOpEvalResult | `{utf8 "id:json"}` (runJavaScriptReturningResult) | main.mm:126 |
-| 0x17 | kOpChannelMsg | `{utf8 "name:message"}` JS channel -> host | main.mm:127 |
-| 0x18 | kOpDownload | `{utf8 suggestedName}` a download started | main.mm:128 |
-| 0x19 | kOpImeBounds | `{u32 x}{u32 y}{u32 w}{u32 h}` caret rect (DIP) | main.mm:129, 1050 |
-| 0x1a | kOpCookies | `{u32 id}{utf8 json-array}` visitAllCookies result | main.mm:130 |
-| 0x1b | kOpTargetId | `{utf8 targetId}` this browser's CDP targetId (reply to 0x36) | main.mm:131 |
-| 0x1c | kOpCreated | `{}` OnAfterCreated — browser is up (create pacer advance) | main.mm:132, 1406 |
-| 0x1d | kOpCreateFailed | `{}` async CreateBrowser dispatch failed — drop the session | main.mm:133, 1705 |
+Protocol version 4. Payload integers are big-endian.
 
-### plugin -> cef_host (0x10-0x41)
+### cef_host -> plugin
 
-Payload minimums are enforced host-side exactly as the macOS read loop does
-(cited); short frames are dropped per-op, not fatal.
+| Op | Name | Payload |
+|---|---|---|
+| 0x01 | kOpPresent | {u64 bridgeHandle}{u32 srcW}{u32 srcH}: bridgeHandle is the DXGI legacy shared handle of the host-minted bridge texture. |
+| 0x02 | kOpReady | {u8 readyFlags}{u8 protocolVersion} on browserId 0, before any browser exists. readyFlags bit0 = ad-hoc (mock keychain) build; Windows sends 0. |
+| 0x03 | kOpCursor | {u32 cef_cursor_type_t} |
+| 0x04 | kOpLog | {utf8 message}; browserId 0 = process-level |
+| 0x05 | kOpLoadState | {u8 loading}{u8 canGoBack}{u8 canGoForward} |
+| 0x06 | kOpTitle | {utf8 title} |
+| 0x07 | kOpUrl | {utf8 main-frame url} |
+| 0x08 | kOpLoadErr | {u32 code}{utf8 "url\ntext"} |
+| 0x09 | kOpConsole | {u32 level}{utf8 "source:line\tmsg"} |
+| 0x0a | kOpPageStart | {utf8 url} main-frame load started |
+| 0x0b | kOpPageFinish | {utf8 url} main-frame load finished |
+| 0x0c | kOpProgress | {u32 percent 0-100} |
+| 0x0d | kOpNewWindow | {utf8 url} popup / target=_blank |
+| 0x0e | kOpFindResult | {u32 count}{u32 activeOrdinal}{u8 final} |
+| 0x0f | kOpJsDialog | {u32 id}{u32 type}{u32 msgLen}{utf8 msg}{utf8 defaultText} |
+| 0x16 | kOpEvalResult | {utf8 "id:json"} reply to kOpEvalReturning |
+| 0x17 | kOpChannelMsg | {utf8 "name:message"} JS channel -> plugin |
+| 0x18 | kOpDownload | {utf8 suggestedName} a download started |
+| 0x19 | kOpImeBounds | {u32 x}{u32 y}{u32 w}{u32 h} caret rect (DIP) |
+| 0x1a | kOpCookies | {u32 id}{utf8 json-array} reply to kOpVisitCookies |
+| 0x1b | kOpTargetId | {utf8 targetId} this browser's CDP targetId, reply to kOpResolveTargetId |
+| 0x1c | kOpCreated | {} OnAfterCreated: the browser is up; the plugin paces the next create on it |
+| 0x1d | kOpCreateFailed | {} the async CreateBrowser dispatch failed; the plugin drops the session |
 
-| Op | Name | Payload | Source |
-|---|---|---|---|
-| 0x10 | kOpPointer | `{u8 type}{u8 button}{u8 clickCount}{u8 pad}{u32 modifiers}{f64 x}{f64 y}{f64 dx}{f64 dy}` = 40 bytes. type: 0=move 1=down 2=up 3=wheel 4=leave; button: 0=left 1=middle 2=right. x/y logical (DIP). | main.mm:2560-2570 |
-| 0x11 | kOpResize | `{u32 w}{u32 h}[{f64 dpr}]` — plen>=8; dpr present iff plen>=16, `0`/absent = unchanged; guard `0 < dpr <= 8` else treat as 0. Producer-allocates: no surface id. EVERY WasResized discards CEF's frame pool (LAW 4). | main.mm:135, 2384-2394 |
-| 0x12 | kOpKey | `{u8 type}{u8 pad×3}{u32 modifiers}{u32 windowsKeyCode}{u32 nativeKeyCode}{u32 character}` = 20 bytes. type: 0=rawkeydown 2=keyup 3=char. wkc/nkc are i32 stored as u32 BE. | main.mm:136, 2571-2582 |
-| 0x13 | kOpCreateBrowser | `{u32 w}{u32 h}{f64 dpr}{utf8 url}` (plen>=16); frame browserId = the NEW wire id; producer-allocates (no surface id); empty url -> about:blank; guard `0 < dpr <= 8` else 1.0. | main.mm:137, 2364-2376 |
-| 0x14 | kOpShutdown | `{}` tear down the whole PROCESS (all browsers); browserId 0. | main.mm:138, 2381-2383 |
-| 0x15 | kOpDisposeBrowser | `{}` close ONE browser (target = frame browserId); process survives. | main.mm:139, 2377-2380 |
-| 0x20 | kOpNavigate | `{utf8 url}` — do NOT require a bound slot; resolve by wire id on the UI thread (a nav right behind a queued create must not drop). | main.mm:140, 2395-2402 |
-| 0x21 | kOpReload | `{}` | main.mm:141 |
-| 0x22 | kOpStop | `{}` | main.mm:142 |
-| 0x23 | kOpBack | `{}` | main.mm:143 |
-| 0x24 | kOpForward | `{}` | main.mm:144 |
-| 0x25 | kOpExecuteJs | `{utf8 code}` | main.mm:145 |
-| 0x26 | kOpSetZoom | `{f64 level}` (factor = 1.2^level) | main.mm:146, 2434-2439 |
-| 0x27 | kOpFind | `{u8 fwd}{u8 matchCase}{u8 findNext}{utf8 text}` (plen>=3) | main.mm:147, 2452-2459 |
-| 0x28 | kOpStopFind | `{u8 clearSelection}` (absent = 1) | main.mm:148, 2460-2465 |
-| 0x29 | kOpJsDialogResp | `{u32 id}{u8 ok}{utf8 text}` (plen>=5) | main.mm:149, 2466-2474 |
-| 0x2a | kOpEvalReturning | `{u32 id}{utf8 code}` (plen>=4) | main.mm:150, 2475-2482 |
-| 0x2b | kOpAddChannel | `{utf8 name}` — do NOT require a bound slot (registers process-global; injected on load). | main.mm:151, 2483-2494 |
-| 0x2c | kOpSetCookie | `{utf8 url\0name\0value\0domain\0path[\0secure(0|1)\0httpOnly(0|1)\0sameSite(unspecified|none|lax|strict)]}` (NUL-separated, pad missing fields to 8; hosts older than the attribute fields read only the first five) | main.mm:152, 2495-2510 |
-| 0x2d | kOpClearCookies | `{}` delete all cookies | main.mm:153 |
-| 0x2e | kOpVisitCookies | `{u32 id}{utf8 url}` enumerate (url empty = all) | main.mm:154, 2515-2522 |
-| 0x2f | kOpDeleteCookie | `{utf8 url\0name}` delete one | main.mm:155, 2523-2531 |
-| 0x30 | kOpImeSetComp | `{utf8 text}` IME composition update | main.mm:156 |
-| 0x31 | kOpImeCommit | `{utf8 text}` commit composed text | main.mm:157 |
-| 0x32 | kOpImeCancel | `{}` cancel composition | main.mm:158 |
-| 0x33 | kOpShowDevTools | `{}` open DevTools in a window | main.mm:159 |
-| 0x34 | kOpLoadTrusted | `{utf8 url}` host content-load, exempt from allowlist; do NOT require a bound slot (same as 0x20). | main.mm:160, 2403-2411 |
-| 0x35 | kOpSetVisible | `{u8 visible}` (absent = 1) -> `WasHidden(!visible)` | main.mm:161, 2446-2451 |
-| 0x36 | kOpResolveTargetId | `{}` resolve this browser's CDP targetId -> kOpTargetId | main.mm:162 |
-| 0x37 | kOpInvalidate | `{}` force a repaint (`Invalidate(PET_VIEW)`) to re-kick a stalled first frame | main.mm:163 |
-| 0x38 | kOpEditCommand | `{u8 cmd}` focused-frame edit command: 0=copy 1=cut 2=paste 3=selectAll 4=undo 5=redo | main.mm:164, 2440-2445 |
-| 0x3f | kOpSetAuthoredHtml | `{utf8 baseUrl}\0{utf8 html}` — store-only: serve `html` as the MAIN-FRAME response for exactly `baseUrl` (normalized: no fragment, bare authority gets `/`), so the document has that URL's real origin and no 2 MB `data:` cap. Consumed by the following kOpCreateBrowser / kOpLoadTrusted for that URL; sticky across reloads; cleared by kOpNavigate, a kOpLoadTrusted to another URL, or dispose. Stored on the reader thread (no slot required). | main.mm:183, g_authored |
-| 0x41 | kOpSetDocumentStart | `{u8 kind}{u32 len}{utf8}`* (kind 0 = JS channel name, 1 = script) — store-only, ahead of kOpCreateBrowser: rides into every renderer hosting the browser as CreateBrowser `extra_info`; the renderer installs the channel shims then evals each script in `OnContextCreated` for every main-frame document, before its own scripts. A throwing script is reported via `console.error` and the next one still runs. | main.mm:187, document_start.h |
+### plugin -> cef_host
 
-Reserved (do NOT reuse): `0x1e` was earmarked `kOpPresentV2` by PLAN §4.3
-stage-1; the slice instead reuses `kOpPresent 0x01` with the Windows payload
-(LAW 10) because the Windows plugin is the only peer of the Windows host.
+| Op | Name | Payload |
+|---|---|---|
+| 0x10 | kOpPointer | {u8 type}{u8 button}{u8 clickCount}{u8 pad}{u32 modifiers}{f64 x}{f64 y}{f64 dx}{f64 dy}; type 0=move 1=down 2=up 3=wheel 4=leave, button 0=left 1=middle 2=right, x/y in DIP |
+| 0x11 | kOpResize | {u32 w}{u32 h}[{f64 dpr}]: dpr absent or 0 = unchanged, must be in (0, 8] |
+| 0x12 | kOpKey | {u8 type}{u8 pad x3}{u32 modifiers}{u32 windowsKeyCode}{u32 nativeKeyCode}{u32 character}; type 0=rawkeydown 2=keyup 3=char |
+| 0x13 | kOpCreateBrowser | {u32 w}{u32 h}{f64 dpr}{utf8 url}; the frame's browserId is the NEW id; empty url = about:blank |
+| 0x14 | kOpShutdown | {} on browserId 0: end the whole process |
+| 0x15 | kOpDisposeBrowser | {} close one browser; the process survives |
+| 0x20 | kOpNavigate | {utf8 url} |
+| 0x21 | kOpReload | {} |
+| 0x22 | kOpStop | {} |
+| 0x23 | kOpBack | {} |
+| 0x24 | kOpForward | {} |
+| 0x25 | kOpExecuteJs | {utf8 code} |
+| 0x26 | kOpSetZoom | {f64 level}; factor = 1.2^level |
+| 0x27 | kOpFind | {u8 forward}{u8 matchCase}{u8 findNext}{utf8 text} |
+| 0x28 | kOpStopFind | {u8 clearSelection}; absent = 1 |
+| 0x29 | kOpJsDialogResp | {u32 id}{u8 ok}{utf8 text} |
+| 0x2a | kOpEvalReturning | {u32 id}{utf8 expression}; replies kOpEvalResult |
+| 0x2b | kOpAddChannel | {utf8 name} register a JS channel |
+| 0x2c | kOpSetCookie | {utf8 url\0name\0value\0domain\0path[\0secure(0\|1)\0httpOnly(0\|1)\0sameSite(unspecified\|none\|lax\|strict)]} |
+| 0x2d | kOpClearCookies | {} delete all cookies |
+| 0x2e | kOpVisitCookies | {u32 id}{utf8 url}; empty url = all; replies kOpCookies |
+| 0x2f | kOpDeleteCookie | {utf8 url\0name} |
+| 0x30 | kOpImeSetComp | {utf8 text} IME composition update |
+| 0x31 | kOpImeCommit | {utf8 text} commit composed text |
+| 0x32 | kOpImeCancel | {} cancel composition |
+| 0x33 | kOpShowDevTools | {} open DevTools in a window |
+| 0x34 | kOpLoadTrusted | {utf8 url} a load by the embedder, exempt from the scheme allowlist |
+| 0x35 | kOpSetVisible | {u8 visible}; absent = 1 |
+| 0x36 | kOpResolveTargetId | {} replies kOpTargetId |
+| 0x37 | kOpInvalidate | {} force a repaint, to re-kick a stalled first frame |
+| 0x38 | kOpEditCommand | {u8 cmd} in the focused frame: 0=copy 1=cut 2=paste 3=selectAll 4=undo 5=redo |
+| 0x3f | kOpSetAuthoredHtml | {utf8 baseUrl}\0{utf8 html}: store-only; serve html as the main-frame response for exactly baseUrl (empty html clears it). The load is a following kOpCreateBrowser or kOpLoadTrusted for that URL |
+| 0x41 | kOpSetDocumentStart | ({u8 kind}{u32 len}{utf8})*, kind 0 = JS channel name, 1 = script (document_start.h): store-only, for the browser created right behind it |
+
+macOS only, never reuse on Windows: 0x1e kOpMediaRequest, 0x1f kOpMediaState, 0x40 kOpContextMenu, 0x39 kOpOpenAuthWindow, 0x3a kOpSetAudioMuted, 0x3b kOpSetPumpInterval, 0x3c kOpMediaResponse, 0x3d kOpSetMediaSetting, 0x3e kOpContextMenuCommand.
+
+<!-- END GENERATED OPCODES -->
 
 ## 3. Method-channel verbs (Dart -> plugin), channel `flutter_cef`
 
