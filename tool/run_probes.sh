@@ -41,6 +41,7 @@ APP="$ROOT/example/build/macos/Build/Products/Debug/flutter_cef_example.app/Cont
 #           soak or Windows-only: listed, never run)
 PROBES=(
   "authored_origin|authored_origin_probe|120|default|-|loadHtmlString(baseUrl:) serves the document at that origin"
+  "device_frame|device_frame_probe|300|default|-|switching size and render scale keeps a slow page painting"
   "document_start|document_start_probe|120|default|-|document-start scripts run before page scripts"
   "hidden_at_create|hidden_at_create_probe|120|default|-|a view created hidden paints once shown"
   "host_start_failure|host_start_failure_probe|60|false|-|a host that exits at once reports createFailed"

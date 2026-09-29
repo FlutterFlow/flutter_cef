@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "authored_content.h"
+#include "browser_ops.h"
 #include "include/cef_request_context.h"
 #include "include/wrapper/cef_helpers.h"
 #include "include/wrapper/cef_message_router.h"
@@ -551,6 +552,9 @@ class HostClient : public CefClient,
       slot_->begin_frame_pump_started = true;
       PumpBeginFrame(slot_->browser_id);
     }
+    // A resize that arrived while the browser was being created: CEF built its view at the
+    // create size, so hand it the latest geometry now (hidden: DoSetVisible does it on show).
+    ApplyGeometry(slot_);
   }
 
   // CefLifeSpanHandler: route popups (window.open / target=_blank) to the host
