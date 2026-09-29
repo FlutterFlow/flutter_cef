@@ -145,9 +145,14 @@ struct Slot {
   // is. Guarded by surface_mutex. MRC: holds the +1 from newTextureWithDescriptor.
   id<MTLTexture> dst_mtl = nil;
   uint32_t dst_mtl_sid = 0;
-  int width = 800;   // logical (DIP) — GetViewRect; CEF scales by dpr.
+  int width = 800;   // logical (DIP) size the plugin asked for.
   int height = 600;
-  double dpr = 1.0;  // device pixel ratio; the IOSurface is logical*dpr px.
+  double dpr = 1.0;  // device pixel ratio the plugin asked for.
+  // The geometry CEF sees (GetViewRect / GetScreenInfo). It trails width/height/dpr
+  // while a resize is in flight: see ApplyGeometry in browser_ops.mm.
+  int cef_width = 800;
+  int cef_height = 600;
+  double cef_dpr = 1.0;
 
   // Popup widgets (<select> dropdowns, autofill) paint into a separate PET_POPUP
   // buffer that we composite over the view at the popup rect. Guarded by
@@ -203,12 +208,15 @@ struct Slot {
   // consumer can drop an unengaged tile to ~30fps without touching hidden
   // gating. UI-thread only, like `visible`.
   int pump_interval_ms = 16;
-  // A dpr/screen-info change that lands while the slot is HIDDEN is deferred —
-  // the begin-frame pump is gated off while hidden, so notifying + painting now would
-  // composite into a surface nothing displays and mislead the Swift resize watchdog into
-  // promoting a never-painted buffer. DoResize sets this while hidden; DoSetVisible's
-  // hidden->visible edge re-asserts screen info before forcing a full repaint. UI-thread only.
-  bool needs_screen_info_on_show = false;
+  // A resize handed to CEF and not yet painted (see ApplyGeometry in
+  // browser_ops.mm): since when, the pixel size CEF will paint, how long the
+  // current wait may run before a kick, and the kicks so far. UI-thread only.
+  bool resize_in_flight = false;
+  std::chrono::steady_clock::time_point resize_wait_since{};
+  int resize_want_w = 0;
+  int resize_want_h = 0;
+  int resize_wait_ms = 0;
+  int resize_kicks = 0;
   // Per-slot pump-tick + accelerated-paint counters, logged from PumpBeginFrame when
   // FLUTTER_CEF_DEBUG is set — diagnostics for paint-stall investigation at scale.
   uint64_t diag_pump_ticks = 0;

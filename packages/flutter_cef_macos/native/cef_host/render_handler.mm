@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include "browser_ops.h"
 #include "include/base/cef_callback.h"
 #include "include/cef_life_span_handler.h"
 #include "include/cef_task.h"
@@ -34,6 +35,7 @@ void PumpBeginFrame(uint32_t wire_id) {
   std::shared_ptr<Slot> slot = LookupWireId(wire_id);
   if (!slot || !slot->browser) return;  // disposed mid-flight — let the pump die
   if (slot->visible) slot->browser->GetHost()->SendExternalBeginFrame();
+  CheckResizeStall(slot);
   slot->diag_pump_ticks++;  // DIAG
   if (g_debug && slot->diag_pump_ticks % 120 == 0)
     SendLog(wire_id, "diag wire=" + std::to_string(wire_id) +
@@ -207,7 +209,7 @@ class HostRenderHandler : public CefRenderHandler {
 
   void GetViewRect(CefRefPtr<CefBrowser>, CefRect& rect) override {
     std::lock_guard<std::mutex> lock(slot_->surface_mutex);
-    rect = CefRect(0, 0, slot_->width, slot_->height);
+    rect = CefRect(0, 0, slot_->cef_width, slot_->cef_height);
   }
 
   // The REAL display the app sits on (DIP). Reporting screen == the tile's own
@@ -240,7 +242,7 @@ class HostRenderHandler : public CefRenderHandler {
   // AND the real screen bounds + color depth (see RealScreenDip).
   bool GetScreenInfo(CefRefPtr<CefBrowser>, CefScreenInfo& info) override {
     std::lock_guard<std::mutex> lock(slot_->surface_mutex);
-    info.device_scale_factor = static_cast<float>(slot_->dpr);
+    info.device_scale_factor = static_cast<float>(slot_->cef_dpr);
     info.depth = 24;             // screen.colorDepth — 0 was a headless tell
     info.depth_per_component = 8;
     info.is_monochrome = 0;
@@ -260,7 +262,7 @@ class HostRenderHandler : public CefRenderHandler {
   bool GetRootScreenRect(CefRefPtr<CefBrowser>, CefRect& rect) override {
     std::lock_guard<std::mutex> lock(slot_->surface_mutex);
     constexpr int kChromeH = 87;  // tab strip + toolbar, ~ real Chrome on macOS
-    rect = CefRect(100, 80, slot_->width, slot_->height + kChromeH);
+    rect = CefRect(100, 80, slot_->cef_width, slot_->cef_height + kChromeH);
     return true;
   }
 
@@ -294,6 +296,7 @@ class HostRenderHandler : public CefRenderHandler {
   void OnPaint(CefRefPtr<CefBrowser>, PaintElementType type, const RectList&,
                const void* buffer, int width, int height) override {
     ApplyBlankFirstNav(slot_);
+    if (type == PET_VIEW) NoteViewPaint(slot_, width, height);
     std::lock_guard<std::mutex> lock(slot_->surface_mutex);
     // PRODUCER-ALLOCATES (software path): mint/resize the surface to the painted VIEW dims
     // before the guard, mirroring OnAcceleratedPaint — else the surface is never created and
@@ -311,8 +314,8 @@ class HostRenderHandler : public CefRenderHandler {
     // scaled by the device pixel ratio. Without this the dropdown paints at the
     // wrong position on HiDPI and mouse clicks miss it (CEF hit-tests the popup
     // against the logical rect, which no longer matches where it was drawn).
-    const int popup_px = static_cast<int>(slot_->popup_rect.x * slot_->dpr);
-    const int popup_py = static_cast<int>(slot_->popup_rect.y * slot_->dpr);
+    const int popup_px = static_cast<int>(slot_->popup_rect.x * slot_->cef_dpr);
+    const int popup_py = static_cast<int>(slot_->popup_rect.y * slot_->cef_dpr);
     if (type == PET_VIEW) {
       BlitBGRA(dst, dst_stride, surf_w, surf_h, src, width, height, 0, 0);
       // Keep an open popup (<select> dropdown) painted on top of the view.
@@ -450,8 +453,8 @@ class HostRenderHandler : public CefRenderHandler {
       IOSurfaceUnlock(view_src, kIOSurfaceLockReadOnly, nullptr);
     }
     if (slot_->popup_visible && !slot_->popup_buf.empty()) {
-      const int px = static_cast<int>(slot_->popup_rect.x * slot_->dpr);
-      const int py = static_cast<int>(slot_->popup_rect.y * slot_->dpr);
+      const int px = static_cast<int>(slot_->popup_rect.x * slot_->cef_dpr);
+      const int py = static_cast<int>(slot_->popup_rect.y * slot_->cef_dpr);
       BlitBGRA(dst, ds, dw, dh, slot_->popup_buf.data(), slot_->popup_w,
                slot_->popup_h, px, py);
     }
@@ -632,6 +635,9 @@ class HostRenderHandler : public CefRenderHandler {
       SendLog(slot_->browser_id, "OnAcceleratedPaint: null io_surface");
       return;
     }
+    if (type == PET_VIEW)
+      NoteViewPaint(slot_, static_cast<int>(IOSurfaceGetWidth(src)),
+                    static_cast<int>(IOSurfaceGetHeight(src)));
     std::lock_guard<std::mutex> lock(slot_->surface_mutex);
     // PRODUCER-ALLOCATES: the surface is minted lazily by the FIRST view paint (and re-minted on
     // any size change) inside the composite path — so we must NOT early-return on a null surface

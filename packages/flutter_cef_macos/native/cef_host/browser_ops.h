@@ -60,4 +60,11 @@ void DoKey(const std::shared_ptr<Slot>& slot, int type, uint32_t modifiers,
            uint32_t character);
 void DoInvalidate(const std::shared_ptr<Slot>& slot);
 
+// Resizes, one at a time (see ApplyGeometry): hand CEF the latest geometry,
+// note each view paint, and check for a stall from the begin-frame pump. All on
+// the CEF UI thread.
+void ApplyGeometry(const std::shared_ptr<Slot>& slot);
+void NoteViewPaint(const std::shared_ptr<Slot>& slot, int pixel_w, int pixel_h);
+void CheckResizeStall(const std::shared_ptr<Slot>& slot);
+
 }  // namespace cef_host

@@ -1,3 +1,13 @@
+## Unreleased
+
+* Fix: a view could stop painting for good after a resize that changed the
+  render scale, typically when switching the device frame in a preview of a page
+  slow to relayout. Hide/show and reload didn't bring it back. `cef_host` now
+  hands CEF one resize at a time: a new size or scale reaches CEF only after it
+  has painted the previous one, and a resize with no paint at its size gets the
+  renderer a fresh surface (1, 2, then 4 s apart). Probe: `device_frame`. The
+  prebuilt must be republished.
+
 ## 0.3.0
 
 * Removed the unused `native/cef_host/entitlements.browser.plist`, which

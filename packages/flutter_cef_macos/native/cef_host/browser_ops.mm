@@ -2,6 +2,8 @@
 
 #import <Cocoa/Cocoa.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -10,9 +12,12 @@
 
 #include "authored_content.h"
 #include "host_client.h"
+#include "include/base/cef_callback.h"
 #include "include/cef_cookie.h"
 #include "include/cef_devtools_message_observer.h"
 #include "include/cef_request_context.h"
+#include "include/cef_task.h"
+#include "include/wrapper/cef_closure_task.h"
 #include "include/wrapper/cef_helpers.h"
 #include "ipc.h"
 #include "mac_key_bindings.h"
@@ -74,9 +79,9 @@ void DoCreateBrowser(uint32_t wire_id, int w, int h, double dpr,
   }
   auto slot = std::make_shared<Slot>();
   slot->browser_id = wire_id;
-  slot->width = w < 1 ? 1 : w;
-  slot->height = h < 1 ? 1 : h;
-  slot->dpr = dpr;
+  slot->width = slot->cef_width = w < 1 ? 1 : w;
+  slot->height = slot->cef_height = h < 1 ? 1 : h;
+  slot->dpr = slot->cef_dpr = dpr;
   {
     auto early = g_early_channels.find(wire_id);
     if (early != g_early_channels.end()) {
@@ -234,41 +239,22 @@ void DoResize(const std::shared_ptr<Slot>& slot, int w, int h, double dpr) {
   // EnsureSurfaceForPaint (in the composite path) reallocates slot->surface to match + the next
   // present hands the consumer the new id. So there is no IOSurfaceLookup/CFRelease-swap here
   // (that was the consumer-allocates handoff that could crop when src≠dst). dpr<=0 = unchanged.
-  bool dpr_changed = false;
   {
     std::lock_guard<std::mutex> lock(slot->surface_mutex);
     slot->width = w;
     slot->height = h;
-    if (dpr > 0.0 && dpr != slot->dpr) {
-      slot->dpr = dpr;
-      dpr_changed = true;
-    }
+    if (dpr > 0.0) slot->dpr = dpr;
     // dst_mtl is rebuilt by EnsureSurfaceForPaint on the realloc; nil it here too so a same-size
     // relayout that doesn't realloc still drops a wrap that could be mid-rebuild (belt + suspenders).
     [slot->dst_mtl release];
     slot->dst_mtl = nil;
     slot->dst_mtl_sid = 0;
   }
-  if (slot->browser) {
-    if (slot->visible) {
-      // A device-scale change needs the renderer told (screen info), not just a relayout.
-      if (dpr_changed) slot->browser->GetHost()->NotifyScreenInfoChanged();
-      slot->browser->GetHost()->WasResized();
-      // Drive a frame right now at the new size. With external begin-frame this is a guaranteed
-      // tick (not a coalesce-able Invalidate request), so the re-laid-out content composites into
-      // the new surface immediately; PumpBeginFrame's ongoing ticks cover the heavy-page settle.
-      slot->browser->GetHost()->SendExternalBeginFrame();
-    } else {
-      // HIDDEN — the begin-frame pump is gated off (PumpBeginFrame skips while
-      // !visible), so WasResized()+SendExternalBeginFrame() here would never paint the
-      // freshly-swapped (blank) surface, yet the Swift resizeWatchdog would force-promote
-      // it to the live texture → permanent blank on a static page. The surface + dims are
-      // already swapped above (geometry is current); defer the screen-info re-assert + the
-      // repaint to DoSetVisible's hidden->visible edge. WasResized while hidden is
-      // pointless (no frame can result), so it is dropped, not deferred.
-      if (dpr_changed) slot->needs_screen_info_on_show = true;
-    }
-  }
+  // HIDDEN: the begin-frame pump is gated off (PumpBeginFrame skips while !visible), so
+  // nothing CEF could paint now would reach the screen, yet the Swift resizeWatchdog would
+  // force-promote the blank surface → permanent blank on a static page. DoSetVisible's
+  // hidden->visible edge hands CEF the new geometry instead.
+  if (slot->browser && slot->visible) ApplyGeometry(slot);
 }
 
 void DoNavigate(const std::shared_ptr<Slot>& slot, const std::string& url) {
@@ -374,23 +360,131 @@ void DoSetVisible(const std::shared_ptr<Slot>& slot, bool visible) {
   if (!slot->browser) return;
   slot->browser->GetHost()->WasHidden(!visible);
   // On the hidden->visible edge, FORCE a fresh full-viewport repaint at the
-  // current geometry. WasHidden(false) alone does NOT repaint, and three things can have left
-  // the live texture blank/stale while hidden: (a) a resize landed while the pump was gated off
-  // (DoResize deferred its paint here); (b) a dpr/screen-info change was deferred; (c) Chromium's
-  // FrameEvictionManager reclaimed the off-screen compositor frame entirely (happens past ~5
-  // browsers / under memory pressure) so there is nothing to show even though geometry is
-  // unchanged. Re-assert screen info (if a dpr change was deferred) + size, then drive a
-  // guaranteed frame — mirrors DoResize/DoInvalidate. Unconditional on the edge because the
-  // eviction case carries no resize to key off.
+  // current geometry. WasHidden(false) alone does NOT repaint, and two things can have left
+  // the live texture blank/stale while hidden: (a) a resize or dpr change landed while the pump
+  // was gated off (DoResize left it for here); (b) Chromium's FrameEvictionManager reclaimed the
+  // off-screen compositor frame entirely (happens past ~5 browsers / under memory pressure) so
+  // there is nothing to show even though geometry is unchanged. Hand CEF the new geometry, re-
+  // assert size, then drive a guaranteed frame — mirrors DoResize/DoInvalidate. Unconditional on
+  // the edge because the eviction case carries no resize to key off.
   if (visible && !was_visible) {
-    if (slot->needs_screen_info_on_show) {
-      slot->browser->GetHost()->NotifyScreenInfoChanged();
-      slot->needs_screen_info_on_show = false;
-    }
+    // A resize still in flight gets a fresh wait: nothing paints while hidden.
+    slot->resize_wait_since = std::chrono::steady_clock::now();
+    ApplyGeometry(slot);
     slot->browser->GetHost()->WasResized();
     slot->browser->GetHost()->Invalidate(PET_VIEW);
     slot->browser->GetHost()->SendExternalBeginFrame();
   }
+}
+
+// Hand CEF a new size or density only once it has painted the last one.
+//
+// CEF's OSR view keeps one resize in flight: a change to the view size or scale
+// "holds" until a paint arrives at the new pixel size, and a change made during
+// the hold is queued and applied when it releases. A queued DENSITY change is
+// applied through RenderWidgetHostViewBase::UpdateScreenInfo, which sends the
+// renderer the new scale under the surface id it already has. The renderer's
+// next frame then has a different scale for the same surface id, viz rejects it
+// (a "surface invariants violation") and drops the renderer's frame sink. On
+// macOS that view never draws again: the renderer comes back under a surface id
+// it allocated itself, which CEF 144 never embeds (DidUpdateVisualProperties is
+// compiled out for Mac), or the external begin-frame source waits forever on
+// the dropped sink. Hide/show and reload don't bring it back. A slow page makes
+// the hold long, so switching device frames on one froze Test Mode.
+//
+// NotifyScreenInfoChanged applies a density change safely: it retires the surface
+// id first. It only gets to do that when no hold is on, so CEF sees geometry
+// through cef_width/cef_height/cef_dpr, and those change only when no resize is
+// in flight. Changes the plugin asks for meanwhile collapse into the latest one.
+namespace {
+constexpr int kResizePaintWaitMs = 1000;
+constexpr int kResizePaintMaxWaitMs = 4000;
+constexpr int kResizeMaxKicks = 6;
+
+// The pixel size CEF paints a view at: gfx::ScaleToCeiledSize in float, as
+// CefRenderWidgetHostViewOSR computes it, so a paint matches it exactly.
+int CefPixels(int logical, double dpr) {
+  return static_cast<int>(
+      std::ceil(static_cast<float>(logical) * static_cast<float>(dpr)));
+}
+}  // namespace
+
+void ApplyGeometry(const std::shared_ptr<Slot>& slot) {
+  if (!slot->browser || !slot->visible || slot->resize_in_flight) return;
+  bool dpr_changed;
+  {
+    std::lock_guard<std::mutex> lock(slot->surface_mutex);
+    if (slot->cef_width == slot->width && slot->cef_height == slot->height &&
+        slot->cef_dpr == slot->dpr)
+      return;
+    dpr_changed = static_cast<float>(slot->cef_dpr) != static_cast<float>(slot->dpr);
+    slot->cef_width = slot->width;
+    slot->cef_height = slot->height;
+    slot->cef_dpr = slot->dpr;
+    slot->resize_want_w = CefPixels(slot->cef_width, slot->cef_dpr);
+    slot->resize_want_h = CefPixels(slot->cef_height, slot->cef_dpr);
+  }
+  CefRefPtr<CefBrowserHost> host = slot->browser->GetHost();
+  // NotifyScreenInfoChanged applies the new size along with the new scale.
+  if (dpr_changed)
+    host->NotifyScreenInfoChanged();
+  else
+    host->WasResized();
+  // Drive a frame right now at the new size. With external begin-frame this is a guaranteed
+  // tick (not a coalesce-able Invalidate request), so the re-laid-out content composites into
+  // the new surface immediately; PumpBeginFrame's ongoing ticks cover the heavy-page settle.
+  host->Invalidate(PET_VIEW);
+  host->SendExternalBeginFrame();
+  slot->resize_in_flight = true;
+  slot->resize_wait_since = std::chrono::steady_clock::now();
+  slot->resize_wait_ms = kResizePaintWaitMs;
+  slot->resize_kicks = 0;
+}
+
+void NoteViewPaint(const std::shared_ptr<Slot>& slot, int pixel_w, int pixel_h) {
+  if (!slot->resize_in_flight || pixel_w != slot->resize_want_w ||
+      pixel_h != slot->resize_want_h)
+    return;
+  if (slot->resize_kicks > 0)
+    SendLog(slot->browser_id, "resize: painted " + std::to_string(pixel_w) + "x" +
+                                  std::to_string(pixel_h) + " after " +
+                                  std::to_string(slot->resize_kicks) + " kick(s)");
+  slot->resize_in_flight = false;
+  // CEF releases its hold after this paint callback returns; apply what came in
+  // meanwhile after that.
+  CefPostTask(TID_UI, base::BindOnce(&ApplyGeometry, slot));
+}
+
+// The fallback if a resize still doesn't paint. With the hold on and the
+// geometry CEF sees unchanged, NotifyScreenInfoChanged only swaps in a fresh
+// surface id, which gets the renderer to paint again. Waits back off (1, 2,
+// 4 s) so a page that is merely slow to lay out isn't kicked over and over.
+void CheckResizeStall(const std::shared_ptr<Slot>& slot) {
+  if (!slot->resize_in_flight || !slot->visible || !slot->browser) return;
+  const auto now = std::chrono::steady_clock::now();
+  if (now - slot->resize_wait_since <
+      std::chrono::milliseconds(slot->resize_wait_ms))
+    return;
+  const std::string want = std::to_string(slot->resize_want_w) + "x" +
+                           std::to_string(slot->resize_want_h);
+  if (slot->resize_kicks >= kResizeMaxKicks) {
+    SendLog(slot->browser_id, "resize: no paint at " + want + " after " +
+                                  std::to_string(kResizeMaxKicks) +
+                                  " kicks; moving on");
+    slot->resize_in_flight = false;
+    ApplyGeometry(slot);
+    return;
+  }
+  slot->resize_kicks++;
+  SendLog(slot->browser_id, "resize: no paint at " + want + " in " +
+                                std::to_string(slot->resize_wait_ms) +
+                                "ms; kick " + std::to_string(slot->resize_kicks));
+  CefRefPtr<CefBrowserHost> host = slot->browser->GetHost();
+  host->NotifyScreenInfoChanged();
+  host->Invalidate(PET_VIEW);
+  host->SendExternalBeginFrame();
+  slot->resize_wait_since = now;
+  slot->resize_wait_ms = std::min(slot->resize_wait_ms * 2, kResizePaintMaxWaitMs);
 }
 void DoSetAudioMuted(const std::shared_ptr<Slot>& slot, bool muted) {
   if (slot->browser) slot->browser->GetHost()->SetAudioMuted(muted);
