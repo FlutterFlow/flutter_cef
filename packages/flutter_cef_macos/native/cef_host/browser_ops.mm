@@ -398,12 +398,17 @@ void DoSetVisible(const std::shared_ptr<Slot>& slot, bool visible) {
 // in flight. Changes the plugin asks for meanwhile collapse into the latest one.
 //
 // The paint that ends a resize needs a capture after the resize lands. On macOS
-// CEF paints by capturing the root frame at the size of the renderer's last
-// activated frame. When the renderer's frame at the new size activates, the
-// capture size changes, but a page with nothing else changing gives the
-// capturer no damage, and it drops refresh requests while it still sees the
-// content as animating. The one Invalidate at the start of a resize comes before
-// all of that, so ask again every kResizeRefreshMs until the paint arrives.
+// CEF paints by capturing the root frame (viz's FrameSinkVideoCapturer) at the
+// size of the renderer's last activated frame. When the renderer's frame at the
+// new size activates, it is captured at the OLD size, and only then does CEF set
+// the new capture size. The capture that change asks for is rate-limited (one
+// was just taken), and the capturer's own retries go through a stricter check
+// (nothing pending, no recent animation) that can turn them all away. A page
+// with nothing else changing gives it no damage either, so no paint at the new
+// size came until the stall kick. Invalidate asks for a capture the way a
+// compositor update does, which isn't subject to that check. The one at the
+// start of a resize comes too early, so ask again every kResizeRefreshMs until
+// the paint arrives.
 namespace {
 constexpr int kResizeRefreshMs = 100;
 constexpr int kResizePaintWaitMs = 1000;
