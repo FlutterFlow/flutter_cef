@@ -24,6 +24,10 @@
 // for JANK_MS per frame around each switch. With FIXED_DPR=true switches change
 // only the size, which never wedged.
 //
+// cef_host logs `resize: no paint at WxH ... kick N` when a resize waits a
+// second without a paint at its size. A healthy run has none; if they're back,
+// cef_host has stopped asking for a fresh capture while a resize waits.
+//
 // Run:  FLUTTER_CEF_HOST=<.../cef_host.app/Contents/MacOS/cef_host> \
 //         flutter run -d macos -t lib/device_frame_probe.dart
 //       [--dart-define=ROUNDS=30 --dart-define=LIMIT_MS=4000

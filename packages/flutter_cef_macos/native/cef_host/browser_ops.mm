@@ -396,7 +396,16 @@ void DoSetVisible(const std::shared_ptr<Slot>& slot, bool visible) {
 // id first. It only gets to do that when no hold is on, so CEF sees geometry
 // through cef_width/cef_height/cef_dpr, and those change only when no resize is
 // in flight. Changes the plugin asks for meanwhile collapse into the latest one.
+//
+// The paint that ends a resize needs a capture after the resize lands. On macOS
+// CEF paints by capturing the root frame at the size of the renderer's last
+// activated frame. When the renderer's frame at the new size activates, the
+// capture size changes, but a page with nothing else changing gives the
+// capturer no damage, and it drops refresh requests while it still sees the
+// content as animating. The one Invalidate at the start of a resize comes before
+// all of that, so ask again every kResizeRefreshMs until the paint arrives.
 namespace {
+constexpr int kResizeRefreshMs = 100;
 constexpr int kResizePaintWaitMs = 1000;
 constexpr int kResizePaintMaxWaitMs = 4000;
 constexpr int kResizeMaxKicks = 6;
@@ -437,6 +446,8 @@ void ApplyGeometry(const std::shared_ptr<Slot>& slot) {
   host->SendExternalBeginFrame();
   slot->resize_in_flight = true;
   slot->resize_wait_since = std::chrono::steady_clock::now();
+  slot->resize_refresh_at =
+      slot->resize_wait_since + std::chrono::milliseconds(kResizeRefreshMs);
   slot->resize_wait_ms = kResizePaintWaitMs;
   slot->resize_kicks = 0;
 }
@@ -455,13 +466,19 @@ void NoteViewPaint(const std::shared_ptr<Slot>& slot, int pixel_w, int pixel_h) 
   CefPostTask(TID_UI, base::BindOnce(&ApplyGeometry, slot));
 }
 
-// The fallback if a resize still doesn't paint. With the hold on and the
-// geometry CEF sees unchanged, NotifyScreenInfoChanged only swaps in a fresh
-// surface id, which gets the renderer to paint again. Waits back off (1, 2,
-// 4 s) so a page that is merely slow to lay out isn't kicked over and over.
+// Runs every begin frame while a resize is in flight: asks for a fresh capture
+// every kResizeRefreshMs (see above), and kicks if the paint still doesn't come.
+// With the hold on and the geometry CEF sees unchanged, NotifyScreenInfoChanged
+// only swaps in a fresh surface id, which gets the renderer to paint again.
+// Waits back off (1, 2, 4 s) so a page that is merely slow to lay out isn't
+// kicked over and over.
 void CheckResizeStall(const std::shared_ptr<Slot>& slot) {
   if (!slot->resize_in_flight || !slot->visible || !slot->browser) return;
   const auto now = std::chrono::steady_clock::now();
+  if (now >= slot->resize_refresh_at) {
+    slot->browser->GetHost()->Invalidate(PET_VIEW);
+    slot->resize_refresh_at = now + std::chrono::milliseconds(kResizeRefreshMs);
+  }
   if (now - slot->resize_wait_since <
       std::chrono::milliseconds(slot->resize_wait_ms))
     return;
