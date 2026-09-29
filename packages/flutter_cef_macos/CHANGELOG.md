@@ -4,8 +4,9 @@
   the new size (up to about 4 s), most often mid-way through an animated device
   switch. CEF paints by capturing the view: the renderer's first frame at the
   new size was captured at the old size, and the capturer's own retries were
-  turned away until the stall fallback kicked in. `cef_host` now asks for a
-  fresh capture every 100 ms while a resize waits for its paint.
+  turned away until the stall fallback kicked in (CEF issue #3826, fixed in
+  CEF 8037+). `cef_host` now asks for a fresh capture every 100 ms while a
+  resize waits for its paint.
   `device_frame` no longer needs the stall fallback (it did in 1 to 12 of 30
   switches). The prebuilt must be republished.
 * Fix: a view could stop painting for good after a resize that changed the

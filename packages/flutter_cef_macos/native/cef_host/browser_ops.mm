@@ -402,13 +402,15 @@ void DoSetVisible(const std::shared_ptr<Slot>& slot, bool visible) {
 // size of the renderer's last activated frame. When the renderer's frame at the
 // new size activates, it is captured at the OLD size, and only then does CEF set
 // the new capture size. The capture that change asks for is rate-limited (one
-// was just taken), and the capturer's own retries go through a stricter check
-// (nothing pending, no recent animation) that can turn them all away. A page
-// with nothing else changing gives it no damage either, so no paint at the new
-// size came until the stall kick. Invalidate asks for a capture the way a
-// compositor update does, which isn't subject to that check. The one at the
-// start of a resize comes too early, so ask again every kResizeRefreshMs until
-// the paint arrives.
+// was just taken), and the capturer's own retries only capture when no capture
+// is pending. Chromium leaves a dropped capture counted as pending, so after one
+// drop those retries never capture again (CEF issue #3826). A page with nothing
+// else changing gives it no damage either, so no paint at the new size came
+// until the stall kick. Invalidate asks for a capture the way a compositor
+// update does, which isn't subject to that check. The one at the start of a
+// resize comes too early, so ask again every kResizeRefreshMs until the paint
+// arrives. CEF fixed the bookkeeping in viz_capture_3826.patch (branch 8037 and
+// later); on such a CEF this refresh is no longer needed.
 namespace {
 constexpr int kResizeRefreshMs = 100;
 constexpr int kResizePaintWaitMs = 1000;
