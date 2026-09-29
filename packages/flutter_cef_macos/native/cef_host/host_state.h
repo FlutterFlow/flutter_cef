@@ -209,10 +209,12 @@ struct Slot {
   // gating. UI-thread only, like `visible`.
   int pump_interval_ms = 16;
   // A resize handed to CEF and not yet painted (see ApplyGeometry in
-  // browser_ops.mm): since when, the pixel size CEF will paint, how long the
-  // current wait may run before a kick, and the kicks so far. UI-thread only.
+  // browser_ops.mm): since when, when to next ask for a fresh capture, the
+  // pixel size CEF will paint, how long the current wait may run before a kick,
+  // and the kicks so far. UI-thread only.
   bool resize_in_flight = false;
   std::chrono::steady_clock::time_point resize_wait_since{};
+  std::chrono::steady_clock::time_point resize_refresh_at{};
   int resize_want_w = 0;
   int resize_want_h = 0;
   int resize_wait_ms = 0;

@@ -1,5 +1,12 @@
 ## Unreleased
 
+* Fix: on macOS, a resize could wait a second or more for its first paint at
+  the new size (up to about 4 s), most often mid-way through an animated device
+  switch. CEF paints by capturing the view, and after a big resize nothing asked
+  it to capture again once the renderer's new-size frame was in. `cef_host` now
+  asks for a fresh capture every 100 ms while a resize waits for its paint.
+  `device_frame` no longer needs the stall fallback (it did in 1 to 12 of 30
+  switches). The prebuilt must be republished.
 * Fix: a view could stop painting for good after a resize that changed the
   render scale, typically when switching the device frame in a preview of a page
   slow to relayout. Hide/show and reload didn't bring it back. `cef_host` now
